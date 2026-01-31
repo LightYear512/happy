@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!--
+        Base configuration: Trust all system and user certificates for HTTPS.
+        This allows custom server URLs without needing to modify source code.
+    -->
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <!-- Trust system certificates (default Android CA store) -->
+            <certificates src="system" />
+            <!-- Trust user-installed certificates (for corporate/custom CAs) -->
+            <certificates src="user" />
+        </trust-anchors>
+    </base-config>
+
+    <!--
+        Allow HTTP (cleartext) for localhost and private networks.
+        This enables local development servers without HTTPS.
+    -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">localhost</domain>
+        <domain includeSubdomains="true">10.0.2.2</domain>
+        <domain includeSubdomains="true">127.0.0.1</domain>
+        <!-- Private network ranges -->
+        <domain includeSubdomains="false">192.168.0.1</domain>
+        <domain includeSubdomains="false">192.168.1.1</domain>
+        <domain includeSubdomains="false">192.168.4.1</domain>
+        <domain includeSubdomains="false">192.168.4.5</domain>
+        <domain includeSubdomains="false">172.16.0.1</domain>
+    </domain-config>
+</network-security-config>
