@@ -21,6 +21,9 @@ import { enableAuthentication } from "./utils/enableAuthentication";
 import { userRoutes } from "./routes/userRoutes";
 import { feedRoutes } from "./routes/feedRoutes";
 import { kvRoutes } from "./routes/kvRoutes";
+import { isLocalStorage, getLocalFilesDir } from "@/storage/files";
+import * as path from "path";
+import * as fs from "fs";
 
 export async function startApi() {
 
@@ -50,6 +53,25 @@ export async function startApi() {
     enableMonitoring(typed);
     enableErrorHandlers(typed);
     enableAuthentication(typed);
+
+    // Serve local files when using local storage
+    if (isLocalStorage()) {
+        app.get('/files/*', function (request, reply) {
+            const filePath = (request.params as any)['*'];
+            const baseDir = path.resolve(getLocalFilesDir());
+            const fullPath = path.resolve(baseDir, filePath);
+            if (!fullPath.startsWith(baseDir + path.sep)) {
+                reply.code(403).send('Forbidden');
+                return;
+            }
+            if (!fs.existsSync(fullPath)) {
+                reply.code(404).send('Not found');
+                return;
+            }
+            const stream = fs.createReadStream(fullPath);
+            reply.send(stream);
+        });
+    }
 
     // Routes
     authRoutes(typed);
