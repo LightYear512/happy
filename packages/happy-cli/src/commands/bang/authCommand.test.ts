@@ -68,58 +68,109 @@ describe('handleAuthBangCommand', () => {
     });
 
     describe('!auth (list profiles)', () => {
-        it('should show warning when no CCS profiles exist', async () => {
-            mockExistsSync.mockReturnValue(false);
-
-            const result = await handleAuthBangCommand('', createMockContext());
-            expect(result.action).toBe('none');
-            expect(result.message).toContain('No CCS profiles found');
-        });
-
-        it('should list available profiles', async () => {
-            mockCcsProfiles(
-                { work: { type: 'account' }, personal: { type: 'account' } },
-                'work'
-            );
-
-            const result = await handleAuthBangCommand('', createMockContext());
-            expect(result.action).toBe('none');
-            expect(result.message).toContain('work');
-            expect(result.message).toContain('personal');
-            expect(result.message).toContain('[default]');
-        });
-
-        it('should mark current profile when CLAUDE_CONFIG_DIR is set', async () => {
-            mockCcsProfiles(
-                { work: { type: 'account' }, personal: { type: 'account' } },
-                'work'
-            );
+        it('should show current account as isolated when not in a shared group', async () => {
+            mockCcsProfiles({ work: { type: 'account' } });
             process.env.CLAUDE_CONFIG_DIR = join(ccsDir, 'instances', 'work');
 
             const result = await handleAuthBangCommand('', createMockContext());
-            expect(result.message).toContain('(current)');
+            expect(result.action).toBe('none');
+            expect(result.message).toContain('isolated');
+            expect(result.message).toContain('No switchable accounts');
         });
 
-        it('should show "default (current)" when no profile is active', async () => {
+        it('should show default as current when no profile is active', async () => {
             mockCcsProfiles({ work: { type: 'account' } });
 
             const result = await handleAuthBangCommand('', createMockContext());
             expect(result.message).toContain('default (current)');
+            expect(result.message).toContain('No switchable accounts');
+        });
+
+        it('should list same-group profiles when in a shared group', async () => {
+            mockCcsProfiles({
+                work: { type: 'account', context_mode: 'shared', context_group: 'team' },
+                personal: { type: 'account', context_mode: 'shared', context_group: 'team' },
+                other: { type: 'account', context_mode: 'shared', context_group: 'solo' },
+            });
+            process.env.CLAUDE_CONFIG_DIR = join(ccsDir, 'instances', 'work');
+
+            const result = await handleAuthBangCommand('', createMockContext());
+            expect(result.action).toBe('none');
+            expect(result.message).toContain('Group "team"');
+            expect(result.message).toContain('work (current)');
+            expect(result.message).toContain('personal');
+            // Should NOT show profile from a different group
+            expect(result.message).not.toContain('other');
+            expect(result.message).toContain('!auth <name>');
+        });
+
+        it('should show no switchable when alone in shared group', async () => {
+            mockCcsProfiles({
+                work: { type: 'account', context_mode: 'shared', context_group: 'team' },
+            });
+            process.env.CLAUDE_CONFIG_DIR = join(ccsDir, 'instances', 'work');
+
+            const result = await handleAuthBangCommand('', createMockContext());
+            expect(result.message).toContain('No switchable accounts');
         });
     });
 
     describe('!auth <name> (switch profile)', () => {
-        it('should switch to a valid profile', async () => {
-            mockCcsProfiles({ work: { type: 'account' } });
+        it('should switch between profiles in the same shared group', async () => {
+            mockCcsProfiles({
+                work: { type: 'account', context_mode: 'shared', context_group: 'team' },
+                personal: { type: 'account', context_mode: 'shared', context_group: 'team' },
+            });
+            process.env.CLAUDE_CONFIG_DIR = join(ccsDir, 'instances', 'work');
 
-            const result = await handleAuthBangCommand('work', createMockContext());
-            expect(result.action).toBe('restart-session');
-            expect(result.message).toContain('Switching to "work"');
+            const result = await handleAuthBangCommand('personal', createMockContext());
+            expect(result.action).toBe('none');
+            expect(result.message).toContain('Switched to "personal"');
+            expect(process.env.CLAUDE_CONFIG_DIR).toBe(join(ccsDir, 'instances', 'personal'));
+        });
+
+        it('should reject switching to a profile in a different group', async () => {
+            mockCcsProfiles({
+                work: { type: 'account', context_mode: 'shared', context_group: 'team' },
+                other: { type: 'account', context_mode: 'shared', context_group: 'solo' },
+            });
+            process.env.CLAUDE_CONFIG_DIR = join(ccsDir, 'instances', 'work');
+
+            const result = await handleAuthBangCommand('other', createMockContext());
+            expect(result.action).toBe('none');
+            expect(result.message).toContain('not in the same context group');
+            // Should NOT have changed CLAUDE_CONFIG_DIR
             expect(process.env.CLAUDE_CONFIG_DIR).toBe(join(ccsDir, 'instances', 'work'));
         });
 
+        it('should reject switching to an isolated profile', async () => {
+            mockCcsProfiles({
+                work: { type: 'account', context_mode: 'shared', context_group: 'team' },
+                isolated: { type: 'account' },
+            });
+            process.env.CLAUDE_CONFIG_DIR = join(ccsDir, 'instances', 'work');
+
+            const result = await handleAuthBangCommand('isolated', createMockContext());
+            expect(result.action).toBe('none');
+            expect(result.message).toContain('not in the same context group');
+        });
+
+        it('should reject switching when current profile is not shared', async () => {
+            mockCcsProfiles({
+                work: { type: 'account' },
+                personal: { type: 'account', context_mode: 'shared', context_group: 'team' },
+            });
+            process.env.CLAUDE_CONFIG_DIR = join(ccsDir, 'instances', 'work');
+
+            const result = await handleAuthBangCommand('personal', createMockContext());
+            expect(result.action).toBe('none');
+            expect(result.message).toContain('not in the same context group');
+        });
+
         it('should skip switch when already on same profile', async () => {
-            mockCcsProfiles({ work: { type: 'account' } });
+            mockCcsProfiles({
+                work: { type: 'account', context_mode: 'shared', context_group: 'team' },
+            });
             process.env.CLAUDE_CONFIG_DIR = join(ccsDir, 'instances', 'work');
 
             const result = await handleAuthBangCommand('work', createMockContext());
@@ -135,45 +186,22 @@ describe('handleAuthBangCommand', () => {
             expect(result.message).toContain('not found');
         });
 
-        it('should suggest similar profile names', async () => {
-            mockCcsProfiles({ workspace: { type: 'account' } });
-
-            const result = await handleAuthBangCommand('work', createMockContext());
-            expect(result.message).toContain('workspace');
-        });
-
-        it('should switch to default (unset CLAUDE_CONFIG_DIR)', async () => {
-            process.env.CLAUDE_CONFIG_DIR = join(ccsDir, 'instances', 'work');
-            mockCcsProfiles({ work: { type: 'account' } });
-
-            const result = await handleAuthBangCommand('default', createMockContext());
-            expect(result.action).toBe('restart-session');
-            expect(process.env.CLAUDE_CONFIG_DIR).toBeUndefined();
-        });
-
-        it('should skip switch when already on default', async () => {
-            // No CLAUDE_CONFIG_DIR set = already on default
-            mockCcsProfiles({ work: { type: 'account' } });
-
-            const result = await handleAuthBangCommand('default', createMockContext());
-            expect(result.action).toBe('none');
-            expect(result.message).toContain('Already using default');
-        });
-
         it('should error when instance directory is not initialized', async () => {
-            // Profile exists but instance dir doesn't
             mockExistsSync.mockImplementation((path: string) => {
                 if (path === ccsDir) return true;
                 if (path === join(ccsDir, 'profiles.json')) return true;
-                // Instance directory does NOT exist
+                // Instance directory for 'personal' does NOT exist
+                if (path === join(ccsDir, 'instances', 'work')) return true;
                 return false;
             });
 
             mockReadFileSync.mockReturnValue(JSON.stringify({
-                work: { type: 'account' },
+                work: { type: 'account', context_mode: 'shared', context_group: 'team' },
+                personal: { type: 'account', context_mode: 'shared', context_group: 'team' },
             }));
+            process.env.CLAUDE_CONFIG_DIR = join(ccsDir, 'instances', 'work');
 
-            const result = await handleAuthBangCommand('work', createMockContext());
+            const result = await handleAuthBangCommand('personal', createMockContext());
             expect(result.action).toBe('none');
             expect(result.message).toContain('not initialized');
         });
