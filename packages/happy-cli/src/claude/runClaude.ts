@@ -365,11 +365,15 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 session: currentSession,
                 messageQueue,
                 currentEnhancedMode: enhancedMode,
-            }).then(result => {
+            }).then(async result => {
+                await new Promise(resolve => setTimeout(resolve, 100));
                 session.sendSessionEvent({ type: 'message', message: result.message });
-            }).catch(error => {
+                session.sendSessionEvent({ type: 'ready' });
+            }).catch(async error => {
                 logger.debug('[start] Bang command error:', error);
+                await new Promise(resolve => setTimeout(resolve, 100));
                 session.sendSessionEvent({ type: 'message', message: `❌ Command error: ${error}` });
+                session.sendSessionEvent({ type: 'ready' });
             });
             return;
         }
