@@ -28,6 +28,10 @@
       "autoIncrement": true,
       "distribution": "internal",
       "channel": "preview",
+      "android": {
+        "buildType": "apk",
+        "gradleCommand": ":app:assembleRelease -PreactNativeArchitectures=arm64-v8a"
+      },
       "env": {
         "APP_ENV": "preview",
         "SHARP_IGNORE_GLOBAL_LIBVIPS": "1"
@@ -37,6 +41,9 @@
       "autoIncrement": true,
       "distribution": "store",
       "channel": "preview",
+      "android": {
+        "buildType": "apk"
+      },
       "env": {
         "APP_ENV": "preview",
         "SHARP_IGNORE_GLOBAL_LIBVIPS": "1"
