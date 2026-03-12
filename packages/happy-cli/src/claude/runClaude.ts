@@ -13,6 +13,7 @@ import { hashObject } from '@/utils/deterministicJson';
 import { startCaffeinate, stopCaffeinate } from '@/utils/caffeinate';
 import { extractSDKMetadataAsync } from '@/claude/sdk/metadataExtractor';
 import { parseSpecialCommand } from '@/parsers/specialCommands';
+import { isBangCommand, executeBangCommand } from '@/commands/bang/dispatcher';
 import { getEnvironmentInfo } from '@/ui/doctor';
 import { configuration } from '@/configuration';
 import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
@@ -333,6 +334,38 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             logger.debug(`[loop] Disallowed tools updated from user message: ${messageDisallowedTools ? messageDisallowedTools.join(', ') : 'reset to none'}`);
         } else {
             logger.debug(`[loop] User message received with no disallowed tools override, using current: ${currentDisallowedTools ? currentDisallowedTools.join(', ') : 'none'}`);
+        }
+
+        // Check for bang commands (! prefix) - handle without LLM
+        if (isBangCommand(message.content.text)) {
+            const enhancedMode: EnhancedMode = {
+                permissionMode: messagePermissionMode || 'default',
+                model: messageModel,
+                fallbackModel: messageFallbackModel,
+                customSystemPrompt: messageCustomSystemPrompt,
+                appendSystemPrompt: messageAppendSystemPrompt,
+                allowedTools: messageAllowedTools,
+                disallowedTools: messageDisallowedTools
+            };
+            executeBangCommand(message.content.text, {
+                client: session,
+                session: currentSession,
+                messageQueue,
+                currentEnhancedMode: enhancedMode,
+            }).then(result => {
+                session.sendSessionEvent({ type: 'message', message: result.message });
+
+                if (result.action === 'restart-session') {
+                    if (currentSession) {
+                        currentSession.clearSessionId();
+                    }
+                    messageQueue.pushIsolateAndClear('/clear', enhancedMode);
+                }
+            }).catch(error => {
+                logger.debug('[start] Bang command error:', error);
+                session.sendSessionEvent({ type: 'message', message: `❌ Command error: ${error}` });
+            });
+            return;
         }
 
         // Check for special commands before processing
