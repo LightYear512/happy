@@ -1,5 +1,5 @@
 import { EnhancedMode } from "./loop";
-import { query, type QueryOptions, type SDKMessage, type SDKSystemMessage, AbortError, SDKUserMessage } from '@/claude/sdk'
+import { query, type QueryOptions, type SDKMessage, type SDKSystemMessage, type SDKResultMessage, AbortError, SDKUserMessage } from '@/claude/sdk'
 import { mapToClaudeMode } from "./utils/permissionMode";
 import { claudeCheckSession } from "./utils/claudeCheckSession";
 import { join, resolve } from 'node:path';
@@ -39,7 +39,9 @@ export async function claudeRemote(opts: {
     onThinkingChange?: (thinking: boolean) => void,
     onMessage: (message: SDKMessage) => void,
     onCompletionEvent?: (message: string) => void,
-    onSessionReset?: () => void
+    onSessionReset?: () => void,
+    /** Called when Claude returns an error result (rate limit, max turns, etc.) */
+    onErrorResult?: (message: string) => void,
 }) {
 
     // Check if session is valid
@@ -189,10 +191,39 @@ export async function claudeRemote(opts: {
                 }
             }
 
+            // Handle rate_limit_event — forward rate limit info to mobile
+            if (message.type === 'rate_limit_event') {
+                const info = (message as any).rate_limit_info;
+                if (info && info.status !== 'allowed') {
+                    const resetsAt = info.resetsAt ? new Date(info.resetsAt * 1000).toLocaleTimeString() : 'unknown';
+                    logger.debug(`[claudeRemote] Rate limit hit: type=${info.rateLimitType}, resets=${resetsAt}`);
+                }
+            }
+
             // Handle result messages
             if (message.type === 'result') {
                 updateThinking(false);
-                logger.debug('[claudeRemote] Result received, exiting claudeRemote');
+                const resultMsg = message as SDKResultMessage;
+                logger.debug(`[claudeRemote] Result received: subtype=${resultMsg.subtype}, is_error=${resultMsg.is_error}`);
+
+                // Error result (rate limit, max turns, execution error)
+                if (resultMsg.is_error) {
+                    const errorText = resultMsg.result || `Error: ${resultMsg.subtype}`;
+                    logger.debug(`[claudeRemote] Error result: ${errorText}`);
+                    if (opts.onErrorResult) {
+                        opts.onErrorResult(errorText);
+                    }
+                    // Don't call onReady() — turn should be closed as 'failed' by launcher
+                    // Still wait for next message so user can retry after limit resets
+                    const next = await opts.nextMessage();
+                    if (!next) {
+                        messages.end();
+                        return;
+                    }
+                    mode = next.mode;
+                    messages.push({ type: 'user', message: { role: 'user', content: next.message } });
+                    continue;
+                }
 
                 // Send completion messages
                 if (isCompactCommand) {
