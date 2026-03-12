@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import { resolve, join } from "node:path";
+import { homedir } from "node:os";
 import { createInterface } from "node:readline";
-import { mkdirSync, existsSync } from "node:fs";
+import { mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { logger } from "@/ui/logger";
 import { claudeCheckSession } from "./utils/claudeCheckSession";
@@ -11,6 +12,49 @@ import { projectPath } from "@/projectPath";
 import { systemPrompt } from "./utils/systemPrompt";
 import type { SandboxConfig } from "@/persistence";
 import { initializeSandbox, wrapCommand } from "@/sandbox/manager";
+
+/**
+ * Pre-write workspace trust state so Claude Code doesn't show the interactive
+ * "Accessing workspace" safety prompt on re-spawn.
+ *
+ * Claude Code stores trust in `$CLAUDE_CONFIG_DIR/.claude.json` under
+ * `projects[workingDirectory].hasTrustDialogAccepted`.
+ */
+function ensureWorkspaceTrust(workingDirectory: string): void {
+    const claudeConfigDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude');
+    const claudeJsonPath = join(claudeConfigDir, '.claude.json');
+
+    try {
+        let data: Record<string, any> = {};
+        if (existsSync(claudeJsonPath)) {
+            data = JSON.parse(readFileSync(claudeJsonPath, 'utf8'));
+        }
+
+        if (!data.projects) {
+            data.projects = {};
+        }
+
+        const resolvedPath = resolve(workingDirectory);
+        // Normalise to forward slashes (Claude Code on Windows uses forward slashes as keys)
+        const projectKey = resolvedPath.replace(/\\/g, '/');
+
+        if (!data.projects[projectKey]) {
+            data.projects[projectKey] = {};
+        }
+
+        if (data.projects[projectKey].hasTrustDialogAccepted === true) {
+            return; // Already trusted
+        }
+
+        data.projects[projectKey].hasTrustDialogAccepted = true;
+        mkdirSync(claudeConfigDir, { recursive: true });
+        writeFileSync(claudeJsonPath, JSON.stringify(data, null, 2), 'utf8');
+        logger.debug(`[ClaudeLocal] Pre-wrote workspace trust for: ${projectKey}`);
+    } catch (err) {
+        // Non-fatal: if we fail, Claude Code will just show the prompt as before
+        logger.debug(`[ClaudeLocal] Failed to pre-write workspace trust: ${err}`);
+    }
+}
 
 /**
  * Error thrown when the Claude process exits with a non-zero exit code.
@@ -51,6 +95,9 @@ export async function claudeLocal(opts: {
     // Ensure project directory exists
     const projectDir = getProjectPath(opts.path);
     mkdirSync(projectDir, { recursive: true });
+
+    // Pre-write workspace trust to prevent interactive "Accessing workspace" prompt on re-spawn
+    ensureWorkspaceTrust(opts.path);
 
     // Check if claudeArgs contains --continue or --resume (user passed these flags)
     const hasContinueFlag = opts.claudeArgs?.includes('--continue');
