@@ -174,6 +174,7 @@ function parseYamlAccounts(yaml: string): CcsProfileInfo[] {
         // Exit accounts section when a new top-level key appears
         if (inAccounts && /^\S/.test(line) && !line.startsWith('#')) {
             if (current) accounts.push(current);
+            current = null;
             inAccounts = false;
             continue;
         }
