@@ -9,6 +9,7 @@ export interface AppConfig {
     elevenLabsAgentIdDev?: string;
     elevenLabsAgentIdProd?: string;
     serverUrl?: string;
+    enableGms: boolean;
 }
 
 /**
@@ -96,6 +97,13 @@ export function loadAppConfig(): AppConfig {
         console.log('[loadAppConfig] Override serverUrl from EXPO_PUBLIC_SERVER_URL');
         config.serverUrl = process.env.EXPO_PUBLIC_SERVER_URL;
     }
+
+    // Check if GMS is enabled based on expo-notifications plugin
+    const plugins = Constants.expoConfig?.plugins;
+    const hasNotificationsPlugin = Array.isArray(plugins) && plugins.some(p =>
+        (Array.isArray(p) && p[0] === 'expo-notifications') || p === 'expo-notifications'
+    );
+    config.enableGms = hasNotificationsPlugin;
 
     return config as AppConfig;
 }

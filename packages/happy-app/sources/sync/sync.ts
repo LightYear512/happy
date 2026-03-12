@@ -115,7 +115,7 @@ class Sync {
         this.feedSync = new InvalidateSync(this.fetchFeed);
 
         const registerPushToken = async () => {
-            if (__DEV__) {
+            if (__DEV__ || !config.enableGms) {
                 return;
             }
             await this.registerPushToken();
@@ -140,8 +140,10 @@ class Sync {
                 this.purchasesSync.invalidate();
                 this.profileSync.invalidate();
                 this.machinesSync.invalidate();
-                this.pushTokenSync.invalidate();
-                this.sessionsSync.invalidate();
+                if (config.enableGms) {
+                    this.pushTokenSync.invalidate();
+                    this.purchasesSync.invalidate();
+                }
                 this.nativeUpdateSync.invalidate();
                 log.log('📱 App became active: Invalidating artifacts sync');
                 this.artifactsSync.invalidate();
@@ -202,9 +204,10 @@ class Sync {
         this.sessionsSync.invalidate();
         this.settingsSync.invalidate();
         this.profileSync.invalidate();
-        this.purchasesSync.invalidate();
-        this.machinesSync.invalidate();
-        this.pushTokenSync.invalidate();
+        if (config.enableGms) {
+            this.purchasesSync.invalidate();
+            this.pushTokenSync.invalidate();
+        }
         this.nativeUpdateSync.invalidate();
         this.friendsSync.invalidate();
         this.friendRequestsSync.invalidate();
@@ -1476,6 +1479,9 @@ class Sync {
     }
 
     private syncPurchases = async () => {
+        if (!config.enableGms) {
+            return;
+        }
         try {
             // Initialize RevenueCat if not already done
             if (!this.revenueCatInitialized) {
