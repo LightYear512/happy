@@ -28,6 +28,9 @@ const logLevelMap = {
 
 class RevenueCatNative implements RevenueCatInterface {
     configure(config: RevenueCatConfig): void {
+        if (!config.apiKey) {
+            return;
+        }
         Purchases.configure({
             apiKey: config.apiKey,
             appUserID: config.appUserID,
