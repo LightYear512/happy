@@ -569,6 +569,13 @@ ${chalk.bold('To clean up runaway processes:')} Use ${chalk.cyan('happy doctor c
         unknownArgs.push('--dangerously-skip-permissions')
       } else if (arg === '--started-by') {
         options.startedBy = args[++i] as 'daemon' | 'terminal'
+      } else if (arg === '--profile') {
+        const profile = args[++i]
+        if (!profile) {
+          console.error(chalk.red(`--profile requires a profile name`))
+          process.exit(1)
+        }
+        options.profile = profile
       } else if (arg === '--js-runtime') {
         const runtime = args[++i]
         if (runtime !== 'node' && runtime !== 'bun') {
@@ -649,6 +656,7 @@ ${chalk.bold('Examples:')}
   happy --chrome           Enable Chrome browser access for this session
   happy --no-chrome        Disable Chrome even if default is on
   happy --no-sandbox       Disable Happy sandbox for this session
+  happy --profile work     Use a specific CCS account profile
   happy --js-runtime bun   Use bun instead of node to spawn Claude Code
   happy --claude-env ANTHROPIC_BASE_URL=http://127.0.0.1:3456
                            Use a custom API endpoint (e.g., claude-code-router)
