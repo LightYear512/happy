@@ -20,10 +20,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Testing
 - `yarn test` - Run tests in watch mode (Vitest)
-- No existing tests in the codebase yet
+- Test files use `.test.ts` or `.spec.ts` extension
+- Limited test coverage currently exists
 
 ### Production
-- `yarn ota` - Deploy over-the-air updates via EAS Update to production branch
+- `yarn ota` - Deploy over-the-air updates via EAS Update to preview branch
+- `yarn ota:production` - Deploy to production via EAS workflow
+- `yarn submit` - Submit iOS build to App Store
 
 ## Changelog Management
 
@@ -106,17 +109,41 @@ sources/
 
 ### Development Guidelines
 
+#### Code Style & Structure
 - Use **4 spaces** for indentation
 - Use **yarn** instead of npm for package management
 - Path alias `@/*` maps to `./sources/*`
 - TypeScript strict mode is enabled - ensure all code is properly typed
-- Follow existing component patterns when creating new UI components
+- Always wrap pages in `React.memo`
+- Always put styles at the very end of component/page files
+- When non-trivial hooks are needed, create dedicated ones in `hooks/` folder with comments explaining logic
+- Store all temporary scripts and tests outside of unit tests in `sources/trash/` folder
+
+#### Navigation & Screens
+- Store app pages in `sources/app/(app)/`
+- When setting screen parameters, ALWAYS set them in `_layout.tsx` if possible to avoid layout shifts
+- Never use custom headers in navigation
+- Almost never use `Stack.Screen` options in individual pages, only when showing dynamic content
+- Always show header on all screens
+- Always use **expo-router API**, not react-navigation API directly
+
+#### UI Components
+- **Never use Alert module from React Native** - always use `@/modal/index.ts` instead
+- Always use `Item`/`ItemList`/`ItemGroup` components for most containers
+- Always use `Avatar` component for all avatars
+- Always use `useHappyAction` hook for async operations (automatic error handling)
+- **Always apply layout width constraints** from `@/components/layout` to full-screen ScrollViews and content containers for responsive design
+- For hotkeys use `useGlobalKeyboard` (Web-only), do not modify it
+
+#### Data & Sync
+- Core principle: never show loading errors, always retry automatically
+- Always sync main data in "sync" class
+- Always use invalidate sync for data updates
 - Real-time sync operations are handled through SyncSocket and SyncSession classes
-- Store all temporary scripts and any test outside of unit tests in sources/trash folder
-- When setting screen parameters ALWAYS set them in _layout.tsx if possible this avoids layout shifts
-- **Never use Alert module from React Native, always use @sources/modal/index.ts instead**
-- **Always apply layout width constraints** from `@/components/layout` to full-screen ScrollViews and content containers for responsive design across device sizes
+
+#### Code Quality
 - Always run `yarn typecheck` after all changes to ensure type safety
+- No backward compatibility unless explicitly stated
 
 ### Internationalization (i18n) Guidelines
 
@@ -206,12 +233,35 @@ When working with translations, use the **i18n-translator** agent for:
 
 The agent should be called whenever new user-facing text is introduced to the codebase or when translation verification is needed.
 
+### Core UI Components
+
+#### Item Components
+- **`Item.tsx`** - Base component for list items with consistent styling
+- **`ItemList.tsx`** - Scrollable container for Item components with grouped/inset styling
+- **`ItemGroup.tsx`** - Groups multiple Item components with headers/footers
+- Use these components for most UI layouts instead of custom containers
+
+#### Layout System
+- **`sources/components/layout.ts`** - Responsive layout constraints
+  - `layout.maxWidth` - Maximum content width for tablets/desktop (800px)
+  - `layout.headerMaxWidth` - Maximum header width
+  - Automatically adjusts for phones (full width) and macOS desktop (1400px)
+  - Apply to ScrollViews and content containers for responsive design
+
+#### Avatar Component
+- **`Avatar.tsx`** - Unified avatar component with multiple styles
+  - Supports user images, gradients, and flavor icons (Claude, Codex, Gemini)
+  - Handles monochrome mode, square/circle shapes, thumbhash placeholders
+  - Always use this component for all avatar needs
+
 ### Important Files
 
 - `sources/sync/types.ts` - Core type definitions for the sync protocol
 - `sources/sync/reducer.ts` - State management logic for sync operations
 - `sources/auth/AuthContext.tsx` - Authentication state management
 - `sources/app/_layout.tsx` - Root navigation structure
+- `sources/hooks/useHappyAction.ts` - Standard hook for async operations with error handling
+- `sources/hooks/useGlobalKeyboard.ts` - Web-only keyboard shortcut handler
 
 ### Custom Header Component
 
@@ -442,21 +492,7 @@ const MyComponent = () => {
 
 ## Project Scope and Priorities
 
-- This project targets Android, iOS, and web platforms
-- Web is considered a secondary platform
-- Avoid web-specific implementations unless explicitly requested
-- Keep dev pages without i18n, always use t(...) function to translate all strings, when adding new string add it to all languages, think about context before translating.
-- Core principles: never show loading error, always just retry. Always sync main data in "sync" class. Always use invalidate sync for it. Always use Item component first and only then you should use anything else or custom ones for content. Do not ever do backward compatibility if not explicitly stated.
-- Never use custom headers in navigation, almost never use Stack.Page options in individual pages. Only when you need to show something dynamic. Always show header on all screens.
-- store app pages in @sources/app/(app)/
-- use ItemList for most containers for UI, if it is not custom like chat one.
-- Always use expo-router api, not react-navigation one.
-- Always try to use "useHappyAction" from @sources/hooks/useHappyAction.ts if you need to run some async operation, do not handle errors, etc - it is handled automatically.
-- Never use unistyles for expo-image, use classical one
-- Always use "Avatar" for avatars
-- No backward compatibliity ever
-- When non-trivial hook is needed - create a dedicated one in hooks folder, add a comment explaining it's logic
-- Always put styles in the very end of the component or page file
-- Always wrap pages in memo
-- For hotkeys use "useGlobalKeyboard", do not change it, it works only on Web
-- Use "AsyncLock" class for exclusive async locks
+- This project targets **Android, iOS, and web** platforms
+- **Web is considered a secondary platform** - avoid web-specific implementations unless explicitly requested
+- Keep dev/debug pages without i18n translations
+- **No backward compatibility** unless explicitly stated
