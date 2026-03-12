@@ -47,17 +47,34 @@ export function getServerInfo(): { hostname: string; port?: number; isCustom: bo
 }
 
 export function validateServerUrl(url: string): { valid: boolean; error?: string } {
+    console.log('[validateServerUrl] Input:', url);
+
     if (!url || !url.trim()) {
+        console.log('[validateServerUrl] URL is empty');
         return { valid: false, error: 'Server URL cannot be empty' };
     }
-    
+
     try {
+        console.log('[validateServerUrl] Parsing URL with URL constructor...');
         const parsed = new URL(url);
+        console.log('[validateServerUrl] Parsed successfully:', {
+            protocol: parsed.protocol,
+            hostname: parsed.hostname,
+            port: parsed.port,
+            pathname: parsed.pathname,
+            href: parsed.href
+        });
+
         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+            console.error('[validateServerUrl] Invalid protocol:', parsed.protocol);
             return { valid: false, error: 'Server URL must use HTTP or HTTPS protocol' };
         }
+
+        console.log('[validateServerUrl] ✅ Validation passed');
         return { valid: true };
-    } catch {
+    } catch (err) {
+        console.error('[validateServerUrl] URL parsing failed:', err);
+        console.error('[validateServerUrl] Error message:', err instanceof Error ? err.message : String(err));
         return { valid: false, error: 'Invalid URL format' };
     }
 }
