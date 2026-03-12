@@ -23,8 +23,33 @@ import { FaviconPermissionIndicator } from '@/components/web/FaviconPermissionIn
 import { CommandPaletteProvider } from '@/components/CommandPalette/CommandPaletteProvider';
 import { StatusBarProvider } from '@/components/StatusBarProvider';
 // import * as SystemUI from 'expo-system-ui';
+import { config } from '@/config';
 import { monkeyPatchConsoleForRemoteLoggingForFasterAiAutoDebuggingOnlyInLocalBuilds } from '@/utils/remoteLogger';
 import { useUnistyles } from 'react-native-unistyles';
+import * as Notifications from 'expo-notifications';
+
+// Configure notification handler for foreground notifications
+if (config.enableGms) {
+    Notifications.setNotificationHandler({
+        handleNotification: async () => ({
+            shouldShowAlert: true,
+            shouldPlaySound: true,
+            shouldSetBadge: true,
+            shouldShowBanner: true,
+            shouldShowList: true,
+        }),
+    });
+}
+
+// Setup Android notification channel (required for Android 8.0+)
+if (Platform.OS === 'android' && config.enableGms) {
+    Notifications.setNotificationChannelAsync('default', {
+        name: 'Default',
+        importance: Notifications.AndroidImportance.MAX,
+        vibrationPattern: [0, 250, 250, 250],
+        lightColor: '#FF231F7C',
+    });
+}
 
 export {
     // Catch any errors thrown by the Layout component.

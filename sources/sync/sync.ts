@@ -67,7 +67,7 @@ class Sync {
 
 
         const registerPushToken = async () => {
-            if (__DEV__) {
+            if (__DEV__ || !config.enableGms) {
                 return;
             }
             await this.registerPushToken();
@@ -82,8 +82,10 @@ class Sync {
                 this.purchasesSync.invalidate();
                 this.profileSync.invalidate();
                 this.machinesSync.invalidate();
-                this.pushTokenSync.invalidate();
-                this.sessionsSync.invalidate();
+                if (config.enableGms) {
+                    this.pushTokenSync.invalidate();
+                    this.purchasesSync.invalidate();
+                }
                 this.nativeUpdateSync.invalidate();
             } else {
                 log.log(`📱 App state changed to: ${nextAppState}`);
@@ -136,9 +138,10 @@ class Sync {
         this.sessionsSync.invalidate();
         this.settingsSync.invalidate();
         this.profileSync.invalidate();
-        this.purchasesSync.invalidate();
-        this.machinesSync.invalidate();
-        this.pushTokenSync.invalidate();
+        if (config.enableGms) {
+            this.purchasesSync.invalidate();
+            this.pushTokenSync.invalidate();
+        }
         this.nativeUpdateSync.invalidate();
 
         // Wait for both sessions and machines to load, then mark as ready
@@ -809,6 +812,9 @@ class Sync {
     }
 
     private syncPurchases = async () => {
+        if (!config.enableGms) {
+            return;
+        }
         try {
             // Initialize RevenueCat if not already done
             if (!this.revenueCatInitialized) {
