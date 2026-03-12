@@ -124,7 +124,6 @@ export async function claudeLocalLauncher(session: Session): Promise<LauncherRes
 
                 // Normal exit
                 if (!exitReason) {
-                    session.client.closeClaudeSessionTurn('completed');
                     exitReason = { type: 'exit', code: 0 };
                     break;
                 }
@@ -132,7 +131,6 @@ export async function claudeLocalLauncher(session: Session): Promise<LauncherRes
                 logger.debug('[local]: launch error', e);
                 // If Claude exited with non-zero exit code, propagate it
                 if (e instanceof ExitCodeError) {
-                    session.client.closeClaudeSessionTurn('failed');
                     exitReason = { type: 'exit', code: e.exitCode };
                     break;
                 }
@@ -154,12 +152,18 @@ export async function claudeLocalLauncher(session: Session): Promise<LauncherRes
         session.client.rpcHandlerManager.registerHandler('abort', async () => { });
         session.client.rpcHandlerManager.registerHandler('switch', async () => { });
         session.queue.setOnMessage(null);
-        
+
         // Remove session found callback
         session.removeSessionFoundCallback(scannerSessionCallback);
 
-        // Cleanup
+        // Cleanup scanner FIRST — flush any remaining messages to mobile
+        // before closing the turn (ensures hit-limit/error messages are sent)
         await scanner.cleanup();
+
+        // Close the turn AFTER scanner has flushed all messages
+        if (exitReason?.type === 'exit') {
+            session.client.closeClaudeSessionTurn(exitReason.code === 0 ? 'completed' : 'failed');
+        }
     }
 
     // Return

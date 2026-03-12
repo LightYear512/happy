@@ -391,6 +391,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             );
                         }
                     },
+                    onErrorResult: (message: string) => {
+                        session.client.closeClaudeSessionTurn('failed');
+                        session.client.sendSessionEvent({ type: 'message', message });
+                    },
                     signal: abortController.signal,
                 });
                 
