@@ -1,7 +1,7 @@
 import { logger } from '@/ui/logger'
 import { EventEmitter } from 'node:events'
 import { io, Socket } from 'socket.io-client'
-import { AgentState, ClientToServerEvents, Metadata, ServerToClientEvents, Session, Update, UserMessage, UserMessageSchema, Usage } from './types'
+import { AgentState, ClientToServerEvents, MessageContent, Metadata, ServerToClientEvents, Session, Update, UserMessage, UserMessageSchema, Usage } from './types'
 import { decodeBase64, decrypt, encodeBase64, encrypt } from './encryption';
 import { backoff, delay } from '@/utils/time';
 import { configuration } from '@/configuration';
@@ -359,11 +359,48 @@ export class ApiSessionClient extends EventEmitter {
      * @param body - Message body (can be MessageContent or raw content for agent messages)
      */
     sendClaudeSessionMessage(body: RawJSONLines) {
-        const mapped = mapClaudeLogMessageToSessionEnvelopes(body, this.claudeSessionProtocolState);
-        this.claudeSessionProtocolState.currentTurnId = mapped.currentTurnId;
-        for (const envelope of mapped.envelopes) {
-            this.sendSessionProtocolMessage(envelope);
+        let content: MessageContent;
+
+        // Check if body is already a MessageContent (has role property)
+        if (body.type === 'user' && typeof body.message.content === 'string' && body.isSidechain !== true && body.isMeta !== true) {
+            content = {
+                role: 'user',
+                content: {
+                    type: 'text',
+                    text: body.message.content
+                },
+                meta: {
+                    sentFrom: 'cli'
+                }
+            }
+        } else {
+            // Wrap Claude messages in the expected format
+            content = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: body  // This wraps the entire Claude message
+                },
+                meta: {
+                    sentFrom: 'cli'
+                }
+            };
         }
+
+        logger.debugLargeJson('[SOCKET] Sending message through socket:', content)
+
+        // Check if socket is connected before sending
+        if (!this.socket.connected) {
+            logger.debug('[API] Socket not connected, cannot send Claude session message. Message will be lost:', { type: body.type });
+            return;
+        }
+
+        const encrypted = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, content));
+        this.socket.emit('message', {
+            sid: this.sessionId,
+            message: encrypted
+        });
+
         // Track usage from assistant messages
         if (body.type === 'assistant' && body.message?.usage) {
             try {

@@ -1,5 +1,12 @@
 import { createId } from '@paralleldrive/cuid2';
-import { createEnvelope, type CreateEnvelopeOptions, type SessionEnvelope } from '@slopus/happy-wire';
+// Minimal types inlined from @slopus/happy-wire (not available on compat branch)
+type SessionRole = 'user' | 'agent';
+type SessionEnvelope = { id: string; role: SessionRole; time: number; ev: any; turn?: string; subagent?: string };
+type CreateEnvelopeOptions = { turn?: string; time?: number; id?: string; subagent?: string };
+function createEnvelope(_role: SessionRole, ev: Record<string, unknown>, opts: CreateEnvelopeOptions = {}): SessionEnvelope {
+  const { createId } = require('@paralleldrive/cuid2');
+  return { id: opts.id ?? createId(), time: opts.time ?? Date.now(), role: _role, ...(opts.turn ? { turn: opts.turn } : {}), ev };
+}
 import type { AgentMessage } from '@/agent/core';
 
 function turnOptions(turnId: string | null, time: number): CreateEnvelopeOptions {

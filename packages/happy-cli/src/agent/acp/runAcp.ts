@@ -6,7 +6,8 @@ import type { AgentMessage } from '@/agent/core';
 import { AcpBackend, type AcpPermissionHandler } from './AcpBackend';
 import { DefaultTransport } from '@/agent/transport';
 import { AcpSessionManager } from './AcpSessionManager';
-import type { SessionEnvelope } from '@slopus/happy-wire';
+// Minimal type inlined from @slopus/happy-wire (not available on compat branch)
+type SessionEnvelope = { id: string; role: 'user' | 'agent'; time: number; ev: any; turn?: string; subagent?: string };
 import { logger } from '@/ui/logger';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
