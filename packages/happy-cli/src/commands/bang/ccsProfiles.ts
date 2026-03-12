@@ -162,6 +162,7 @@ function parseYamlAccounts(yaml: string): CcsProfileInfo[] {
     const accounts: CcsProfileInfo[] = [];
     const lines = yaml.split('\n');
     let inAccounts = false;
+    let current: CcsProfileInfo | null = null;
 
     for (const line of lines) {
         // Detect accounts: section
@@ -172,6 +173,7 @@ function parseYamlAccounts(yaml: string): CcsProfileInfo[] {
 
         // Exit accounts section when a new top-level key appears
         if (inAccounts && /^\S/.test(line) && !line.startsWith('#')) {
+            if (current) accounts.push(current);
             inAccounts = false;
             continue;
         }
@@ -180,14 +182,32 @@ function parseYamlAccounts(yaml: string): CcsProfileInfo[] {
             // Match account entries like "  my-account:" or "  work:"
             const accountMatch = line.match(/^\s{2}(\S+):\s*$/);
             if (accountMatch) {
-                const name = accountMatch[1];
-                accounts.push({
-                    name,
-                    instancePath: getInstancePath(name),
-                });
+                if (current) accounts.push(current);
+                current = {
+                    name: accountMatch[1],
+                    instancePath: getInstancePath(accountMatch[1]),
+                };
+                continue;
+            }
+
+            // Match nested properties (4-space indent) for the current account
+            if (current) {
+                const propMatch = line.match(/^\s{4}(\w+):\s*(.+)$/);
+                if (propMatch) {
+                    const [, key, rawValue] = propMatch;
+                    const value = rawValue.replace(/^["']|["']$/g, '').trim();
+                    if (key === 'context_mode' && (value === 'shared' || value === 'isolated')) {
+                        current.contextMode = value;
+                    } else if (key === 'context_group') {
+                        current.contextGroup = value;
+                    }
+                }
             }
         }
     }
+
+    // Don't forget the last account
+    if (current) accounts.push(current);
 
     return accounts;
 }

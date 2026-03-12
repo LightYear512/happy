@@ -367,13 +367,6 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 currentEnhancedMode: enhancedMode,
             }).then(result => {
                 session.sendSessionEvent({ type: 'message', message: result.message });
-
-                if (result.action === 'restart-session') {
-                    if (currentSession) {
-                        currentSession.clearSessionId();
-                    }
-                    messageQueue.pushIsolateAndClear('/clear', enhancedMode);
-                }
             }).catch(error => {
                 logger.debug('[start] Bang command error:', error);
                 session.sendSessionEvent({ type: 'message', message: `❌ Command error: ${error}` });

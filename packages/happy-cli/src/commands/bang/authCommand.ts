@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs';
 import { logger } from '@/ui/logger';
-import { readCcsProfiles, getCurrentCcsProfile, getInstancePath } from './ccsProfiles';
+import { readCcsProfiles, getCurrentCcsProfile, type CcsProfileInfo } from './ccsProfiles';
 import type { BangCommandContext, BangCommandResult } from './types';
 
 /**
@@ -20,87 +20,75 @@ export async function handleAuthBangCommand(args: string, ctx: BangCommandContex
 }
 
 function listProfiles(): BangCommandResult {
-    const { profiles, defaultProfile } = readCcsProfiles();
-
-    if (profiles.length === 0) {
-        return {
-            message: [
-                '⚠️ No CCS profiles found',
-                '',
-                'Create profiles with:',
-                '  ccs auth create <name>',
-                '',
-                'Use --share-context to share project context across profiles.',
-            ].join('\n'),
-            action: 'none',
-        };
-    }
-
+    const { profiles } = readCcsProfiles();
     const currentProfile = getCurrentCcsProfile();
-    const lines: string[] = ['📋 Available accounts:'];
-    lines.push('');
+    const currentProfileInfo = currentProfile
+        ? profiles.find(p => p.name === currentProfile) ?? null
+        : null;
 
-    for (const profile of profiles) {
-        const isCurrent = profile.name === currentProfile;
-        const isDefault = profile.name === defaultProfile;
-        const indicator = isCurrent ? '●' : '○';
-        const currentTag = isCurrent ? ' (current)' : '';
-        const defaultTag = isDefault ? ' [default]' : '';
-        const contextTag = profile.contextMode === 'shared'
-            ? ` [shared: ${profile.contextGroup || 'default'}]`
-            : '';
+    const currentName = currentProfile || 'default';
+    const isShared = currentProfileInfo?.contextMode === 'shared';
+    const currentGroup = isShared ? (currentProfileInfo.contextGroup || 'default') : null;
 
-        lines.push(`  ${indicator} ${profile.name}${currentTag}${defaultTag}${contextTag}`);
+    // Find other profiles in the same shared group
+    const switchable = currentGroup
+        ? profiles.filter(p =>
+            p.contextMode === 'shared'
+            && (p.contextGroup || 'default') === currentGroup
+            && p.name !== currentProfile)
+        : [];
+
+    const lines: string[] = [];
+
+    if (currentGroup) {
+        lines.push(`📋 Group "${currentGroup}":`);
+    } else {
+        lines.push(`📋 Account: ${currentName} (isolated)`);
     }
 
-    // Show "default Claude" entry if no profile is active
-    if (!currentProfile) {
-        lines.push(`  ● default (current)`);
-    }
-
     lines.push('');
-    lines.push('Switch: !auth <name>');
+
+    if (!currentGroup || switchable.length === 0) {
+        lines.push(`  ● ${currentName} (current)`);
+        lines.push('');
+        lines.push('No switchable accounts.');
+    } else {
+        lines.push(`  ● ${currentName} (current)`);
+        for (const profile of switchable) {
+            lines.push(`  ○ ${profile.name}`);
+        }
+        lines.push('');
+        lines.push('Switch: !auth <name>');
+    }
 
     return { message: lines.join('\n'), action: 'none' };
 }
 
-function switchProfile(profileName: string, ctx: BangCommandContext): BangCommandResult {
+/**
+ * Check whether two profiles share the same context (both shared mode, same group).
+ * When context is shared, switching profiles should NOT reset the session.
+ */
+function isSharedContext(
+    source: CcsProfileInfo | null,
+    target: CcsProfileInfo,
+): boolean {
+    if (!source) return false;
+    if (source.contextMode !== 'shared' || target.contextMode !== 'shared') return false;
+    const sourceGroup = source.contextGroup || 'default';
+    const targetGroup = target.contextGroup || 'default';
+    return sourceGroup === targetGroup;
+}
+
+function switchProfile(profileName: string, _ctx: BangCommandContext): BangCommandResult {
     const { profiles } = readCcsProfiles();
     const currentProfile = getCurrentCcsProfile();
-
-    // Handle switching to "default" (unset CLAUDE_CONFIG_DIR)
-    if (profileName === 'default') {
-        if (!currentProfile) {
-            return {
-                message: '✅ Already using default Claude account.',
-                action: 'none',
-            };
-        }
-
-        delete process.env.CLAUDE_CONFIG_DIR;
-        logger.debug(`[!auth] Switched to default profile (unset CLAUDE_CONFIG_DIR)`);
-
-        return {
-            message: '🔄 Switching to default Claude account...',
-            action: 'restart-session',
-        };
-    }
 
     // Find the target profile
     const target = profiles.find(p => p.name === profileName);
 
     if (!target) {
-        // Suggest similar names
-        const suggestions = profiles
-            .filter(p => p.name.includes(profileName) || profileName.includes(p.name))
-            .map(p => p.name);
-
-        const suggestionText = suggestions.length > 0
-            ? `\n\nDid you mean: ${suggestions.join(', ')}?`
-            : `\n\nAvailable profiles: ${profiles.map(p => p.name).join(', ')}`;
-
         return {
-            message: `❌ Profile "${profileName}" not found.${suggestionText}`,
+            message: `❌ Profile "${profileName}" not found. Use !auth to see available accounts.`,
             action: 'none',
         };
     }
@@ -113,25 +101,32 @@ function switchProfile(profileName: string, ctx: BangCommandContext): BangComman
         };
     }
 
-    // Verify instance directory exists
-    if (!existsSync(target.instancePath)) {
+    // Only allow switching within the same shared context group
+    const currentProfileInfo = currentProfile
+        ? profiles.find(p => p.name === currentProfile) ?? null
+        : null;
+
+    if (!isSharedContext(currentProfileInfo, target)) {
         return {
-            message: [
-                `❌ Profile "${profileName}" instance not initialized.`,
-                '',
-                `Run: ccs auth create ${profileName}`,
-                'to initialize the profile instance.',
-            ].join('\n'),
+            message: `❌ Cannot switch to "${profileName}" — not in the same context group.`,
             action: 'none',
         };
     }
 
-    // Perform the switch
+    // Verify instance directory exists
+    if (!existsSync(target.instancePath)) {
+        return {
+            message: `❌ Profile "${profileName}" instance not initialized.`,
+            action: 'none',
+        };
+    }
+
+    // Perform the switch — shared context, no session reset needed
     process.env.CLAUDE_CONFIG_DIR = target.instancePath;
     logger.debug(`[!auth] Switched CLAUDE_CONFIG_DIR to: ${target.instancePath}`);
 
     return {
-        message: `🔄 Switching to "${profileName}"...`,
-        action: 'restart-session',
+        message: `✅ Switched to "${profileName}".`,
+        action: 'none',
     };
 }
