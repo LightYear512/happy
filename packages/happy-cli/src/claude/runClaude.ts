@@ -369,6 +369,12 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 await new Promise(resolve => setTimeout(resolve, 100));
                 session.sendSessionEvent({ type: 'message', message: result.message });
                 session.sendSessionEvent({ type: 'ready' });
+
+                // Restart SDK session so new env vars (e.g. CLAUDE_CONFIG_DIR) take effect
+                if (result.action === 'restart-session') {
+                    logger.debug('[start] Bang command requested session restart');
+                    messageQueue.interrupt();
+                }
             }).catch(async error => {
                 logger.debug('[start] Bang command error:', error);
                 await new Promise(resolve => setTimeout(resolve, 100));

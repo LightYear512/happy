@@ -22,7 +22,7 @@ export interface BangCommandResult {
     /** Message to send back to the mobile client */
     message: string;
     /** Action to perform after sending the message */
-    action: 'none';
+    action: 'none' | 'restart-session';
 }
 
 export type BangCommandHandler = (args: string, ctx: BangCommandContext) => Promise<BangCommandResult>;

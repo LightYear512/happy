@@ -15,6 +15,7 @@ export class MessageQueue2<T> {
     public queue: QueueItem<T>[] = []; // Made public for testing
     private waiter: ((hasMessages: boolean) => void) | null = null;
     private closed = false;
+    private interrupted = false;
     private onMessageHandler: ((message: string, mode: T) => void) | null = null;
     modeHasher: (mode: T) => string;
 
@@ -177,12 +178,31 @@ export class MessageQueue2<T> {
     }
 
     /**
+     * Interrupt any waiting consumer so it returns null immediately.
+     * If no consumer is waiting, the flag persists until the next
+     * waitForMessagesAndGetAsString call, which will return null and clear it.
+     * Messages already in the queue are preserved for the next non-interrupted read.
+     */
+    interrupt(): void {
+        logger.debug(`[MessageQueue2] interrupt() called`);
+        this.interrupted = true;
+
+        // Wake up any waiting consumer immediately
+        if (this.waiter) {
+            const waiter = this.waiter;
+            this.waiter = null;
+            waiter(false);
+        }
+    }
+
+    /**
      * Reset the queue - clears all messages and resets to empty state
      */
     reset(): void {
         logger.debug(`[MessageQueue2] reset() called. Clearing ${this.queue.length} messages`);
         this.queue = [];
         this.closed = false;
+        this.interrupted = false;
 
         // Clear waiter without calling it since we're not closing
         this.waiter = null;
@@ -222,6 +242,13 @@ export class MessageQueue2<T> {
      * Returns { message: string, mode: T } or null if aborted/closed
      */
     async waitForMessagesAndGetAsString(abortSignal?: AbortSignal): Promise<{ message: string, mode: T, isolate: boolean, hash: string } | null> {
+        // If interrupted, clear flag and return null (don't consume queued messages)
+        if (this.interrupted) {
+            this.interrupted = false;
+            logger.debug(`[MessageQueue2] Interrupted — returning null without consuming queue`);
+            return null;
+        }
+
         // If we have messages, return them immediately
         if (this.queue.length > 0) {
             return this.collectBatch();

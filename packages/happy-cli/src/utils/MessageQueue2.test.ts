@@ -426,6 +426,73 @@ describe('MessageQueue2', () => {
         expect(batch3?.mode.type).toBe('A');
     });
 
+    it('should return null when interrupted while waiting', async () => {
+        const queue = new MessageQueue2<string>(mode => mode);
+
+        // Start waiting on empty queue
+        const waitPromise = queue.waitForMessagesAndGetAsString();
+
+        // Interrupt after a tick
+        setTimeout(() => queue.interrupt(), 10);
+
+        const result = await waitPromise;
+        expect(result).toBeNull();
+    });
+
+    it('should return null on next call when interrupted with no waiter', async () => {
+        const queue = new MessageQueue2<string>(mode => mode);
+
+        // Interrupt before anyone is waiting — flag persists
+        queue.interrupt();
+
+        // Next call should return null immediately
+        const result = await queue.waitForMessagesAndGetAsString();
+        expect(result).toBeNull();
+
+        // Flag is cleared — subsequent call should wait normally
+        queue.push('after', 'local');
+        const result2 = await queue.waitForMessagesAndGetAsString();
+        expect(result2).not.toBeNull();
+        expect(result2?.message).toBe('after');
+    });
+
+    it('should preserve queued messages after interrupt', async () => {
+        const queue = new MessageQueue2<string>(mode => mode);
+
+        // Push messages first
+        queue.push('preserved1', 'local');
+        queue.push('preserved2', 'local');
+
+        // Interrupt — should NOT consume these messages
+        queue.interrupt();
+
+        // First call returns null (interrupted)
+        const result1 = await queue.waitForMessagesAndGetAsString();
+        expect(result1).toBeNull();
+
+        // Second call returns the preserved messages
+        const result2 = await queue.waitForMessagesAndGetAsString();
+        expect(result2).not.toBeNull();
+        expect(result2?.message).toBe('preserved1\npreserved2');
+        expect(queue.size()).toBe(0);
+    });
+
+    it('should clear interrupted flag on reset', async () => {
+        const queue = new MessageQueue2<string>(mode => mode);
+
+        // Set interrupted flag
+        queue.interrupt();
+
+        // Reset clears it
+        queue.reset();
+
+        // Push a message — should be returned normally (not interrupted)
+        queue.push('after-reset', 'local');
+        const result = await queue.waitForMessagesAndGetAsString();
+        expect(result).not.toBeNull();
+        expect(result?.message).toBe('after-reset');
+    });
+
     it('should differentiate between pushImmediate and pushIsolateAndClear behavior', async () => {
         const queue = new MessageQueue2<{ type: string }>((mode) => mode.type);
         
