@@ -127,6 +127,6 @@ function switchProfile(profileName: string, _ctx: BangCommandContext): BangComma
 
     return {
         message: `✅ Switched to "${profileName}".`,
-        action: 'none',
+        action: 'restart-session',
     };
 }
