@@ -314,24 +314,34 @@ export class ApiSessionClient extends EventEmitter {
         }
 
         const batch = this.pendingOutbox.slice();
-        const response = await axios.post<V3PostSessionMessagesResponse>(
-            `${configuration.serverUrl}/v3/sessions/${encodeURIComponent(this.sessionId)}/messages`,
-            {
-                messages: batch
-            },
-            {
-                headers: this.authHeaders(),
-                timeout: 60000
+        logger.debug(`[API] flushOutbox: sending ${batch.length} messages to session ${this.sessionId}`);
+        try {
+            const response = await axios.post<V3PostSessionMessagesResponse>(
+                `${configuration.serverUrl}/v3/sessions/${encodeURIComponent(this.sessionId)}/messages`,
+                {
+                    messages: batch
+                },
+                {
+                    headers: this.authHeaders(),
+                    timeout: 60000
+                }
+            );
+
+            this.pendingOutbox.splice(0, batch.length);
+
+            const messages = Array.isArray(response.data.messages) ? response.data.messages : [];
+            const maxSeq = messages.reduce((acc, message) => (
+                message.seq > acc ? message.seq : acc
+            ), this.lastSeq);
+            this.lastSeq = maxSeq;
+            logger.debug(`[API] flushOutbox: success, ${messages.length} messages acknowledged, lastSeq=${maxSeq}`);
+        } catch (error: any) {
+            logger.debug(`[API] flushOutbox: FAILED - ${error.response?.status ?? error.code ?? error.message}, pendingOutbox=${this.pendingOutbox.length}`);
+            if (error.response?.data) {
+                logger.debug(`[API] flushOutbox: response body:`, error.response.data);
             }
-        );
-
-        this.pendingOutbox.splice(0, batch.length);
-
-        const messages = Array.isArray(response.data.messages) ? response.data.messages : [];
-        const maxSeq = messages.reduce((acc, message) => (
-            message.seq > acc ? message.seq : acc
-        ), this.lastSeq);
-        this.lastSeq = maxSeq;
+            throw error;
+        }
     }
 
     private enqueueMessage(content: unknown, invalidate: boolean = true) {
