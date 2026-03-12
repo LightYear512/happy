@@ -24,7 +24,9 @@ import { generateHookSettingsFile, cleanupHookSettingsFile } from '@/claude/util
 import { registerKillSessionHandler } from './registerKillSessionHandler';
 import { projectPath } from '../projectPath';
 import { resolve } from 'node:path';
+import { existsSync } from 'node:fs';
 import { startOfflineReconnection, connectionState } from '@/utils/serverConnectionErrors';
+import { readCcsProfiles, getInstancePath, getCurrentCcsProfile } from '@/commands/bang/ccsProfiles';
 import { claudeLocal } from '@/claude/claudeLocal';
 import { createSessionScanner } from '@/claude/utils/sessionScanner';
 import { Session } from './session';
@@ -44,12 +46,23 @@ export interface StartOptions {
     noSandbox?: boolean
     /** JavaScript runtime to use for spawning Claude Code (default: 'node') */
     jsRuntime?: JsRuntime
+    /** CCS profile name to use at startup */
+    profile?: string
 }
 
 export async function runClaude(credentials: Credentials, options: StartOptions = {}): Promise<void> {
     logger.debug(`[CLAUDE] ===== CLAUDE MODE STARTING =====`);
     logger.debug(`[CLAUDE] This is the Claude agent, NOT Gemini`);
-    
+
+    // Resolve CCS profile: --profile flag > CCS default > system default
+    const resolvedProfile = resolveCcsProfile(options.profile);
+    if (resolvedProfile.configDir) {
+        process.env.CLAUDE_CONFIG_DIR = resolvedProfile.configDir;
+        logger.debug(`[CLAUDE] Using CCS profile "${resolvedProfile.name}" → ${resolvedProfile.configDir}`);
+    }
+    // Print current account info
+    console.log(`🔑 Account: ${resolvedProfile.name}${resolvedProfile.source !== 'default' ? ` (${resolvedProfile.source})` : ''}`);
+
     const workingDirectory = process.cwd();
     const sessionTag = randomUUID();
 
@@ -540,4 +553,43 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
     // Exit with the code from Claude
     process.exit(exitCode);
+}
+
+/**
+ * Resolve which CCS profile to use at startup.
+ * Priority: --profile flag > CLAUDE_CONFIG_DIR env > CCS default profile > system default
+ */
+function resolveCcsProfile(profileFlag?: string): { name: string; configDir: string | null; source: string } {
+    // 1. Explicit --profile flag
+    if (profileFlag) {
+        if (profileFlag === 'default') {
+            return { name: 'default', configDir: null, source: '--profile' };
+        }
+        const instancePath = getInstancePath(profileFlag);
+        if (!existsSync(instancePath)) {
+            console.error(`❌ Profile "${profileFlag}" not found at ${instancePath}`);
+            console.error(`   Run: ccs auth create ${profileFlag}`);
+            process.exit(1);
+        }
+        return { name: profileFlag, configDir: instancePath, source: '--profile' };
+    }
+
+    // 2. Already set via CLAUDE_CONFIG_DIR (e.g. by shell/CCS)
+    const currentProfile = getCurrentCcsProfile();
+    if (currentProfile) {
+        return { name: currentProfile, configDir: process.env.CLAUDE_CONFIG_DIR!, source: 'env' };
+    }
+
+    // 3. CCS default profile
+    const { defaultProfile } = readCcsProfiles();
+    if (defaultProfile) {
+        const instancePath = getInstancePath(defaultProfile);
+        if (existsSync(instancePath)) {
+            return { name: defaultProfile, configDir: instancePath, source: 'ccs default' };
+        }
+        logger.debug(`[CLAUDE] CCS default profile "${defaultProfile}" instance not found, falling back to system default`);
+    }
+
+    // 4. System default
+    return { name: 'default', configDir: null, source: 'default' };
 }
