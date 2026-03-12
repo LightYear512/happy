@@ -1,4 +1,5 @@
 const variant = process.env.APP_ENV || 'development';
+const enableGms = process.env.ENABLE_GMS === "1";
 const name = {
     development: "Happy (dev)",
     preview: "Happy (preview)",
@@ -66,7 +67,7 @@ export default {
                 "android.permission.READ_MEDIA_VIDEO",
             ],
             package: bundleId,
-            googleServicesFile: "./google-services.json",
+            googleServicesFile: enableGms ? "./google-services.json" : undefined,
             intentFilters: variant === 'production' ? [
                 {
                     "action": "VIEW",
@@ -134,13 +135,15 @@ export default {
                     recordAudioAndroid: true
                 }
             ],
-            [
-                "expo-notifications",
-                {
-                    "enableBackgroundRemoteNotifications": true,
-                    "icon": "./sources/assets/images/icon-notification.png"
-                }
-            ],
+            ...(enableGms ? [
+                [
+                    "expo-notifications",
+                    {
+                        "enableBackgroundRemoteNotifications": true,
+                        "icon": "./sources/assets/images/icon-notification.png"
+                    }
+                ]
+            ] : []),
             [
                 'expo-splash-screen',
                 {
@@ -161,12 +164,6 @@ export default {
                 }
             ]
         ],
-        updates: {
-            url: "https://u.expo.dev/4558dd3d-cd5a-47cd-bad9-e591a241cc06",
-            requestHeaders: {
-                "expo-channel-name": "production"
-            }
-        },
         experiments: {
             typedRoutes: true
         },
@@ -175,7 +172,7 @@ export default {
                 root: "./sources/app"
             },
             eas: {
-                projectId: "4558dd3d-cd5a-47cd-bad9-e591a241cc06"
+                projectId: "03d0d40c-1c11-473b-97b0-fd9daf6fe83d"
             },
             app: {
                 postHogKey: process.env.EXPO_PUBLIC_POSTHOG_API_KEY,
@@ -186,6 +183,6 @@ export default {
                 consoleLoggingDefault,
             }
         },
-        owner: "bulkacorp"
+        owner: "lightyear512"
     }
 };
