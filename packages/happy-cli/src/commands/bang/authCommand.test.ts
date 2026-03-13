@@ -5,11 +5,17 @@ import { homedir } from 'node:os';
 // Mock fs
 const mockExistsSync = vi.hoisted(() => vi.fn());
 const mockReadFileSync = vi.hoisted(() => vi.fn());
+const mockWriteFileSync = vi.hoisted(() => vi.fn());
 
-vi.mock('node:fs', () => ({
-    existsSync: mockExistsSync,
-    readFileSync: mockReadFileSync,
-}));
+vi.mock('node:fs', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('node:fs')>();
+    return {
+        ...actual,
+        existsSync: mockExistsSync,
+        readFileSync: mockReadFileSync,
+        writeFileSync: mockWriteFileSync,
+    };
+});
 
 // Mock logger
 vi.mock('@/ui/logger', () => ({
@@ -75,15 +81,15 @@ describe('handleAuthBangCommand', () => {
             const result = await handleAuthBangCommand('', createMockContext());
             expect(result.action).toBe('none');
             expect(result.message).toContain('isolated');
-            expect(result.message).toContain('No switchable accounts');
+            expect(result.message).toContain('Isolated mode');
         });
 
-        it('should show default as current when no profile is active', async () => {
+        it('should show no active profile when CLAUDE_CONFIG_DIR is not set', async () => {
             mockCcsProfiles({ work: { type: 'account' } });
 
             const result = await handleAuthBangCommand('', createMockContext());
-            expect(result.message).toContain('default (current)');
-            expect(result.message).toContain('No switchable accounts');
+            expect(result.message).toContain('No CCS profile active');
+            expect(result.message).toContain('work');
         });
 
         it('should list same-group profiles when in a shared group', async () => {
@@ -111,7 +117,7 @@ describe('handleAuthBangCommand', () => {
             process.env.CLAUDE_CONFIG_DIR = join(ccsDir, 'instances', 'work');
 
             const result = await handleAuthBangCommand('', createMockContext());
-            expect(result.message).toContain('No switchable accounts');
+            expect(result.message).toContain('No other accounts in this group');
         });
     });
 
@@ -124,7 +130,7 @@ describe('handleAuthBangCommand', () => {
             process.env.CLAUDE_CONFIG_DIR = join(ccsDir, 'instances', 'work');
 
             const result = await handleAuthBangCommand('personal', createMockContext());
-            expect(result.action).toBe('none');
+            expect(result.action).toBe('restart-session');
             expect(result.message).toContain('Switched to "personal"');
             expect(process.env.CLAUDE_CONFIG_DIR).toBe(join(ccsDir, 'instances', 'personal'));
         });
@@ -138,7 +144,9 @@ describe('handleAuthBangCommand', () => {
 
             const result = await handleAuthBangCommand('other', createMockContext());
             expect(result.action).toBe('none');
-            expect(result.message).toContain('not in the same context group');
+            expect(result.message).toContain('Cannot switch');
+            expect(result.message).toContain('group "team"');
+            expect(result.message).toContain('group "solo"');
             // Should NOT have changed CLAUDE_CONFIG_DIR
             expect(process.env.CLAUDE_CONFIG_DIR).toBe(join(ccsDir, 'instances', 'work'));
         });
@@ -152,7 +160,8 @@ describe('handleAuthBangCommand', () => {
 
             const result = await handleAuthBangCommand('isolated', createMockContext());
             expect(result.action).toBe('none');
-            expect(result.message).toContain('not in the same context group');
+            expect(result.message).toContain('Cannot switch');
+            expect(result.message).toContain('isolated');
         });
 
         it('should reject switching when current profile is not shared', async () => {
@@ -164,7 +173,8 @@ describe('handleAuthBangCommand', () => {
 
             const result = await handleAuthBangCommand('personal', createMockContext());
             expect(result.action).toBe('none');
-            expect(result.message).toContain('not in the same context group');
+            expect(result.message).toContain('Cannot switch');
+            expect(result.message).toContain('"work" is isolated');
         });
 
         it('should skip switch when already on same profile', async () => {
