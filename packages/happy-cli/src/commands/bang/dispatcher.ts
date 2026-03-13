@@ -1,5 +1,6 @@
 import { logger } from '@/ui/logger';
 import { handleAuthBangCommand } from './authCommand';
+import { handleUsageBangCommand } from './usageCommand';
 import type { BangCommandContext, BangCommandHandler, BangCommandResult } from './types';
 
 /**
@@ -8,6 +9,7 @@ import type { BangCommandContext, BangCommandHandler, BangCommandResult } from '
  */
 const commands: Record<string, BangCommandHandler> = {
     auth: handleAuthBangCommand,
+    usage: handleUsageBangCommand,
 };
 
 /**
