@@ -82,7 +82,23 @@ function listProfiles(): BangCommandResult {
         ? profiles.find(p => p.name === currentProfile) ?? null
         : null;
 
-    const currentName = currentProfile || 'default';
+    const lines: string[] = [];
+
+    // No active CCS profile (session not started via CCS)
+    if (!currentProfile) {
+        lines.push('📋 No CCS profile active.');
+        lines.push('');
+        if (profiles.length > 0) {
+            lines.push('Available profiles:');
+            for (const p of profiles) {
+                lines.push(`  ○ ${p.name}`);
+            }
+        } else {
+            lines.push('No CCS profiles configured.');
+        }
+        return { message: lines.join('\n'), action: 'none' };
+    }
+
     const isShared = currentProfileInfo?.contextMode === 'shared';
     const currentGroup = isShared ? (currentProfileInfo.contextGroup || 'default') : null;
 
@@ -94,27 +110,27 @@ function listProfiles(): BangCommandResult {
             && p.name !== currentProfile)
         : [];
 
-    const lines: string[] = [];
-
     if (currentGroup) {
         lines.push(`📋 Group "${currentGroup}":`);
     } else {
-        lines.push(`📋 Account: ${currentName} (isolated)`);
+        lines.push(`📋 Account: ${currentProfile} (isolated)`);
     }
 
     lines.push('');
+    lines.push(`  ● ${currentProfile} (current)`);
 
-    if (!currentGroup || switchable.length === 0) {
-        lines.push(`  ● ${currentName} (current)`);
-        lines.push('');
-        lines.push('No switchable accounts.');
-    } else {
-        lines.push(`  ● ${currentName} (current)`);
+    if (currentGroup && switchable.length > 0) {
         for (const profile of switchable) {
             lines.push(`  ○ ${profile.name}`);
         }
         lines.push('');
-        lines.push('Switch: !auth <name> | !auth all <name>');
+        lines.push('Switch: !auth <name> (this session) | !auth all <name> (all sessions)');
+    } else if (currentGroup) {
+        lines.push('');
+        lines.push('No other accounts in this group.');
+    } else {
+        lines.push('');
+        lines.push('Isolated mode — switching is not available.');
     }
 
     return { message: lines.join('\n'), action: 'none' };
@@ -163,8 +179,10 @@ function switchProfile(profileName: string): BangCommandResult {
         : null;
 
     if (!isSharedContext(currentProfileInfo, target)) {
+        const describeMode = (p: CcsProfileInfo | null): string =>
+            !p || p.contextMode !== 'shared' ? 'isolated' : `group "${p.contextGroup || 'default'}"`;
         return {
-            message: `❌ Cannot switch to "${profileName}" — not in the same context group.`,
+            message: `❌ Cannot switch: "${currentProfile || 'unknown'}" is ${describeMode(currentProfileInfo)}, "${profileName}" is ${describeMode(target)}.`,
             action: 'none',
         };
     }
@@ -206,7 +224,7 @@ function switchAllProfiles(profileName: string): BangCommandResult {
     } catch (err) {
         logger.debug('[!auth] Failed to write global profile file:', err);
         return {
-            message: `✅ Switched to "${profileName}" locally, but failed to broadcast to other sessions.`,
+            message: `⚠️ Switched to "${profileName}" locally, but failed to broadcast to other sessions.`,
             action: 'restart-session',
         };
     }
