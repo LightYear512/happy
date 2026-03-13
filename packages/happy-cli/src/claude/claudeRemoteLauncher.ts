@@ -1,4 +1,5 @@
 import { render } from "ink";
+import { watch, type FSWatcher } from "node:fs";
 import { Session } from "./session";
 import { MessageBuffer } from "@/ui/ink/messageBuffer";
 import { RemoteModeDisplay } from "@/ui/ink/RemoteModeDisplay";
@@ -15,6 +16,8 @@ import { EnhancedMode } from "./loop";
 import { RawJSONLines } from "@/claude/types";
 import { OutgoingMessageQueue } from "./utils/OutgoingMessageQueue";
 import { getToolName } from "./utils/getToolName";
+import { configuration } from "@/configuration";
+import { tryGlobalProfileSwitch } from "@/commands/bang/authCommand";
 import { getCurrentCcsProfile } from "@/commands/bang/ccsProfiles";
 
 interface PermissionsField {
@@ -290,6 +293,34 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         }
     }
 
+    // Set up fs.watch for global auth switching (!auth all <profile>)
+    // Watches the happyHomeDir directory for changes to the active-ccs-profile file.
+    // When another session writes this file, we detect the change and restart the SDK
+    // with the new CLAUDE_CONFIG_DIR so the auth switch takes effect.
+    let profileWatcher: FSWatcher | null = null;
+    let profileDebounceTimer: NodeJS.Timeout | null = null;
+
+    try {
+        profileWatcher = watch(configuration.happyHomeDir, (event, filename) => {
+            if (filename !== 'active-ccs-profile') return;
+            if (profileDebounceTimer) clearTimeout(profileDebounceTimer);
+            profileDebounceTimer = setTimeout(() => {
+                const switched = tryGlobalProfileSwitch();
+                if (switched) {
+                    const newProfile = getCurrentCcsProfile() || 'unknown';
+                    logger.debug(`[remote]: Global profile change detected → "${newProfile}", interrupting session`);
+                    session.client.sendSessionEvent({ type: 'message', message: `🔄 Switched to "${newProfile}" (via !auth all)` });
+                    session.queue.interrupt();
+                }
+            }, 200);
+        });
+        profileWatcher.on('error', (err) => {
+            logger.debug('[remote]: Profile watcher error:', err);
+        });
+    } catch (err) {
+        logger.debug('[remote]: Failed to set up profile watcher:', err);
+    }
+
     try {
         let pending: {
             message: string;
@@ -446,6 +477,16 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             }
         }
     } finally {
+
+        // Clean up profile watcher
+        if (profileWatcher) {
+            profileWatcher.close();
+            profileWatcher = null;
+        }
+        if (profileDebounceTimer) {
+            clearTimeout(profileDebounceTimer);
+            profileDebounceTimer = null;
+        }
 
         // Clean up permission handler
         permissionHandler.reset();
