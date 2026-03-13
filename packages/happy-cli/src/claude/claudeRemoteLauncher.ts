@@ -15,6 +15,7 @@ import { EnhancedMode } from "./loop";
 import { RawJSONLines } from "@/claude/types";
 import { OutgoingMessageQueue } from "./utils/OutgoingMessageQueue";
 import { getToolName } from "./utils/getToolName";
+import { getCurrentCcsProfile } from "@/commands/bang/ccsProfiles";
 
 interface PermissionsField {
     date: number;
@@ -393,7 +394,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     },
                     onErrorResult: (message: string) => {
                         session.client.closeClaudeSessionTurn('failed');
-                        session.client.sendSessionEvent({ type: 'message', message });
+                        const profile = getCurrentCcsProfile();
+                        const displayMsg = profile ? `${message}\n\n[account: ${profile}]` : message;
+                        session.client.sendSessionEvent({ type: 'message', message: displayMsg });
                     },
                     signal: abortController.signal,
                 });
