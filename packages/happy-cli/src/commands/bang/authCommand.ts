@@ -62,7 +62,7 @@ export function tryGlobalProfileSwitch(): boolean {
         }
 
         if (!existsSync(target.instancePath)) {
-            logger.debug(`[!auth] Global switch: instance path not found for "${profileName}"`);
+            logger.warn(`[!auth] Global switch: profile "${profileName}" instance not initialized (${target.instancePath}), skipping`);
             return false;
         }
 
@@ -211,26 +211,73 @@ function switchProfile(profileName: string): BangCommandResult {
  * to a global file so other sessions pick it up via fs.watch.
  */
 function switchAllProfiles(profileName: string): BangCommandResult {
-    // Validate and switch current session first (reuses all switchProfile checks)
-    const result = switchProfile(profileName);
-    if (result.action !== 'restart-session') {
-        return result; // Validation failed — return the error message as-is
+    const { profiles } = readCcsProfiles();
+    const currentProfile = getCurrentCcsProfile();
+    const target = profiles.find(p => p.name === profileName);
+
+    if (!target) {
+        return {
+            message: `❌ Profile "${profileName}" not found. Use !auth to see available accounts.`,
+            action: 'none',
+        };
     }
 
-    // Write to global file so other sessions detect the change via fs.watch
+    const currentProfileInfo = currentProfile
+        ? profiles.find(p => p.name === currentProfile) ?? null
+        : null;
+
+    if (!isSharedContext(currentProfileInfo, target)) {
+        const describeMode = (p: CcsProfileInfo | null): string =>
+            !p || p.contextMode !== 'shared' ? 'isolated' : `group "${p.contextGroup || 'default'}"`;
+        return {
+            message: `❌ Cannot switch: "${currentProfile || 'unknown'}" is ${describeMode(currentProfileInfo)}, "${profileName}" is ${describeMode(target)}.`,
+            action: 'none',
+        };
+    }
+
+    if (!existsSync(target.instancePath)) {
+        return {
+            message: `❌ Profile "${profileName}" instance not initialized.`,
+            action: 'none',
+        };
+    }
+
+    const alreadyCurrent = target.name === currentProfile;
+    const groupName = currentProfileInfo?.contextGroup || 'default';
+
+    // Switch current session (skip if already on target)
+    if (!alreadyCurrent) {
+        process.env.CLAUDE_CONFIG_DIR = target.instancePath;
+        logger.debug(`[!auth] Switched CLAUDE_CONFIG_DIR to: ${target.instancePath}`);
+    }
+
+    // Always write global file so other sessions pick up the change
     try {
         writeFileSync(configuration.activeProfileFile, profileName, 'utf-8');
         logger.debug(`[!auth] Wrote global active profile: ${profileName}`);
     } catch (err) {
         logger.debug('[!auth] Failed to write global profile file:', err);
+        if (alreadyCurrent) {
+            return {
+                message: `⚠️ Already using "${profileName}", but failed to broadcast to other sessions.`,
+                action: 'none',
+            };
+        }
         return {
             message: `⚠️ Switched to "${profileName}" locally, but failed to broadcast to other sessions.`,
             action: 'restart-session',
         };
     }
 
+    if (alreadyCurrent) {
+        return {
+            message: `✅ Already using "${profileName}". Broadcasted to other sessions in group "${groupName}".`,
+            action: 'none',
+        };
+    }
+
     return {
-        message: `✅ Switched all sessions to "${profileName}".`,
+        message: `✅ Switched all sessions in group "${groupName}" to "${profileName}".`,
         action: 'restart-session',
     };
 }
