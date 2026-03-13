@@ -175,9 +175,20 @@ export class SDKToLogConverter {
             }
 
             case 'result': {
-                // Result messages are not converted to log messages
-                // They're SDK-specific messages that indicate session completion
-                // Not part of the actual conversation log
+                const resultMsg = sdkMessage as SDKResultMessage
+                // Result messages with text content (e.g., /usage, /cost output)
+                // should be forwarded as assistant messages so the mobile app can display them
+                if (resultMsg.result) {
+                    logMessage = {
+                        ...baseFields,
+                        type: 'assistant',
+                        message: {
+                            role: 'assistant',
+                            content: [{ type: 'text', text: resultMsg.result }],
+                        },
+                    }
+                }
+                // Result messages without text content are SDK-specific session completion signals
                 break
             }
 
