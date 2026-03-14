@@ -1,15 +1,22 @@
 import { logger } from '@/ui/logger';
 import { handleAuthBangCommand } from './authCommand';
 import { handleUsageBangCommand } from './usageCommand';
+import { centerText } from './format';
 import type { BangCommandContext, BangCommandHandler, BangCommandResult } from './types';
 
 /**
- * Registry of bang commands.
- * Add new commands here to make them available via `!<name>` from the mobile chat.
+ * Registry of bang commands with descriptions for !help.
  */
-const commands: Record<string, BangCommandHandler> = {
-    auth: handleAuthBangCommand,
-    usage: handleUsageBangCommand,
+const commands: Record<string, { handler: BangCommandHandler; desc: string; loadingMsg?: string }> = {
+    auth:  { handler: handleAuthBangCommand,  desc: '切换 CCS 账号' },
+    usage: { handler: handleUsageBangCommand, desc: '查看 API 用量', loadingMsg: '⏳ 正在查询用量...' },
+};
+
+/** Short aliases for convenience on mobile keyboards. */
+const aliases: Record<string, string> = {
+    a: 'auth',
+    u: 'usage',
+    h: 'help',
 };
 
 /**
@@ -40,28 +47,70 @@ function parseBangCommand(text: string): { name: string; args: string } {
 }
 
 /**
+ * Build the !help output listing all available commands.
+ */
+function buildHelp(): BangCommandResult {
+    const lines: string[] = [
+        '📖 快捷命令',
+        '',
+    ];
+
+    const allCommands: Array<[string, string]> = [
+        ...Object.entries(commands).map(([name, { desc }]) => [name, desc] as [string, string]),
+        ['help', '显示帮助'],
+    ];
+
+    for (const [name, desc] of allCommands) {
+        const cmdAliases = Object.entries(aliases)
+            .filter(([, target]) => target === name)
+            .map(([alias]) => `!${alias}`);
+
+        const aliasStr = cmdAliases.length > 0 ? ` (${cmdAliases.join(', ')})` : '';
+        lines.push(`!${name}${aliasStr} — ${desc}`);
+    }
+
+    return { message: centerText(lines), action: 'none' };
+}
+
+/**
  * Execute a bang command. Returns null if the command is not recognized.
  */
 export async function executeBangCommand(text: string, ctx: BangCommandContext): Promise<BangCommandResult> {
-    const { name, args } = parseBangCommand(text);
+    let { name, args } = parseBangCommand(text);
     logger.debug(`[bang] Executing command: !${name} args="${args}"`);
 
-    const handler = commands[name];
+    // Resolve alias
+    if (aliases[name]) {
+        name = aliases[name];
+    }
 
-    if (!handler) {
-        const available = Object.keys(commands).map(c => `!${c}`).join(', ');
-        return {
-            message: `❌ Unknown command "!${name}".\n\nAvailable commands: ${available}`,
-            action: 'none',
-        };
+    // Built-in help command
+    if (name === 'help') {
+        return buildHelp();
+    }
+
+    const entry = commands[name];
+
+    if (!entry) {
+        const lines = [
+            `❌ 未知命令 "!${name}"`,
+            '',
+            '输入 !help 查看可用命令。',
+        ];
+        return { message: centerText(lines), action: 'none' };
+    }
+
+    // Send loading indicator before async commands
+    if (entry.loadingMsg) {
+        ctx.client.sendSessionEvent({ type: 'message', message: entry.loadingMsg });
     }
 
     try {
-        return await handler(args, ctx);
+        return await entry.handler(args, ctx);
     } catch (error) {
         logger.debug(`[bang] Command !${name} failed:`, error);
         return {
-            message: `❌ Command !${name} failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
+            message: `❌ !${name} 失败: ${error instanceof Error ? error.message : 'Unknown error'}`,
             action: 'none',
         };
     }

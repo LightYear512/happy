@@ -1,8 +1,10 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { request } from 'node:https';
 import { logger } from '@/ui/logger';
 import { getCurrentCcsProfile } from './ccsProfiles';
+import { centerText } from './format';
 import type { BangCommandContext, BangCommandResult } from './types';
 
 const USAGE_API_URL = 'https://api.anthropic.com/api/oauth/usage';
@@ -38,11 +40,13 @@ const cache = new Map<string, CachedUsage>();
  */
 function resolveOAuthToken(): { token: string; profileLabel: string; cacheKey: string } | null {
     const configDir = process.env.CLAUDE_CONFIG_DIR;
+    logger.debug(`[!usage] resolveOAuthToken: CLAUDE_CONFIG_DIR=${configDir ?? '(unset)'}`);
 
     // Try CCS profile credentials first
     if (configDir) {
         const credPath = join(configDir, '.credentials.json');
         const token = readTokenFromFile(credPath);
+        logger.debug(`[!usage] CCS cred path=${credPath}, token found=${!!token}`);
         if (token) {
             const profileName = getCurrentCcsProfile() ?? configDir;
             return { token, profileLabel: profileName, cacheKey: configDir };
@@ -52,6 +56,7 @@ function resolveOAuthToken(): { token: string; profileLabel: string; cacheKey: s
     // Fallback to default ~/.claude/.credentials.json
     const defaultCredPath = join(homedir(), '.claude', '.credentials.json');
     const token = readTokenFromFile(defaultCredPath);
+    logger.debug(`[!usage] Default cred path=${defaultCredPath}, token found=${!!token}`);
     if (token) {
         return { token, profileLabel: 'default', cacheKey: defaultCredPath };
     }
@@ -70,28 +75,56 @@ function readTokenFromFile(path: string): string | null {
 }
 
 /**
+ * Direct HTTPS request that bypasses HTTP_PROXY/HTTPS_PROXY env vars.
+ * Node.js global fetch respects proxy env vars, which causes Cloudflare to return 403.
+ */
+function directGet(url: string, headers: Record<string, string>): Promise<{ status: number; body: string }> {
+    const parsed = new URL(url);
+    return new Promise((resolve, reject) => {
+        const req = request({
+            hostname: parsed.hostname,
+            port: 443,
+            path: parsed.pathname + parsed.search,
+            method: 'GET',
+            headers,
+        }, (res) => {
+            const chunks: Buffer[] = [];
+            res.on('data', (chunk: Buffer) => chunks.push(chunk));
+            res.on('end', () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString() }));
+        });
+        req.on('error', reject);
+        req.setTimeout(10_000, () => { req.destroy(new Error('Request timed out')); });
+        req.end();
+    });
+}
+
+/**
  * Fetch usage data from the Anthropic OAuth usage API.
  */
-async function fetchUsage(token: string): Promise<UsageData> {
-    const response = await fetch(USAGE_API_URL, {
-        headers: {
-            'Authorization': `Bearer ${token}`,
-            'anthropic-beta': 'oauth-2025-04-20',
-        },
+async function fetchUsage(token: string, debugLabel: string): Promise<UsageData> {
+    const tokenPrefix = token.substring(0, 15) + '...';
+    logger.debug(`[!usage] Calling ${USAGE_API_URL} with token=${tokenPrefix} label=${debugLabel}`);
+
+    const { status, body } = await directGet(USAGE_API_URL, {
+        'Authorization': `Bearer ${token}`,
+        'anthropic-beta': 'oauth-2025-04-20',
     });
 
-    if (!response.ok) {
-        if (response.status === 401) {
-            throw new Error('OAuth token expired or invalid. Please re-authenticate your CCS profile.');
+    if (status < 200 || status >= 300) {
+        logger.debug(`[!usage] API error: ${status} ${body}`);
+        if (status === 401) {
+            throw new Error('OAuth 令牌已过期或无效，请重新认证 CCS 配置。');
         }
-        if (response.status === 429) {
-            throw new Error('Rate limited by Anthropic API. Try again later.');
+        if (status === 403) {
+            throw new Error('请求被拒绝 (403)，请尝试重新登录。');
         }
-        const text = await response.text().catch(() => '');
-        throw new Error(`API returned ${response.status}: ${text}`);
+        if (status === 429) {
+            throw new Error('Anthropic API 限流，请稍后再试。');
+        }
+        throw new Error(`API 返回 ${status}: ${body}`);
     }
 
-    return await response.json() as UsageData;
+    return JSON.parse(body) as UsageData;
 }
 
 /**
@@ -102,18 +135,18 @@ function formatResetTime(resetsAt: string): string {
     const now = new Date();
     const diffMs = resetDate.getTime() - now.getTime();
 
-    if (diffMs <= 0) return 'now';
+    if (diffMs <= 0) return '即将重置';
 
     const diffMin = Math.floor(diffMs / 60000);
-    if (diffMin < 60) return `${diffMin}m`;
+    if (diffMin < 60) return `${diffMin} 分钟`;
 
     const diffHours = Math.floor(diffMin / 60);
     const remainMin = diffMin % 60;
-    if (diffHours < 24) return remainMin > 0 ? `${diffHours}h ${remainMin}m` : `${diffHours}h`;
+    if (diffHours < 24) return remainMin > 0 ? `${diffHours} 小时 ${remainMin} 分钟` : `${diffHours} 小时`;
 
     const diffDays = Math.floor(diffHours / 24);
     const remainHours = diffHours % 24;
-    return remainHours > 0 ? `${diffDays}d ${remainHours}h` : `${diffDays}d`;
+    return remainHours > 0 ? `${diffDays} 天 ${remainHours} 小时` : `${diffDays} 天`;
 }
 
 /**
@@ -126,27 +159,44 @@ function usageBar(utilization: number): string {
 }
 
 /**
- * Format the usage data into a readable message.
+ * Get a one-line usage summary from cache for a given config dir (used by !auth after switch).
+ * Returns null if no cached data is available.
+ */
+export function getCachedUsageSummary(cacheKey: string): string | null {
+    const cached = cache.get(cacheKey);
+    if (!cached || (Date.now() - cached.fetchedAt) >= CACHE_TTL_MS) return null;
+
+    const { data } = cached;
+    const parts: string[] = [];
+
+    if (data.five_hour) parts.push(`5h: ${data.five_hour.utilization.toFixed(0)}%`);
+    if (data.seven_day) parts.push(`7d: ${data.seven_day.utilization.toFixed(0)}%`);
+
+    return parts.length > 0 ? `📊 ${parts.join(' · ')}` : null;
+}
+
+/**
+ * Format the usage data into a readable, centered message.
  */
 function formatUsage(data: UsageData, profileLabel: string, cachedAt: number): string {
     const lines: string[] = [];
 
-    lines.push(`📊 Usage — ${profileLabel}`);
+    lines.push(`📊 用量 — ${profileLabel}`);
     lines.push('');
 
     // 5-hour window
     if (data.five_hour) {
-        lines.push(`⏱ 5-Hour Window`);
-        lines.push(`  ${usageBar(data.five_hour.utilization)}`);
-        lines.push(`  Resets in ${formatResetTime(data.five_hour.resets_at)}`);
+        lines.push('⏱ 5 小时窗口');
+        lines.push(`${usageBar(data.five_hour.utilization)}`);
+        lines.push(`${formatResetTime(data.five_hour.resets_at)} 后重置`);
         lines.push('');
     }
 
     // 7-day overall
     if (data.seven_day) {
-        lines.push(`📅 7-Day Overall`);
-        lines.push(`  ${usageBar(data.seven_day.utilization)}`);
-        lines.push(`  Resets in ${formatResetTime(data.seven_day.resets_at)}`);
+        lines.push('📅 7 天总量');
+        lines.push(`${usageBar(data.seven_day.utilization)}`);
+        lines.push(`${formatResetTime(data.seven_day.resets_at)} 后重置`);
         lines.push('');
     }
 
@@ -158,7 +208,7 @@ function formatUsage(data: UsageData, profileLabel: string, cachedAt: number): s
 
     for (const { label, entry } of modelBreakdowns) {
         if (entry) {
-            lines.push(`  ${label}: ${usageBar(entry.utilization)}`);
+            lines.push(`${label}: ${usageBar(entry.utilization)}`);
         }
     }
 
@@ -168,12 +218,12 @@ function formatUsage(data: UsageData, profileLabel: string, cachedAt: number): s
 
     // Extra usage
     if (data.extra_usage?.is_enabled) {
-        lines.push(`💰 Extra Usage`);
+        lines.push('💰 额外用量');
         if (data.extra_usage.utilization !== null) {
-            lines.push(`  ${usageBar(data.extra_usage.utilization)}`);
+            lines.push(`${usageBar(data.extra_usage.utilization)}`);
         }
         if (data.extra_usage.used_credits !== null && data.extra_usage.monthly_limit !== null) {
-            lines.push(`  $${data.extra_usage.used_credits.toFixed(2)} / $${data.extra_usage.monthly_limit.toFixed(2)}`);
+            lines.push(`$${data.extra_usage.used_credits.toFixed(2)} / $${data.extra_usage.monthly_limit.toFixed(2)}`);
         }
         lines.push('');
     }
@@ -183,10 +233,11 @@ function formatUsage(data: UsageData, profileLabel: string, cachedAt: number): s
     const ageSec = Math.floor(ageMs / 1000);
     if (ageSec > 5) {
         const ageMin = Math.floor(ageSec / 60);
-        lines.push(`ℹ️ Cached ${ageMin > 0 ? `${ageMin}m ago` : `${ageSec}s ago`} (15min TTL)`);
+        const ageStr = ageMin > 0 ? `${ageMin} 分钟前` : `${ageSec} 秒前`;
+        lines.push(`ℹ️ 缓存于 ${ageStr}`);
     }
 
-    return lines.join('\n');
+    return centerText(lines);
 }
 
 /**
@@ -198,7 +249,7 @@ export async function handleUsageBangCommand(_args: string, _ctx: BangCommandCon
     const resolved = resolveOAuthToken();
     if (!resolved) {
         return {
-            message: '❌ No OAuth credentials found. Make sure you are logged in via CCS or Claude CLI.',
+            message: '❌ 未找到 OAuth 凭证。请确认已通过 CCS 或 Claude CLI 登录。',
             action: 'none',
         };
     }
@@ -215,10 +266,10 @@ export async function handleUsageBangCommand(_args: string, _ctx: BangCommandCon
         };
     }
 
-    // Fetch fresh data
+    // Fetch fresh data (retry once with re-read token on auth failures)
     try {
-        logger.debug(`[!usage] Fetching usage for profile: ${profileLabel}`);
-        const data = await fetchUsage(token);
+        logger.debug(`[!usage] Fetching usage for profile: ${profileLabel}, configDir=${process.env.CLAUDE_CONFIG_DIR ?? '(unset)'}`);
+        const data = await fetchUsage(token, profileLabel);
         const now = Date.now();
 
         cache.set(cacheKey, { data, fetchedAt: now });
@@ -231,16 +282,39 @@ export async function handleUsageBangCommand(_args: string, _ctx: BangCommandCon
         const errorMsg = error instanceof Error ? error.message : 'Unknown error';
         logger.debug(`[!usage] Failed to fetch usage: ${errorMsg}`);
 
+        // On auth errors (401/403), re-read token from disk and retry once
+        // The daemon may hold a stale token while the credential file has been refreshed
+        const isAuthError = errorMsg.includes('401') || errorMsg.includes('403') || errorMsg.includes('过期') || errorMsg.includes('被拒绝');
+        if (isAuthError) {
+            logger.debug(`[!usage] Auth error detected, re-reading token from disk...`);
+            const refreshed = resolveOAuthToken();
+            if (refreshed && refreshed.token !== token) {
+                logger.debug(`[!usage] Token changed on disk, retrying with fresh token`);
+                try {
+                    const data = await fetchUsage(refreshed.token, refreshed.profileLabel);
+                    const now = Date.now();
+                    cache.set(refreshed.cacheKey, { data, fetchedAt: now });
+                    return {
+                        message: formatUsage(data, refreshed.profileLabel, now),
+                        action: 'none',
+                    };
+                } catch (retryError) {
+                    const retryMsg = retryError instanceof Error ? retryError.message : 'Unknown error';
+                    logger.debug(`[!usage] Retry also failed: ${retryMsg}`);
+                }
+            }
+        }
+
         // Return stale cache if available
         if (cached) {
             return {
-                message: formatUsage(cached.data, profileLabel, cached.fetchedAt) + '\n\n⚠️ Fresh data unavailable: ' + errorMsg,
+                message: formatUsage(cached.data, profileLabel, cached.fetchedAt) + '\n\n⚠️ 无法获取最新数据: ' + errorMsg,
                 action: 'none',
             };
         }
 
         return {
-            message: `❌ Failed to fetch usage: ${errorMsg}`,
+            message: `❌ 获取用量失败: ${errorMsg}`,
             action: 'none',
         };
     }

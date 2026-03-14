@@ -210,11 +210,45 @@ export class ApiSessionClient extends EventEmitter {
      * @param body - Message body (can be MessageContent or raw content for agent messages)
      */
     sendClaudeSessionMessage(body: RawJSONLines) {
-        const mapped = mapClaudeLogMessageToSessionEnvelopes(body, this.claudeSessionProtocolState);
-        this.claudeSessionProtocolState.currentTurnId = mapped.currentTurnId;
-        for (const envelope of mapped.envelopes) {
-            this.sendSessionProtocolMessage(envelope);
+        let content: MessageContent;
+
+        // Check if body is already a MessageContent (has role property)
+        if (body.type === 'user' && typeof body.message.content === 'string' && body.isSidechain !== true && body.isMeta !== true) {
+            content = {
+                role: 'user',
+                content: {
+                    type: 'text',
+                    text: body.message.content
+                },
+                meta: {
+                    sentFrom: 'cli'
+                }
+            }
+        } else {
+            // Wrap Claude messages in the expected format
+            content = {
+                role: 'agent',
+                content: {
+                    type: 'output',
+                    data: body  // This wraps the entire Claude message
+                },
+                meta: {
+                    sentFrom: 'cli'
+                }
+            };
         }
+
+        // Check if socket is connected before sending
+        if (!this.socket.connected) {
+            logger.debug('[API] Socket not connected, cannot send Claude session message. Message will be lost:', { type: body.type });
+            return;
+        }
+
+        const encrypted = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, content));
+        this.socket.emit('message', {
+            sid: this.sessionId,
+            message: encrypted
+        });
 
         // Track usage from assistant messages
         if (body.type === 'assistant' && body.message?.usage) {
@@ -237,12 +271,9 @@ export class ApiSessionClient extends EventEmitter {
         }
     }
 
-    closeClaudeSessionTurn(status: SessionTurnEndStatus = 'completed') {
-        const mapped = closeClaudeTurnWithStatus(this.claudeSessionProtocolState, status);
-        this.claudeSessionProtocolState.currentTurnId = mapped.currentTurnId;
-        for (const envelope of mapped.envelopes) {
-            this.sendSessionProtocolMessage(envelope);
-        }
+    closeClaudeSessionTurn(_status: SessionTurnEndStatus = 'completed') {
+        // No-op: turn lifecycle is managed by the caller via sendSessionEvent({ type: 'ready' })
+        // Session protocol turn-end envelopes are not understood by the mobile app in legacy mode
     }
 
     sendCodexMessage(body: any) {

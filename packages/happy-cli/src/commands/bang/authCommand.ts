@@ -1,7 +1,10 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { logger } from '@/ui/logger';
 import { readCcsProfiles, getCurrentCcsProfile, type CcsProfileInfo } from './ccsProfiles';
 import { configuration } from '@/configuration';
+import { centerText } from './format';
+import { getCachedUsageSummary } from './usageCommand';
 import type { BangCommandContext, BangCommandResult } from './types';
 
 /**
@@ -75,6 +78,25 @@ export function tryGlobalProfileSwitch(): boolean {
     }
 }
 
+/**
+ * Check whether a profile's OAuth token is available and likely valid.
+ * Returns a status indicator: '' (ok), '⚠' (no token / not initialized).
+ */
+function getProfileStatus(profile: CcsProfileInfo): string {
+    if (!existsSync(profile.instancePath)) return '⚠';
+
+    try {
+        const credPath = join(profile.instancePath, '.credentials.json');
+        const raw = readFileSync(credPath, 'utf-8');
+        const data = JSON.parse(raw);
+        if (!data.claudeAiOauth?.accessToken) return '⚠';
+    } catch {
+        return '⚠';
+    }
+
+    return '';
+}
+
 function listProfiles(): BangCommandResult {
     const { profiles } = readCcsProfiles();
     const currentProfile = getCurrentCcsProfile();
@@ -86,17 +108,18 @@ function listProfiles(): BangCommandResult {
 
     // No active CCS profile (session not started via CCS)
     if (!currentProfile) {
-        lines.push('📋 No CCS profile active.');
+        lines.push('📋 当前无 CCS 配置。');
         lines.push('');
         if (profiles.length > 0) {
-            lines.push('Available profiles:');
+            lines.push('可用配置:');
             for (const p of profiles) {
-                lines.push(`  ○ ${p.name}`);
+                const status = getProfileStatus(p);
+                lines.push(status ? `○ ${p.name} ${status}` : `○ ${p.name}`);
             }
         } else {
-            lines.push('No CCS profiles configured.');
+            lines.push('未找到 CCS 配置。');
         }
-        return { message: lines.join('\n'), action: 'none' };
+        return { message: centerText(lines), action: 'none' };
     }
 
     const isShared = currentProfileInfo?.contextMode === 'shared';
@@ -111,29 +134,32 @@ function listProfiles(): BangCommandResult {
         : [];
 
     if (currentGroup) {
-        lines.push(`📋 Group "${currentGroup}":`);
+        lines.push(`📋 组 "${currentGroup}"`);
     } else {
-        lines.push(`📋 Account: ${currentProfile} (isolated)`);
+        lines.push(`📋 ${currentProfile} (独立)`);
     }
 
     lines.push('');
-    lines.push(`  ● ${currentProfile} (current)`);
+    const currentStatus = currentProfileInfo ? getProfileStatus(currentProfileInfo) : '';
+    lines.push(currentStatus ? `● ${currentProfile} ${currentStatus}` : `● ${currentProfile}`);
 
     if (currentGroup && switchable.length > 0) {
         for (const profile of switchable) {
-            lines.push(`  ○ ${profile.name}`);
+            const status = getProfileStatus(profile);
+            lines.push(status ? `○ ${profile.name} ${status}` : `○ ${profile.name}`);
         }
         lines.push('');
-        lines.push('Switch: !auth <name> (this session) | !auth all <name> (all sessions)');
+        lines.push('!auth <名称> · 当前会话');
+        lines.push('!auth all <名称> · 全部会话');
     } else if (currentGroup) {
         lines.push('');
-        lines.push('No other accounts in this group.');
+        lines.push('本组无其他账号。');
     } else {
         lines.push('');
-        lines.push('Isolated mode — switching is not available.');
+        lines.push('无法切换。');
     }
 
-    return { message: lines.join('\n'), action: 'none' };
+    return { message: centerText(lines), action: 'none' };
 }
 
 /**
@@ -159,18 +185,17 @@ function switchProfile(profileName: string): BangCommandResult {
     const target = profiles.find(p => p.name === profileName);
 
     if (!target) {
-        return {
-            message: `❌ Profile "${profileName}" not found. Use !auth to see available accounts.`,
-            action: 'none',
-        };
+        const lines = [
+            `❌ 未找到配置 "${profileName}"。`,
+            '',
+            '使用 !auth 查看可用账号。',
+        ];
+        return { message: centerText(lines), action: 'none' };
     }
 
     // Check if already on this profile
     if (target.name === currentProfile) {
-        return {
-            message: `✅ Already using "${profileName}".`,
-            action: 'none',
-        };
+        return { message: centerText([`✅ 当前已是 "${profileName}"`]), action: 'none' };
     }
 
     // Only allow switching within the same shared context group
@@ -180,29 +205,31 @@ function switchProfile(profileName: string): BangCommandResult {
 
     if (!isSharedContext(currentProfileInfo, target)) {
         const describeMode = (p: CcsProfileInfo | null): string =>
-            !p || p.contextMode !== 'shared' ? 'isolated' : `group "${p.contextGroup || 'default'}"`;
-        return {
-            message: `❌ Cannot switch: "${currentProfile || 'unknown'}" is ${describeMode(currentProfileInfo)}, "${profileName}" is ${describeMode(target)}.`,
-            action: 'none',
-        };
+            !p || p.contextMode !== 'shared' ? '独立' : `组 "${p.contextGroup || 'default'}"`;
+        const lines = [
+            '❌ 无法切换',
+            '',
+            `"${currentProfile || 'unknown'}" → ${describeMode(currentProfileInfo)}`,
+            `"${profileName}" → ${describeMode(target)}`,
+        ];
+        return { message: centerText(lines), action: 'none' };
     }
 
     // Verify instance directory exists
     if (!existsSync(target.instancePath)) {
-        return {
-            message: `❌ Profile "${profileName}" instance not initialized.`,
-            action: 'none',
-        };
+        return { message: centerText([`❌ 配置 "${profileName}" 未初始化。`]), action: 'none' };
     }
 
     // Perform the switch — shared context, no session reset needed
     process.env.CLAUDE_CONFIG_DIR = target.instancePath;
     logger.debug(`[!auth] Switched CLAUDE_CONFIG_DIR to: ${target.instancePath}`);
 
-    return {
-        message: `✅ Switched to "${profileName}".`,
-        action: 'restart-session',
-    };
+    const usageLine = getCachedUsageSummary(target.instancePath);
+    const lines = [`✅ 已切换到 "${profileName}"`];
+    if (usageLine) {
+        lines.push('', usageLine);
+    }
+    return { message: centerText(lines), action: 'restart-session' };
 }
 
 /**
@@ -216,10 +243,12 @@ function switchAllProfiles(profileName: string): BangCommandResult {
     const target = profiles.find(p => p.name === profileName);
 
     if (!target) {
-        return {
-            message: `❌ Profile "${profileName}" not found. Use !auth to see available accounts.`,
-            action: 'none',
-        };
+        const lines = [
+            `❌ 未找到配置 "${profileName}"。`,
+            '',
+            '使用 !auth 查看可用账号。',
+        ];
+        return { message: centerText(lines), action: 'none' };
     }
 
     const currentProfileInfo = currentProfile
@@ -228,18 +257,18 @@ function switchAllProfiles(profileName: string): BangCommandResult {
 
     if (!isSharedContext(currentProfileInfo, target)) {
         const describeMode = (p: CcsProfileInfo | null): string =>
-            !p || p.contextMode !== 'shared' ? 'isolated' : `group "${p.contextGroup || 'default'}"`;
-        return {
-            message: `❌ Cannot switch: "${currentProfile || 'unknown'}" is ${describeMode(currentProfileInfo)}, "${profileName}" is ${describeMode(target)}.`,
-            action: 'none',
-        };
+            !p || p.contextMode !== 'shared' ? '独立' : `组 "${p.contextGroup || 'default'}"`;
+        const lines = [
+            '❌ 无法切换',
+            '',
+            `"${currentProfile || 'unknown'}" → ${describeMode(currentProfileInfo)}`,
+            `"${profileName}" → ${describeMode(target)}`,
+        ];
+        return { message: centerText(lines), action: 'none' };
     }
 
     if (!existsSync(target.instancePath)) {
-        return {
-            message: `❌ Profile "${profileName}" instance not initialized.`,
-            action: 'none',
-        };
+        return { message: centerText([`❌ 配置 "${profileName}" 未初始化。`]), action: 'none' };
     }
 
     const alreadyCurrent = target.name === currentProfile;
@@ -258,26 +287,38 @@ function switchAllProfiles(profileName: string): BangCommandResult {
     } catch (err) {
         logger.debug('[!auth] Failed to write global profile file:', err);
         if (alreadyCurrent) {
-            return {
-                message: `⚠️ Already using "${profileName}", but failed to broadcast to other sessions.`,
-                action: 'none',
-            };
+            const lines = [
+                `✅ 当前已是 "${profileName}"`,
+                '',
+                '广播到其他会话失败。',
+            ];
+            return { message: centerText(lines), action: 'none' };
         }
-        return {
-            message: `⚠️ Switched to "${profileName}" locally, but failed to broadcast to other sessions.`,
-            action: 'restart-session',
-        };
+        const lines = [
+            `⚠️ 已在本地切换到 "${profileName}"`,
+            '',
+            '广播到其他会话失败。',
+        ];
+        return { message: centerText(lines), action: 'restart-session' };
     }
+
+    const usageLine = getCachedUsageSummary(target.instancePath);
 
     if (alreadyCurrent) {
-        return {
-            message: `✅ Already using "${profileName}". Broadcasted to other sessions in group "${groupName}".`,
-            action: 'none',
-        };
+        const lines = [
+            `✅ 当前已是 "${profileName}"`,
+            '',
+            `已广播到组 "${groupName}"`,
+        ];
+        if (usageLine) lines.push('', usageLine);
+        return { message: centerText(lines), action: 'none' };
     }
 
-    return {
-        message: `✅ Switched all sessions in group "${groupName}" to "${profileName}".`,
-        action: 'restart-session',
-    };
+    const lines = [
+        `✅ 已切换到 "${profileName}"`,
+        '',
+        `组 "${groupName}" 中的所有会话`,
+    ];
+    if (usageLine) lines.push('', usageLine);
+    return { message: centerText(lines), action: 'restart-session' };
 }
