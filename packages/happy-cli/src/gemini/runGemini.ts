@@ -298,8 +298,8 @@ export async function runGemini(opts: {
     session.sendSessionEvent({ type: 'ready' });
     try {
       api.push().sendToAllDevices(
-        "It's ready!",
-        'Gemini is waiting for your command',
+        '准备就绪',
+        'Gemini 等待你的指令',
         { sessionId: session.sessionId }
       );
     } catch (pushError) {

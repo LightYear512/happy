@@ -435,8 +435,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         session.client.closeClaudeSessionTurn('completed');
                         if (!pending && session.queue.size() === 0) {
                             session.api.push().sendToAllDevices(
-                                'It\'s ready!',
-                                `Claude is waiting for your command`,
+                                '准备就绪',
+                                `Claude 等待你的指令`,
                                 { sessionId: session.client.sessionId }
                             );
                         }

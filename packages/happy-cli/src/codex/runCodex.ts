@@ -208,8 +208,8 @@ export async function runCodex(opts: {
         session.sendSessionEvent({ type: 'ready' });
         try {
             api.push().sendToAllDevices(
-                "It's ready!",
-                'Codex is waiting for your command',
+                '准备就绪',
+                'Codex 等待你的指令',
                 { sessionId: session.sessionId }
             );
         } catch (pushError) {
