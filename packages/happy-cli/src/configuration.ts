@@ -23,6 +23,7 @@ class Configuration {
   public readonly daemonStateFile: string
   public readonly daemonLockFile: string
   public readonly activeProfileFile: string
+  public readonly restartSignalFile: string
   public readonly currentCliVersion: string
 
   public readonly isExperimentalEnabled: boolean
@@ -52,6 +53,7 @@ class Configuration {
     this.daemonStateFile = join(this.happyHomeDir, 'daemon.state.json')
     this.daemonLockFile = join(this.happyHomeDir, 'daemon.state.json.lock')
     this.activeProfileFile = join(this.happyHomeDir, 'active-ccs-profile')
+    this.restartSignalFile = join(this.happyHomeDir, 'restart-signal')
 
     this.isExperimentalEnabled = ['true', '1', 'yes'].includes(process.env.HAPPY_EXPERIMENTAL?.toLowerCase() || '');
     this.disableCaffeinate = ['true', '1', 'yes'].includes(process.env.HAPPY_DISABLE_CAFFEINATE?.toLowerCase() || '');

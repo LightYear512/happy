@@ -1,5 +1,6 @@
 import { logger } from '@/ui/logger';
 import { handleAuthBangCommand } from './authCommand';
+import { handleRestartBangCommand } from './restartCommand';
 import { handleUsageBangCommand } from './usageCommand';
 import { centerText } from './format';
 import type { BangCommandContext, BangCommandHandler, BangCommandResult } from './types';
@@ -8,13 +9,15 @@ import type { BangCommandContext, BangCommandHandler, BangCommandResult } from '
  * Registry of bang commands with descriptions for !help.
  */
 const commands: Record<string, { handler: BangCommandHandler; desc: string; loadingMsg?: string }> = {
-    auth:  { handler: handleAuthBangCommand,  desc: '切换 CCS 账号' },
-    usage: { handler: handleUsageBangCommand, desc: '查看 API 用量', loadingMsg: '⏳ 正在查询用量...' },
+    auth:    { handler: handleAuthBangCommand,    desc: '切换 CCS 账号' },
+    restart: { handler: handleRestartBangCommand, desc: '重启会话' },
+    usage:   { handler: handleUsageBangCommand,   desc: '查看 API 用量', loadingMsg: '⏳ 正在查询用量...' },
 };
 
 /** Short aliases for convenience on mobile keyboards. */
 const aliases: Record<string, string> = {
     a: 'auth',
+    r: 'restart',
     u: 'usage',
     h: 'help',
 };

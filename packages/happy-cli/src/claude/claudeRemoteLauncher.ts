@@ -1,5 +1,5 @@
 import { render } from "ink";
-import { watch, type FSWatcher } from "node:fs";
+import { readFileSync, watch, type FSWatcher } from "node:fs";
 import { Session } from "./session";
 import { MessageBuffer } from "@/ui/ink/messageBuffer";
 import { RemoteModeDisplay } from "@/ui/ink/RemoteModeDisplay";
@@ -293,32 +293,50 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         }
     }
 
-    // Set up fs.watch for global auth switching (!auth all <profile>)
-    // Watches the happyHomeDir directory for changes to the active-ccs-profile file.
-    // When another session writes this file, we detect the change and restart the SDK
-    // with the new CLAUDE_CONFIG_DIR so the auth switch takes effect.
-    let profileWatcher: FSWatcher | null = null;
+    // Set up fs.watch for global signals (!auth all, !restart all)
+    // Watches the happyHomeDir directory for changes to signal files.
+    // When another session writes a signal file, we detect the change and act accordingly.
+    let signalWatcher: FSWatcher | null = null;
     let profileDebounceTimer: NodeJS.Timeout | null = null;
+    let restartDebounceTimer: NodeJS.Timeout | null = null;
+    let lastRestartSignal = '';
 
     try {
-        profileWatcher = watch(configuration.happyHomeDir, (event, filename) => {
-            if (filename !== 'active-ccs-profile') return;
-            if (profileDebounceTimer) clearTimeout(profileDebounceTimer);
-            profileDebounceTimer = setTimeout(() => {
-                const switched = tryGlobalProfileSwitch();
-                if (switched) {
-                    const newProfile = getCurrentCcsProfile() || 'unknown';
-                    logger.debug(`[remote]: Global profile change detected → "${newProfile}", interrupting session`);
-                    session.client.sendSessionEvent({ type: 'message', message: `🔄 Switched to "${newProfile}" (via !auth all)` });
-                    session.queue.interrupt();
-                }
-            }, 200);
+        signalWatcher = watch(configuration.happyHomeDir, (event, filename) => {
+            if (filename === 'active-ccs-profile') {
+                if (profileDebounceTimer) clearTimeout(profileDebounceTimer);
+                profileDebounceTimer = setTimeout(() => {
+                    const switched = tryGlobalProfileSwitch();
+                    if (switched) {
+                        const newProfile = getCurrentCcsProfile() || 'unknown';
+                        logger.debug(`[remote]: Global profile change detected → "${newProfile}", interrupting session`);
+                        session.client.sendSessionEvent({ type: 'message', message: `🔄 Switched to "${newProfile}" (via !auth all)` });
+                        session.queue.interrupt();
+                    }
+                }, 200);
+            } else if (filename === 'restart-signal') {
+                if (restartDebounceTimer) clearTimeout(restartDebounceTimer);
+                restartDebounceTimer = setTimeout(() => {
+                    try {
+                        const signal = readFileSync(configuration.restartSignalFile, 'utf-8').trim();
+                        if (signal && signal !== lastRestartSignal) {
+                            lastRestartSignal = signal;
+                            const currentProfile = getCurrentCcsProfile() || 'unknown';
+                            logger.debug(`[remote]: Restart signal detected (${currentProfile}), interrupting session`);
+                            session.client.sendSessionEvent({ type: 'message', message: `🔄 正在重启会话 (${currentProfile})` });
+                            session.queue.interrupt();
+                        }
+                    } catch {
+                        // Signal file may have been deleted between watch and read
+                    }
+                }, 200);
+            }
         });
-        profileWatcher.on('error', (err) => {
-            logger.debug('[remote]: Profile watcher error:', err);
+        signalWatcher.on('error', (err) => {
+            logger.debug('[remote]: Signal watcher error:', err);
         });
     } catch (err) {
-        logger.debug('[remote]: Failed to set up profile watcher:', err);
+        logger.debug('[remote]: Failed to set up signal watcher:', err);
     }
 
     try {
@@ -478,14 +496,18 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         }
     } finally {
 
-        // Clean up profile watcher
-        if (profileWatcher) {
-            profileWatcher.close();
-            profileWatcher = null;
+        // Clean up signal watcher
+        if (signalWatcher) {
+            signalWatcher.close();
+            signalWatcher = null;
         }
         if (profileDebounceTimer) {
             clearTimeout(profileDebounceTimer);
             profileDebounceTimer = null;
+        }
+        if (restartDebounceTimer) {
+            clearTimeout(restartDebounceTimer);
+            restartDebounceTimer = null;
         }
 
         // Clean up permission handler
