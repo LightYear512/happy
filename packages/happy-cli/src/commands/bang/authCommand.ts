@@ -5,12 +5,14 @@ import { readCcsProfiles, getCurrentCcsProfile, type CcsProfileInfo } from './cc
 import { configuration } from '@/configuration';
 import { centerText } from './format';
 import { getCachedUsageSummary } from './usageCommand';
+import { handleAuthCreateBangCommand } from './authCreateCommand';
 import type { BangCommandContext, BangCommandResult } from './types';
 
 /**
  * Handle the `!auth` bang command.
  *
  * - `!auth` — List available CCS profiles with current active indicator
+ * - `!auth create <name>` — Create a new CCS profile via interactive login
  * - `!auth <name>` — Switch current session to the specified profile
  * - `!auth all <name>` — Switch all sessions on this machine to the specified profile
  */
@@ -19,6 +21,12 @@ export async function handleAuthBangCommand(args: string, ctx: BangCommandContex
 
     if (!trimmed) {
         return listProfiles();
+    }
+
+    // Route `!auth create <name>` to interactive login handler
+    if (trimmed.toLowerCase() === 'create' || trimmed.toLowerCase().startsWith('create ')) {
+        const createArgs = trimmed.slice(6).trim();
+        return handleAuthCreateBangCommand(createArgs, ctx);
     }
 
     // Check for "all" prefix: !auth all [<profile>]

@@ -5,11 +5,13 @@ import { handleUsageBangCommand } from './usageCommand';
 import { centerText } from './format';
 import type { BangCommandContext, BangCommandHandler, BangCommandResult } from './types';
 
+export { hasActiveInteractiveSession, handleInteractiveInput } from './interactiveSession';
+
 /**
  * Registry of bang commands with descriptions for !help.
  */
 const commands: Record<string, { handler: BangCommandHandler; desc: string; loadingMsg?: string }> = {
-    auth:    { handler: handleAuthBangCommand,    desc: '切换 CCS 账号' },
+    auth:    { handler: handleAuthBangCommand,    desc: '管理 CCS 账号 (create/切换)' },
     restart: { handler: handleRestartBangCommand, desc: '重启会话' },
     usage:   { handler: handleUsageBangCommand,   desc: '查看 API 用量', loadingMsg: '⏳ 正在查询用量...' },
 };
@@ -90,6 +92,11 @@ export async function executeBangCommand(text: string, ctx: BangCommandContext):
     // Built-in help command
     if (name === 'help') {
         return buildHelp();
+    }
+
+    // !cancel without an active interactive session
+    if (name === 'cancel' || name === '取消') {
+        return { message: centerText(['ℹ️ 当前没有进行中的操作']), action: 'none' };
     }
 
     const entry = commands[name];
