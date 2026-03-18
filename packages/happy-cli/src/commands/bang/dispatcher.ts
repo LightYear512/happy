@@ -1,5 +1,6 @@
 import { logger } from '@/ui/logger';
 import { handleAuthBangCommand } from './authCommand';
+import { handleAuthCreateBangCommand } from './authCreateCommand';
 import { handleRestartBangCommand } from './restartCommand';
 import { handleUsageBangCommand } from './usageCommand';
 import { centerText } from './format';
@@ -11,7 +12,8 @@ export { hasActiveInteractiveSession, handleInteractiveInput } from './interacti
  * Registry of bang commands with descriptions for !help.
  */
 const commands: Record<string, { handler: BangCommandHandler; desc: string; loadingMsg?: string }> = {
-    auth:    { handler: handleAuthBangCommand,    desc: '管理 CCS 账号 (create/切换)' },
+    auth:    { handler: handleAuthBangCommand,    desc: '切换 CCS 账号' },
+    login:   { handler: handleAuthCreateBangCommand, desc: '登录新账号' },
     restart: { handler: handleRestartBangCommand, desc: '重启会话' },
     usage:   { handler: handleUsageBangCommand,   desc: '查看 API 用量', loadingMsg: '⏳ 正在查询用量...' },
 };
@@ -19,6 +21,7 @@ const commands: Record<string, { handler: BangCommandHandler; desc: string; load
 /** Short aliases for convenience on mobile keyboards. */
 const aliases: Record<string, string> = {
     a: 'auth',
+    l: 'login',
     r: 'restart',
     u: 'usage',
     h: 'help',
