@@ -167,7 +167,7 @@ function messageKey(message: RawJSONLines): string {
  * Read and parse session log file
  * Returns only valid conversation messages, silently skipping internal events
  */
-async function readSessionLog(projectDir: string, sessionId: string): Promise<RawJSONLines[]> {
+export async function readSessionLog(projectDir: string, sessionId: string): Promise<RawJSONLines[]> {
     const expectedSessionFile = join(projectDir, `${sessionId}.jsonl`);
     logger.debug(`[SESSION_SCANNER] Reading session file: ${expectedSessionFile}`);
     let file: string;

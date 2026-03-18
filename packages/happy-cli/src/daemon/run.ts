@@ -219,6 +219,12 @@ export async function startDaemon(): Promise<void> {
     const spawnSession = async (options: SpawnSessionOptions): Promise<SpawnSessionResult> => {
       logger.debugLargeJson('[DAEMON RUN] Spawning session', options);
 
+      // Validate resume session ID format (UUID) to prevent injection in tmux string concatenation
+      if (options.resume && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(options.resume)) {
+        logger.debug(`[DAEMON RUN] Invalid resume session ID format: ${options.resume}`);
+        return { type: 'error', errorMessage: `Invalid resume session ID format: ${options.resume}` };
+      }
+
       const { directory, sessionId, machineId, approvedNewDirectoryCreation = true } = options;
       let directoryCreated = false;
 
@@ -388,7 +394,8 @@ export async function startDaemon(): Promise<void> {
           const cliPath = join(projectPath(), 'dist', 'index.mjs');
           // Determine agent command - support claude, codex, and gemini
           const agent = options.agent === 'gemini' ? 'gemini' : (options.agent === 'codex' ? 'codex' : 'claude');
-          const fullCommand = `node --no-warnings --no-deprecation ${cliPath} ${agent} --happy-starting-mode remote --started-by daemon`;
+          const resumeFlag = options.resume ? ` --resume ${options.resume}` : '';
+          const fullCommand = `node --no-warnings --no-deprecation ${cliPath} ${agent} --happy-starting-mode remote --started-by daemon${resumeFlag}`;
 
           // Spawn in tmux with environment variables
           // IMPORTANT: Pass complete environment (process.env + extraEnv) because:
@@ -495,8 +502,11 @@ export async function startDaemon(): Promise<void> {
             '--started-by', 'daemon'
           ];
 
-          // TODO: In future, sessionId could be used with --resume to continue existing sessions
-          // For now, we ignore it - each spawn creates a new session
+          if (options.resume) {
+            args.push('--resume', options.resume);
+            logger.debug(`[DAEMON RUN] Adding --resume ${options.resume} to CLI args`);
+          }
+
           const happyProcess = spawnHappyCLI(args, {
             cwd: directory,
             detached: true,  // Sessions stay alive when daemon stops
@@ -688,6 +698,45 @@ export async function startDaemon(): Promise<void> {
     // Connect to server
     apiMachine.connect();
 
+    // Spawn console session (lightweight bang-command-only session for mobile control)
+    let consoleSessionPid: number | null = null;
+    let consoleSessionSpawning = false;
+    const consoleDir = join(configuration.happyHomeDir, 'console');
+    try {
+      await fs.mkdir(consoleDir, { recursive: true });
+    } catch { /* already exists */ }
+
+    const spawnConsoleSession = async () => {
+      if (consoleSessionSpawning) return;
+      consoleSessionSpawning = true;
+      logger.debug('[DAEMON RUN] Spawning console session');
+      try {
+        const result = await spawnSession({
+          directory: consoleDir,
+          approvedNewDirectoryCreation: true,
+        });
+        if (result.type === 'success') {
+          // Find the PID of the console session from tracked sessions
+          for (const [pid, tracked] of pidToTrackedSession.entries()) {
+            if (tracked.happySessionId === result.sessionId) {
+              consoleSessionPid = pid;
+              break;
+            }
+          }
+          logger.debug(`[DAEMON RUN] Console session spawned: ${result.sessionId} (PID: ${consoleSessionPid})`);
+        } else {
+          logger.debug(`[DAEMON RUN] Failed to spawn console session: ${result.type === 'error' ? result.errorMessage : 'approval needed'}`);
+        }
+      } catch (error) {
+        logger.debug('[DAEMON RUN] Failed to spawn console session:', error);
+      } finally {
+        consoleSessionSpawning = false;
+      }
+    };
+
+    // Fire-and-forget — don't block other RPC handling
+    spawnConsoleSession();
+
     // Every 60 seconds:
     // 1. Prune stale sessions
     // 2. Check if daemon needs update
@@ -714,6 +763,16 @@ export async function startDaemon(): Promise<void> {
           // Process is dead, remove from tracking
           logger.debug(`[DAEMON RUN] Removing stale session with PID ${pid} (process no longer exists)`);
           pidToTrackedSession.delete(pid);
+        }
+      }
+
+      // Re-spawn console session if it died
+      if (consoleSessionPid !== null) {
+        const consoleAlive = pidToTrackedSession.has(consoleSessionPid);
+        if (!consoleAlive && !consoleSessionSpawning) {
+          logger.debug(`[DAEMON RUN] Console session (PID ${consoleSessionPid}) is dead, re-spawning`);
+          consoleSessionPid = null;
+          spawnConsoleSession();
         }
       }
 

@@ -198,6 +198,22 @@ export class ApiSessionClient extends EventEmitter {
         this.socket.connect();
     }
 
+    /** Wait for socket to connect. Resolves immediately if already connected. */
+    waitForConnect(timeoutMs: number = 10_000): Promise<void> {
+        if (this.socket.connected) return Promise.resolve();
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this.socket.off('connect', onConnect);
+                reject(new Error('Socket connect timeout'));
+            }, timeoutMs);
+            const onConnect = () => {
+                clearTimeout(timer);
+                resolve();
+            };
+            this.socket.once('connect', onConnect);
+        });
+    }
+
     onUserMessage(callback: (data: UserMessage) => void) {
         this.pendingMessageCallback = callback;
         while (this.pendingMessages.length > 0) {

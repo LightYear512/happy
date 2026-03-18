@@ -28,7 +28,8 @@ import { existsSync } from 'node:fs';
 import { startOfflineReconnection, connectionState } from '@/utils/serverConnectionErrors';
 import { readCcsProfiles, getInstancePath, getCurrentCcsProfile } from '@/commands/bang/ccsProfiles';
 import { claudeLocal } from '@/claude/claudeLocal';
-import { createSessionScanner } from '@/claude/utils/sessionScanner';
+import { createSessionScanner, readSessionLog } from '@/claude/utils/sessionScanner';
+import { getProjectPath } from '@/claude/utils/path';
 import { Session } from './session';
 import { applySandboxPermissionPolicy, resolveInitialClaudePermissionMode } from './utils/permissionMode';
 
@@ -192,6 +193,27 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         logger.debug('[START] Failed to report to daemon (may not be running):', error);
     }
 
+    // Detect console session and send welcome message
+    const consoleSessionDir = resolve(configuration.happyHomeDir, 'console');
+    const isConsoleSession = resolve(workingDirectory) === consoleSessionDir;
+    if (isConsoleSession) {
+        logger.debug('[START] Console session detected, sending welcome message');
+        // Short delay to ensure socket is connected before sending
+        setTimeout(() => {
+            session.sendSessionEvent({
+                type: 'message',
+                message: [
+                    '🖥️ Console',
+                    '',
+                    '!sessions (!s) — 查看可恢复会话',
+                    '!resume (!re) <id> — 恢复会话',
+                    '!help (!h) — 所有命令',
+                ].join('\n'),
+            });
+            session.sendSessionEvent({ type: 'ready' });
+        }, 500);
+    }
+
     // Extract SDK metadata in background and update session when ready
     extractSDKMetadataAsync(async (sdkMetadata) => {
         logger.debug('[start] SDK metadata extracted, updating session:', sdkMetadata);
@@ -210,6 +232,39 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
     // Create realtime session
     const session = api.sessionSyncClient(response);
+
+    // Forward JSONL history to app when resuming in remote mode
+    // In local mode, Session Scanner handles this. In remote mode there's no scanner,
+    // so we read the JSONL file directly and send historical messages to the app.
+    if (options.startingMode === 'remote' && options.claudeArgs) {
+        let resumeSessionId: string | null = null;
+        for (let i = 0; i < options.claudeArgs.length; i++) {
+            if (options.claudeArgs[i] === '--resume' && i + 1 < options.claudeArgs.length) {
+                const nextArg = options.claudeArgs[i + 1];
+                if (!nextArg.startsWith('-') && nextArg.includes('-')) {
+                    resumeSessionId = nextArg;
+                }
+                break;
+            }
+        }
+
+        if (resumeSessionId) {
+            logger.debug(`[START] Remote resume detected, forwarding JSONL history for session ${resumeSessionId}`);
+            try {
+                const projectDir = getProjectPath(workingDirectory);
+                const historyMessages = await readSessionLog(projectDir, resumeSessionId);
+                logger.debug(`[START] Found ${historyMessages.length} historical messages to forward, waiting for socket`);
+                await session.waitForConnect();
+                logger.debug(`[START] Socket connected, sending historical messages`);
+                for (const msg of historyMessages) {
+                    session.sendClaudeSessionMessage(msg);
+                }
+                logger.debug(`[START] Historical messages forwarded to app`);
+            } catch (error) {
+                logger.debug(`[START] Failed to forward JSONL history:`, error);
+            }
+        }
+    }
 
     // Start Happy MCP server
     const happyServer = await startHappyServer(session);

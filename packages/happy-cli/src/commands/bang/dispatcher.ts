@@ -3,6 +3,8 @@ import { handleAuthBangCommand } from './authCommand';
 import { handleAuthCreateBangCommand } from './authCreateCommand';
 import { handleRestartBangCommand } from './restartCommand';
 import { handleUsageBangCommand } from './usageCommand';
+import { handleSessionsBangCommand } from './sessionsCommand';
+import { handleResumeBangCommand } from './resumeCommand';
 import { centerText } from './format';
 import type { BangCommandContext, BangCommandHandler, BangCommandResult } from './types';
 
@@ -12,10 +14,12 @@ export { hasActiveInteractiveSession, handleInteractiveInput } from './interacti
  * Registry of bang commands with descriptions for !help.
  */
 const commands: Record<string, { handler: BangCommandHandler; desc: string; loadingMsg?: string }> = {
-    auth:    { handler: handleAuthBangCommand,    desc: '切换 CCS 账号' },
-    login:   { handler: handleAuthCreateBangCommand, desc: '登录新账号' },
-    restart: { handler: handleRestartBangCommand, desc: '重启会话' },
-    usage:   { handler: handleUsageBangCommand,   desc: '查看 API 用量', loadingMsg: '⏳ 正在查询用量...' },
+    auth:     { handler: handleAuthBangCommand,     desc: '切换 CCS 账号' },
+    login:    { handler: handleAuthCreateBangCommand, desc: '登录新账号' },
+    restart:  { handler: handleRestartBangCommand,  desc: '重启会话' },
+    usage:    { handler: handleUsageBangCommand,    desc: '查看 API 用量', loadingMsg: '⏳ 正在查询用量...' },
+    sessions: { handler: handleSessionsBangCommand, desc: '查看可恢复会话', loadingMsg: '⏳ 正在扫描会话...' },
+    resume:   { handler: handleResumeBangCommand,   desc: '恢复指定会话', loadingMsg: '⏳ 正在恢复会话...' },
 };
 
 /** Short aliases for convenience on mobile keyboards. */
@@ -25,6 +29,8 @@ const aliases: Record<string, string> = {
     r: 'restart',
     u: 'usage',
     h: 'help',
+    s: 'sessions',
+    re: 'resume',
 };
 
 /**
