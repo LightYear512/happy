@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { request } from 'node:https';
+import { ProxyAgent, fetch as undiciFetch } from 'undici';
 import { logger } from '@/ui/logger';
 import { getCurrentCcsProfile } from './ccsProfiles';
 import { centerText } from './format';
@@ -75,56 +75,75 @@ function readTokenFromFile(path: string): string | null {
 }
 
 /**
- * Direct HTTPS request that bypasses HTTP_PROXY/HTTPS_PROXY env vars.
- * Node.js global fetch respects proxy env vars, which causes Cloudflare to return 403.
+ * Resolve proxy URL: env vars first, then Claude settings.json (CCS instance or default).
+ * Claude Code injects HTTPS_PROXY via settings.json env, but the daemon session process
+ * may not have these env vars. Reading settings.json mirrors Claude's own proxy behavior.
  */
-function directGet(url: string, headers: Record<string, string>): Promise<{ status: number; body: string }> {
-    const parsed = new URL(url);
-    return new Promise((resolve, reject) => {
-        const req = request({
-            hostname: parsed.hostname,
-            port: 443,
-            path: parsed.pathname + parsed.search,
-            method: 'GET',
-            headers,
-        }, (res) => {
-            const chunks: Buffer[] = [];
-            res.on('data', (chunk: Buffer) => chunks.push(chunk));
-            res.on('end', () => resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString() }));
-        });
-        req.on('error', reject);
-        req.setTimeout(10_000, () => { req.destroy(new Error('Request timed out')); });
-        req.end();
-    });
+function resolveProxy(): string | null {
+    const fromEnv = process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.https_proxy || process.env.http_proxy;
+    if (fromEnv) return fromEnv;
+
+    // Read proxy from Claude settings.json (same source Claude Code uses)
+    const candidates = [
+        process.env.CLAUDE_CONFIG_DIR ? join(process.env.CLAUDE_CONFIG_DIR, 'settings.json') : null,
+        join(homedir(), '.claude', 'settings.json'),
+    ].filter(Boolean) as string[];
+
+    for (const settingsPath of candidates) {
+        try {
+            const raw = readFileSync(settingsPath, 'utf-8');
+            const settings = JSON.parse(raw);
+            const proxy = settings.env?.HTTPS_PROXY || settings.env?.HTTP_PROXY;
+            if (proxy) return proxy;
+        } catch {
+            // File doesn't exist or invalid JSON, try next
+        }
+    }
+
+    return null;
 }
 
 /**
  * Fetch usage data from the Anthropic OAuth usage API.
+ * Uses undici with ProxyAgent when a proxy is configured.
+ * Direct connections from geo-restricted IPs get Cloudflare 403,
+ * so we mirror Claude's own proxy settings from settings.json.
  */
 async function fetchUsage(token: string, debugLabel: string): Promise<UsageData> {
     const tokenPrefix = token.substring(0, 15) + '...';
-    logger.debug(`[!usage] Calling ${USAGE_API_URL} with token=${tokenPrefix} label=${debugLabel}`);
+    const proxy = resolveProxy();
+    logger.debug(`[!usage] Calling ${USAGE_API_URL} token=${tokenPrefix} label=${debugLabel} proxy=${proxy ?? '(none)'}`);
 
-    const { status, body } = await directGet(USAGE_API_URL, {
-        'Authorization': `Bearer ${token}`,
-        'anthropic-beta': 'oauth-2025-04-20',
-    });
+    const fetchOptions: Parameters<typeof undiciFetch>[1] = {
+        headers: {
+            'Authorization': `Bearer ${token}`,
+            'anthropic-beta': 'oauth-2025-04-20',
+        },
+        signal: AbortSignal.timeout(10_000),
+    };
 
-    if (status < 200 || status >= 300) {
-        logger.debug(`[!usage] API error: ${status} ${body}`);
-        if (status === 401) {
-            throw new Error('OAuth 令牌已过期或无效，请重新认证 CCS 配置。');
-        }
-        if (status === 403) {
-            throw new Error('请求被拒绝 (403)，请尝试重新登录。');
-        }
-        if (status === 429) {
-            throw new Error('Anthropic API 限流，请稍后再试。');
-        }
-        throw new Error(`API 返回 ${status}: ${body}`);
+    if (proxy) {
+        (fetchOptions as Record<string, unknown>).dispatcher = new ProxyAgent(proxy);
     }
 
-    return JSON.parse(body) as UsageData;
+    const response = await undiciFetch(USAGE_API_URL, fetchOptions);
+
+    if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        logger.debug(`[!usage] API error: ${response.status} ${text}`);
+        if (response.status === 401) {
+            throw new Error('OAuth 令牌已过期或无效，请重新认证 CCS 配置。');
+        }
+        if (response.status === 403) {
+            throw new Error('请求被拒绝 (403)，请尝试重新登录。');
+        }
+        if (response.status === 429) {
+            throw new Error('Anthropic API 限流，请稍后再试。');
+        }
+        throw new Error(`API 返回 ${response.status}: ${text}`);
+    }
+
+    return await response.json() as UsageData;
 }
 
 /**
