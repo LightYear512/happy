@@ -418,7 +418,7 @@ export async function handleAuthCreateBangCommand(
     if (existsSync(profilesPath)) {
         try {
             const data = JSON.parse(readFileSync(profilesPath, 'utf-8'));
-            if (data[profileName]) {
+            if (data.profiles?.[profileName]) {
                 return {
                     message: `❌ 配置 "${profileName}" 已存在`,
                     action: 'none',

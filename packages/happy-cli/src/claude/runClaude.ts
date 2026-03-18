@@ -65,7 +65,8 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     console.log(`🔑 Account: ${resolvedProfile.name}${resolvedProfile.source !== 'default' ? ` (${resolvedProfile.source})` : ''}`);
 
     const workingDirectory = process.cwd();
-    const sessionTag = randomUUID();
+    const isConsoleSession = process.env.HAPPY_CONSOLE_SESSION === '1';
+    const sessionTag = isConsoleSession ? 'console' : randomUUID();
 
     // Log environment info at startup
     logger.debugLargeJson('[START] Happy process started', getEnvironmentInfo());
@@ -130,6 +131,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         flavor: 'claude',
         sandbox: sandboxConfig?.enabled ? sandboxConfig : null,
         dangerouslySkipPermissions,
+        ...(isConsoleSession ? { name: '🖥️ Console' } : {}),
     };
     const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
 
@@ -193,27 +195,6 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         logger.debug('[START] Failed to report to daemon (may not be running):', error);
     }
 
-    // Detect console session and send welcome message
-    const consoleSessionDir = resolve(configuration.happyHomeDir, 'console');
-    const isConsoleSession = resolve(workingDirectory) === consoleSessionDir;
-    if (isConsoleSession) {
-        logger.debug('[START] Console session detected, sending welcome message');
-        // Short delay to ensure socket is connected before sending
-        setTimeout(() => {
-            session.sendSessionEvent({
-                type: 'message',
-                message: [
-                    '🖥️ Console',
-                    '',
-                    '!sessions (!s) — 查看可恢复会话',
-                    '!resume (!re) <id> — 恢复会话',
-                    '!help (!h) — 所有命令',
-                ].join('\n'),
-            });
-            session.sendSessionEvent({ type: 'ready' });
-        }, 500);
-    }
-
     // Extract SDK metadata in background and update session when ready
     extractSDKMetadataAsync(async (sdkMetadata) => {
         logger.debug('[start] SDK metadata extracted, updating session:', sdkMetadata);
@@ -232,6 +213,25 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
     // Create realtime session
     const session = api.sessionSyncClient(response);
+
+    // Console session: send welcome message (must be after session creation)
+    if (isConsoleSession) {
+        logger.debug('[START] Console session detected, sending welcome message');
+        // Short delay to ensure socket is connected before sending
+        setTimeout(() => {
+            session.sendSessionEvent({
+                type: 'message',
+                message: [
+                    '🖥️ Console',
+                    '',
+                    '!sessions (!s) — 查看可恢复会话',
+                    '!resume (!re) <id> — 恢复会话',
+                    '!help (!h) — 所有命令',
+                ].join('\n'),
+            });
+            session.sendSessionEvent({ type: 'ready' });
+        }, 500);
+    }
 
     // Forward JSONL history to app when resuming in remote mode
     // In local mode, Session Scanner handles this. In remote mode there's no scanner,
