@@ -1,6 +1,6 @@
 import { execSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, renameSync } from 'node:fs';
-import { join } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, renameSync, symlinkSync, copyFileSync, readdirSync, statSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import * as pty from 'node-pty';
@@ -234,6 +234,106 @@ function registerProfile(
     writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf-8');
     renameSync(tmpPath, profilesPath);
     logger.debug(`[!auth create] Registered profile "${profileName}" in ${profilesPath}`);
+}
+
+/**
+ * Link shared directories from instance to ~/.ccs/shared/.
+ * Replicates CCS SharedManager.linkSharedDirectories() behavior.
+ *
+ * On Windows: uses 'junction' for directories (no admin required),
+ * falls back to recursive copy if symlink fails.
+ */
+function linkSharedDirectories(instancePath: string): void {
+    const sharedDir = join(getCcsDir(), 'shared');
+    const claudeDir = join(homedir(), '.claude');
+    const isWindows = process.platform === 'win32';
+
+    // Shared items must match CCS SharedManager.sharedItems
+    const sharedItems: Array<{ name: string; type: 'directory' | 'file' }> = [
+        { name: 'commands', type: 'directory' },
+        { name: 'skills', type: 'directory' },
+        { name: 'agents', type: 'directory' },
+        { name: 'plugins', type: 'directory' },
+        { name: 'settings.json', type: 'file' },
+    ];
+
+    // Ensure shared directories exist and mirror from ~/.claude/
+    mkdirSync(sharedDir, { recursive: true });
+    for (const item of sharedItems) {
+        const sharedPath = join(sharedDir, item.name);
+        const claudePath = join(claudeDir, item.name);
+
+        if (!existsSync(sharedPath)) {
+            if (item.type === 'directory') {
+                // If ~/.claude/<item> exists, it becomes the shared source
+                // Otherwise create empty directory
+                mkdirSync(sharedPath, { recursive: true });
+            } else if (existsSync(claudePath)) {
+                copyFileSync(claudePath, sharedPath);
+            } else {
+                writeFileSync(sharedPath, '{}', 'utf-8');
+            }
+        }
+    }
+
+    // Create instance → shared links
+    for (const item of sharedItems) {
+        const linkPath = join(instancePath, item.name);
+        const targetPath = join(sharedDir, item.name);
+
+        // Remove existing file/directory/link
+        if (existsSync(linkPath)) {
+            try {
+                const stat = statSync(linkPath);
+                if (stat.isDirectory()) {
+                    rmSync(linkPath, { recursive: true, force: true });
+                } else {
+                    rmSync(linkPath, { force: true });
+                }
+            } catch {
+                // lstat may fail on broken symlinks — try unlinking directly
+                try { rmSync(linkPath, { force: true }); } catch { /* ignore */ }
+            }
+        }
+
+        try {
+            if (item.type === 'directory') {
+                // Windows: use junction (no admin required). Unix: use dir symlink.
+                const symlinkType = isWindows ? 'junction' : 'dir';
+                const linkTarget = isWindows ? resolve(targetPath) : targetPath;
+                symlinkSync(linkTarget, linkPath, symlinkType);
+            } else {
+                symlinkSync(targetPath, linkPath, 'file');
+            }
+            logger.debug(`[!login] Linked ${item.name}: ${linkPath} → ${targetPath}`);
+        } catch (err) {
+            // Windows fallback: copy instead of symlink
+            if (isWindows) {
+                if (item.type === 'directory') {
+                    copyDirectoryRecursive(targetPath, linkPath);
+                } else {
+                    copyFileSync(targetPath, linkPath);
+                }
+                logger.debug(`[!login] Copied ${item.name} (symlink failed): ${(err as Error).message}`);
+            } else {
+                logger.debug(`[!login] Failed to link ${item.name}: ${(err as Error).message}`);
+            }
+        }
+    }
+}
+
+/** Recursively copy a directory. */
+function copyDirectoryRecursive(src: string, dest: string): void {
+    mkdirSync(dest, { recursive: true });
+    for (const entry of readdirSync(src)) {
+        const srcPath = join(src, entry);
+        const destPath = join(dest, entry);
+        if (statSync(srcPath).isDirectory()) {
+            copyDirectoryRecursive(srcPath, destPath);
+        } else {
+            copyFileSync(srcPath, destPath);
+        }
+    }
 }
 
 /** Remove instance directory on failure. */
@@ -535,6 +635,9 @@ export async function handleAuthCreateBangCommand(
         if (hasCredentials) {
             try {
                 registerProfile(profileName, contextMode, contextGroup);
+                if (contextMode === 'shared') {
+                    linkSharedDirectories(instancePath);
+                }
                 const modeDesc = contextMode === 'shared'
                     ? `共享 (组: ${contextGroup || 'default'})`
                     : '独立';
