@@ -188,6 +188,19 @@ function findClaudeCli(): { path: string; needsShell: boolean } | null {
     return null;
 }
 
+/** CCS profiles.json schema (must match ProfileData in profile-registry.ts). */
+interface CcsProfileData {
+    version: string;
+    profiles: Record<string, {
+        type: string;
+        created: string;
+        last_used: string | null;
+        context_mode?: 'isolated' | 'shared';
+        context_group?: string;
+    }>;
+    default: string | null;
+}
+
 /** Register a new profile in CCS profiles.json. */
 function registerProfile(
     profileName: string,
@@ -197,16 +210,18 @@ function registerProfile(
     const ccsDir = getCcsDir();
     const profilesPath = join(ccsDir, 'profiles.json');
 
-    let data: Record<string, unknown> = {};
+    let data: CcsProfileData = { version: '2.0.0', profiles: {}, default: null };
     if (existsSync(profilesPath)) {
         try {
-            data = JSON.parse(readFileSync(profilesPath, 'utf-8'));
-        } catch {
-            data = {};
-        }
+            const raw = JSON.parse(readFileSync(profilesPath, 'utf-8'));
+            // Validate structure — must have version + profiles fields
+            if (raw.version && raw.profiles && typeof raw.profiles === 'object') {
+                data = raw as CcsProfileData;
+            }
+        } catch { /* ignore parse errors, start fresh */ }
     }
 
-    data[profileName] = {
+    data.profiles[profileName] = {
         type: 'account',
         created: new Date().toISOString(),
         last_used: null,
