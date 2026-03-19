@@ -247,7 +247,9 @@ function formatUsage(data: UsageData, profileLabel: string, cachedAt: number): s
     if (ageSec > 5) {
         const ageMin = Math.floor(ageSec / 60);
         const ageStr = ageMin > 0 ? `${ageMin} 分钟前` : `${ageSec} 秒前`;
-        messages.push(`ℹ️ 缓存于 ${ageStr}`);
+        const remainMs = CACHE_TTL_MS - ageMs;
+        const remainMin = Math.ceil(remainMs / 60000);
+        messages.push(`ℹ️ 缓存于 ${ageStr}（${remainMin} 分钟后刷新）`);
     }
 
     return messages;
