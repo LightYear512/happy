@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isBangCommand } from './dispatcher';
+import { isBangCommand, buildConsoleWelcome, SEPARATOR } from './dispatcher';
 
 describe('isBangCommand', () => {
     it('should detect bang commands', () => {
@@ -27,5 +27,56 @@ describe('isBangCommand', () => {
     it('should not match exclamation in the middle of text', () => {
         expect(isBangCommand('hello !auth')).toBe(false);
         expect(isBangCommand('run !status now')).toBe(false);
+    });
+});
+
+describe('buildConsoleWelcome', () => {
+    it('returns an array of strings', () => {
+        const messages = buildConsoleWelcome();
+        expect(Array.isArray(messages)).toBe(true);
+        expect(messages.length).toBeGreaterThan(0);
+        for (const msg of messages) {
+            expect(typeof msg).toBe('string');
+        }
+    });
+
+    it('starts with console title', () => {
+        const messages = buildConsoleWelcome();
+        expect(messages[0]).toContain('控制台');
+    });
+
+    it('contains separator lines', () => {
+        const messages = buildConsoleWelcome();
+        const separators = messages.filter(m => m === SEPARATOR);
+        expect(separators.length).toBeGreaterThanOrEqual(2);
+    });
+
+    it('includes commands available in console (not sessionOnly)', () => {
+        const messages = buildConsoleWelcome();
+        const joined = messages.join('\n');
+        // These are consoleOnly or shared commands
+        expect(joined).toContain('!usage');
+        expect(joined).toContain('!login');
+        // sessionOnly commands should NOT appear
+        expect(joined).not.toContain('!restart');
+        expect(joined).not.toContain('!auth');
+    });
+
+    it('does not include hidden commands', () => {
+        const messages = buildConsoleWelcome();
+        const joined = messages.join('\n');
+        expect(joined).not.toContain('!test');
+    });
+
+    it('ends with non-bang message warning', () => {
+        const messages = buildConsoleWelcome();
+        expect(messages[messages.length - 1]).toContain('普通消息');
+    });
+});
+
+describe('SEPARATOR', () => {
+    it('is a non-empty string of box-drawing characters', () => {
+        expect(typeof SEPARATOR).toBe('string');
+        expect(SEPARATOR.length).toBeGreaterThan(0);
     });
 });

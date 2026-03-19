@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import { readdir, stat, open } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { logger } from '@/ui/logger';
-import type { BangCommandContext, BangCommandResult } from './types';
+import { SEPARATOR, type BangCommandContext, type BangCommandResult } from './types';
 
 /** Represents a discovered Claude session file */
 export interface ClaudeSessionInfo {
@@ -177,7 +177,7 @@ export async function handleSessionsBangCommand(args: string, ctx: BangCommandCo
     const displayed = sessions.slice(0, MAX_DISPLAY);
     const messages: string[] = [
         `📋 可恢复的会话 (${Math.min(sessions.length, MAX_DISPLAY)}/${sessions.length})`,
-        '━━━━━━━━━━━━━━━━━━',
+        SEPARATOR,
     ];
 
     for (const s of displayed) {
@@ -193,7 +193,7 @@ export async function handleSessionsBangCommand(args: string, ctx: BangCommandCo
         messages.push(sessionLine);
     }
 
-    messages.push('━━━━━━━━━━━━━━━━━━');
+    messages.push(SEPARATOR);
     messages.push('用法: !resume <id前缀>');
 
     return { message: messages, action: 'none' };

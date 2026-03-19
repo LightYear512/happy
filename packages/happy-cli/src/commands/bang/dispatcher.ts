@@ -6,8 +6,9 @@ import { handleUsageBangCommand } from './usageCommand';
 import { handleSessionsBangCommand } from './sessionsCommand';
 import { handleResumeBangCommand } from './resumeCommand';
 import { handleTestBangCommand } from './testCommand';
-import type { BangCommandContext, BangCommandHandler, BangCommandResult } from './types';
+import { SEPARATOR, type BangCommandContext, type BangCommandHandler, type BangCommandResult } from './types';
 
+export { SEPARATOR };
 export { hasActiveInteractiveSession, handleInteractiveInput } from './interactiveSession';
 
 /**
@@ -76,7 +77,7 @@ function buildHelp(isConsole: boolean): BangCommandResult {
 
     const messages: string[] = [
         '📖 快捷命令',
-        '━━━━━━━━━━━━━━━━━━',
+        SEPARATOR,
     ];
 
     for (const [name, desc] of allCommands) {
@@ -88,9 +89,36 @@ function buildHelp(isConsole: boolean): BangCommandResult {
         messages.push(`!${name}${aliasStr} → ${desc}`);
     }
 
-    messages.push('━━━━━━━━━━━━━━━━━━');
+    messages.push(SEPARATOR);
 
     return { message: messages, action: 'none' };
+}
+
+/**
+ * Build the console welcome message listing key commands.
+ * Derived from the commands registry to stay in sync with !help.
+ */
+export function buildConsoleWelcome(): string[] {
+    const messages: string[] = [
+        '🖥️ 控制台',
+        '常驻轻量级会话，仅处理 ! 指令\n不启动 Claude，不消耗 API 额度',
+        SEPARATOR,
+    ];
+
+    // Show commands available in console (consoleOnly + shared, exclude hidden)
+    const consoleCommands = Object.entries(commands)
+        .filter(([, entry]) => !entry.hidden && !entry.sessionOnly);
+    for (const [name, { desc }] of consoleCommands) {
+        const cmdAliases = Object.entries(aliases)
+            .filter(([, target]) => target === name)
+            .map(([alias]) => `!${alias}`);
+        const aliasStr = cmdAliases.length > 0 ? ` (${cmdAliases.join(', ')})` : '';
+        messages.push(`!${name}${aliasStr} → ${desc}`);
+    }
+
+    messages.push(SEPARATOR);
+    messages.push('普通消息不会被处理，请使用 ! 开头的命令');
+    return messages;
 }
 
 /**

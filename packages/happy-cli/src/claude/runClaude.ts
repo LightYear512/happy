@@ -13,7 +13,7 @@ import { hashObject } from '@/utils/deterministicJson';
 import { startCaffeinate, stopCaffeinate } from '@/utils/caffeinate';
 import { extractSDKMetadataAsync } from '@/claude/sdk/metadataExtractor';
 import { parseSpecialCommand } from '@/parsers/specialCommands';
-import { isBangCommand, executeBangCommand, hasActiveInteractiveSession, handleInteractiveInput } from '@/commands/bang/dispatcher';
+import { isBangCommand, executeBangCommand, hasActiveInteractiveSession, handleInteractiveInput, buildConsoleWelcome } from '@/commands/bang/dispatcher';
 import { getEnvironmentInfo } from '@/ui/doctor';
 import { configuration } from '@/configuration';
 import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
@@ -229,21 +229,10 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 summary: '控制台',
                 leafUuid: randomUUID(),
             });
-            session.sendSessionEvent({ type: 'message', message: '🖥️ 控制台' });
-            session.sendSessionEvent({
-                type: 'message',
-                message: '常驻轻量级会话，仅处理 ! 指令\n不启动 Claude，不消耗 API 额度',
-            });
-            session.sendSessionEvent({ type: 'message', message: '━━━━━━━━━━━━━━━━━━' });
-            session.sendSessionEvent({ type: 'message', message: '!sessions (!s) → 可恢复的会话' });
-            session.sendSessionEvent({ type: 'message', message: '!resume (!re) → 恢复指定会话' });
-            session.sendSessionEvent({ type: 'message', message: '!usage (!u) → API 用量' });
-            session.sendSessionEvent({ type: 'message', message: '!help (!h) → 所有命令' });
-            session.sendSessionEvent({ type: 'message', message: '━━━━━━━━━━━━━━━━━━' });
-            session.sendSessionEvent({
-                type: 'message',
-                message: '普通消息不会被处理，请使用 ! 开头的命令',
-            });
+            // Welcome message derived from command registry (SSoT: dispatcher.ts)
+            for (const msg of buildConsoleWelcome()) {
+                session.sendSessionEvent({ type: 'message', message: msg });
+            }
             session.sendSessionEvent({ type: 'ready' });
         }).catch(error => {
             logger.debug('[START] Console session socket connect failed:', error);
@@ -445,6 +434,8 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 currentEnhancedMode: enhancedMode,
                 isConsoleSession,
             }).then(async result => {
+                // Delay ensures mobile client receives messages in correct order —
+                // it sorts by createdAt timestamp, so rapid events can arrive out of order.
                 await new Promise(resolve => setTimeout(resolve, 100));
                 const messages = Array.isArray(result.message) ? result.message : [result.message];
                 for (const msg of messages) {
@@ -459,6 +450,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 }
             }).catch(async error => {
                 logger.debug('[start] Bang command error:', error);
+                // Same ordering delay as success path (see comment above)
                 await new Promise(resolve => setTimeout(resolve, 100));
                 session.sendSessionEvent({ type: 'message', message: `❌ Command error: ${error}` });
                 session.sendSessionEvent({ type: 'ready' });

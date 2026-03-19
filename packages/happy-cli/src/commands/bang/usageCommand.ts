@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import { ProxyAgent, fetch as undiciFetch } from 'undici';
 import { logger } from '@/ui/logger';
 import { getCurrentCcsProfile, readCcsProfiles, getInstancePath } from './ccsProfiles';
-import type { BangCommandContext, BangCommandResult } from './types';
+import { SEPARATOR, type BangCommandContext, type BangCommandResult } from './types';
 
 const USAGE_API_URL = 'https://api.anthropic.com/api/oauth/usage';
 const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
@@ -287,12 +287,12 @@ export async function handleUsageBangCommand(args: string, ctx: BangCommandConte
         if (accountProfiles.length === 0) {
             return { message: '❌ 未找到已登录的账户。', action: 'none' };
         }
-        const messages = ['📊 请选择要查询的账户:', '━━━━━━━━━━━━━━━━━━'];
+        const messages = ['📊 请选择要查询的账户:', SEPARATOR];
         for (const p of accountProfiles) {
             const marker = p.name === defaultProfile ? ' (默认)' : '';
             messages.push(`${p.name}${marker}`);
         }
-        messages.push('━━━━━━━━━━━━━━━━━━');
+        messages.push(SEPARATOR);
         messages.push('用法: !usage <账户名>');
         return { message: messages, action: 'none' };
     }

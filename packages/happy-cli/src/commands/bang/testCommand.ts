@@ -9,9 +9,7 @@
  * - `!test <unknown>` — Show edge case outputs (unknown command, blocked, etc.)
  */
 
-import type { BangCommandContext, BangCommandResult } from './types';
-
-const SEPARATOR = '━━━━━━━━━━━━━━━━━━';
+import { SEPARATOR, type BangCommandContext, type BangCommandResult } from './types';
 
 function label(text: string): string {
     return `📌 ${text}`;
@@ -141,9 +139,17 @@ function testRestart(): string[] {
 
 function testLogin(): string[] {
     return [
-        label('!login 提示'),
-        '🔑 登录新账号',
-        '用法: !login <账户名>',
+        label('!login 无参（无账户）'),
+        '用法: `!login <名称>`\n\n创建新账户并登录',
+
+        label('!login 无参（有账户）'),
+        '已有账户:\n  • `!login work` — 重新登录\n  • `!login personal` — 重新登录\n\n新建: `!login <新名称>`',
+
+        label('!login 重新登录'),
+        '🔐 正在重新登录...\n\n配置: work\n\n请等待登录提示，然后粘贴 OAuth Key\n\n取消: !cancel',
+
+        label('!login 新建'),
+        '🔐 正在登录...\n\n配置: newaccount (共享)\n\n请等待登录提示，然后粘贴 OAuth Key\n\n取消: !cancel',
     ];
 }
 

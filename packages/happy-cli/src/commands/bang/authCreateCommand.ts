@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import * as pty from 'node-pty';
+import * as yaml from 'js-yaml';
 import { logger } from '@/ui/logger';
 import {
     hasActiveInteractiveSession,
@@ -188,21 +189,26 @@ function findClaudeCli(): { path: string; needsShell: boolean } | null {
     return null;
 }
 
+/** Minimal shape of a CCS config.yaml for the fields we read/write. */
+interface CcsConfig {
+    version?: number;
+    accounts?: Record<string, {
+        created?: string;
+        last_used?: string | null;
+        context_mode?: string;
+        context_group?: string;
+        continuity_mode?: string;
+        [key: string]: unknown;
+    }>;
+    [key: string]: unknown;
+}
+
 /**
  * Register a new account in CCS config.yaml (unified mode).
- *
- * Inserts a new entry under the `accounts:` section using simple text manipulation
- * to avoid a full YAML parser dependency. The format matches CCS's own output:
- *
- *   accounts:
- *     <name>:
- *       created: "<iso>"
- *       last_used: null
- *       context_mode: shared
- *       context_group: default
- *       continuity_mode: standard
+ * Uses js-yaml for reliable YAML round-tripping.
  */
-function registerProfile(
+/** Exported for testing. */
+export function registerProfile(
     profileName: string,
     contextMode: 'isolated' | 'shared',
     contextGroup?: string,
@@ -210,63 +216,49 @@ function registerProfile(
     const ccsDir = getCcsDir();
     const configPath = join(ccsDir, 'config.yaml');
 
-    const now = new Date().toISOString();
-    const entryLines = [
-        `  ${profileName}:`,
-        `    created: "${now}"`,
-        `    last_used: null`,
-        `    context_mode: ${contextMode}`,
-        ...(contextGroup ? [`    context_group: ${contextGroup}`] : []),
-        `    continuity_mode: standard`,
-    ];
-    const entryBlock = entryLines.join('\n');
-
-    if (!existsSync(configPath)) {
-        // No config.yaml yet — create minimal one with just the accounts section
-        mkdirSync(ccsDir, { recursive: true });
-        const content = `# CCS Unified Configuration\nversion: 8\n\naccounts:\n${entryBlock}\n`;
-        const tmpPath = configPath + '.' + randomBytes(4).toString('hex') + '.tmp';
-        writeFileSync(tmpPath, content, 'utf-8');
-        renameSync(tmpPath, configPath);
-        logger.debug(`[!login] Created config.yaml with profile "${profileName}"`);
-        return;
-    }
-
-    const yaml = readFileSync(configPath, 'utf-8');
-    const lines = yaml.split('\n');
-    let insertIdx = -1;
-
-    // Find the `accounts:` section and locate where to insert the new entry.
-    // Insert right after the last account entry (before the next top-level key or EOF).
-    let inAccounts = false;
-    for (let i = 0; i < lines.length; i++) {
-        if (/^accounts:\s*$/.test(lines[i])) {
-            inAccounts = true;
-            insertIdx = i + 1; // default: right after "accounts:"
-            continue;
-        }
-        if (inAccounts) {
-            // Still inside accounts section (indented lines or blank lines)
-            if (/^\s/.test(lines[i]) || lines[i].trim() === '' || lines[i].startsWith('#')) {
-                insertIdx = i + 1;
-            } else {
-                // Hit a new top-level key — stop
-                break;
-            }
-        }
-    }
-
-    if (insertIdx === -1) {
-        // No accounts section found — append one
-        lines.push('', 'accounts:', ...entryLines);
+    let config: CcsConfig;
+    if (existsSync(configPath)) {
+        config = (yaml.load(readFileSync(configPath, 'utf-8')) as CcsConfig) ?? {};
     } else {
-        lines.splice(insertIdx, 0, entryBlock);
+        mkdirSync(ccsDir, { recursive: true });
+        config = { version: 8 };
     }
 
+    if (!config.accounts) config.accounts = {};
+
+    config.accounts[profileName] = {
+        created: new Date().toISOString(),
+        last_used: null,
+        context_mode: contextMode,
+        ...(contextGroup ? { context_group: contextGroup } : {}),
+        continuity_mode: 'standard',
+    };
+
+    const content = yaml.dump(config, { indent: 2, lineWidth: -1, quotingType: '"' });
     const tmpPath = configPath + '.' + randomBytes(4).toString('hex') + '.tmp';
-    writeFileSync(tmpPath, lines.join('\n'), 'utf-8');
+    writeFileSync(tmpPath, content, 'utf-8');
     renameSync(tmpPath, configPath);
     logger.debug(`[!login] Registered profile "${profileName}" in ${configPath}`);
+}
+
+/**
+ * Read account names from CCS config.yaml using js-yaml.
+ */
+function readAccountNames(): string[] {
+    const configPath = join(getCcsDir(), 'config.yaml');
+    if (!existsSync(configPath)) return [];
+    try {
+        const config = yaml.load(readFileSync(configPath, 'utf-8')) as CcsConfig | null;
+        if (!config?.accounts) return [];
+        return Object.keys(config.accounts);
+    } catch { return []; }
+}
+
+/**
+ * Check if an account exists in CCS config.yaml.
+ */
+function accountExists(profileName: string): boolean {
+    return readAccountNames().includes(profileName);
 }
 
 /**
@@ -432,8 +424,19 @@ export async function handleAuthCreateBangCommand(
     const profileName = parts[0];
 
     if (!profileName) {
+        // No args — list existing accounts for easy re-login
+        const accounts = readAccountNames();
+
+        if (accounts.length === 0) {
+            return {
+                message: '用法: `!login <名称>`\n\n创建新账户并登录',
+                action: 'none',
+            };
+        }
+
+        const list = accounts.map(a => `  • \`!login ${a}\` — 重新登录`).join('\n');
         return {
-            message: '❌ 需要配置名称\n\n用法: `!login <名称>`',
+            message: `已有账户:\n${list}\n\n新建: \`!login <新名称>\``,
             action: 'none',
         };
     }
@@ -446,19 +449,7 @@ export async function handleAuthCreateBangCommand(
     }
 
     // Check existing — allow re-login for expired credentials
-    let isRelogin = false;
-    const ccsDir = getCcsDir();
-    const configPath = join(ccsDir, 'config.yaml');
-    if (existsSync(configPath)) {
-        try {
-            const yaml = readFileSync(configPath, 'utf-8');
-            // Simple check: look for "  <profileName>:" under accounts section
-            const accountPattern = new RegExp(`^  ${profileName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:\\s*$`, 'm');
-            if (accountPattern.test(yaml)) {
-                isRelogin = true;
-            }
-        } catch { /* ignore read errors */ }
-    }
+    const isRelogin = accountExists(profileName);
 
     // Parse context flags
     const hasIsolated = parts.includes('--isolated');

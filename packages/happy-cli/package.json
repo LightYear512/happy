@@ -111,6 +111,7 @@
     "http-proxy-middleware": "^3.0.5",
     "ink": "^6.5.1",
     "inquirer": "^13.2.2",
+    "js-yaml": "^4.1.1",
     "node-pty": "^1.1.0",
     "open": "^10.2.0",
     "ps-list": "^8.1.1",
@@ -125,6 +126,7 @@
   "devDependencies": {
     "@eslint/compat": "^1",
     "@types/inquirer": "^9.0.9",
+    "@types/js-yaml": "^4.0.9",
     "@types/node": ">=20",
     "cross-env": "^10.1.0",
     "dotenv": "^16.6.1",

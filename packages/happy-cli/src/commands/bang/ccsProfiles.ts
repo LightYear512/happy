@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import * as yaml from 'js-yaml';
 import { logger } from '@/ui/logger';
 
 export interface CcsProfileInfo {
@@ -90,18 +91,31 @@ export function readCcsProfiles(): CcsProfilesResult {
     const configYamlPath = join(ccsDir, 'config.yaml');
     if (existsSync(configYamlPath)) {
         try {
-            const raw = readFileSync(configYamlPath, 'utf-8');
-            const yamlDefault = parseYamlDefault(raw);
-            if (yamlDefault) {
-                result.defaultProfile = yamlDefault;
-            }
+            const config = yaml.load(readFileSync(configYamlPath, 'utf-8')) as Record<string, unknown> | null;
+            if (config) {
+                if (typeof config.default === 'string') {
+                    result.defaultProfile = config.default;
+                }
 
-            const yamlAccounts = parseYamlAccounts(raw);
-            // Merge: add any accounts from YAML that aren't already in profiles
-            const existingNames = new Set(result.profiles.map(p => p.name));
-            for (const account of yamlAccounts) {
-                if (!existingNames.has(account.name)) {
-                    result.profiles.push(account);
+                const accounts = config.accounts as Record<string, Record<string, unknown> | null> | undefined;
+                if (accounts && typeof accounts === 'object') {
+                    const existingNames = new Set(result.profiles.map(p => p.name));
+                    for (const [name, props] of Object.entries(accounts)) {
+                        if (existingNames.has(name)) continue;
+                        const profile: CcsProfileInfo = {
+                            name,
+                            instancePath: getInstancePath(name),
+                        };
+                        if (props) {
+                            if (props.context_mode === 'shared' || props.context_mode === 'isolated') {
+                                profile.contextMode = props.context_mode;
+                            }
+                            if (typeof props.context_group === 'string') {
+                                profile.contextGroup = props.context_group;
+                            }
+                        }
+                        result.profiles.push(profile);
+                    }
                 }
             }
         } catch (error) {
@@ -145,70 +159,3 @@ export function getCurrentCcsProfile(): string | null {
     return profileDirName;
 }
 
-/**
- * Simple YAML parser to extract the `default:` field value.
- * Avoids needing js-yaml dependency.
- */
-function parseYamlDefault(yaml: string): string | null {
-    const match = yaml.match(/^default:\s*["']?([^"'\n\r]+?)["']?\s*$/m);
-    return match ? match[1].trim() : null;
-}
-
-/**
- * Simple YAML parser to extract account entries from `accounts:` section.
- * Only extracts name and instance path — not a full YAML parser.
- */
-function parseYamlAccounts(yaml: string): CcsProfileInfo[] {
-    const accounts: CcsProfileInfo[] = [];
-    const lines = yaml.split('\n');
-    let inAccounts = false;
-    let current: CcsProfileInfo | null = null;
-
-    for (const line of lines) {
-        // Detect accounts: section
-        if (/^accounts:\s*$/.test(line)) {
-            inAccounts = true;
-            continue;
-        }
-
-        // Exit accounts section when a new top-level key appears
-        if (inAccounts && /^\S/.test(line) && !line.startsWith('#')) {
-            if (current) accounts.push(current);
-            current = null;
-            inAccounts = false;
-            continue;
-        }
-
-        if (inAccounts) {
-            // Match account entries like "  my-account:" or "  work:"
-            const accountMatch = line.match(/^\s{2}(\S+):\s*$/);
-            if (accountMatch) {
-                if (current) accounts.push(current);
-                current = {
-                    name: accountMatch[1],
-                    instancePath: getInstancePath(accountMatch[1]),
-                };
-                continue;
-            }
-
-            // Match nested properties (4-space indent) for the current account
-            if (current) {
-                const propMatch = line.match(/^\s{4}(\w+):\s*(.+)$/);
-                if (propMatch) {
-                    const [, key, rawValue] = propMatch;
-                    const value = rawValue.replace(/^["']|["']$/g, '').trim();
-                    if (key === 'context_mode' && (value === 'shared' || value === 'isolated')) {
-                        current.contextMode = value;
-                    } else if (key === 'context_group') {
-                        current.contextGroup = value;
-                    }
-                }
-            }
-        }
-    }
-
-    // Don't forget the last account
-    if (current) accounts.push(current);
-
-    return accounts;
-}

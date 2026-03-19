@@ -4,7 +4,7 @@ import { logger } from '@/ui/logger';
 import { readCcsProfiles, getCurrentCcsProfile, type CcsProfileInfo } from './ccsProfiles';
 import { configuration } from '@/configuration';
 import { getCachedUsageSummary } from './usageCommand';
-import type { BangCommandContext, BangCommandResult } from './types';
+import { SEPARATOR, type BangCommandContext, type BangCommandResult } from './types';
 
 /**
  * Handle the `!auth` bang command.
@@ -107,12 +107,12 @@ function listProfiles(): BangCommandResult {
     if (!currentProfile) {
         const messages: string[] = ['📋 当前无 CCS 配置。'];
         if (profiles.length > 0) {
-            messages.push('━━━━━━━━━━━━━━━━━━');
+            messages.push(SEPARATOR);
             for (const p of profiles) {
                 const status = getProfileStatus(p);
                 messages.push(status ? `○ ${p.name} ${status}` : `○ ${p.name}`);
             }
-            messages.push('━━━━━━━━━━━━━━━━━━');
+            messages.push(SEPARATOR);
         } else {
             messages.push('未找到 CCS 配置。');
         }
@@ -140,7 +140,7 @@ function listProfiles(): BangCommandResult {
 
     const currentStatus = currentProfileInfo ? getProfileStatus(currentProfileInfo) : '';
 
-    messages.push('━━━━━━━━━━━━━━━━━━');
+    messages.push(SEPARATOR);
     messages.push(currentStatus ? `● ${currentProfile} ${currentStatus}` : `● ${currentProfile}`);
 
     if (currentGroup && switchable.length > 0) {
@@ -148,13 +148,13 @@ function listProfiles(): BangCommandResult {
             const status = getProfileStatus(profile);
             messages.push(status ? `○ ${profile.name} ${status}` : `○ ${profile.name}`);
         }
-        messages.push('━━━━━━━━━━━━━━━━━━');
+        messages.push(SEPARATOR);
         messages.push('!auth <名称> → 当前会话\n!auth all <名称> → 全部会话');
     } else if (currentGroup) {
-        messages.push('━━━━━━━━━━━━━━━━━━');
+        messages.push(SEPARATOR);
         messages.push('本组无其他账号。');
     } else {
-        messages.push('━━━━━━━━━━━━━━━━━━');
+        messages.push(SEPARATOR);
         messages.push('无法切换。');
     }
 

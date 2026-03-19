@@ -1,3 +1,6 @@
+/** Visual separator line for bang command output. */
+export const SEPARATOR = '━━━━━━━━━━━━━━━━━━';
+
 import { ApiSessionClient } from '@/api/apiSession';
 import { Session } from '@/claude/session';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
