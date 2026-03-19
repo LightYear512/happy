@@ -226,18 +226,23 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             // Set session title via summary message (same mechanism as change_title MCP tool)
             session.sendClaudeSessionMessage({
                 type: 'summary',
-                summary: '🖥️ Console',
+                summary: '控制台',
                 leafUuid: randomUUID(),
             });
+            session.sendSessionEvent({ type: 'message', message: '🖥️ 控制台' });
             session.sendSessionEvent({
                 type: 'message',
-                message: [
-                    '🖥️ Console',
-                    '',
-                    '!sessions (!s) — 查看可恢复会话',
-                    '!resume (!re) <id> — 恢复会话',
-                    '!help (!h) — 所有命令',
-                ].join('\n'),
+                message: '常驻轻量级会话，仅处理 ! 指令\n不启动 Claude，不消耗 API 额度',
+            });
+            session.sendSessionEvent({ type: 'message', message: '━━━━━━━━━━━━━━━━━━' });
+            session.sendSessionEvent({ type: 'message', message: '!sessions (!s) → 可恢复的会话' });
+            session.sendSessionEvent({ type: 'message', message: '!resume (!re) → 恢复指定会话' });
+            session.sendSessionEvent({ type: 'message', message: '!usage (!u) → API 用量' });
+            session.sendSessionEvent({ type: 'message', message: '!help (!h) → 所有命令' });
+            session.sendSessionEvent({ type: 'message', message: '━━━━━━━━━━━━━━━━━━' });
+            session.sendSessionEvent({
+                type: 'message',
+                message: '普通消息不会被处理，请使用 ! 开头的命令',
             });
             session.sendSessionEvent({ type: 'ready' });
         }).catch(error => {
@@ -438,9 +443,13 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 session: currentSession,
                 messageQueue,
                 currentEnhancedMode: enhancedMode,
+                isConsoleSession,
             }).then(async result => {
                 await new Promise(resolve => setTimeout(resolve, 100));
-                session.sendSessionEvent({ type: 'message', message: result.message });
+                const messages = Array.isArray(result.message) ? result.message : [result.message];
+                for (const msg of messages) {
+                    session.sendSessionEvent({ type: 'message', message: msg });
+                }
                 session.sendSessionEvent({ type: 'ready' });
 
                 // Restart SDK session so new env vars (e.g. CLAUDE_CONFIG_DIR) take effect
@@ -454,6 +463,13 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 session.sendSessionEvent({ type: 'message', message: `❌ Command error: ${error}` });
                 session.sendSessionEvent({ type: 'ready' });
             });
+            return;
+        }
+
+        // Console session: reject non-bang messages
+        if (isConsoleSession) {
+            session.sendSessionEvent({ type: 'message', message: '⚠️ 控制台仅支持 ! 命令，输入 !help 查看可用命令' });
+            session.sendSessionEvent({ type: 'ready' });
             return;
         }
 

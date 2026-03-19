@@ -8,7 +8,6 @@
 import { logger } from '@/ui/logger';
 import { spawnDaemonSession } from '@/daemon/controlClient';
 import { scanClaudeSessions } from './sessionsCommand';
-import { centerText } from './format';
 import type { BangCommandContext, BangCommandResult } from './types';
 
 /**
@@ -21,12 +20,10 @@ export async function handleResumeBangCommand(args: string, ctx: BangCommandCont
     const prefix = args.trim().toLowerCase();
 
     if (!prefix) {
-        const lines = [
-            '用法: !resume <id前缀>',
-            '',
-            '先使用 !sessions 查看可用会话',
-        ];
-        return { message: centerText(lines), action: 'none' };
+        return {
+            message: ['用法: !resume <id前缀>', '先使用 !sessions 查看可用会话'],
+            action: 'none',
+        };
     }
 
     // Scan all sessions and find matching ones
@@ -35,38 +32,32 @@ export async function handleResumeBangCommand(args: string, ctx: BangCommandCont
     const matches = sessions.filter(s => s.sessionId.toLowerCase().startsWith(prefix));
 
     if (matches.length === 0) {
-        const lines = [
-            `❌ 未找到匹配 "${prefix}" 的会话`,
-            '',
-            '使用 !sessions 查看可用会话',
-        ];
-        return { message: centerText(lines), action: 'none' };
+        return {
+            message: [`❌ 未找到匹配 "${prefix}" 的会话`, '使用 !sessions 查看可用会话'],
+            action: 'none',
+        };
     }
 
     if (matches.length > 1) {
-        const lines = [
-            `⚠️ "${prefix}" 匹配了 ${matches.length} 个会话`,
-            '',
-        ];
+        const messages = [`⚠️ "${prefix}" 匹配了 ${matches.length} 个会话`];
+        const matchLines: string[] = [];
         for (const s of matches.slice(0, 5)) {
             const shortId = s.sessionId.slice(0, 12);
             const dir = s.cwd ? s.cwd.split(/[/\\]/).pop() || s.projectDir : s.projectDir;
-            lines.push(`${shortId} | ${dir}`);
+            matchLines.push(`${shortId} | ${dir}`);
         }
-        lines.push('');
-        lines.push('请提供更长的前缀');
-        return { message: centerText(lines), action: 'none' };
+        messages.push(matchLines.join('\n'));
+        messages.push('请提供更长的前缀');
+        return { message: messages, action: 'none' };
     }
 
     const session = matches[0];
 
     if (!session.cwd) {
-        const lines = [
-            `❌ 无法恢复会话 ${session.sessionId.slice(0, 8)}`,
-            '',
-            '会话文件中缺少工作目录信息',
-        ];
-        return { message: centerText(lines), action: 'none' };
+        return {
+            message: [`❌ 无法恢复会话 ${session.sessionId.slice(0, 8)}`, '会话文件中缺少工作目录信息'],
+            action: 'none',
+        };
     }
 
     const directory = session.cwd;
@@ -78,30 +69,23 @@ export async function handleResumeBangCommand(args: string, ctx: BangCommandCont
         const result = await spawnDaemonSession(directory, undefined, session.sessionId);
 
         if (result.error) {
-            const lines = [
-                '❌ 恢复会话失败',
-                '',
-                result.error,
-            ];
-            return { message: centerText(lines), action: 'none' };
+            return {
+                message: ['❌ 恢复会话失败', result.error],
+                action: 'none',
+            };
         }
 
         const shortId = session.sessionId.slice(0, 8);
         const dir = directory.split(/[/\\]/).pop() || directory;
-        const lines = [
-            `✅ 正在恢复会话 ${shortId}`,
-            '',
-            `目录: ${dir}`,
-            '新会话将在 App 中出现',
-        ];
-        return { message: centerText(lines), action: 'none' };
+        return {
+            message: [`✅ 正在恢复会话 ${shortId}`, `目录: ${dir}`, '新会话将在 App 中出现'],
+            action: 'none',
+        };
     } catch (error) {
         logger.debug('[!resume] Failed to spawn session:', error);
-        const lines = [
-            '❌ 恢复会话失败',
-            '',
-            error instanceof Error ? error.message : 'Unknown error',
-        ];
-        return { message: centerText(lines), action: 'none' };
+        return {
+            message: ['❌ 恢复会话失败', error instanceof Error ? error.message : 'Unknown error'],
+            action: 'none',
+        };
     }
 }

@@ -5,21 +5,24 @@ import { handleRestartBangCommand } from './restartCommand';
 import { handleUsageBangCommand } from './usageCommand';
 import { handleSessionsBangCommand } from './sessionsCommand';
 import { handleResumeBangCommand } from './resumeCommand';
-import { centerText } from './format';
+import { handleTestBangCommand } from './testCommand';
 import type { BangCommandContext, BangCommandHandler, BangCommandResult } from './types';
 
 export { hasActiveInteractiveSession, handleInteractiveInput } from './interactiveSession';
 
 /**
  * Registry of bang commands with descriptions for !help.
+ * sessionOnly: only available in normal Claude sessions (not console)
+ * consoleOnly: only available in console sessions (not normal Claude sessions)
  */
-const commands: Record<string, { handler: BangCommandHandler; desc: string; loadingMsg?: string }> = {
-    auth:     { handler: handleAuthBangCommand,     desc: '切换 CCS 账号' },
-    login:    { handler: handleAuthCreateBangCommand, desc: '登录新账号' },
-    restart:  { handler: handleRestartBangCommand,  desc: '重启会话' },
-    usage:    { handler: handleUsageBangCommand,    desc: '查看 API 用量', loadingMsg: '⏳ 正在查询用量...' },
-    sessions: { handler: handleSessionsBangCommand, desc: '查看可恢复会话', loadingMsg: '⏳ 正在扫描会话...' },
-    resume:   { handler: handleResumeBangCommand,   desc: '恢复指定会话', loadingMsg: '⏳ 正在恢复会话...' },
+const commands: Record<string, { handler: BangCommandHandler; desc: string; loadingMsg?: string; sessionOnly?: boolean; consoleOnly?: boolean; hidden?: boolean }> = {
+    auth:     { handler: handleAuthBangCommand,     desc: '切换 CCS 账号', sessionOnly: true },
+    login:    { handler: handleAuthCreateBangCommand, desc: '登录新账号', consoleOnly: true },
+    restart:  { handler: handleRestartBangCommand,  desc: '重启会话', sessionOnly: true },
+    usage:    { handler: handleUsageBangCommand,    desc: '查看 API 用量' },
+    sessions: { handler: handleSessionsBangCommand, desc: '查看可恢复会话', loadingMsg: '⏳ 正在扫描会话...', consoleOnly: true },
+    resume:   { handler: handleResumeBangCommand,   desc: '恢复指定会话', loadingMsg: '⏳ 正在恢复会话...', consoleOnly: true },
+    test:     { handler: handleTestBangCommand,     desc: '测试命令输出', consoleOnly: true, hidden: true },
 };
 
 /** Short aliases for convenience on mobile keyboards. */
@@ -63,15 +66,17 @@ function parseBangCommand(text: string): { name: string; args: string } {
 /**
  * Build the !help output listing all available commands.
  */
-function buildHelp(): BangCommandResult {
-    const lines: string[] = [
-        '📖 快捷命令',
-        '',
+function buildHelp(isConsole: boolean): BangCommandResult {
+    const allCommands: Array<[string, string]> = [
+        ...Object.entries(commands)
+            .filter(([, entry]) => !entry.hidden && !(isConsole && entry.sessionOnly) && !(!isConsole && entry.consoleOnly))
+            .map(([name, { desc }]) => [name, desc] as [string, string]),
+        ['help', '显示帮助'],
     ];
 
-    const allCommands: Array<[string, string]> = [
-        ...Object.entries(commands).map(([name, { desc }]) => [name, desc] as [string, string]),
-        ['help', '显示帮助'],
+    const messages: string[] = [
+        '📖 快捷命令',
+        '━━━━━━━━━━━━━━━━━━',
     ];
 
     for (const [name, desc] of allCommands) {
@@ -80,10 +85,12 @@ function buildHelp(): BangCommandResult {
             .map(([alias]) => `!${alias}`);
 
         const aliasStr = cmdAliases.length > 0 ? ` (${cmdAliases.join(', ')})` : '';
-        lines.push(`!${name}${aliasStr} — ${desc}`);
+        messages.push(`!${name}${aliasStr} → ${desc}`);
     }
 
-    return { message: centerText(lines), action: 'none' };
+    messages.push('━━━━━━━━━━━━━━━━━━');
+
+    return { message: messages, action: 'none' };
 }
 
 /**
@@ -100,23 +107,31 @@ export async function executeBangCommand(text: string, ctx: BangCommandContext):
 
     // Built-in help command
     if (name === 'help') {
-        return buildHelp();
+        return buildHelp(!!ctx.isConsoleSession);
     }
 
     // !cancel without an active interactive session
     if (name === 'cancel' || name === '取消') {
-        return { message: centerText(['ℹ️ 当前没有进行中的操作']), action: 'none' };
+        return { message: 'ℹ️ 当前没有进行中的操作', action: 'none' };
     }
 
     const entry = commands[name];
 
     if (!entry) {
-        const lines = [
-            `❌ 未知命令 "!${name}"`,
-            '',
-            '输入 !help 查看可用命令。',
-        ];
-        return { message: centerText(lines), action: 'none' };
+        return {
+            message: [`❌ 未知命令 "!${name}"`, '输入 !help 查看可用命令。'],
+            action: 'none',
+        };
+    }
+
+    // Block session-only commands in console
+    if (ctx.isConsoleSession && entry.sessionOnly) {
+        return { message: `ℹ️ !${name} 仅在 Claude 会话中可用`, action: 'none' };
+    }
+
+    // Block console-only commands in normal sessions
+    if (!ctx.isConsoleSession && entry.consoleOnly) {
+        return { message: `ℹ️ !${name} 仅在控制台中可用`, action: 'none' };
     }
 
     // Send loading indicator before async commands

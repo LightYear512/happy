@@ -10,7 +10,6 @@ import { join } from 'node:path';
 import { readdir, stat, open } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { logger } from '@/ui/logger';
-import { centerText } from './format';
 import type { BangCommandContext, BangCommandResult } from './types';
 
 /** Represents a discovered Claude session file */
@@ -172,13 +171,13 @@ export async function handleSessionsBangCommand(args: string, ctx: BangCommandCo
     const sessions = await scanClaudeSessions();
 
     if (sessions.length === 0) {
-        return { message: centerText(['📭 没有找到可恢复的会话']), action: 'none' };
+        return { message: '📭 没有找到可恢复的会话', action: 'none' };
     }
 
     const displayed = sessions.slice(0, MAX_DISPLAY);
-    const lines: string[] = [
+    const messages: string[] = [
         `📋 可恢复的会话 (${Math.min(sessions.length, MAX_DISPLAY)}/${sessions.length})`,
-        '',
+        '━━━━━━━━━━━━━━━━━━',
     ];
 
     for (const s of displayed) {
@@ -188,14 +187,14 @@ export async function handleSessionsBangCommand(args: string, ctx: BangCommandCo
         const msg = s.firstMessage ? s.firstMessage.slice(0, 35).replace(/\n/g, ' ') : '';
         const msgSuffix = s.firstMessage && s.firstMessage.length > 35 ? '...' : '';
 
-        lines.push(`${shortId} | ${dir} | ${time}`);
-        if (msg) {
-            lines.push(`  "${msg}${msgSuffix}"`);
-        }
+        const sessionLine = msg
+            ? `${shortId} | ${dir} | ${time}\n  "${msg}${msgSuffix}"`
+            : `${shortId} | ${dir} | ${time}`;
+        messages.push(sessionLine);
     }
 
-    lines.push('');
-    lines.push('用法: !resume <id前缀>');
+    messages.push('━━━━━━━━━━━━━━━━━━');
+    messages.push('用法: !resume <id前缀>');
 
-    return { message: lines.join('\n'), action: 'none' };
+    return { message: messages, action: 'none' };
 }

@@ -16,11 +16,13 @@ export interface BangCommandContext {
     messageQueue: MessageQueue2<EnhancedMode>;
     /** Current enhanced mode for queue operations */
     currentEnhancedMode: EnhancedMode;
+    /** Whether this is the daemon console session (lightweight, bang-command-only) */
+    isConsoleSession?: boolean;
 }
 
 export interface BangCommandResult {
-    /** Message to send back to the mobile client */
-    message: string;
+    /** Message(s) to send back to the mobile client. Array = multiple chat bubbles. */
+    message: string | string[];
     /** Action to perform after sending the message */
     action: 'none' | 'restart-session';
 }

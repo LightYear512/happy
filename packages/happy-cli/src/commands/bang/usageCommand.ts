@@ -3,8 +3,7 @@ import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { ProxyAgent, fetch as undiciFetch } from 'undici';
 import { logger } from '@/ui/logger';
-import { getCurrentCcsProfile } from './ccsProfiles';
-import { centerText } from './format';
+import { getCurrentCcsProfile, readCcsProfiles, getInstancePath } from './ccsProfiles';
 import type { BangCommandContext, BangCommandResult } from './types';
 
 const USAGE_API_URL = 'https://api.anthropic.com/api/oauth/usage';
@@ -172,8 +171,8 @@ function formatResetTime(resetsAt: string): string {
  * Build a usage bar visualization.
  */
 function usageBar(utilization: number): string {
-    const clamped = Math.max(0, Math.min(20, Math.round(utilization / 5)));
-    const bar = '█'.repeat(clamped) + '░'.repeat(20 - clamped);
+    const clamped = Math.max(0, Math.min(10, Math.round(utilization / 10)));
+    const bar = '█'.repeat(clamped) + '░'.repeat(10 - clamped);
     return `[${bar}] ${utilization.toFixed(0)}%`;
 }
 
@@ -197,54 +196,49 @@ export function getCachedUsageSummary(cacheKey: string): string | null {
 /**
  * Format the usage data into a readable, centered message.
  */
-function formatUsage(data: UsageData, profileLabel: string, cachedAt: number): string {
-    const lines: string[] = [];
-
-    lines.push(`📊 用量 — ${profileLabel}`);
-    lines.push('');
+function formatUsage(data: UsageData, profileLabel: string, cachedAt: number): string[] {
+    const messages: string[] = [`📊 用量 — ${profileLabel}`];
 
     // 5-hour window
     if (data.five_hour) {
-        lines.push('⏱ 5 小时窗口');
-        lines.push(`${usageBar(data.five_hour.utilization)}`);
-        lines.push(`${formatResetTime(data.five_hour.resets_at)} 后重置`);
-        lines.push('');
+        messages.push([
+            '⏱ 5 小时窗口',
+            usageBar(data.five_hour.utilization),
+            `${formatResetTime(data.five_hour.resets_at)} 后重置`,
+        ].join('\n'));
     }
 
     // 7-day overall
     if (data.seven_day) {
-        lines.push('📅 7 天总量');
-        lines.push(`${usageBar(data.seven_day.utilization)}`);
-        lines.push(`${formatResetTime(data.seven_day.resets_at)} 后重置`);
-        lines.push('');
+        messages.push([
+            '📅 7 天总量',
+            usageBar(data.seven_day.utilization),
+            `${formatResetTime(data.seven_day.resets_at)} 后重置`,
+        ].join('\n'));
     }
 
     // 7-day per-model breakdowns (only show if present)
     const modelBreakdowns: Array<{ label: string; entry: { utilization: number; resets_at: string } | null }> = [
-        { label: 'Opus', entry: data.seven_day_opus },
-        { label: 'Sonnet', entry: data.seven_day_sonnet },
+        { label: '🔮 Opus 7天', entry: data.seven_day_opus },
+        { label: '✨ Sonnet 7天', entry: data.seven_day_sonnet },
     ];
 
     for (const { label, entry } of modelBreakdowns) {
         if (entry) {
-            lines.push(`${label}: ${usageBar(entry.utilization)}`);
+            messages.push(`${label}\n${usageBar(entry.utilization)}`);
         }
-    }
-
-    if (modelBreakdowns.some(m => m.entry)) {
-        lines.push('');
     }
 
     // Extra usage
     if (data.extra_usage?.is_enabled) {
-        lines.push('💰 额外用量');
+        const parts = ['💰 额外用量'];
         if (data.extra_usage.utilization !== null) {
-            lines.push(`${usageBar(data.extra_usage.utilization)}`);
+            parts.push(usageBar(data.extra_usage.utilization));
         }
         if (data.extra_usage.used_credits !== null && data.extra_usage.monthly_limit !== null) {
-            lines.push(`$${data.extra_usage.used_credits.toFixed(2)} / $${data.extra_usage.monthly_limit.toFixed(2)}`);
+            parts.push(`$${data.extra_usage.used_credits.toFixed(2)} / $${data.extra_usage.monthly_limit.toFixed(2)}`);
         }
-        lines.push('');
+        messages.push(parts.join('\n'));
     }
 
     // Cache info
@@ -253,25 +247,74 @@ function formatUsage(data: UsageData, profileLabel: string, cachedAt: number): s
     if (ageSec > 5) {
         const ageMin = Math.floor(ageSec / 60);
         const ageStr = ageMin > 0 ? `${ageMin} 分钟前` : `${ageSec} 秒前`;
-        lines.push(`ℹ️ 缓存于 ${ageStr}`);
+        messages.push(`ℹ️ 缓存于 ${ageStr}`);
     }
 
-    return centerText(lines);
+    return messages;
+}
+
+/**
+ * Resolve OAuth token for a specific CCS profile by name.
+ */
+function resolveOAuthTokenForProfile(profileName: string): { token: string; profileLabel: string; cacheKey: string } | null {
+    const instancePath = getInstancePath(profileName);
+    const credPath = join(instancePath, '.credentials.json');
+    const token = readTokenFromFile(credPath);
+    if (token) {
+        return { token, profileLabel: profileName, cacheKey: instancePath };
+    }
+    return null;
 }
 
 /**
  * Handle the `!usage` bang command.
  *
- * - `!usage` — Show current OAuth account usage with 15-minute cache
+ * - `!usage` — Normal session: show current account usage; Console: list profiles
+ * - `!usage <profile>` — Show usage for a specific CCS profile
  */
-export async function handleUsageBangCommand(_args: string, _ctx: BangCommandContext): Promise<BangCommandResult> {
-    const resolved = resolveOAuthToken();
+export async function handleUsageBangCommand(args: string, ctx: BangCommandContext): Promise<BangCommandResult> {
+    const profileArg = args.trim();
+
+    // Console session without args: list available profiles
+    if (ctx.isConsoleSession && !profileArg) {
+        const { profiles, defaultProfile } = readCcsProfiles();
+        // Only show profiles that have credentials
+        const accountProfiles = profiles.filter(p =>
+            readTokenFromFile(join(p.instancePath, '.credentials.json')) !== null
+        );
+        if (accountProfiles.length === 0) {
+            return { message: '❌ 未找到已登录的账户。', action: 'none' };
+        }
+        const messages = ['📊 请选择要查询的账户:', '━━━━━━━━━━━━━━━━━━'];
+        for (const p of accountProfiles) {
+            const marker = p.name === defaultProfile ? ' (默认)' : '';
+            messages.push(`${p.name}${marker}`);
+        }
+        messages.push('━━━━━━━━━━━━━━━━━━');
+        messages.push('用法: !usage <账户名>');
+        return { message: messages, action: 'none' };
+    }
+
+    // Resolve token: by profile name arg, or current session
+    let resolved: { token: string; profileLabel: string; cacheKey: string } | null;
+    if (profileArg) {
+        resolved = resolveOAuthTokenForProfile(profileArg);
+        if (!resolved) {
+            return { message: `❌ 未找到账户 "${profileArg}" 的 OAuth 凭证。`, action: 'none' };
+        }
+    } else {
+        resolved = resolveOAuthToken();
+    }
+
     if (!resolved) {
         return {
             message: '❌ 未找到 OAuth 凭证。请确认已通过 CCS 或 Claude CLI 登录。',
             action: 'none',
         };
     }
+
+    // Send loading indicator (after profile list check, so listing doesn't show loading)
+    ctx.client.sendSessionEvent({ type: 'message', message: '⏳ 正在查询用量...' });
 
     const { token, profileLabel, cacheKey } = resolved;
 
