@@ -66,7 +66,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
     const workingDirectory = process.cwd();
     const isConsoleSession = process.env.HAPPY_CONSOLE_SESSION === '1';
-    const sessionTag = isConsoleSession ? 'console' : randomUUID();
+    const sessionTag = randomUUID();
 
     // Log environment info at startup
     logger.debugLargeJson('[START] Happy process started', getEnvironmentInfo());
@@ -131,7 +131,6 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         flavor: 'claude',
         sandbox: sandboxConfig?.enabled ? sandboxConfig : null,
         dangerouslySkipPermissions,
-        ...(isConsoleSession ? { name: '🖥️ Console' } : {}),
     };
     const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
 
@@ -196,29 +195,40 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     }
 
     // Extract SDK metadata in background and update session when ready
-    extractSDKMetadataAsync(async (sdkMetadata) => {
-        logger.debug('[start] SDK metadata extracted, updating session:', sdkMetadata);
-        try {
-            // Update session metadata with tools and slash commands
-            api.sessionSyncClient(response).updateMetadata((currentMetadata) => ({
-                ...currentMetadata,
-                tools: sdkMetadata.tools,
-                slashCommands: sdkMetadata.slashCommands
-            }));
-            logger.debug('[start] Session metadata updated with SDK capabilities');
-        } catch (error) {
-            logger.debug('[start] Failed to update session metadata:', error);
-        }
-    });
+    // Skip for console sessions — they don't use Claude SDK and the SDK query
+    // can call process.exit(1) when running in the console directory
+    if (!isConsoleSession) {
+        extractSDKMetadataAsync(async (sdkMetadata) => {
+            logger.debug('[start] SDK metadata extracted, updating session:', sdkMetadata);
+            try {
+                // Update session metadata with tools and slash commands
+                api.sessionSyncClient(response).updateMetadata((currentMetadata) => ({
+                    ...currentMetadata,
+                    tools: sdkMetadata.tools,
+                    slashCommands: sdkMetadata.slashCommands
+                }));
+                logger.debug('[start] Session metadata updated with SDK capabilities');
+            } catch (error) {
+                logger.debug('[start] Failed to update session metadata:', error);
+            }
+        });
+    }
 
     // Create realtime session
     const session = api.sessionSyncClient(response);
 
-    // Console session: send welcome message (must be after session creation)
+    // Console session: set title, send welcome message
     if (isConsoleSession) {
-        logger.debug('[START] Console session detected, sending welcome message');
-        // Short delay to ensure socket is connected before sending
-        setTimeout(() => {
+        logger.debug('[START] Console session detected');
+
+        // Wait for socket connection, then send title and welcome
+        session.waitForConnect().then(() => {
+            // Set session title via summary message (same mechanism as change_title MCP tool)
+            session.sendClaudeSessionMessage({
+                type: 'summary',
+                summary: '🖥️ Console',
+                leafUuid: randomUUID(),
+            });
             session.sendSessionEvent({
                 type: 'message',
                 message: [
@@ -230,7 +240,9 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 ].join('\n'),
             });
             session.sendSessionEvent({ type: 'ready' });
-        }, 500);
+        }).catch(error => {
+            logger.debug('[START] Console session socket connect failed:', error);
+        });
     }
 
     // Forward JSONL history to app when resuming in remote mode

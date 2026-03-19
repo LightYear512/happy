@@ -339,6 +339,11 @@ export async function startDaemon(): Promise<void> {
         extraEnv = expandEnvironmentVariables(extraEnv, process.env);
         logger.debug(`[DAEMON RUN] After variable expansion: ${Object.keys(extraEnv).join(', ')}`);
 
+        // Mark console session so the child process can use a deterministic tag and custom name
+        if (options.consoleSession) {
+          extraEnv = { ...extraEnv, HAPPY_CONSOLE_SESSION: '1' };
+        }
+
         // Fail-fast validation: Check that any auth variables present are fully expanded
         // Only validate variables that are actually set (different agents need different auth)
         const potentialAuthVars = ['ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'OPENAI_API_KEY', 'CODEX_HOME', 'AZURE_OPENAI_API_KEY', 'TOGETHER_API_KEY'];
@@ -713,6 +718,7 @@ export async function startDaemon(): Promise<void> {
       try {
         const result = await spawnSession({
           directory: consoleDir,
+          consoleSession: true,
           approvedNewDirectoryCreation: true,
         });
         if (result.type === 'success') {
@@ -844,6 +850,21 @@ export async function startDaemon(): Promise<void> {
       if (restartOnStaleVersionAndHeartbeat) {
         clearInterval(restartOnStaleVersionAndHeartbeat);
         logger.debug('[DAEMON RUN] Health check interval cleared');
+      }
+
+      // Close console session via machine socket (SIGTERM doesn't work on Windows -
+      // the process is forcefully killed without running cleanup handlers)
+      if (consoleSessionPid !== null) {
+        const consoleTracked = pidToTrackedSession.get(consoleSessionPid);
+        if (consoleTracked?.happySessionId) {
+          logger.debug(`[DAEMON RUN] Sending session-end for console session ${consoleTracked.happySessionId}`);
+          apiMachine.sendSessionEnd(consoleTracked.happySessionId);
+          // Brief wait so the event reaches the server before we disconnect
+          await new Promise(resolve => setTimeout(resolve, 200));
+        }
+        try {
+          process.kill(consoleSessionPid, 'SIGTERM');
+        } catch {}
       }
 
       // Update daemon state before shutting down

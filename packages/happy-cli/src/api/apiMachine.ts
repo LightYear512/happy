@@ -319,6 +319,17 @@ export class ApiMachineClient {
         }
     }
 
+    /**
+     * Notify the server that a session has ended (used for graceful cleanup on Windows
+     * where SIGTERM cannot trigger child process cleanup handlers)
+     */
+    sendSessionEnd(sessionId: string) {
+        if (this.socket) {
+            (this.socket as any).emit('session-end', { sid: sessionId, time: Date.now() });
+            logger.debug(`[API MACHINE] Sent session-end for ${sessionId}`);
+        }
+    }
+
     shutdown() {
         logger.debug('[API MACHINE] Shutting down');
         this.stopKeepAlive();

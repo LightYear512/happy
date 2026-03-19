@@ -121,6 +121,8 @@ export interface SpawnSessionOptions {
     sessionId?: string;
     /** Claude Code session ID to resume via --resume flag */
     resume?: string;
+    /** Mark this session as the daemon console session (lightweight, bang-command-only) */
+    consoleSession?: boolean;
     approvedNewDirectoryCreation?: boolean;
     agent?: 'claude' | 'codex' | 'gemini';
     token?: string;

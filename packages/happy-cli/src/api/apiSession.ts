@@ -416,6 +416,8 @@ export class ApiSessionClient extends EventEmitter {
         this.socket.emit('session-end', { sid: this.sessionId, time: Date.now() });
     }
 
+
+
     /**
      * Send usage data to the server
      */
