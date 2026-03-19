@@ -188,52 +188,85 @@ function findClaudeCli(): { path: string; needsShell: boolean } | null {
     return null;
 }
 
-/** CCS profiles.json schema (must match ProfileData in profile-registry.ts). */
-interface CcsProfileData {
-    version: string;
-    profiles: Record<string, {
-        type: string;
-        created: string;
-        last_used: string | null;
-        context_mode?: 'isolated' | 'shared';
-        context_group?: string;
-    }>;
-    default: string | null;
-}
-
-/** Register a new profile in CCS profiles.json. */
+/**
+ * Register a new account in CCS config.yaml (unified mode).
+ *
+ * Inserts a new entry under the `accounts:` section using simple text manipulation
+ * to avoid a full YAML parser dependency. The format matches CCS's own output:
+ *
+ *   accounts:
+ *     <name>:
+ *       created: "<iso>"
+ *       last_used: null
+ *       context_mode: shared
+ *       context_group: default
+ *       continuity_mode: standard
+ */
 function registerProfile(
     profileName: string,
     contextMode: 'isolated' | 'shared',
     contextGroup?: string,
 ): void {
     const ccsDir = getCcsDir();
-    const profilesPath = join(ccsDir, 'profiles.json');
+    const configPath = join(ccsDir, 'config.yaml');
 
-    let data: CcsProfileData = { version: '2.0.0', profiles: {}, default: null };
-    if (existsSync(profilesPath)) {
-        try {
-            const raw = JSON.parse(readFileSync(profilesPath, 'utf-8'));
-            // Validate structure — must have version + profiles fields
-            if (raw.version && raw.profiles && typeof raw.profiles === 'object') {
-                data = raw as CcsProfileData;
-            }
-        } catch { /* ignore parse errors, start fresh */ }
+    const now = new Date().toISOString();
+    const entryLines = [
+        `  ${profileName}:`,
+        `    created: "${now}"`,
+        `    last_used: null`,
+        `    context_mode: ${contextMode}`,
+        ...(contextGroup ? [`    context_group: ${contextGroup}`] : []),
+        `    continuity_mode: standard`,
+    ];
+    const entryBlock = entryLines.join('\n');
+
+    if (!existsSync(configPath)) {
+        // No config.yaml yet — create minimal one with just the accounts section
+        mkdirSync(ccsDir, { recursive: true });
+        const content = `# CCS Unified Configuration\nversion: 8\n\naccounts:\n${entryBlock}\n`;
+        const tmpPath = configPath + '.' + randomBytes(4).toString('hex') + '.tmp';
+        writeFileSync(tmpPath, content, 'utf-8');
+        renameSync(tmpPath, configPath);
+        logger.debug(`[!login] Created config.yaml with profile "${profileName}"`);
+        return;
     }
 
-    data.profiles[profileName] = {
-        type: 'account',
-        created: new Date().toISOString(),
-        last_used: null,
-        context_mode: contextMode,
-        ...(contextGroup ? { context_group: contextGroup } : {}),
-    };
+    const yaml = readFileSync(configPath, 'utf-8');
+    const lines = yaml.split('\n');
+    let insertIdx = -1;
 
-    mkdirSync(ccsDir, { recursive: true });
-    const tmpPath = profilesPath + '.' + randomBytes(4).toString('hex') + '.tmp';
-    writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf-8');
-    renameSync(tmpPath, profilesPath);
-    logger.debug(`[!auth create] Registered profile "${profileName}" in ${profilesPath}`);
+    // Find the `accounts:` section and locate where to insert the new entry.
+    // Insert right after the last account entry (before the next top-level key or EOF).
+    let inAccounts = false;
+    for (let i = 0; i < lines.length; i++) {
+        if (/^accounts:\s*$/.test(lines[i])) {
+            inAccounts = true;
+            insertIdx = i + 1; // default: right after "accounts:"
+            continue;
+        }
+        if (inAccounts) {
+            // Still inside accounts section (indented lines or blank lines)
+            if (/^\s/.test(lines[i]) || lines[i].trim() === '' || lines[i].startsWith('#')) {
+                insertIdx = i + 1;
+            } else {
+                // Hit a new top-level key — stop
+                break;
+            }
+        }
+    }
+
+    if (insertIdx === -1) {
+        // No accounts section found — append one
+        lines.push('', 'accounts:', ...entryLines);
+    } else {
+        lines.splice(insertIdx, 0, entryBlock);
+    }
+
+    const tmpPath = configPath + '.' + randomBytes(4).toString('hex') + '.tmp';
+    writeFileSync(tmpPath, lines.join('\n'), 'utf-8');
+    renameSync(tmpPath, configPath);
+    logger.debug(`[!login] Registered profile "${profileName}" in ${configPath}`);
 }
 
 /**
@@ -412,19 +445,19 @@ export async function handleAuthCreateBangCommand(
         };
     }
 
-    // Check existing
+    // Check existing — allow re-login for expired credentials
+    let isRelogin = false;
     const ccsDir = getCcsDir();
-    const profilesPath = join(ccsDir, 'profiles.json');
-    if (existsSync(profilesPath)) {
+    const configPath = join(ccsDir, 'config.yaml');
+    if (existsSync(configPath)) {
         try {
-            const data = JSON.parse(readFileSync(profilesPath, 'utf-8'));
-            if (data.profiles?.[profileName]) {
-                return {
-                    message: `❌ 配置 "${profileName}" 已存在`,
-                    action: 'none',
-                };
+            const yaml = readFileSync(configPath, 'utf-8');
+            // Simple check: look for "  <profileName>:" under accounts section
+            const accountPattern = new RegExp(`^  ${profileName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}:\\s*$`, 'm');
+            if (accountPattern.test(yaml)) {
+                isRelogin = true;
             }
-        } catch { /* ignore parse errors */ }
+        } catch { /* ignore read errors */ }
     }
 
     // Parse context flags
@@ -633,24 +666,28 @@ export async function handleAuthCreateBangCommand(
         const hasCredentials = existsSync(credPath);
 
         if (hasCredentials) {
-            try {
-                registerProfile(profileName, contextMode, contextGroup);
-                if (contextMode === 'shared') {
-                    linkSharedDirectories(instancePath);
+            if (isRelogin) {
+                ctx.client.sendCodexMessage({ type: 'message', message: `✅ 配置 "${profileName}" 重新登录成功` });
+            } else {
+                try {
+                    registerProfile(profileName, contextMode, contextGroup);
+                    if (contextMode === 'shared') {
+                        linkSharedDirectories(instancePath);
+                    }
+                    const modeDesc = contextMode === 'shared'
+                        ? `共享 (组: ${contextGroup || 'default'})`
+                        : '独立';
+                    const msg = `✅ 配置 "${profileName}" 创建成功\n\n`
+                        + `模式: ${modeDesc}\n\n`
+                        + `切换账号: !auth ${profileName}`;
+                    ctx.client.sendCodexMessage({ type: 'message', message: msg });
+                } catch (err) {
+                    logger.debug('[!auth create] Failed to register profile:', err);
+                    ctx.client.sendCodexMessage({ type: 'message', message: `⚠️ 登录成功但注册失败: ${(err as Error).message}` });
                 }
-                const modeDesc = contextMode === 'shared'
-                    ? `共享 (组: ${contextGroup || 'default'})`
-                    : '独立';
-                const msg = `✅ 配置 "${profileName}" 创建成功\n\n`
-                    + `模式: ${modeDesc}\n\n`
-                    + `切换账号: !auth ${profileName}`;
-                ctx.client.sendCodexMessage({ type: 'message', message: msg });
-            } catch (err) {
-                logger.debug('[!auth create] Failed to register profile:', err);
-                ctx.client.sendCodexMessage({ type: 'message', message: `⚠️ 登录成功但注册失败: ${(err as Error).message}` });
             }
         } else {
-            cleanupInstance(instancePath);
+            if (!isRelogin) cleanupInstance(instancePath);
             ctx.client.sendCodexMessage({ type: 'message', message: `❌ 登录失败或已取消 (退出码: ${exitCode ?? 'unknown'})` });
         }
 
@@ -658,8 +695,8 @@ export async function handleAuthCreateBangCommand(
     });
 
     // Return immediately — the interactive session runs asynchronously
-    const msg = `🔐 正在启动登录...\n\n`
-        + `配置: ${profileName} (${contextMode === 'shared' ? '共享' : '独立'})\n\n`
+    const msg = `🔐 正在${isRelogin ? '重新' : ''}登录...\n\n`
+        + `配置: ${profileName}${isRelogin ? '' : ` (${contextMode === 'shared' ? '共享' : '独立'})`}\n\n`
         + '请等待登录提示，然后粘贴 OAuth Key\n\n'
         + '取消: !cancel';
     return { message: msg, action: 'none' };
