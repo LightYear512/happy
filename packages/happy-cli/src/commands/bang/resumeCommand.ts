@@ -7,7 +7,7 @@
 
 import { logger } from '@/ui/logger';
 import { spawnDaemonSession } from '@/daemon/controlClient';
-import { scanClaudeSessions } from './sessionsCommand';
+import { scanClaudeSessions } from './sessionCommand';
 import type { BangCommandContext, BangCommandResult } from './types';
 
 /**
@@ -21,7 +21,7 @@ export async function handleResumeBangCommand(args: string, ctx: BangCommandCont
 
     if (!prefix) {
         return {
-            message: ['用法: !resume <id前缀>', '先使用 !sessions 查看可用会话'],
+            message: ['用法: !resume <id前缀>', '先使用 !session 查看可用会话'],
             action: 'none',
         };
     }
@@ -33,7 +33,7 @@ export async function handleResumeBangCommand(args: string, ctx: BangCommandCont
 
     if (matches.length === 0) {
         return {
-            message: [`❌ 未找到匹配 "${prefix}" 的会话`, '使用 !sessions 查看可用会话'],
+            message: [`❌ 未找到匹配 "${prefix}" 的会话`, '使用 !session 查看可用会话'],
             action: 'none',
         };
     }

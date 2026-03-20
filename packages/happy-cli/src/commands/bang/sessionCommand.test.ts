@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { join } from 'node:path';
 import { mkdtemp, writeFile, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { scanClaudeSessions, type ClaudeSessionInfo } from './sessionsCommand';
+import { scanClaudeSessions, type ClaudeSessionInfo } from './sessionCommand';
 
 /**
  * Helper: create a JSONL session file with given lines in a temp projects dir.

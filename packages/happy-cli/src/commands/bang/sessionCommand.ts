@@ -1,5 +1,5 @@
 /**
- * `!sessions` bang command — List recoverable Claude Code sessions.
+ * `!session` bang command — List recoverable Claude Code sessions.
  *
  * Scans ~/.claude/projects/ for JSONL session files and displays them
  * sorted by recency, with short IDs for use with `!resume`.
@@ -42,7 +42,7 @@ export async function scanClaudeSessions(): Promise<ClaudeSessionInfo[]> {
     const projectsDir = join(claudeConfigDir, 'projects');
 
     if (!existsSync(projectsDir)) {
-        logger.debug(`[!sessions] Projects directory not found: ${projectsDir}`);
+        logger.debug(`[!session] Projects directory not found: ${projectsDir}`);
         return [];
     }
 
@@ -80,15 +80,15 @@ export async function scanClaudeSessions(): Promise<ClaudeSessionInfo[]> {
                             preview,
                         });
                     } catch (err) {
-                        logger.debug(`[!sessions] Failed to stat ${filePath}:`, err);
+                        logger.debug(`[!session] Failed to stat ${filePath}:`, err);
                     }
                 }
             } catch (err) {
-                logger.debug(`[!sessions] Failed to read project dir ${dirPath}:`, err);
+                logger.debug(`[!session] Failed to read project dir ${dirPath}:`, err);
             }
         }
     } catch (err) {
-        logger.debug(`[!sessions] Failed to read projects directory:`, err);
+        logger.debug(`[!session] Failed to read projects directory:`, err);
     }
 
     // Filter out console sessions (cwd is ~/.happy/console or similar)
@@ -238,7 +238,7 @@ function shortenPath(fullPath: string): string {
 }
 
 /**
- * Handle the `!sessions` bang command.
+ * Handle the `!session` bang command.
  */
 export async function handleSessionsBangCommand(args: string, ctx: BangCommandContext): Promise<BangCommandResult> {
     const rawFilter = args.trim() || null;

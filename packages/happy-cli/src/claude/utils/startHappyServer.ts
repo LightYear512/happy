@@ -32,7 +32,7 @@ export async function startHappyServer(client: ApiSessionClient, options?: Happy
                 leafUuid: randomUUID()
             });
 
-            // Persist title to JSONL session file for !sessions preview
+            // Persist title to JSONL session file for !session preview
             const filePath = options?.getSessionFilePath?.();
             if (filePath) {
                 const line = JSON.stringify({ type: 'happy_title', title }) + '\n';

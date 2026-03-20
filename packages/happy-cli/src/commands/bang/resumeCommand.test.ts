@@ -52,7 +52,7 @@ describe('handleResumeBangCommand', () => {
     it('shows usage when no args provided', async () => {
         const result = await handleResumeBangCommand('', createMockContext());
         expect(result.action).toBe('none');
-        expect(result.message).toContain('!sessions');
+        expect(result.message).toContain('!session');
     });
 
     it('returns error when no session matches prefix', async () => {
