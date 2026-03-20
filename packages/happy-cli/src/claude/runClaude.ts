@@ -458,10 +458,11 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             }).then(async result => {
                 // Delay ensures mobile client receives messages in correct order —
                 // it sorts by createdAt timestamp, so rapid events can arrive out of order.
-                await new Promise(resolve => setTimeout(resolve, 100));
+                await new Promise(resolve => setTimeout(resolve, 200));
                 const messages = Array.isArray(result.message) ? result.message : [result.message];
                 for (const msg of messages) {
                     session.sendSessionEvent({ type: 'message', message: msg });
+                    await new Promise(resolve => setTimeout(resolve, 50));
                 }
                 session.sendSessionEvent({ type: 'ready' });
 
