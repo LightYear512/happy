@@ -11,7 +11,7 @@ import {
     registerInteractiveSession,
     unregisterInteractiveSession,
 } from './interactiveSession';
-import type { BangCommandContext, BangCommandResult } from './types';
+import { SEPARATOR, type BangCommandContext, type BangCommandResult } from './types';
 
 const PROFILE_NAME_REGEX = /^[a-zA-Z][a-zA-Z0-9_-]*$/;
 
@@ -424,21 +424,25 @@ export async function handleAuthCreateBangCommand(
     const profileName = parts[0];
 
     if (!profileName) {
-        // No args — list existing accounts for easy re-login
+        // No args — list existing accounts (same style as !auth)
         const accounts = readAccountNames();
 
         if (accounts.length === 0) {
             return {
-                message: '用法: `!login <名称>`\n\n创建新账户并登录',
+                message: '用法: !login <名称>\n\n创建新账户并登录',
                 action: 'none',
             };
         }
 
-        const list = accounts.map(a => `  • \`!login ${a}\` — 重新登录`).join('\n');
-        return {
-            message: `已有账户:\n${list}\n\n新建: \`!login <新名称>\``,
-            action: 'none',
-        };
+        const messages: string[] = ['📋 已有账户'];
+        messages.push(SEPARATOR);
+        for (const name of accounts) {
+            messages.push(name);
+        }
+        messages.push(SEPARATOR);
+        messages.push('!login <名称> → 重新登录\n!login <新名称> → 创建新账户');
+
+        return { message: messages, action: 'none' };
     }
 
     if (!PROFILE_NAME_REGEX.test(profileName)) {
