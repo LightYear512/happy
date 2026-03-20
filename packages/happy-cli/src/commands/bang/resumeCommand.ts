@@ -66,7 +66,7 @@ export async function handleResumeBangCommand(args: string, ctx: BangCommandCont
 
     // Ask daemon to spawn a new session with --resume
     try {
-        const result = await spawnDaemonSession(directory, undefined, session.sessionId);
+        const result = await spawnDaemonSession(directory, undefined, session.sessionId, session.preview || undefined);
 
         if (result.error) {
             return {

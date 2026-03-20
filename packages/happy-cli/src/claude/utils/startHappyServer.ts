@@ -8,14 +8,20 @@ import { createServer } from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { AddressInfo } from "node:net";
 import { z } from "zod";
+import { appendFile } from "node:fs/promises";
 import { logger } from "@/ui/logger";
 import { ApiSessionClient } from "@/api/apiSession";
 import { randomUUID } from "node:crypto";
 
-export async function startHappyServer(client: ApiSessionClient) {
+export interface HappyServerOptions {
+    /** Returns the current JSONL session file path, or null if not yet available */
+    getSessionFilePath?: () => string | null;
+}
+
+export async function startHappyServer(client: ApiSessionClient, options?: HappyServerOptions) {
     logger.debug(`[happyMCP] server:start sessionId=${client.sessionId}`);
 
-    // Handler that sends title updates via the client
+    // Handler that sends title updates via the client and persists to JSONL
     const handler = async (title: string) => {
         logger.debug('[happyMCP] Changing title to:', title);
         try {
@@ -25,7 +31,15 @@ export async function startHappyServer(client: ApiSessionClient) {
                 summary: title,
                 leafUuid: randomUUID()
             });
-            
+
+            // Persist title to JSONL session file for !sessions preview
+            const filePath = options?.getSessionFilePath?.();
+            if (filePath) {
+                const line = JSON.stringify({ type: 'happy_title', title }) + '\n';
+                await appendFile(filePath, line, 'utf-8');
+                logger.debug(`[happyMCP] Appended happy_title to ${filePath}`);
+            }
+
             return { success: true };
         } catch (error) {
             return { success: false, error: String(error) };

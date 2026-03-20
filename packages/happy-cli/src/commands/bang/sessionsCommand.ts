@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { readdir, stat, open } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { logger } from '@/ui/logger';
+import { configuration } from '@/configuration';
 import { SEPARATOR, type BangCommandContext, type BangCommandResult } from './types';
 
 /** Represents a discovered Claude session file */
@@ -22,8 +23,8 @@ export interface ClaudeSessionInfo {
     cwd: string | null;
     /** Last modification time */
     mtime: Date;
-    /** First user message preview */
-    firstMessage: string | null;
+    /** Session preview: happy_title or last user message */
+    preview: string | null;
 }
 
 /** Max sessions to display */
@@ -69,15 +70,14 @@ export async function scanClaudeSessions(): Promise<ClaudeSessionInfo[]> {
                         // Skip tiny files (likely empty/corrupt)
                         if (fileStat.size < 50) continue;
 
-                        // Read first few lines to extract cwd and first user message
-                        const { cwd, firstMessage } = await extractSessionPreview(filePath);
+                        const { cwd, preview } = await extractSessionPreview(filePath, fileStat.size);
 
                         sessions.push({
                             sessionId,
                             projectDir: dir.name,
                             cwd,
                             mtime: fileStat.mtime,
-                            firstMessage,
+                            preview,
                         });
                     } catch (err) {
                         logger.debug(`[!sessions] Failed to stat ${filePath}:`, err);
@@ -91,62 +91,107 @@ export async function scanClaudeSessions(): Promise<ClaudeSessionInfo[]> {
         logger.debug(`[!sessions] Failed to read projects directory:`, err);
     }
 
+    // Filter out console sessions (cwd is ~/.happy/console or similar)
+    const consoleDir = join(configuration.happyHomeDir, 'console').replace(/\\/g, '/');
+    const filtered = sessions.filter(s => {
+        if (!s.cwd) return true;
+        const normalised = s.cwd.replace(/\\/g, '/');
+        return !normalised.startsWith(consoleDir);
+    });
+
     // Sort by most recent first
-    sessions.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
-    return sessions;
+    filtered.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+    return filtered;
+}
+
+/** Size of chunks to read from head/tail of session files */
+const READ_CHUNK = 8192;
+
+/**
+ * Extract a user message from a parsed JSONL object.
+ * Returns null for system-injected messages (starting with <).
+ */
+function extractUserMessage(obj: any): string | null {
+    // queue-operation enqueue format
+    if (obj.type === 'queue-operation' && obj.operation === 'enqueue' && obj.content) {
+        if (typeof obj.content === 'string' && !obj.content.trimStart().startsWith('<')) {
+            return obj.content;
+        }
+    }
+    // Standard user message format
+    if (obj.message?.role === 'user') {
+        const content = obj.message.content;
+        let text: string | null = null;
+        if (typeof content === 'string') {
+            text = content;
+        } else if (Array.isArray(content)) {
+            const textBlock = content.find((c: any) => c.type === 'text');
+            if (textBlock) text = textBlock.text;
+        }
+        if (text && !text.trimStart().startsWith('<')) return text;
+    }
+    return null;
 }
 
 /**
- * Read the first few lines of a JSONL file to extract cwd and first user message.
+ * Read session file to extract cwd (from head) and preview (from tail).
+ * Preview priority: last happy_title > last user message.
  */
-async function extractSessionPreview(filePath: string): Promise<{ cwd: string | null; firstMessage: string | null }> {
+async function extractSessionPreview(filePath: string, fileSize: number): Promise<{ cwd: string | null; preview: string | null }> {
     let cwd: string | null = null;
-    let firstMessage: string | null = null;
+    let preview: string | null = null;
 
     const handle = await open(filePath, 'r');
     try {
-        // Read only first 8KB — avoid loading multi-MB session files into memory
-        const buffer = Buffer.alloc(8192);
-        const { bytesRead } = await handle.read(buffer, 0, 8192, 0);
-        const chunk = buffer.toString('utf-8', 0, bytesRead);
-        const lines = chunk.split('\n').filter(l => l.trim().length > 0);
+        // --- Head: extract cwd from first few lines ---
+        const headBuf = Buffer.alloc(READ_CHUNK);
+        const { bytesRead: headRead } = await handle.read(headBuf, 0, READ_CHUNK, 0);
+        const headLines = headBuf.toString('utf-8', 0, headRead).split('\n').filter(l => l.trim().length > 0);
 
-        for (const line of lines.slice(0, 10)) {
+        for (const line of headLines.slice(0, 10)) {
             try {
                 const obj = JSON.parse(line);
-
-                // Extract cwd from any line that has it
-                if (!cwd && obj.cwd) {
-                    cwd = obj.cwd;
-                }
-
-                // Extract first user message content
-                if (!firstMessage && obj.type === 'queue-operation' && obj.operation === 'enqueue' && obj.content) {
-                    firstMessage = typeof obj.content === 'string' ? obj.content : null;
-                }
-
-                // Also check for user messages in the standard format
-                if (!firstMessage && obj.message?.role === 'user') {
-                    const content = obj.message.content;
-                    if (typeof content === 'string') {
-                        firstMessage = content;
-                    } else if (Array.isArray(content)) {
-                        const textBlock = content.find((c: any) => c.type === 'text');
-                        if (textBlock) firstMessage = textBlock.text;
-                    }
-                }
-
-                if (cwd && firstMessage) break;
-            } catch {
-                // Skip unparseable lines
-            }
+                if (obj.cwd) { cwd = obj.cwd; break; }
+            } catch { /* skip */ }
         }
+
+        // --- Tail: find last happy_title or last user message ---
+        const tailOffset = Math.max(0, fileSize - READ_CHUNK);
+        const tailBuf = Buffer.alloc(READ_CHUNK);
+        const { bytesRead: tailRead } = await handle.read(tailBuf, 0, READ_CHUNK, tailOffset);
+        const tailChunk = tailBuf.toString('utf-8', 0, tailRead);
+        // If reading from middle of file, skip first partial line
+        const tailLines = tailOffset > 0
+            ? tailChunk.slice(tailChunk.indexOf('\n') + 1).split('\n').filter(l => l.trim().length > 0)
+            : tailChunk.split('\n').filter(l => l.trim().length > 0);
+
+        let lastUserMsg: string | null = null;
+
+        for (const line of tailLines) {
+            try {
+                const obj = JSON.parse(line);
+                if (obj.type === 'happy_title' && obj.title) {
+                    preview = obj.title;
+                }
+                const msg = extractUserMessage(obj);
+                if (msg) lastUserMsg = msg;
+            } catch { /* skip */ }
+        }
+
+        // Fallback: title > last user message
+        if (!preview) preview = lastUserMsg;
     } finally {
         await handle.close();
     }
 
-    return { cwd, firstMessage };
+    return { cwd, preview };
 }
+
+/** Separator bar character */
+const BAR = '━';
+
+/** Fixed separator length appended after time group labels */
+const GROUP_BAR_LEN = 19;
 
 /**
  * Format relative time from a Date to now.
@@ -165,36 +210,86 @@ function relativeTime(date: Date): string {
 }
 
 /**
+ * Determine the time group label for a session.
+ */
+function timeGroupLabel(date: Date): string {
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const yesterday = new Date(today.getTime() - 86_400_000);
+    const sessionDay = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+
+    if (sessionDay.getTime() >= today.getTime()) return '今天';
+    if (sessionDay.getTime() >= yesterday.getTime()) return '昨天';
+
+    const diffDay = Math.floor((today.getTime() - sessionDay.getTime()) / 86_400_000);
+    if (diffDay < 7) return `${diffDay}天前`;
+    if (diffDay < 30) return `${Math.floor(diffDay / 7)}周前`;
+    return `${Math.floor(diffDay / 30)}月前`;
+}
+
+/**
+ * Shorten a path for display: last segment, or ~ if it's the home directory itself.
+ */
+function shortenPath(fullPath: string): string {
+    const home = homedir().replace(/\\/g, '/');
+    const normalised = fullPath.replace(/\\/g, '/').replace(/\/+$/, '');
+    if (normalised === home) return '~';
+    return normalised.split('/').pop() || normalised;
+}
+
+/**
  * Handle the `!sessions` bang command.
  */
 export async function handleSessionsBangCommand(args: string, ctx: BangCommandContext): Promise<BangCommandResult> {
-    const sessions = await scanClaudeSessions();
+    const rawFilter = args.trim() || null;
+    const dirFilter = rawFilter
+        ? rawFilter.replace(/^~/, homedir()).replace(/\\/g, '/').toLowerCase()
+        : null;
+    let sessions = await scanClaudeSessions();
+
+    if (dirFilter) {
+        sessions = sessions.filter(s => {
+            const dir = s.cwd ? s.cwd.replace(/\\/g, '/') : s.projectDir;
+            return dir.toLowerCase().includes(dirFilter);
+        });
+    }
 
     if (sessions.length === 0) {
-        return { message: '📭 没有找到可恢复的会话', action: 'none' };
+        const hint = dirFilter ? ` (筛选: "${dirFilter}")` : '';
+        return { message: `📭 没有找到可恢复的会话${hint}`, action: 'none' };
     }
 
     const displayed = sessions.slice(0, MAX_DISPLAY);
+    const countLabel = `${Math.min(sessions.length, MAX_DISPLAY)}/${sessions.length}`;
+    const filterLabel = rawFilter ? ` · 筛选: "${rawFilter}"` : '';
     const messages: string[] = [
-        `📋 可恢复的会话 (${Math.min(sessions.length, MAX_DISPLAY)}/${sessions.length})`,
-        SEPARATOR,
+        `📋 可恢复的会话 (${countLabel}${filterLabel})`,
     ];
 
+    let currentGroup = '';
+
     for (const s of displayed) {
+        const group = timeGroupLabel(s.mtime);
+        if (group !== currentGroup) {
+            currentGroup = group;
+            messages.push(`▸ ${group} ${BAR.repeat(GROUP_BAR_LEN)}`);
+        }
+
         const shortId = s.sessionId.slice(0, SHORT_ID_LEN);
         const time = relativeTime(s.mtime);
-        const dir = s.cwd ? s.cwd.split(/[/\\]/).pop() || s.projectDir : s.projectDir;
-        const msg = s.firstMessage ? s.firstMessage.slice(0, 35).replace(/\n/g, ' ') : '';
-        const msgSuffix = s.firstMessage && s.firstMessage.length > 35 ? '...' : '';
+        const dir = s.cwd ? shortenPath(s.cwd) : s.projectDir;
+        const cleanMsg = s.preview ? s.preview.replace(/\n/g, ' ').trim() : '';
+        const msg = cleanMsg.slice(0, 35);
+        const msgSuffix = cleanMsg.length > 35 ? '…' : '';
 
         const sessionLine = msg
-            ? `${shortId} | ${dir} | ${time}\n  "${msg}${msgSuffix}"`
-            : `${shortId} | ${dir} | ${time}`;
+            ? `  [${shortId}] ${dir} · ${time} — ${msg}${msgSuffix}`
+            : `  [${shortId}] ${dir} · ${time}`;
         messages.push(sessionLine);
     }
 
-    messages.push(SEPARATOR);
-    messages.push('用法: !resume <id前缀>');
+    messages.push('');
+    messages.push('💡 !resume <id前缀>');
 
     return { message: messages, action: 'none' };
 }

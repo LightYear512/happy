@@ -344,6 +344,11 @@ export async function startDaemon(): Promise<void> {
           extraEnv = { ...extraEnv, HAPPY_CONSOLE_SESSION: '1' };
         }
 
+        // Pass resume title so the new session can restore it
+        if (options.title) {
+          extraEnv = { ...extraEnv, HAPPY_RESUME_TITLE: options.title };
+        }
+
         // Fail-fast validation: Check that any auth variables present are fully expanded
         // Only validate variables that are actually set (different agents need different auth)
         const potentialAuthVars = ['ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'OPENAI_API_KEY', 'CODEX_HOME', 'AZURE_OPENAI_API_KEY', 'TOGETHER_API_KEY'];

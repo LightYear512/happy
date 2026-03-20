@@ -23,7 +23,7 @@ import { startHookServer } from '@/claude/utils/startHookServer';
 import { generateHookSettingsFile, cleanupHookSettingsFile } from '@/claude/utils/generateHookSettings';
 import { registerKillSessionHandler } from './registerKillSessionHandler';
 import { projectPath } from '../projectPath';
-import { resolve } from 'node:path';
+import { resolve, join } from 'node:path';
 import { existsSync } from 'node:fs';
 import { startOfflineReconnection, connectionState } from '@/utils/serverConnectionErrors';
 import { readCcsProfiles, getInstancePath, getCurrentCcsProfile } from '@/commands/bang/ccsProfiles';
@@ -239,6 +239,22 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         });
     }
 
+    // Restore session title when resuming
+    const resumeTitle = process.env.HAPPY_RESUME_TITLE;
+    logger.debug(`[START] HAPPY_RESUME_TITLE=${resumeTitle || '(not set)'}`);
+    if (resumeTitle) {
+        session.waitForConnect().then(() => {
+            session.sendClaudeSessionMessage({
+                type: 'summary',
+                summary: resumeTitle,
+                leafUuid: randomUUID(),
+            });
+            logger.debug(`[START] Restored resume title: ${resumeTitle}`);
+        }).catch(error => {
+            logger.debug('[START] Failed to restore resume title:', error);
+        });
+    }
+
     // Forward JSONL history to app when resuming in remote mode
     // In local mode, Session Scanner handles this. In remote mode there's no scanner,
     // so we read the JSONL file directly and send historical messages to the app.
@@ -273,7 +289,13 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     }
 
     // Start Happy MCP server
-    const happyServer = await startHappyServer(session);
+    const happyServer = await startHappyServer(session, {
+        getSessionFilePath: () => {
+            if (!currentSession?.sessionId) return null;
+            const projDir = getProjectPath(currentSession.path);
+            return join(projDir, `${currentSession.sessionId}.jsonl`);
+        },
+    });
     logger.debug(`[START] Happy MCP server started at ${happyServer.url}`);
 
     // Variable to track current session instance (updated via onSessionReady callback)

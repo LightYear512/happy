@@ -51,13 +51,14 @@ function testSessions(): string[] {
         '📭 没有找到可恢复的会话',
 
         label('!sessions 有结果'),
-        '📋 可恢复的会话 (3/3)',
-        SEPARATOR,
-        'a1b2c3d4 | happy | 5分钟前\n  "帮我重构这个组件..."',
-        'e5f6g7h8 | workspace | 2小时前\n  "list files in this directory"',
-        'i9j0k1l2 | project | 3天前\n  "fix the login bug"',
-        SEPARATOR,
-        '用法: !resume <id前缀>',
+        '📋 可恢复的会话 (3/5)',
+        '▸ 今天 ━━━━━━━━━━━━━━━━━━━',
+        '  [a1b2c3d4] happy · 5分钟前 — 帮我重构这个组件…',
+        '  [e5f6g7h8] workspace · 2小时前 — list files in this…',
+        '▸ 3天前 ━━━━━━━━━━━━━━━━━━━',
+        '  [i9j0k1l2] project — fix the login bug',
+        '',
+        '💡 !resume <id前缀>',
     ];
 }
 
@@ -140,10 +141,15 @@ function testRestart(): string[] {
 function testLogin(): string[] {
     return [
         label('!login 无参（无账户）'),
-        '用法: `!login <名称>`\n\n创建新账户并登录',
+        '用法: !login <名称>\n\n创建新账户并登录',
 
         label('!login 无参（有账户）'),
-        '已有账户:\n  • `!login work` — 重新登录\n  • `!login personal` — 重新登录\n\n新建: `!login <新名称>`',
+        '📋 已有账户',
+        SEPARATOR,
+        'work',
+        'personal',
+        SEPARATOR,
+        '!login <名称> → 重新登录\n!login <新名称> → 创建新账户',
 
         label('!login 重新登录'),
         '🔐 正在重新登录...\n\n配置: work\n\n请等待登录提示，然后粘贴 OAuth Key\n\n取消: !cancel',
