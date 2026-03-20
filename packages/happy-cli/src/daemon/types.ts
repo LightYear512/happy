@@ -19,4 +19,6 @@ export interface TrackedSession {
   message?: string;
   /** tmux session identifier (format: session:window) */
   tmuxSessionId?: string;
+  /** Claude session ID this process is resuming (set at spawn time for dedup) */
+  resumeTarget?: string;
 }

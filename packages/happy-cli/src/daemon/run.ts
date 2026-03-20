@@ -168,7 +168,11 @@ export async function startDaemon(): Promise<void> {
     const pidToTrackedSession = new Map<number, TrackedSession>();
 
     // Session spawning awaiter system
-    const pidToAwaiter = new Map<number, (session: TrackedSession) => void>();
+    interface SessionAwaiter {
+      resolve: (session: TrackedSession) => void;
+      timeout: ReturnType<typeof setTimeout>;
+    }
+    const pidToAwaiter = new Map<number, SessionAwaiter>();
 
     // Helper functions
     const getCurrentChildren = () => Array.from(pidToTrackedSession.values());
@@ -199,7 +203,8 @@ export async function startDaemon(): Promise<void> {
         const awaiter = pidToAwaiter.get(pid);
         if (awaiter) {
           pidToAwaiter.delete(pid);
-          awaiter(existingSession);
+          clearTimeout(awaiter.timeout);
+          awaiter.resolve(existingSession);
           logger.debug(`[DAEMON RUN] Resolved session awaiter for PID ${pid}`);
         }
       } else if (!existingSession) {
@@ -376,6 +381,57 @@ export async function startDaemon(): Promise<void> {
           };
         }
 
+        // Kill stale processes before spawning when resuming the same Claude session
+        if (options.resume) {
+          const staleEntries: Array<[number, TrackedSession]> = [];
+          for (const [pid, session] of pidToTrackedSession) {
+            if (session.resumeTarget === options.resume ||
+                session.happySessionMetadataFromLocalWebhook?.claudeSessionId === options.resume) {
+              staleEntries.push([pid, session]);
+            }
+          }
+
+          for (const [pid, session] of staleEntries) {
+            logger.debug(`[DAEMON RUN] Killing stale session PID ${pid} before resume ${options.resume}`);
+            try {
+              if (session.startedBy === 'daemon' && session.childProcess) {
+                session.childProcess.kill('SIGTERM');
+                await Promise.race([
+                  new Promise<void>(resolve => session.childProcess!.once('exit', resolve)),
+                  new Promise<void>(resolve => setTimeout(resolve, 3000)),
+                ]);
+              } else {
+                process.kill(pid, 'SIGTERM');
+                await new Promise<void>(resolve => setTimeout(resolve, 1000));
+              }
+            } catch {
+              // Process may have already exited, ignore
+            }
+            // Cancel pending webhook awaiter and its timeout so the first caller
+            // gets an immediate result instead of hanging for 15s
+            const pendingAwaiter = pidToAwaiter.get(pid);
+            if (pendingAwaiter) {
+              clearTimeout(pendingAwaiter.timeout);
+              // Resolve with the killed session — caller gets a "success" with whatever
+              // happySessionId was available (may be undefined if webhook never arrived,
+              // which means the HTTP response will show the session was superseded)
+              pendingAwaiter.resolve(session);
+              pidToAwaiter.delete(pid);
+              logger.debug(`[DAEMON RUN] Cancelled pending awaiter for superseded PID ${pid}`);
+            }
+            // Notify server that the old session ended (after process exit/timeout)
+            if (session.happySessionId) {
+              apiMachine.sendSessionEnd(session.happySessionId);
+              logger.debug(`[DAEMON RUN] Sent session-end for stale session ${session.happySessionId}`);
+            }
+            pidToTrackedSession.delete(pid);
+          }
+
+          if (staleEntries.length > 0) {
+            logger.debug(`[DAEMON RUN] Cleaned up ${staleEntries.length} stale session(s) for resume ${options.resume}`);
+          }
+        }
+
         // Check if tmux is available and should be used
         const tmuxAvailable = await isTmuxAvailable();
         let useTmux = tmuxAvailable;
@@ -444,6 +500,7 @@ export async function startDaemon(): Promise<void> {
               startedBy: 'daemon',
               pid: tmuxResult.pid, // Real PID from tmux -P flag
               tmuxSessionId: tmuxResult.sessionId,
+              resumeTarget: options.resume,
               directoryCreated,
               message: directoryCreated
                 ? `The path '${directory}' did not exist. We created a new folder and spawned a new session in tmux session '${tmuxSessionName}'. Use 'tmux attach -t ${tmuxSessionName}' to view the session.`
@@ -468,13 +525,16 @@ export async function startDaemon(): Promise<void> {
               }, 15_000); // Same timeout as regular sessions
 
               // Register awaiter for tmux session (exact same as regular flow)
-              pidToAwaiter.set(tmuxResult.pid!, (completedSession) => {
-                clearTimeout(timeout);
-                logger.debug(`[DAEMON RUN] Session ${completedSession.happySessionId} fully spawned with webhook (tmux)`);
-                resolve({
-                  type: 'success',
-                  sessionId: completedSession.happySessionId!
-                });
+              pidToAwaiter.set(tmuxResult.pid!, {
+                timeout,
+                resolve: (completedSession) => {
+                  clearTimeout(timeout);
+                  logger.debug(`[DAEMON RUN] Session ${completedSession.happySessionId} fully spawned with webhook (tmux)`);
+                  resolve({
+                    type: 'success',
+                    sessionId: completedSession.happySessionId!
+                  });
+                }
               });
             });
           } else {
@@ -551,6 +611,7 @@ export async function startDaemon(): Promise<void> {
             startedBy: 'daemon',
             pid: happyProcess.pid,
             childProcess: happyProcess,
+            resumeTarget: options.resume,
             directoryCreated,
             message: directoryCreated ? `The path '${directory}' did not exist. We created a new folder and spawned a new session there.` : undefined
           };
@@ -588,13 +649,16 @@ export async function startDaemon(): Promise<void> {
             }, 15_000);
 
             // Register awaiter
-            pidToAwaiter.set(happyProcess.pid!, (completedSession) => {
-              clearTimeout(timeout);
-              logger.debug(`[DAEMON RUN] Session ${completedSession.happySessionId} fully spawned with webhook`);
-              resolve({
-                type: 'success',
-                sessionId: completedSession.happySessionId!
-              });
+            pidToAwaiter.set(happyProcess.pid!, {
+              timeout,
+              resolve: (completedSession) => {
+                clearTimeout(timeout);
+                logger.debug(`[DAEMON RUN] Session ${completedSession.happySessionId} fully spawned with webhook`);
+                resolve({
+                  type: 'success',
+                  sessionId: completedSession.happySessionId!
+                });
+              }
             });
           });
         }
