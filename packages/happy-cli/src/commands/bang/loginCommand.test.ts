@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { analyzePtyOutput, stripAnsiOnly, type PtyAction } from './authCreateCommand';
+import { analyzePtyOutput, stripAnsiOnly, type PtyAction } from './loginCommand';
 
 // Real OAuth URL from actual Claude Code login flow
 const REAL_OAUTH_URL = 'https://claude.ai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference+user%3Asessions%3Aclaude_code+user%3Amcp_servers+user%3Afile_upload&code_challenge=9wvqXasXp7FespyUXZRRUy7pzFl6NfFQR0bO-vCLBr4&code_challenge_method=S256&state=2ppMXLEutGbkjDlq3aZdYUJqF3-sU7RUX1xODTviPkE';

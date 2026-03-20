@@ -11,7 +11,7 @@ import {
     registerInteractiveSession,
     unregisterInteractiveSession,
 } from './interactiveSession';
-import { SEPARATOR, type BangCommandContext, type BangCommandResult } from './types';
+import { SEPARATOR, codeBlock, type BangCommandContext, type BangCommandResult } from './types';
 
 const PROFILE_NAME_REGEX = /^[a-zA-Z][a-zA-Z0-9_-]*$/;
 
@@ -566,7 +566,7 @@ export async function handleAuthCreateBangCommand(
         outputBuffer = '';
         if (text) {
             // Use sendAgentTextMessage for markdown rendering (code block with copy button)
-            ctx.client.sendCodexMessage({ type: 'message', message: '```\n' + text + '\n```' });
+            ctx.client.sendCodexMessage({ type: 'message', message: codeBlock(text) });
         }
     };
 
@@ -595,7 +595,7 @@ export async function handleAuthCreateBangCommand(
                 if (flushTimer) clearTimeout(flushTimer);
 
                 ctx.client.sendCodexMessage({ type: 'message', message:
-                    '🔗 请在浏览器中打开以下链接登录:\n\n```\n' + result.url + '\n```\n\n登录后将 OAuth Key 粘贴到下方发送'
+                    '🔗 请在浏览器中打开以下链接登录:\n\n' + codeBlock(result.url) + '\n\n登录后将 OAuth Key 粘贴到下方发送'
                 });
                 return;
 

@@ -3,7 +3,7 @@ import { mkdirSync, readFileSync, writeFileSync, rmSync, existsSync } from 'node
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomBytes } from 'node:crypto';
-import { registerProfile } from './authCreateCommand';
+import { registerProfile } from './loginCommand';
 
 /** Create a unique temp directory and set CCS_DIR to point to it. */
 function createTempCcsDir(): string {
