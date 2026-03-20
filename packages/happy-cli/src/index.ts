@@ -485,7 +485,8 @@ import { extractNoSandboxFlag } from './utils/sandboxFlags'
       await startDaemon()
       process.exit(0)
     } else if (daemonSubcommand === 'stop') {
-      await stopDaemon()
+      const killSessions = args.includes('--kill-sessions');
+      await stopDaemon(killSessions ? { stopSessions: true } : undefined)
       process.exit(0)
     } else if (daemonSubcommand === 'status') {
       // Show daemon-specific doctor output

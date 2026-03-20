@@ -84,8 +84,8 @@ export async function spawnDaemonSession(directory: string, sessionId?: string, 
   return result;
 }
 
-export async function stopDaemonHttp(): Promise<void> {
-  await daemonPost('/stop');
+export async function stopDaemonHttp(options?: { stopSessions?: boolean }): Promise<void> {
+  await daemonPost('/stop', options?.stopSessions ? { stopSessions: true } : undefined);
 }
 
 /**
@@ -193,7 +193,7 @@ export async function cleanupDaemonState(): Promise<void> {
   }
 }
 
-export async function stopDaemon() {
+export async function stopDaemon(options?: { stopSessions?: boolean }) {
   try {
     const state = await readDaemonState();
     if (!state) {
@@ -201,14 +201,14 @@ export async function stopDaemon() {
       return;
     }
 
-    logger.debug(`Stopping daemon with PID ${state.pid}`);
+    logger.debug(`Stopping daemon with PID ${state.pid}`, { stopSessions: options?.stopSessions });
 
     // Try HTTP graceful stop
     try {
-      await stopDaemonHttp();
+      await stopDaemonHttp(options);
 
-      // Wait for daemon to die
-      await waitForProcessDeath(state.pid, 2000);
+      // Wait for daemon to die (allow more time when stopping sessions)
+      await waitForProcessDeath(state.pid, options?.stopSessions ? 10000 : 2000);
       logger.debug('Daemon stopped gracefully via HTTP');
       return;
     } catch (error) {
