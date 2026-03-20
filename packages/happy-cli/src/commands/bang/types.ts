@@ -1,6 +1,11 @@
 /** Visual separator line for bang command output. */
 export const SEPARATOR = '━━━━━━━━━━━━━━━━━━';
 
+/** Wrap text in a markdown code block for codex messages (renders with copy button on mobile). */
+export function codeBlock(text: string): string {
+    return '```\n' + text + '\n```';
+}
+
 import { ApiSessionClient } from '@/api/apiSession';
 import { Session } from '@/claude/session';
 import { MessageQueue2 } from '@/utils/MessageQueue2';

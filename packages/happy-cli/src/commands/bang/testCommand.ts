@@ -9,7 +9,8 @@
  * - `!test <unknown>` — Show edge case outputs (unknown command, blocked, etc.)
  */
 
-import { SEPARATOR, type BangCommandContext, type BangCommandResult } from './types';
+import { SEPARATOR, codeBlock, type BangCommandContext, type BangCommandResult } from './types';
+import { formatUsage, type UsageData } from './usageCommand';
 
 function label(text: string): string {
     return `📌 ${text}`;
@@ -21,12 +22,23 @@ function testHelp(): string[] {
         '📖 快捷命令',
         SEPARATOR,
         '!usage (!u) → 查看 API 用量',
-        '!sessions (!s) → 查看可恢复会话',
-        '!resume (!re) → 恢复指定会话',
+        '!session (!s) → 查看可恢复会话',
+        '!resume (!r) → 恢复指定会话',
         '!help (!h) → 显示帮助',
         SEPARATOR,
     ];
 }
+
+/** Mock UsageData for visual testing — calls real formatUsage() to guarantee output consistency. */
+const mockUsageData: UsageData = {
+    five_hour: { utilization: 18, resets_at: new Date(Date.now() + 4 * 3600_000 + 14 * 60_000).toISOString() },
+    seven_day: { utilization: 42, resets_at: new Date(Date.now() + 5 * 86400_000 + 3 * 3600_000).toISOString() },
+    seven_day_oauth_apps: null,
+    seven_day_opus: { utilization: 65, resets_at: new Date(Date.now() + 5 * 86400_000).toISOString() },
+    seven_day_sonnet: { utilization: 12, resets_at: new Date(Date.now() + 5 * 86400_000).toISOString() },
+    seven_day_cowork: null,
+    extra_usage: null,
+};
 
 function testUsage(): string[] {
     return [
@@ -39,18 +51,18 @@ function testUsage(): string[] {
         '用法: !usage <账户名>',
 
         label('!usage 查询结果'),
-        '📊 用量 — hassel',
-        '⏱ 5 小时窗口\n[██░░░░░░░░] 18%\n4 小时 14 分钟 后重置',
-        '📅 7 天总量\n[████░░░░░░] 42%\n5 天 3 小时 后重置',
+        ...formatUsage(mockUsageData, 'hassel', Date.now()),
+
+        label('!usage 获取失败'),
     ];
 }
 
 function testSessions(): string[] {
     return [
-        label('!sessions 空结果'),
+        label('!session 空结果'),
         '📭 没有找到可恢复的会话',
 
-        label('!sessions 有结果'),
+        label('!session 有结果'),
         '📋 可恢复的会话 (3/5)',
         '▸ 今天 ━━━━━━━━━━━━━━━━━━━',
         '  [a1b2c3d4] happy · 5分钟前 — 帮我重构这个组件…',
@@ -66,11 +78,11 @@ function testResume(): string[] {
     return [
         label('!resume 无参数'),
         '用法: !resume <id前缀>',
-        '先使用 !sessions 查看可用会话',
+        '先使用 !session 查看可用会话',
 
         label('!resume 未找到'),
         '❌ 未找到匹配 "xyz" 的会话',
-        '使用 !sessions 查看可用会话',
+        '使用 !session 查看可用会话',
 
         label('!resume 多个匹配'),
         '⚠️ "a1b" 匹配了 2 个会话',
@@ -169,7 +181,7 @@ function testEdgeCases(): string[] {
         'ℹ️ !auth 仅在 Claude 会话中可用',
 
         label('控制台专属命令被阻止'),
-        'ℹ️ !sessions 仅在控制台中可用',
+        'ℹ️ !session 仅在控制台中可用',
 
         label('取消无操作'),
         'ℹ️ 当前没有进行中的操作',
@@ -179,18 +191,24 @@ function testEdgeCases(): string[] {
 const testSuites: Record<string, () => string[]> = {
     help: testHelp,
     usage: testUsage,
-    sessions: testSessions,
+    session: testSessions,
     resume: testResume,
     auth: testAuth,
     restart: testRestart,
     login: testLogin,
 };
 
+/** Send codex-style test messages directly via ctx.client (usage error simulation). */
+function sendCodexTests(ctx: BangCommandContext): void {
+    ctx.client.sendSessionEvent({ type: 'message', message: '❌ 获取用量失败' });
+    ctx.client.sendCodexMessage({ type: 'message', message: codeBlock('The operation was aborted due to timeout') });
+}
+
 export async function handleTestBangCommand(args: string, ctx: BangCommandContext): Promise<BangCommandResult> {
     const target = args.trim().toLowerCase();
 
     if (!target) {
-        // Run all tests
+        // Run all tests — need direct sending for codex messages at the end
         const messages: string[] = [];
         for (const [name, suite] of Object.entries(testSuites)) {
             messages.push(label(`── ${name} ──`));
@@ -198,7 +216,21 @@ export async function handleTestBangCommand(args: string, ctx: BangCommandContex
         }
         messages.push(label('── 边界情况 ──'));
         messages.push(...testEdgeCases());
-        return { message: messages, action: 'none' };
+        for (const msg of messages) {
+            ctx.client.sendSessionEvent({ type: 'message', message: msg });
+        }
+        sendCodexTests(ctx);
+        return { message: [], action: 'none' };
+    }
+
+    // Usage needs codex messages — send directly
+    if (target === 'usage') {
+        const messages = testUsage();
+        for (const msg of messages) {
+            ctx.client.sendSessionEvent({ type: 'message', message: msg });
+        }
+        sendCodexTests(ctx);
+        return { message: [], action: 'none' };
     }
 
     const suite = testSuites[target];

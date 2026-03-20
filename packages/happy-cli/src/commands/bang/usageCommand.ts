@@ -4,12 +4,12 @@ import { homedir } from 'node:os';
 import { ProxyAgent, fetch as undiciFetch } from 'undici';
 import { logger } from '@/ui/logger';
 import { getCurrentCcsProfile, readCcsProfiles, getInstancePath } from './ccsProfiles';
-import { SEPARATOR, type BangCommandContext, type BangCommandResult } from './types';
+import { SEPARATOR, codeBlock, type BangCommandContext, type BangCommandResult } from './types';
 
 const USAGE_API_URL = 'https://api.anthropic.com/api/oauth/usage';
 const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 
-interface UsageData {
+export interface UsageData {
     five_hour: { utilization: number; resets_at: string } | null;
     seven_day: { utilization: number; resets_at: string } | null;
     seven_day_oauth_apps: { utilization: number; resets_at: string } | null;
@@ -171,8 +171,9 @@ function formatResetTime(resetsAt: string): string {
  * Build a usage bar visualization.
  */
 function usageBar(utilization: number): string {
-    const clamped = Math.max(0, Math.min(10, Math.round(utilization / 10)));
-    const bar = '█'.repeat(clamped) + '░'.repeat(10 - clamped);
+    const total = 15;
+    const filled = Math.max(0, Math.min(total, Math.round(utilization / 100 * total)));
+    const bar = '█'.repeat(filled) + '░'.repeat(total - filled);
     return `[${bar}] ${utilization.toFixed(0)}%`;
 }
 
@@ -196,7 +197,7 @@ export function getCachedUsageSummary(cacheKey: string): string | null {
 /**
  * Format the usage data into a readable, centered message.
  */
-function formatUsage(data: UsageData, profileLabel: string, cachedAt: number): string[] {
+export function formatUsage(data: UsageData, profileLabel: string, cachedAt: number): string[] {
     const messages: string[] = [`📊 用量 — ${profileLabel}`];
 
     // 5-hour window
@@ -369,17 +370,18 @@ export async function handleUsageBangCommand(args: string, ctx: BangCommandConte
             }
         }
 
-        // Return stale cache if available
+        // Return stale cache if available, with error detail as codex message
         if (cached) {
-            return {
-                message: formatUsage(cached.data, profileLabel, cached.fetchedAt) + '\n\n⚠️ 无法获取最新数据: ' + errorMsg,
-                action: 'none',
-            };
+            const messages = [...formatUsage(cached.data, profileLabel, cached.fetchedAt), '⚠️ 无法获取最新数据'];
+            for (const msg of messages) {
+                ctx.client.sendSessionEvent({ type: 'message', message: msg });
+            }
+            ctx.client.sendCodexMessage({ type: 'message', message: codeBlock(errorMsg) });
+            return { message: [], action: 'none' };
         }
 
-        return {
-            message: `❌ 获取用量失败: ${errorMsg}`,
-            action: 'none',
-        };
+        ctx.client.sendSessionEvent({ type: 'message', message: '❌ 获取用量失败' });
+        ctx.client.sendCodexMessage({ type: 'message', message: codeBlock(errorMsg) });
+        return { message: [], action: 'none' };
     }
 }
