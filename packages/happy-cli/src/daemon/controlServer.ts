@@ -161,9 +161,17 @@ export function startDaemonControlServer({
             directory: result.directory
           };
         
+        case 'superseded':
+          // Session was killed because a newer resume for the same Claude session
+          // was requested. Return 200 so the caller doesn't show an error.
+          return {
+            success: true,
+            approvedNewDirectoryCreation: true
+          };
+
         case 'error':
           reply.code(500);
-          return { 
+          return {
             success: false,
             error: result.errorMessage
           };

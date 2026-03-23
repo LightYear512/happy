@@ -170,6 +170,7 @@ export async function startDaemon(): Promise<void> {
     // Session spawning awaiter system
     interface SessionAwaiter {
       resolve: (session: TrackedSession) => void;
+      cancel: () => void;
       timeout: ReturnType<typeof setTimeout>;
     }
     const pidToAwaiter = new Map<number, SessionAwaiter>();
@@ -407,15 +408,11 @@ export async function startDaemon(): Promise<void> {
             } catch {
               // Process may have already exited, ignore
             }
-            // Cancel pending webhook awaiter and its timeout so the first caller
-            // gets an immediate result instead of hanging for 15s
+            // Cancel pending webhook awaiter: resolve immediately as error
+            // so the first caller's HTTP request doesn't hang
             const pendingAwaiter = pidToAwaiter.get(pid);
             if (pendingAwaiter) {
-              clearTimeout(pendingAwaiter.timeout);
-              // Resolve with the killed session — caller gets a "success" with whatever
-              // happySessionId was available (may be undefined if webhook never arrived,
-              // which means the HTTP response will show the session was superseded)
-              pendingAwaiter.resolve(session);
+              pendingAwaiter.cancel();
               pidToAwaiter.delete(pid);
               logger.debug(`[DAEMON RUN] Cancelled pending awaiter for superseded PID ${pid}`);
             }
@@ -534,6 +531,10 @@ export async function startDaemon(): Promise<void> {
                     type: 'success',
                     sessionId: completedSession.happySessionId!
                   });
+                },
+                cancel: () => {
+                  clearTimeout(timeout);
+                  resolve({ type: 'superseded' });
                 }
               });
             });
@@ -658,6 +659,10 @@ export async function startDaemon(): Promise<void> {
                   type: 'success',
                   sessionId: completedSession.happySessionId!
                 });
+              },
+              cancel: () => {
+                clearTimeout(timeout);
+                resolve({ type: 'superseded' });
               }
             });
           });

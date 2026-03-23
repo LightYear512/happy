@@ -146,7 +146,8 @@ export interface SpawnSessionOptions {
 export type SpawnSessionResult =
     | { type: 'success'; sessionId: string }
     | { type: 'requestToApproveDirectoryCreation'; directory: string }
-    | { type: 'error'; errorMessage: string };
+    | { type: 'error'; errorMessage: string }
+    | { type: 'superseded' };
 
 /**
  * Register all RPC handlers with the session

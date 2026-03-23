@@ -120,6 +120,10 @@ export class ApiMachineClient {
                     logger.debug(`[API MACHINE] Requesting directory creation approval for: ${result.directory}`);
                     return { type: 'requestToApproveDirectoryCreation', directory: result.directory };
 
+                case 'superseded':
+                    logger.debug(`[API MACHINE] Session superseded by a newer resume`);
+                    return { type: 'success', sessionId: 'superseded' };
+
                 case 'error':
                     throw new Error(result.errorMessage);
             }
