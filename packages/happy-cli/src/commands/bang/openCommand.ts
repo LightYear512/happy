@@ -7,28 +7,27 @@
 
 import { logger } from '@/ui/logger';
 import { spawnDaemonSession } from '@/daemon/controlClient';
-import { scanClaudeSessions } from './sessionCommand';
+import { scanClaudeSessions, formatAllSessionsListing } from './sessionCommand';
 import type { BangCommandContext, BangCommandResult } from './types';
 
 /**
  * Handle the `!open` bang command.
  *
  * - `!open <id-prefix>` — Open a session matching the prefix
- * - `!open` (no args) — Show usage hint and suggest `!session`
+ * - `!open` (no args) — Show all recent sessions with quick-open buttons
  */
 export async function handleOpenBangCommand(args: string, ctx: BangCommandContext): Promise<BangCommandResult> {
     const prefix = args.trim().toLowerCase();
 
-    if (!prefix) {
-        return {
-            message: ['💡 用法: !open <id前缀>', '使用 !session 浏览项目目录和会话'],
-            action: 'none',
-            suggestions: ['!session'],
-        };
-    }
-
-    // Scan all sessions (only when we actually need them)
+    // Scan all sessions
     const sessions = await scanClaudeSessions();
+
+    if (!prefix) {
+        if (sessions.length === 0) {
+            return { message: '📭 没有找到可恢复的会话', action: 'none' };
+        }
+        return formatAllSessionsListing(sessions);
+    }
 
     const matches = sessions.filter(s => s.sessionId.toLowerCase().startsWith(prefix));
 

@@ -352,6 +352,44 @@ function formatDirectoryListing(sessions: ClaudeSessionInfo[]): BangCommandResul
 }
 
 /**
+ * Format a full session listing (no filter). Used by `!open` no-args.
+ */
+export function formatAllSessionsListing(sessions: ClaudeSessionInfo[]): BangCommandResult {
+    const displayed = sessions.slice(0, MAX_DISPLAY);
+    const countLabel = `${displayed.length}/${sessions.length}`;
+
+    const messages: string[] = [`📋 可恢复的会话 (${countLabel})`];
+
+    let currentGroup = '';
+
+    for (const s of displayed) {
+        const group = timeGroupLabel(s.mtime);
+        if (group !== currentGroup) {
+            currentGroup = group;
+            messages.push(`▸ ${group} ${BAR.repeat(GROUP_BAR_LEN)}`);
+        }
+
+        const shortId = s.sessionId.slice(0, SHORT_ID_LEN);
+        const time = relativeTime(s.mtime);
+        const dir = s.cwd ? shortenPath(s.cwd) : s.projectDir;
+        const cleanMsg = s.preview ? s.preview.replace(/\n/g, ' ').trim() : '';
+        const msg = cleanMsg.slice(0, 35);
+        const msgSuffix = cleanMsg.length > 35 ? '…' : '';
+
+        const sessionLine = msg
+            ? `  [${shortId}] ${dir} · ${time} — ${msg}${msgSuffix}`
+            : `  [${shortId}] ${dir} · ${time}`;
+        messages.push(sessionLine);
+    }
+
+    messages.push('');
+    messages.push('💡 !open <id前缀>');
+
+    const suggestions = displayed.slice(0, 5).map(s => `!open ${s.sessionId.slice(0, SHORT_ID_LEN)}`);
+    return { message: messages, action: 'none', suggestions };
+}
+
+/**
  * Format a session listing filtered by directory.
  */
 function formatSessionListing(sessions: ClaudeSessionInfo[], rawFilter: string): BangCommandResult {
