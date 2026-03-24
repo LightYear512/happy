@@ -9,24 +9,41 @@ import { SEPARATOR, type BangCommandContext, type BangCommandResult } from './ty
 /**
  * Handle the `!auth` bang command.
  *
+ * In normal sessions:
  * - `!auth` — List available CCS profiles with current active indicator
  * - `!auth <name>` — Switch current session to the specified profile
+ *
+ * In console:
+ * - `!auth` — List available CCS profiles
  * - `!auth all <name>` — Switch all sessions on this machine to the specified profile
  */
 export async function handleAuthBangCommand(args: string, ctx: BangCommandContext): Promise<BangCommandResult> {
     const trimmed = args.trim();
 
     if (!trimmed) {
-        return listProfiles();
+        return listProfiles(!!ctx.isConsoleSession);
     }
 
     // Check for "all" prefix: !auth all [<profile>]
     if (trimmed.toLowerCase() === 'all' || trimmed.toLowerCase().startsWith('all ')) {
+        if (!ctx.isConsoleSession) {
+            return {
+                message: ['❌ !auth all 仅在控制台中可用'],
+                action: 'none',
+            };
+        }
         const profileName = trimmed.slice(3).trim();
         if (!profileName) {
-            return listProfiles();
+            return listProfiles(true);
         }
         return switchAllProfiles(profileName);
+    }
+
+    if (ctx.isConsoleSession) {
+        return {
+            message: ['❌ 控制台中请使用 !auth all <name> 切换所有会话'],
+            action: 'none',
+        };
     }
 
     return switchProfile(trimmed);
@@ -96,7 +113,7 @@ function getProfileStatus(profile: CcsProfileInfo): string {
     return '';
 }
 
-function listProfiles(): BangCommandResult {
+function listProfiles(isConsole: boolean): BangCommandResult {
     const { profiles } = readCcsProfiles();
     const currentProfile = getCurrentCcsProfile();
     const currentProfileInfo = currentProfile
@@ -149,7 +166,9 @@ function listProfiles(): BangCommandResult {
             messages.push(status ? `○ ${profile.name} ${status}` : `○ ${profile.name}`);
         }
         messages.push(SEPARATOR);
-        messages.push('!auth <名称> → 当前会话\n!auth all <名称> → 全部会话');
+        messages.push(isConsole
+            ? '!auth all <名称> → 切换全部会话'
+            : '!auth <名称> → 切换当前会话');
     } else if (currentGroup) {
         messages.push(SEPARATOR);
         messages.push('本组无其他账号。');
@@ -266,42 +285,22 @@ function switchAllProfiles(profileName: string): BangCommandResult {
         return { message: `❌ 配置 "${profileName}" 未初始化。`, action: 'none' };
     }
 
-    const alreadyCurrent = target.name === currentProfile;
     const groupName = currentProfileInfo?.contextGroup || 'default';
 
-    // Switch current session (skip if already on target)
-    if (!alreadyCurrent) {
-        process.env.CLAUDE_CONFIG_DIR = target.instancePath;
-        logger.debug(`[!auth] Switched CLAUDE_CONFIG_DIR to: ${target.instancePath}`);
-    }
-
-    // Always write global file so other sessions pick up the change
+    // Write global file so other sessions pick up the change via fs.watch
     try {
         writeFileSync(configuration.activeProfileFile, profileName, 'utf-8');
         logger.debug(`[!auth] Wrote global active profile: ${profileName}`);
     } catch (err) {
         logger.debug('[!auth] Failed to write global profile file:', err);
-        if (alreadyCurrent) {
-            return {
-                message: [`✅ 当前已是 "${profileName}"`, '广播到其他会话失败。'],
-                action: 'none',
-            };
-        }
         return {
-            message: [`⚠️ 已在本地切换到 "${profileName}"`, '广播到其他会话失败。'],
-            action: 'restart-session',
+            message: ['❌ 广播配置切换失败'],
+            action: 'none',
         };
     }
 
     const usageLine = getCachedUsageSummary(target.instancePath);
-
-    if (alreadyCurrent) {
-        const messages = [`✅ 当前已是 "${profileName}"`, `已广播到组 "${groupName}"`];
-        if (usageLine) messages.push(usageLine);
-        return { message: messages, action: 'none' };
-    }
-
-    const messages = [`✅ 已切换到 "${profileName}"`, `组 "${groupName}" 中的所有会话`];
+    const messages = [`✅ 已广播切换到 "${profileName}"`, `组 "${groupName}" 中的所有会话`];
     if (usageLine) messages.push(usageLine);
-    return { message: messages, action: 'restart-session' };
+    return { message: messages, action: 'none' };
 }
