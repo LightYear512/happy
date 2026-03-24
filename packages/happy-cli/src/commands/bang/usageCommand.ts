@@ -131,7 +131,7 @@ async function fetchUsage(token: string, debugLabel: string): Promise<UsageData>
         const text = await response.text().catch(() => '');
         logger.debug(`[!usage] API error: ${response.status} ${text}`);
         if (response.status === 401) {
-            throw new Error('OAuth 令牌已过期或无效，请重新认证 CCS 配置。');
+            throw new Error('OAuth 令牌已过期或无效。请在 cc 中发送任意消息以刷新令牌后重试，若仍失败请 !login 重新登录。');
         }
         if (response.status === 403) {
             throw new Error('请求被拒绝 (403)，请尝试重新登录。');
