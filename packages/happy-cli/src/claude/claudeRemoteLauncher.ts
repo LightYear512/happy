@@ -367,6 +367,15 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 logger.debug(`[remote]: Continuing existing session: ${session.sessionId}`);
             }
 
+            // Send restart confirmation if pending
+            if (session.pendingRestartConfirmation) {
+                session.pendingRestartConfirmation = false;
+                const profile = getCurrentCcsProfile();
+                const profileLabel = profile ? ` (${profile})` : '';
+                session.client.sendSessionEvent({ type: 'message', message: `✅ 会话已重启${profileLabel}` });
+                logger.debug(`[remote]: Restart confirmation sent${profileLabel}`);
+            }
+
             previousSessionId = session.sessionId;
             const controller = new AbortController();
             abortController = controller;

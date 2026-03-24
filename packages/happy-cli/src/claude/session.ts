@@ -25,6 +25,8 @@ export class Session {
     sessionId: string | null;
     mode: 'local' | 'remote' = 'local';
     thinking: boolean = false;
+    /** Set when !restart is triggered; cleared after confirmation is sent */
+    pendingRestartConfirmation: boolean = false;
     
     /** Callbacks to be notified when session ID is found/changed */
     private sessionFoundCallbacks: ((sessionId: string) => void)[] = [];

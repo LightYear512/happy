@@ -469,6 +469,9 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 // Restart SDK session so new env vars (e.g. CLAUDE_CONFIG_DIR) take effect
                 if (result.action === 'restart-session') {
                     logger.debug('[start] Bang command requested session restart');
+                    if (currentSession) {
+                        currentSession.pendingRestartConfirmation = true;
+                    }
                     messageQueue.interrupt();
                 }
             }).catch(async error => {
