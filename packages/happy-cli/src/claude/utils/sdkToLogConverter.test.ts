@@ -158,7 +158,7 @@ describe('SDKToLogConverter', () => {
     })
 
     describe('Result messages', () => {
-        it('should not convert result messages', () => {
+        it('should convert result messages with text content to assistant messages', () => {
             const sdkMessage: SDKResultMessage = {
                 type: 'result',
                 subtype: 'success',
@@ -177,7 +177,11 @@ describe('SDKToLogConverter', () => {
 
             const logMessage = converter.convert(sdkMessage)
 
-            expect(logMessage).toBeNull()
+            // Result messages with text content are forwarded as assistant messages
+            // so the mobile app can display them
+            expect(logMessage).toBeTruthy()
+            expect(logMessage?.type).toBe('assistant')
+            expect((logMessage as any).message.content[0].text).toBe('Task completed')
         })
 
         it('should not convert error results', () => {

@@ -58,9 +58,9 @@ describe('buildConsoleWelcome', () => {
         // These are consoleOnly or shared commands
         expect(joined).toContain('!usage');
         expect(joined).toContain('!login');
-        // sessionOnly commands should NOT appear
-        expect(joined).not.toContain('!restart');
-        expect(joined).not.toContain('!auth');
+        // sessionOnly commands should NOT appear (use regex to avoid matching !restart-all, !auth-all)
+        expect(joined).not.toMatch(/!restart(?!-all)/);
+        expect(joined).not.toMatch(/!auth(?!-all)/);
     });
 
     it('does not include hidden commands', () => {

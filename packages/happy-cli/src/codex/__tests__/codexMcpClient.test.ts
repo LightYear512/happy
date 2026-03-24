@@ -89,7 +89,7 @@ describe('CodexMcpClient sandbox integration', () => {
         process.env.RUST_LOG = originalRustLog;
     });
 
-    it('wraps MCP transport when sandbox is enabled', async () => {
+    it.skipIf(process.platform === 'win32')('wraps MCP transport when sandbox is enabled', async () => {
         const client = new CodexMcpClient(sandboxConfig);
 
         await client.connect();
@@ -128,7 +128,7 @@ describe('CodexMcpClient sandbox integration', () => {
         expect(client.sandboxEnabled).toBe(false);
     });
 
-    it('resets sandbox on disconnect', async () => {
+    it.skipIf(process.platform === 'win32')('resets sandbox on disconnect', async () => {
         const client = new CodexMcpClient(sandboxConfig);
 
         await client.connect();

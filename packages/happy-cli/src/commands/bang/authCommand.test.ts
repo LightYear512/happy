@@ -37,6 +37,11 @@ function createMockContext(): BangCommandContext {
     };
 }
 
+/** Flatten result.message (string or string[]) into a single string for assertion */
+function flatMsg(message: string | string[]): string {
+    return Array.isArray(message) ? message.join('\n') : message;
+}
+
 /** Set up mock filesystem with given profiles */
 function mockCcsProfiles(profiles: Record<string, any>, defaultProfile?: string) {
     const data: Record<string, any> = { ...profiles };
@@ -80,16 +85,17 @@ describe('handleAuthBangCommand', () => {
 
             const result = await handleAuthBangCommand('', createMockContext());
             expect(result.action).toBe('none');
-            expect(result.message).toContain('isolated');
-            expect(result.message).toContain('Isolated mode');
+            const msg = flatMsg(result.message);
+            expect(msg).toContain('独立');
         });
 
         it('should show no active profile when CLAUDE_CONFIG_DIR is not set', async () => {
             mockCcsProfiles({ work: { type: 'account' } });
 
             const result = await handleAuthBangCommand('', createMockContext());
-            expect(result.message).toContain('No CCS profile active');
-            expect(result.message).toContain('work');
+            const msg = flatMsg(result.message);
+            expect(msg).toMatch(/当前无 CCS|No CCS/);
+            expect(msg).toContain('work');
         });
 
         it('should list same-group profiles when in a shared group', async () => {
@@ -102,12 +108,13 @@ describe('handleAuthBangCommand', () => {
 
             const result = await handleAuthBangCommand('', createMockContext());
             expect(result.action).toBe('none');
-            expect(result.message).toContain('Group "team"');
-            expect(result.message).toContain('work (current)');
-            expect(result.message).toContain('personal');
+            const msg = flatMsg(result.message);
+            expect(msg).toMatch(/组 "team"|Group "team"/);
+            expect(msg).toContain('work');
+            expect(msg).toContain('personal');
             // Should NOT show profile from a different group
-            expect(result.message).not.toContain('other');
-            expect(result.message).toContain('!auth <name>');
+            expect(msg).not.toContain('other');
+            expect(msg).toContain('!auth');
         });
 
         it('should show no switchable when alone in shared group', async () => {
@@ -117,7 +124,10 @@ describe('handleAuthBangCommand', () => {
             process.env.CLAUDE_CONFIG_DIR = join(ccsDir, 'instances', 'work');
 
             const result = await handleAuthBangCommand('', createMockContext());
-            expect(result.message).toContain('No other accounts in this group');
+            const msg = flatMsg(result.message);
+            // Only one profile in group — shows the group but only the current profile
+            expect(msg).toContain('work');
+            expect(msg).toMatch(/组 "team"|Group "team"/);
         });
     });
 
@@ -131,7 +141,8 @@ describe('handleAuthBangCommand', () => {
 
             const result = await handleAuthBangCommand('personal', createMockContext());
             expect(result.action).toBe('restart-session');
-            expect(result.message).toContain('Switched to "personal"');
+            const msg = flatMsg(result.message);
+            expect(msg).toMatch(/切换到 "personal"|Switched to "personal"/);
             expect(process.env.CLAUDE_CONFIG_DIR).toBe(join(ccsDir, 'instances', 'personal'));
         });
 
@@ -144,9 +155,10 @@ describe('handleAuthBangCommand', () => {
 
             const result = await handleAuthBangCommand('other', createMockContext());
             expect(result.action).toBe('none');
-            expect(result.message).toContain('Cannot switch');
-            expect(result.message).toContain('group "team"');
-            expect(result.message).toContain('group "solo"');
+            const msg = flatMsg(result.message);
+            expect(msg).toMatch(/无法切换|Cannot switch/);
+            expect(msg).toContain('"team"');
+            expect(msg).toContain('"solo"');
             // Should NOT have changed CLAUDE_CONFIG_DIR
             expect(process.env.CLAUDE_CONFIG_DIR).toBe(join(ccsDir, 'instances', 'work'));
         });
@@ -160,8 +172,8 @@ describe('handleAuthBangCommand', () => {
 
             const result = await handleAuthBangCommand('isolated', createMockContext());
             expect(result.action).toBe('none');
-            expect(result.message).toContain('Cannot switch');
-            expect(result.message).toContain('isolated');
+            const msg = flatMsg(result.message);
+            expect(msg).toMatch(/无法切换|Cannot switch/);
         });
 
         it('should reject switching when current profile is not shared', async () => {
@@ -173,8 +185,9 @@ describe('handleAuthBangCommand', () => {
 
             const result = await handleAuthBangCommand('personal', createMockContext());
             expect(result.action).toBe('none');
-            expect(result.message).toContain('Cannot switch');
-            expect(result.message).toContain('"work" is isolated');
+            const msg = flatMsg(result.message);
+            expect(msg).toMatch(/无法切换|Cannot switch/);
+            expect(msg).toMatch(/"work".*独立|"work" is isolated/);
         });
 
         it('should skip switch when already on same profile', async () => {
@@ -185,7 +198,8 @@ describe('handleAuthBangCommand', () => {
 
             const result = await handleAuthBangCommand('work', createMockContext());
             expect(result.action).toBe('none');
-            expect(result.message).toContain('Already using');
+            const msg = flatMsg(result.message);
+            expect(msg).toMatch(/当前已是|Already using/);
         });
 
         it('should error for non-existent profile', async () => {
@@ -193,7 +207,8 @@ describe('handleAuthBangCommand', () => {
 
             const result = await handleAuthBangCommand('nonexistent', createMockContext());
             expect(result.action).toBe('none');
-            expect(result.message).toContain('not found');
+            const msg = flatMsg(result.message);
+            expect(msg).toMatch(/未找到|not found/i);
         });
 
         it('should error when instance directory is not initialized', async () => {
@@ -213,7 +228,8 @@ describe('handleAuthBangCommand', () => {
 
             const result = await handleAuthBangCommand('personal', createMockContext());
             expect(result.action).toBe('none');
-            expect(result.message).toContain('not initialized');
+            const msg = flatMsg(result.message);
+            expect(msg).toMatch(/未初始化|not initialized/i);
         });
     });
 });

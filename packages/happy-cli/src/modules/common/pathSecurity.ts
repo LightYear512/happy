@@ -1,4 +1,4 @@
-import { resolve } from 'path';
+import { resolve, sep } from 'path';
 
 export interface PathValidationResult {
     valid: boolean;
@@ -18,7 +18,7 @@ export function validatePath(targetPath: string, workingDirectory: string): Path
 
     // Check if the resolved target path starts with the working directory
     // This prevents access to files outside the working directory
-    if (!resolvedTarget.startsWith(resolvedWorkingDir + '/') && resolvedTarget !== resolvedWorkingDir) {
+    if (!resolvedTarget.startsWith(resolvedWorkingDir + sep) && resolvedTarget !== resolvedWorkingDir) {
         return {
             valid: false,
             error: `Access denied: Path '${targetPath}' is outside the working directory`
