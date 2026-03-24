@@ -9,21 +9,15 @@ import type { BangCommandContext, BangCommandResult } from './types';
  *
  * In normal sessions:
  * - `!restart` — Restart the current session (keep same account)
- *
- * In console:
- * - `!restart all` — Broadcast restart to all sessions on this machine
  */
 export async function handleRestartBangCommand(args: string, ctx: BangCommandContext): Promise<BangCommandResult> {
     const trimmed = args.trim().toLowerCase();
 
     if (ctx.isConsoleSession) {
-        // Console: only "all" is valid
-        if (trimmed === 'all') {
-            return restartAll();
-        }
         return {
-            message: ['用法: !restart all → 重启全部会话'],
+            message: ['ℹ️ 控制台中请使用 !restart-all 重启全部会话'],
             action: 'none',
+            suggestions: ['!restart-all'],
         };
     }
 
@@ -39,17 +33,19 @@ export async function handleRestartBangCommand(args: string, ctx: BangCommandCon
         return restartCurrent();
     }
 
-    if (trimmed === 'all') {
-        return {
-            message: ['❌ !restart all 仅在控制台中可用'],
-            action: 'none',
-        };
-    }
-
     return {
         message: ['用法: !restart → 重启当前会话'],
         action: 'none',
     };
+}
+
+/**
+ * Handle the `!restart-all` bang command (console only).
+ *
+ * Broadcast restart to all sessions on this machine.
+ */
+export async function handleRestartAllBangCommand(_args: string, _ctx: BangCommandContext): Promise<BangCommandResult> {
+    return restartAll();
 }
 
 /**

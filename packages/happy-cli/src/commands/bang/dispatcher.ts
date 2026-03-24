@@ -1,7 +1,7 @@
 import { logger } from '@/ui/logger';
-import { handleAuthBangCommand } from './authCommand';
+import { handleAuthBangCommand, handleAuthAllBangCommand } from './authCommand';
 import { handleAuthCreateBangCommand } from './loginCommand';
-import { handleRestartBangCommand } from './restartCommand';
+import { handleRestartBangCommand, handleRestartAllBangCommand } from './restartCommand';
 import { handleUsageBangCommand } from './usageCommand';
 import { handleSessionsBangCommand } from './sessionCommand';
 import { handleOpenBangCommand } from './openCommand';
@@ -17,21 +17,25 @@ export { hasActiveInteractiveSession, handleInteractiveInput } from './interacti
  * consoleOnly: only available in console sessions (not normal Claude sessions)
  */
 const commands: Record<string, { handler: BangCommandHandler; desc: string; loadingMsg?: string; sessionOnly?: boolean; consoleOnly?: boolean; hidden?: boolean }> = {
-    auth:     { handler: handleAuthBangCommand,     desc: '切换 CCS 账号', sessionOnly: true },
-    login:    { handler: handleAuthCreateBangCommand, desc: '登录新账号/重新登录旧账号', consoleOnly: true },
-    restart:  { handler: handleRestartBangCommand,  desc: '重启会话', sessionOnly: true },
-    usage:    { handler: handleUsageBangCommand,    desc: '查看 API 用量' },
-    session:  { handler: handleSessionsBangCommand, desc: '查看可恢复会话', loadingMsg: '⏳ 正在扫描会话...', consoleOnly: true },
-    open:     { handler: handleOpenBangCommand,      desc: '打开会话', loadingMsg: '⏳ 正在打开会话...', consoleOnly: true },
-    test:     { handler: handleTestBangCommand,     desc: '测试命令输出', consoleOnly: true, hidden: true },
+    'auth':        { handler: handleAuthBangCommand,        desc: '切换 CCS 账号', sessionOnly: true },
+    'auth-all':    { handler: handleAuthAllBangCommand,     desc: '切换全部会话账号', consoleOnly: true },
+    'login':       { handler: handleAuthCreateBangCommand,  desc: '登录新账号/重新登录旧账号', consoleOnly: true },
+    'restart':     { handler: handleRestartBangCommand,     desc: '重启会话', sessionOnly: true },
+    'restart-all': { handler: handleRestartAllBangCommand,  desc: '重启全部会话', consoleOnly: true },
+    'usage':       { handler: handleUsageBangCommand,       desc: '查看 API 用量' },
+    'session':     { handler: handleSessionsBangCommand,    desc: '查看可恢复会话', loadingMsg: '⏳ 正在扫描会话...', consoleOnly: true },
+    'open':        { handler: handleOpenBangCommand,        desc: '打开会话', loadingMsg: '⏳ 正在打开会话...', consoleOnly: true },
+    'test':        { handler: handleTestBangCommand,        desc: '测试命令输出', consoleOnly: true, hidden: true },
 };
 
 /** Short aliases for convenience on mobile keyboards. */
 const aliases: Record<string, string> = {
     a: 'auth',
+    aa: 'auth-all',
     l: 'login',
     o: 'open',
     r: 'restart',
+    ra: 'restart-all',
     u: 'usage',
     h: 'help',
     s: 'session',

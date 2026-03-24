@@ -293,7 +293,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         }
     }
 
-    // Set up fs.watch for global signals (!auth all, !restart all)
+    // Set up fs.watch for global signals (!auth-all, !restart-all)
     // Watches the happyHomeDir directory for changes to signal files.
     // When another session writes a signal file, we detect the change and act accordingly.
     let signalWatcher: FSWatcher | null = null;
@@ -310,7 +310,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     if (switched) {
                         const newProfile = getCurrentCcsProfile() || 'unknown';
                         logger.debug(`[remote]: Global profile change detected → "${newProfile}", interrupting session`);
-                        session.client.sendSessionEvent({ type: 'message', message: `🔄 Switched to "${newProfile}" (via !auth all)` });
+                        session.client.sendSessionEvent({ type: 'message', message: `🔄 Switched to "${newProfile}" (via !auth-all)` });
                         session.queue.interrupt();
                     }
                 }, 200);

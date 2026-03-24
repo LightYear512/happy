@@ -14,8 +14,7 @@ import { SEPARATOR, type BangCommandContext, type BangCommandResult } from './ty
  * - `!auth <name>` — Switch current session to the specified profile
  *
  * In console:
- * - `!auth` — List available CCS profiles
- * - `!auth all <name>` — Switch all sessions on this machine to the specified profile
+ * - `!auth` — List available CCS profiles (use !auth-all to switch all sessions)
  */
 export async function handleAuthBangCommand(args: string, ctx: BangCommandContext): Promise<BangCommandResult> {
     const trimmed = args.trim();
@@ -24,29 +23,31 @@ export async function handleAuthBangCommand(args: string, ctx: BangCommandContex
         return listProfiles(!!ctx.isConsoleSession);
     }
 
-    // Check for "all" prefix: !auth all [<profile>]
-    if (trimmed.toLowerCase() === 'all' || trimmed.toLowerCase().startsWith('all ')) {
-        if (!ctx.isConsoleSession) {
-            return {
-                message: ['❌ !auth all 仅在控制台中可用'],
-                action: 'none',
-            };
-        }
-        const profileName = trimmed.slice(3).trim();
-        if (!profileName) {
-            return listProfiles(true);
-        }
-        return switchAllProfiles(profileName);
-    }
-
     if (ctx.isConsoleSession) {
         return {
-            message: ['❌ 控制台中请使用 !auth all <name> 切换所有会话'],
+            message: ['❌ 控制台中请使用 !auth-all <name> 切换所有会话'],
             action: 'none',
+            suggestions: ['!auth-all'],
         };
     }
 
     return switchProfile(trimmed);
+}
+
+/**
+ * Handle the `!auth-all` bang command (console only).
+ *
+ * - `!auth-all` — List available CCS profiles
+ * - `!auth-all <name>` — Switch all sessions on this machine to the specified profile
+ */
+export async function handleAuthAllBangCommand(args: string, _ctx: BangCommandContext): Promise<BangCommandResult> {
+    const trimmed = args.trim();
+
+    if (!trimmed) {
+        return listProfiles(true);
+    }
+
+    return switchAllProfiles(trimmed);
 }
 
 /**
@@ -167,11 +168,11 @@ function listProfiles(isConsole: boolean): BangCommandResult {
         }
         messages.push(SEPARATOR);
         messages.push(isConsole
-            ? '!auth all <名称> → 切换全部会话'
+            ? '!auth-all <名称> → 切换全部会话'
             : '!auth <名称> → 切换当前会话');
 
         const suggestions = switchable.map(p =>
-            isConsole ? `!auth all ${p.name}` : `!auth ${p.name}`
+            isConsole ? `!auth-all ${p.name}` : `!auth ${p.name}`
         );
         return { message: messages, action: 'none', suggestions };
     } else if (currentGroup) {
