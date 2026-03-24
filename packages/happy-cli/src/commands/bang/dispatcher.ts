@@ -18,7 +18,7 @@ export { hasActiveInteractiveSession, handleInteractiveInput } from './interacti
  */
 const commands: Record<string, { handler: BangCommandHandler; desc: string; loadingMsg?: string; sessionOnly?: boolean; consoleOnly?: boolean; hidden?: boolean }> = {
     auth:     { handler: handleAuthBangCommand,     desc: '切换 CCS 账号', sessionOnly: true },
-    login:    { handler: handleAuthCreateBangCommand, desc: '登录新账号', consoleOnly: true },
+    login:    { handler: handleAuthCreateBangCommand, desc: '登录新账号/重新登录旧账号', consoleOnly: true },
     restart:  { handler: handleRestartBangCommand,  desc: '重启会话', sessionOnly: true },
     usage:    { handler: handleUsageBangCommand,    desc: '查看 API 用量' },
     session:  { handler: handleSessionsBangCommand, desc: '查看可恢复会话', loadingMsg: '⏳ 正在扫描会话...', consoleOnly: true },
