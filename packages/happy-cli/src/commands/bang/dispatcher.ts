@@ -23,7 +23,7 @@ const commands: Record<string, { handler: BangCommandHandler; desc: string; load
     'restart':     { handler: handleRestartBangCommand,     desc: '重启会话', sessionOnly: true },
     'restart-all': { handler: handleRestartAllBangCommand,  desc: '重启全部会话', consoleOnly: true },
     'usage':       { handler: handleUsageBangCommand,       desc: '查看 API 用量' },
-    'session':     { handler: handleSessionsBangCommand,    desc: '查看可恢复会话', loadingMsg: '⏳ 正在扫描会话...', consoleOnly: true },
+    'session':     { handler: handleSessionsBangCommand,    desc: '浏览项目目录和会话', loadingMsg: '⏳ 正在扫描会话...', consoleOnly: true },
     'open':        { handler: handleOpenBangCommand,        desc: '打开会话', loadingMsg: '⏳ 正在打开会话...', consoleOnly: true },
     'test':        { handler: handleTestBangCommand,        desc: '测试命令输出', consoleOnly: true, hidden: true },
 };

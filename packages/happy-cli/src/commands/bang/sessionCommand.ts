@@ -237,33 +237,144 @@ function shortenPath(fullPath: string): string {
     return normalised.split('/').pop() || normalised;
 }
 
+/** Max directories to display in directory listing */
+const MAX_DIR_DISPLAY = 10;
+
 /**
  * Handle the `!session` bang command.
+ *
+ * - `!session` (no args) — List recent project directories
+ * - `!session <dir>` — List sessions under matching directory
  */
 export async function handleSessionsBangCommand(args: string, ctx: BangCommandContext): Promise<BangCommandResult> {
     const rawFilter = args.trim() || null;
-    const dirFilter = rawFilter
-        ? rawFilter.replace(/^~/, homedir()).replace(/\\/g, '/').toLowerCase()
-        : null;
-    let sessions = await scanClaudeSessions();
 
-    if (dirFilter) {
-        sessions = sessions.filter(s => {
-            const dir = s.cwd ? s.cwd.replace(/\\/g, '/') : s.projectDir;
-            return dir.toLowerCase().includes(dirFilter);
-        });
-    }
+    const sessions = await scanClaudeSessions();
 
     if (sessions.length === 0) {
-        const hint = dirFilter ? ` (筛选: "${dirFilter}")` : '';
-        return { message: `📭 没有找到可恢复的会话${hint}`, action: 'none' };
+        return { message: '📭 没有找到可恢复的会话', action: 'none' };
     }
 
-    const displayed = sessions.slice(0, MAX_DISPLAY);
-    const countLabel = `${Math.min(sessions.length, MAX_DISPLAY)}/${sessions.length}`;
-    const filterLabel = rawFilter ? ` · 筛选: "${rawFilter}"` : '';
+    // No args: show directory listing
+    if (!rawFilter) {
+        return formatDirectoryListing(sessions);
+    }
+
+    // With args: filter sessions by directory
+    return formatSessionListing(sessions, rawFilter);
+}
+
+/**
+ * Build a display-name map for a list of paths, disambiguating duplicates.
+ * When two paths share the same last segment (e.g. `E:/a/happy` and `D:/b/happy`),
+ * uses `parent/name` for both. Returns a Map<cwd, displayName>.
+ */
+function buildDisplayNames(paths: string[]): Map<string, string> {
+    const result = new Map<string, string>();
+    // Group by short name to detect collisions
+    const shortToFulls = new Map<string, string[]>();
+
+    for (const p of paths) {
+        const short = shortenPath(p);
+        const group = shortToFulls.get(short) || [];
+        group.push(p);
+        shortToFulls.set(short, group);
+    }
+
+    for (const [short, fulls] of shortToFulls) {
+        if (fulls.length === 1) {
+            result.set(fulls[0], short);
+        } else {
+            // Disambiguate: use parent/name
+            for (const p of fulls) {
+                const parts = p.replace(/\\/g, '/').replace(/\/+$/, '').split('/');
+                const display = parts.length >= 2
+                    ? `${parts[parts.length - 2]}/${parts[parts.length - 1]}`
+                    : short;
+                result.set(p, display);
+            }
+        }
+    }
+
+    return result;
+}
+
+/**
+ * Format a directory listing grouped by recency.
+ * Each directory shows session count and most recent activity time.
+ */
+function formatDirectoryListing(sessions: ClaudeSessionInfo[]): BangCommandResult {
+    // Group sessions by normalised cwd
+    const dirMap = new Map<string, { cwd: string; count: number; mtime: Date }>();
+
+    for (const s of sessions) {
+        const cwd = s.cwd || s.projectDir;
+        const key = cwd.replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '');
+
+        const existing = dirMap.get(key);
+        if (existing) {
+            existing.count++;
+            if (s.mtime > existing.mtime) existing.mtime = s.mtime;
+        } else {
+            dirMap.set(key, { cwd, count: 1, mtime: s.mtime });
+        }
+    }
+
+    // Sort by most recent first
+    const dirs = [...dirMap.values()].sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+    const displayed = dirs.slice(0, MAX_DIR_DISPLAY);
+    const countLabel = `${displayed.length}/${dirs.length}`;
+
+    // Build disambiguated display names
+    const displayNames = buildDisplayNames(displayed.map(d => d.cwd));
+
+    const messages: string[] = [`📂 最近项目目录 (${countLabel})`];
+
+    let currentGroup = '';
+
+    for (const d of displayed) {
+        const group = timeGroupLabel(d.mtime);
+        if (group !== currentGroup) {
+            currentGroup = group;
+            messages.push(`▸ ${group} ${BAR.repeat(GROUP_BAR_LEN)}`);
+        }
+
+        const time = relativeTime(d.mtime);
+        const name = displayNames.get(d.cwd) || shortenPath(d.cwd);
+        messages.push(`  ${name} · ${d.count}个会话 · ${time}`);
+    }
+
+    messages.push('');
+    messages.push('💡 !session <目录> 查看该目录下的会话');
+
+    const suggestions = displayed.slice(0, 5).map(d => `!session ${displayNames.get(d.cwd) || shortenPath(d.cwd)}`);
+    return { message: messages, action: 'none', suggestions };
+}
+
+/**
+ * Format a session listing filtered by directory.
+ */
+function formatSessionListing(sessions: ClaudeSessionInfo[], rawFilter: string): BangCommandResult {
+    const dirFilter = rawFilter.replace(/^~/, homedir()).replace(/\\/g, '/').toLowerCase();
+
+    const filtered = sessions.filter(s => {
+        const dir = s.cwd ? s.cwd.replace(/\\/g, '/') : s.projectDir;
+        return dir.toLowerCase().includes(dirFilter);
+    });
+
+    if (filtered.length === 0) {
+        return {
+            message: `📭 没有找到匹配 "${rawFilter}" 的会话`,
+            action: 'none',
+            suggestions: ['!session'],
+        };
+    }
+
+    const displayed = filtered.slice(0, MAX_DISPLAY);
+    const countLabel = `${displayed.length}/${filtered.length}`;
+
     const messages: string[] = [
-        `📋 可恢复的会话 (${countLabel}${filterLabel})`,
+        `📋 可恢复的会话 (${countLabel} · 目录: "${rawFilter}")`,
     ];
 
     let currentGroup = '';
@@ -277,14 +388,13 @@ export async function handleSessionsBangCommand(args: string, ctx: BangCommandCo
 
         const shortId = s.sessionId.slice(0, SHORT_ID_LEN);
         const time = relativeTime(s.mtime);
-        const dir = s.cwd ? shortenPath(s.cwd) : s.projectDir;
         const cleanMsg = s.preview ? s.preview.replace(/\n/g, ' ').trim() : '';
         const msg = cleanMsg.slice(0, 35);
         const msgSuffix = cleanMsg.length > 35 ? '…' : '';
 
         const sessionLine = msg
-            ? `  [${shortId}] ${dir} · ${time} — ${msg}${msgSuffix}`
-            : `  [${shortId}] ${dir} · ${time}`;
+            ? `  [${shortId}] ${time} — ${msg}${msgSuffix}`
+            : `  [${shortId}] ${time}`;
         messages.push(sessionLine);
     }
 
