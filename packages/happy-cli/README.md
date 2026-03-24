@@ -6,8 +6,26 @@ Free. Open source. Code anywhere.
 
 ## Installation
 
+### 1. Install CCS (Claude Code Supervisor)
+
+Happy uses [CCS](https://www.npmjs.com/package/@kaitranntt/ccs) to manage Claude Code authentication profiles. Install it first:
+
 ```bash
-npm install -g happy-coder
+npm install -g @kaitranntt/ccs
+```
+
+### 2. Create a CCS account
+
+```bash
+ccs auth create <profile-name>
+```
+
+This creates a profile at `~/.ccs/instances/<profile-name>/` with OAuth credentials. You can create multiple profiles (e.g. `work`, `personal`) and switch between them.
+
+### 3. Install Happy CLI
+
+```bash
+npm install -g https://github.com/LightYear512/happy/releases/download/v0.13.0-compat.2/happy-coder-0.13.0-compat.2.tgz
 ```
 
 ## Run From Source
@@ -66,6 +84,7 @@ happy connect gemini
 - `happy notify` – Send a push notification to your devices
 - `happy daemon` – Manage background service
 - `happy doctor` – System diagnostics & troubleshooting
+- `happy logout` – Log out and clear stored credentials
 
 ### Connect Subcommands
 
@@ -111,6 +130,7 @@ happy sandbox disable    # Disable sandboxing
 
 - `-m, --model <model>` - Claude model to use (default: sonnet)
 - `-p, --permission-mode <mode>` - Permission mode: auto, default, or plan
+- `--profile <name>` - Use a specific CCS profile (overrides default)
 - `--claude-env KEY=VALUE` - Set environment variable for Claude Code
 - `--claude-arg ARG` - Pass additional argument to Claude CLI
 
@@ -119,6 +139,33 @@ happy sandbox disable    # Disable sandboxing
 - `-h, --help` - Show help
 - `-v, --version` - Show version
 - `--no-sandbox` - Disable sandbox for the current Claude/Codex run
+
+## Console Commands (Bang Commands)
+
+When inside a Happy session, you can use bang commands to manage sessions and profiles:
+
+### Session Management
+
+- `!open` – List all sessions with quick-resume buttons
+- `!open <id>` – Resume a specific session (aliases: `!o`, `!r`)
+- `!session` – List recent project directories
+- `!session <dir>` – List sessions under a specific directory
+
+### Profile Switching
+
+- `!auth` – List available CCS profiles for the current session
+- `!auth <name>` – Switch current session to a different CCS profile
+
+### Console-Only Commands
+
+These commands are only available in the console (multi-session) mode:
+
+- `!auth-all <name>` – Switch all sessions on this machine to a CCS profile
+- `!restart-all` – Restart all sessions
+
+## MCP Server
+
+Happy CLI includes an MCP (Model Context Protocol) server (`happy-mcp`) that acts as a bridge for AI agents (Codex, Gemini, ACP). It is invoked automatically when running `happy codex`, `happy gemini`, or `happy acp` — no manual setup required.
 
 ## Environment Variables
 
@@ -172,6 +219,7 @@ Interested in contributing? See [CONTRIBUTING.md](CONTRIBUTING.md) for developme
 ## Requirements
 
 - Node.js >= 20.0.0
+- [CCS](https://www.npmjs.com/package/@kaitranntt/ccs) installed with at least one profile (`ccs auth create <name>`)
 
 ### For Claude
 
