@@ -113,7 +113,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     });
 
     let metadata: Metadata = {
-        path: workingDirectory,
+        path: isConsoleSession ? os.homedir() : workingDirectory,
         host: os.hostname(),
         version: packageJson.version,
         os: os.platform(),

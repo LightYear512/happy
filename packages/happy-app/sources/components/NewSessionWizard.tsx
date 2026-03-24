@@ -14,6 +14,7 @@ import { AIBackendProfile, validateProfileForAgent, getProfileEnvironmentVariabl
 import { Modal } from '@/modal';
 import { sync } from '@/sync/sync';
 import { profileSyncService } from '@/sync/profileSync';
+import { isConsolePath } from '@/utils/pathUtils';
 
 const stylesheet = StyleSheet.create((theme) => ({
     container: {
@@ -831,7 +832,7 @@ export function NewSessionWizard({ onComplete, onCancel, initialPrompt = '' }: N
 
         // First, add paths from recentMachinePaths (these are the most recent)
         recentMachinePaths.forEach(entry => {
-            if (entry.machineId === selectedMachineId && !pathSet.has(entry.path)) {
+            if (entry.machineId === selectedMachineId && !pathSet.has(entry.path) && !isConsolePath(entry.path)) {
                 paths.push(entry.path);
                 pathSet.add(entry.path);
             }
@@ -845,7 +846,7 @@ export function NewSessionWizard({ onComplete, onCancel, initialPrompt = '' }: N
                 if (typeof item === 'string') return; // Skip section headers
 
                 const session = item as any;
-                if (session.metadata?.machineId === selectedMachineId && session.metadata?.path) {
+                if (session.metadata?.machineId === selectedMachineId && session.metadata?.path && !isConsolePath(session.metadata.path)) {
                     const path = session.metadata.path;
                     if (!pathSet.has(path)) {
                         pathSet.add(path);

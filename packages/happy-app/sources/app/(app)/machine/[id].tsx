@@ -13,6 +13,7 @@ import { Modal } from '@/modal';
 import { formatPathRelativeToHome, getSessionName, getSessionSubtitle } from '@/utils/sessionUtils';
 import { isMachineOnline } from '@/utils/machineUtils';
 import { sync } from '@/sync/sync';
+import { isConsolePath } from '@/utils/pathUtils';
 import { useUnistyles, StyleSheet } from 'react-native-unistyles';
 import { t } from '@/text';
 import { useNavigateToSession } from '@/hooks/useNavigateToSession';
@@ -84,7 +85,9 @@ export default function MachineDetailScreen() {
         return sessions.filter(item => {
             if (typeof item === 'string') return false;
             const session = item as Session;
-            return session.metadata?.machineId === machineId;
+            const isConsole = session.metadata?.path && isConsolePath(session.metadata.path);
+            if (isConsole) console.log('[machine/id] FILTERED console session:', session.metadata?.path);
+            return session.metadata?.machineId === machineId && !isConsole;
         }) as Session[];
     }, [sessions, machineId]);
 
@@ -97,7 +100,7 @@ export default function MachineDetailScreen() {
     const recentPaths = useMemo(() => {
         const paths = new Set<string>();
         machineSessions.forEach(session => {
-            if (session.metadata?.path) {
+            if (session.metadata?.path && !isConsolePath(session.metadata.path)) {
                 paths.add(session.metadata.path);
             }
         });

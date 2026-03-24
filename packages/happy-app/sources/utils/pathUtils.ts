@@ -73,3 +73,9 @@ export function resolveAbsolutePath(path: string, homeDir?: string): string {
     // Handle ~username paths (not supported, return original)
     return path;
 }
+
+/**
+ * Check if a path is the internal console directory (e.g. ~/.happy/console, ~/.happy-dev/console).
+ * Console sessions use this directory as their cwd and should be hidden from user-facing path lists.
+ */
+export const isConsolePath = (path: string): boolean => /[/\\]\.happy[^/\\]*[/\\]console$/.test(path);

@@ -35,7 +35,7 @@ import { randomUUID } from 'expo-crypto';
 import { useCLIDetection } from '@/hooks/useCLIDetection';
 import { useEnvironmentVariables, resolveEnvVarSubstitution, extractEnvVarReferences } from '@/hooks/useEnvironmentVariables';
 import { formatPathRelativeToHome } from '@/utils/sessionUtils';
-import { resolveAbsolutePath } from '@/utils/pathUtils';
+import { resolveAbsolutePath, isConsolePath } from '@/utils/pathUtils';
 import { MultiTextInput } from '@/components/MultiTextInput';
 import { isMachineOnline } from '@/utils/machineUtils';
 import { StatusDot } from '@/components/StatusDot';
@@ -70,9 +70,6 @@ const transformProfileToEnvironmentVars = (profile: AIBackendProfile, agentType:
     // including custom environmentVariables array and provider-specific configs
     return getProfileEnvironmentVariables(profile);
 };
-
-// Check if a path is the internal console directory (e.g. ~/.happy/console, ~/.happy-dev/console)
-const isConsolePath = (path: string): boolean => /[/\\]\.happy[^/\\]*[/\\]console$/.test(path);
 
 // Helper function to get the most recent path for a machine
 // Returns the path from the most recently CREATED session for this machine

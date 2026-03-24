@@ -11,6 +11,7 @@ import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 import { layout } from '@/components/layout';
 import { t } from '@/text';
 import { MultiTextInput, MultiTextInputHandle } from '@/components/MultiTextInput';
+import { isConsolePath } from '@/utils/pathUtils';
 
 const stylesheet = StyleSheet.create((theme) => ({
     container: {
@@ -85,7 +86,9 @@ export default function PathPickerScreen() {
 
         // First, add paths from recentMachinePaths (these are the most recent)
         recentMachinePaths.forEach(entry => {
-            if (entry.machineId === params.machineId && !pathSet.has(entry.path)) {
+            const filtered = isConsolePath(entry.path);
+            if (filtered) console.log('[pick/path] FILTERED recentMachinePath:', entry.path);
+            if (entry.machineId === params.machineId && !pathSet.has(entry.path) && !filtered) {
                 paths.push(entry.path);
                 pathSet.add(entry.path);
             }
@@ -100,6 +103,10 @@ export default function PathPickerScreen() {
 
                 const session = item as any;
                 if (session.metadata?.machineId === params.machineId && session.metadata?.path) {
+                    const filtered = isConsolePath(session.metadata.path);
+                    if (filtered) console.log('[pick/path] FILTERED session path:', session.metadata.path);
+                    if (filtered) return;
+                }
                     const path = session.metadata.path;
                     if (!pathSet.has(path)) {
                         pathSet.add(path);
