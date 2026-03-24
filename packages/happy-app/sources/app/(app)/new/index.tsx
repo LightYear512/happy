@@ -71,6 +71,9 @@ const transformProfileToEnvironmentVars = (profile: AIBackendProfile, agentType:
     return getProfileEnvironmentVariables(profile);
 };
 
+// Check if a path is the internal console directory (e.g. ~/.happy/console, ~/.happy-dev/console)
+const isConsolePath = (path: string): boolean => /[/\\]\.happy[^/\\]*[/\\]console$/.test(path);
+
 // Helper function to get the most recent path for a machine
 // Returns the path from the most recently CREATED session for this machine
 const getRecentPathForMachine = (machineId: string | null, recentPaths: Array<{ machineId: string; path: string }>): string => {
@@ -84,7 +87,7 @@ const getRecentPathForMachine = (machineId: string | null, recentPaths: Array<{ 
     const pathsWithTimestamps: Array<{ path: string; timestamp: number }> = [];
 
     sessions.forEach(session => {
-        if (session.metadata?.machineId === machineId && session.metadata?.path) {
+        if (session.metadata?.machineId === machineId && session.metadata?.path && !isConsolePath(session.metadata.path)) {
             pathsWithTimestamps.push({
                 path: session.metadata.path,
                 timestamp: session.createdAt // Use createdAt, not updatedAt
@@ -622,7 +625,7 @@ function NewSessionWizard() {
 
         // First, add paths from recentMachinePaths (these are the most recent)
         recentMachinePaths.forEach(entry => {
-            if (entry.machineId === selectedMachineId && !pathSet.has(entry.path)) {
+            if (entry.machineId === selectedMachineId && !pathSet.has(entry.path) && !isConsolePath(entry.path)) {
                 paths.push(entry.path);
                 pathSet.add(entry.path);
             }
@@ -636,7 +639,7 @@ function NewSessionWizard() {
                 if (typeof item === 'string') return; // Skip section headers
 
                 const session = item as any;
-                if (session.metadata?.machineId === selectedMachineId && session.metadata?.path) {
+                if (session.metadata?.machineId === selectedMachineId && session.metadata?.path && !isConsolePath(session.metadata.path)) {
                     const path = session.metadata.path;
                     if (!pathSet.has(path)) {
                         pathSet.add(path);
