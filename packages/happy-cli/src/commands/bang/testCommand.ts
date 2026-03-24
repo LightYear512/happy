@@ -204,11 +204,24 @@ function sendCodexTests(ctx: BangCommandContext): void {
     ctx.client.sendCodexMessage({ type: 'message', message: codeBlock('The operation was aborted due to timeout') });
 }
 
+/** Send options test — clickable quick-reply buttons rendered via MarkdownView <options> block. */
+function sendOptionsTest(ctx: BangCommandContext): void {
+    ctx.client.sendCodexMessage({ type: 'message', message: '🧪 可点击选项测试\n\n选择一个操作:\n<options>\n<option>!usage</option>\n<option>!session</option>\n<option>!auth</option>\n<option>!help</option>\n</options>' });
+    ctx.client.sendCodexMessage({ type: 'message', message: '🧪 内联选项测试\n\n快速切换账户:\n<options>\n<option>!auth hassel</option>\n<option>!auth chulai</option>\n</options>' });
+}
+
 export async function handleTestBangCommand(args: string, ctx: BangCommandContext): Promise<BangCommandResult> {
     const target = args.trim().toLowerCase();
 
     if (!target) {
-        // Run all tests — need direct sending for codex messages at the end
+        const allNames = [...Object.keys(testSuites), 'options', 'edge'];
+        const optionsBlock = '<options>\n' + allNames.map(n => `<option>!test ${n}</option>`).join('\n') + '\n</options>';
+        ctx.client.sendCodexMessage({ type: 'message', message: `🧪 测试用例\n\n选择要运行的测试:\n${optionsBlock}` });
+        return { message: [], action: 'none' };
+    }
+
+    // Run all tests
+    if (target === 'all') {
         const messages: string[] = [];
         for (const [name, suite] of Object.entries(testSuites)) {
             messages.push(label(`── ${name} ──`));
@@ -220,6 +233,13 @@ export async function handleTestBangCommand(args: string, ctx: BangCommandContex
             ctx.client.sendSessionEvent({ type: 'message', message: msg });
         }
         sendCodexTests(ctx);
+        sendOptionsTest(ctx);
+        return { message: [], action: 'none' };
+    }
+
+    // Options test — needs direct sending via codex messages
+    if (target === 'options') {
+        sendOptionsTest(ctx);
         return { message: [], action: 'none' };
     }
 
@@ -231,6 +251,10 @@ export async function handleTestBangCommand(args: string, ctx: BangCommandContex
         }
         sendCodexTests(ctx);
         return { message: [], action: 'none' };
+    }
+
+    if (target === 'edge') {
+        return { message: testEdgeCases(), action: 'none' };
     }
 
     const suite = testSuites[target];

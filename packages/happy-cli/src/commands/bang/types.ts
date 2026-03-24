@@ -33,6 +33,8 @@ export interface BangCommandResult {
     message: string | string[];
     /** Action to perform after sending the message */
     action: 'none' | 'restart-session';
+    /** Optional clickable quick-reply suggestions rendered as <options> buttons after the message. */
+    suggestions?: string[];
 }
 
 export type BangCommandHandler = (args: string, ctx: BangCommandContext) => Promise<BangCommandResult>;

@@ -464,6 +464,11 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                     session.sendSessionEvent({ type: 'message', message: msg });
                     await new Promise(resolve => setTimeout(resolve, 50));
                 }
+                if (result.suggestions && result.suggestions.length > 0) {
+                    const options = result.suggestions.map(s => `<option>${s}</option>`).join('\n');
+                    session.sendCodexMessage({ type: 'message', message: `<options>\n${options}\n</options>` });
+                    await new Promise(resolve => setTimeout(resolve, 50));
+                }
                 session.sendSessionEvent({ type: 'ready' });
 
                 // Restart SDK session so new env vars (e.g. CLAUDE_CONFIG_DIR) take effect
