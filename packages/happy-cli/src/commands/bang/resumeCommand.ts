@@ -32,20 +32,23 @@ export async function handleResumeBangCommand(args: string, ctx: BangCommandCont
         return {
             message: [`❌ 未找到匹配 "${prefix}" 的会话`, '使用 !session 查看可用会话'],
             action: 'none',
+            suggestions: ['!session'],
         };
     }
 
     if (matches.length > 1) {
         const messages = [`⚠️ "${prefix}" 匹配了 ${matches.length} 个会话`];
         const matchLines: string[] = [];
+        const suggestions: string[] = [];
         for (const s of matches.slice(0, 5)) {
             const shortId = s.sessionId.slice(0, 12);
             const dir = s.cwd ? s.cwd.split(/[/\\]/).pop() || s.projectDir : s.projectDir;
             matchLines.push(`${shortId} | ${dir}`);
+            suggestions.push(`!resume ${shortId}`);
         }
         messages.push(matchLines.join('\n'));
         messages.push('请提供更长的前缀');
-        return { message: messages, action: 'none' };
+        return { message: messages, action: 'none', suggestions };
     }
 
     const session = matches[0];

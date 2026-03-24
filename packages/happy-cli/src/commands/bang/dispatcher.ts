@@ -102,7 +102,7 @@ function buildHelp(isConsole: boolean): BangCommandResult {
  * Build the console welcome message listing key commands.
  * Derived from the commands registry to stay in sync with !help.
  */
-export function buildConsoleWelcome(): string[] {
+export function buildConsoleWelcome(): BangCommandResult {
     const messages: string[] = [
         '🖥️ 控制台',
         '常驻轻量级会话，仅处理 ! 指令\n不启动 Claude，不消耗 API 额度',
@@ -122,7 +122,12 @@ export function buildConsoleWelcome(): string[] {
 
     messages.push(SEPARATOR);
     messages.push('普通消息不会被处理，请使用 ! 开头的命令');
-    return messages;
+
+    return {
+        message: messages,
+        action: 'none',
+        suggestions: consoleCommands.map(([name]) => `!${name}`),
+    };
 }
 
 /**
@@ -153,6 +158,7 @@ export async function executeBangCommand(text: string, ctx: BangCommandContext):
         return {
             message: [`❌ 未知命令 "!${name}"`, '输入 !help 查看可用命令。'],
             action: 'none',
+            suggestions: ['!help'],
         };
     }
 

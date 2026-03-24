@@ -230,8 +230,14 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 leafUuid: randomUUID(),
             });
             // Welcome message derived from command registry (SSoT: dispatcher.ts)
-            for (const msg of buildConsoleWelcome()) {
+            const welcome = buildConsoleWelcome();
+            const welcomeMessages = Array.isArray(welcome.message) ? welcome.message : [welcome.message];
+            for (const msg of welcomeMessages) {
                 session.sendSessionEvent({ type: 'message', message: msg });
+            }
+            if (welcome.suggestions && welcome.suggestions.length > 0) {
+                const options = welcome.suggestions.map(s => `<option>${s}</option>`).join('\n');
+                session.sendCodexMessage({ type: 'message', message: `<options>\n${options}\n</options>` });
             }
             session.sendSessionEvent({ type: 'ready' });
         }).catch(error => {

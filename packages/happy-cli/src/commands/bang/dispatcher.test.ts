@@ -31,8 +31,9 @@ describe('isBangCommand', () => {
 });
 
 describe('buildConsoleWelcome', () => {
-    it('returns an array of strings', () => {
-        const messages = buildConsoleWelcome();
+    it('returns a BangCommandResult with message array', () => {
+        const result = buildConsoleWelcome();
+        const messages = result.message as string[];
         expect(Array.isArray(messages)).toBe(true);
         expect(messages.length).toBeGreaterThan(0);
         for (const msg of messages) {
@@ -41,18 +42,18 @@ describe('buildConsoleWelcome', () => {
     });
 
     it('starts with console title', () => {
-        const messages = buildConsoleWelcome();
+        const messages = buildConsoleWelcome().message as string[];
         expect(messages[0]).toContain('控制台');
     });
 
     it('contains separator lines', () => {
-        const messages = buildConsoleWelcome();
+        const messages = buildConsoleWelcome().message as string[];
         const separators = messages.filter(m => m === SEPARATOR);
         expect(separators.length).toBeGreaterThanOrEqual(2);
     });
 
     it('includes commands available in console (not sessionOnly)', () => {
-        const messages = buildConsoleWelcome();
+        const messages = buildConsoleWelcome().message as string[];
         const joined = messages.join('\n');
         // These are consoleOnly or shared commands
         expect(joined).toContain('!usage');
@@ -63,14 +64,21 @@ describe('buildConsoleWelcome', () => {
     });
 
     it('does not include hidden commands', () => {
-        const messages = buildConsoleWelcome();
+        const messages = buildConsoleWelcome().message as string[];
         const joined = messages.join('\n');
         expect(joined).not.toContain('!test');
     });
 
     it('ends with non-bang message warning', () => {
-        const messages = buildConsoleWelcome();
+        const messages = buildConsoleWelcome().message as string[];
         expect(messages[messages.length - 1]).toContain('普通消息');
+    });
+
+    it('includes suggestion buttons for console commands', () => {
+        const result = buildConsoleWelcome();
+        expect(result.suggestions).toBeDefined();
+        expect(result.suggestions!.length).toBeGreaterThan(0);
+        expect(result.suggestions!.every(s => s.startsWith('!'))).toBe(true);
     });
 });
 

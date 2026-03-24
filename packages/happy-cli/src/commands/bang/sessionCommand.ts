@@ -291,5 +291,6 @@ export async function handleSessionsBangCommand(args: string, ctx: BangCommandCo
     messages.push('');
     messages.push('💡 !resume <id前缀>');
 
-    return { message: messages, action: 'none' };
+    const suggestions = displayed.slice(0, 5).map(s => `!resume ${s.sessionId.slice(0, SHORT_ID_LEN)}`);
+    return { message: messages, action: 'none', suggestions };
 }

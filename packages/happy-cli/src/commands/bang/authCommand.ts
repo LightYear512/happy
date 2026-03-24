@@ -169,6 +169,11 @@ function listProfiles(isConsole: boolean): BangCommandResult {
         messages.push(isConsole
             ? '!auth all <名称> → 切换全部会话'
             : '!auth <名称> → 切换当前会话');
+
+        const suggestions = switchable.map(p =>
+            isConsole ? `!auth all ${p.name}` : `!auth ${p.name}`
+        );
+        return { message: messages, action: 'none', suggestions };
     } else if (currentGroup) {
         messages.push(SEPARATOR);
         messages.push('本组无其他账号。');
