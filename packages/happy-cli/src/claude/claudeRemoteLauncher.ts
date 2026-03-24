@@ -324,6 +324,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             const currentProfile = getCurrentCcsProfile() || 'unknown';
                             logger.debug(`[remote]: Restart signal detected (${currentProfile}), interrupting session`);
                             session.client.sendSessionEvent({ type: 'message', message: `🔄 正在重启会话 (${currentProfile})` });
+                            session.pendingRestartConfirmation = true;
                             session.queue.interrupt();
                         }
                     } catch {

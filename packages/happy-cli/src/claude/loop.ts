@@ -68,6 +68,8 @@ export async function loop(opts: LoopOptions): Promise<number> {
     opts.onSessionReady?.(session)
 
     let mode: 'local' | 'remote' = opts.startingMode ?? 'local';
+    // Set initial mode on session directly (no side effects like keepAlive/callback)
+    session.mode = mode;
     while (true) {
         logger.debug(`[loop] Iteration with mode: ${mode}`);
 

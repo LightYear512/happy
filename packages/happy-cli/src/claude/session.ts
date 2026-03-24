@@ -170,6 +170,11 @@ export class Session {
                     if (!nextArg.startsWith('-') && nextArg.includes('-')) {
                         // Skip both --resume and the UUID
                         i++; // Skip the UUID
+                        // Preserve session ID so restart can resume the same session
+                        if (!this.sessionId) {
+                            this.sessionId = nextArg;
+                            logger.debug(`[Session] Preserved session ID from --resume: ${nextArg}`);
+                        }
                         logger.debug(`[Session] Consumed --resume flag with session ID: ${nextArg}`);
                     } else {
                         // Just --resume without UUID
