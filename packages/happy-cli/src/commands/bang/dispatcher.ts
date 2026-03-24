@@ -91,7 +91,11 @@ function buildHelp(isConsole: boolean): BangCommandResult {
 
     messages.push(SEPARATOR);
 
-    return { message: messages, action: 'none' };
+    return {
+        message: messages,
+        action: 'none',
+        suggestions: allCommands.filter(([name]) => name !== 'help').map(([name]) => `!${name}`),
+    };
 }
 
 /**

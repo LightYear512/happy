@@ -295,7 +295,11 @@ export async function handleUsageBangCommand(args: string, ctx: BangCommandConte
         }
         messages.push(SEPARATOR);
         messages.push('用法: !usage <账户名>');
-        return { message: messages, action: 'none' };
+        return {
+            message: messages,
+            action: 'none',
+            suggestions: accountProfiles.slice(0, 3).map(p => `!usage ${p.name}`),
+        };
     }
 
     // Resolve token: by profile name arg, or current session
