@@ -226,7 +226,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             // Set session title via summary message (same mechanism as change_title MCP tool)
             session.sendClaudeSessionMessage({
                 type: 'summary',
-                summary: '🖥️ 控制台',
+                summary: `🖥️ 控制台 - ${os.hostname()}`,
                 leafUuid: randomUUID(),
             });
             // Welcome message derived from command registry (SSoT: dispatcher.ts)
