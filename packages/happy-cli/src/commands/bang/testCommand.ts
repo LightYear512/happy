@@ -23,7 +23,7 @@ function testHelp(): string[] {
         SEPARATOR,
         '!usage (!u) → 查看 API 用量',
         '!session (!s) → 查看可恢复会话',
-        '!resume (!r) → 恢复指定会话',
+        '!open (!o) → 打开会话',
         '!help (!h) → 显示帮助',
         SEPARATOR,
     ];
@@ -70,27 +70,27 @@ function testSessions(): string[] {
         '▸ 3天前 ━━━━━━━━━━━━━━━━━━━',
         '  [i9j0k1l2] project — fix the login bug',
         '',
-        '💡 !resume <id前缀>',
+        '💡 !open <id前缀>',
     ];
 }
 
-function testResume(): string[] {
+function testOpen(): string[] {
     return [
-        label('!resume 无参数'),
-        '用法: !resume <id前缀>',
+        label('!open 无参数'),
+        '用法: !open <id前缀>',
         '先使用 !session 查看可用会话',
 
-        label('!resume 未找到'),
+        label('!open 未找到'),
         '❌ 未找到匹配 "xyz" 的会话',
         '使用 !session 查看可用会话',
 
-        label('!resume 多个匹配'),
+        label('!open 多个匹配'),
         '⚠️ "a1b" 匹配了 2 个会话',
         'a1b2c3d4e5f6 | happy\na1b9x8y7z6w5 | workspace',
         '请提供更长的前缀',
 
-        label('!resume 成功'),
-        '✅ 正在恢复会话 a1b2c3d4',
+        label('!open 成功'),
+        '✅ 正在打开会话 a1b2c3d4',
         '目录: happy',
         '新会话将在 App 中出现',
     ];
@@ -192,7 +192,7 @@ const testSuites: Record<string, () => string[]> = {
     help: testHelp,
     usage: testUsage,
     session: testSessions,
-    resume: testResume,
+    open: testOpen,
     auth: testAuth,
     restart: testRestart,
     login: testLogin,

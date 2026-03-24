@@ -1,5 +1,5 @@
 /**
- * `!resume <id>` bang command — Resume a Claude Code session.
+ * `!open <id>` bang command — Open a Claude Code session.
  *
  * Finds the matching Claude session by ID prefix, determines its working
  * directory, and asks the daemon to spawn a new happy-cli session with --resume.
@@ -11,12 +11,12 @@ import { scanClaudeSessions, handleSessionsBangCommand } from './sessionCommand'
 import type { BangCommandContext, BangCommandResult } from './types';
 
 /**
- * Handle the `!resume` bang command.
+ * Handle the `!open` bang command.
  *
- * - `!resume <id-prefix>` — Resume a session matching the prefix
- * - `!resume` (no args) — Show session list with quick-resume buttons
+ * - `!open <id-prefix>` — Open a session matching the prefix
+ * - `!open` (no args) — Show session list with quick-open buttons
  */
-export async function handleResumeBangCommand(args: string, ctx: BangCommandContext): Promise<BangCommandResult> {
+export async function handleOpenBangCommand(args: string, ctx: BangCommandContext): Promise<BangCommandResult> {
     const prefix = args.trim().toLowerCase();
 
     // Scan all sessions
@@ -44,7 +44,7 @@ export async function handleResumeBangCommand(args: string, ctx: BangCommandCont
             const shortId = s.sessionId.slice(0, 12);
             const dir = s.cwd ? s.cwd.split(/[/\\]/).pop() || s.projectDir : s.projectDir;
             matchLines.push(`${shortId} | ${dir}`);
-            suggestions.push(`!resume ${shortId}`);
+            suggestions.push(`!open ${shortId}`);
         }
         messages.push(matchLines.join('\n'));
         messages.push('请提供更长的前缀');
@@ -55,14 +55,14 @@ export async function handleResumeBangCommand(args: string, ctx: BangCommandCont
 
     if (!session.cwd) {
         return {
-            message: [`❌ 无法恢复会话 ${session.sessionId.slice(0, 8)}`, '会话文件中缺少工作目录信息'],
+            message: [`❌ 无法打开会话 ${session.sessionId.slice(0, 8)}`, '会话文件中缺少工作目录信息'],
             action: 'none',
         };
     }
 
     const directory = session.cwd;
 
-    logger.debug(`[!resume] Resuming session ${session.sessionId} in ${directory}`);
+    logger.debug(`[!open] Resuming session ${session.sessionId} in ${directory}`);
 
     // Ask daemon to spawn a new session with --resume
     try {
@@ -70,7 +70,7 @@ export async function handleResumeBangCommand(args: string, ctx: BangCommandCont
 
         if (result.error) {
             return {
-                message: ['❌ 恢复会话失败', result.error],
+                message: ['❌ 打开会话失败', result.error],
                 action: 'none',
             };
         }
@@ -78,13 +78,13 @@ export async function handleResumeBangCommand(args: string, ctx: BangCommandCont
         const shortId = session.sessionId.slice(0, 8);
         const dir = directory.split(/[/\\]/).pop() || directory;
         return {
-            message: [`✅ 正在恢复会话 ${shortId}`, `目录: ${dir}`, '新会话将在 App 中出现'],
+            message: [`✅ 正在打开会话 ${shortId}`, `目录: ${dir}`, '新会话将在 App 中出现'],
             action: 'none',
         };
     } catch (error) {
-        logger.debug('[!resume] Failed to spawn session:', error);
+        logger.debug('[!open] Failed to spawn session:', error);
         return {
-            message: ['❌ 恢复会话失败', error instanceof Error ? error.message : 'Unknown error'],
+            message: ['❌ 打开会话失败', error instanceof Error ? error.message : 'Unknown error'],
             action: 'none',
         };
     }

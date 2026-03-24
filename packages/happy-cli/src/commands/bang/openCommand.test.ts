@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { join } from 'node:path';
 import { mkdtemp, writeFile, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { handleResumeBangCommand } from './resumeCommand';
+import { handleOpenBangCommand } from './openCommand';
 import type { BangCommandContext } from './types';
 
 /**
@@ -35,7 +35,7 @@ function createMockContext(): BangCommandContext {
     };
 }
 
-describe('handleResumeBangCommand', () => {
+describe('handleOpenBangCommand', () => {
     let tempDir: string;
     const originalEnv = process.env.CLAUDE_CONFIG_DIR;
 
@@ -50,13 +50,13 @@ describe('handleResumeBangCommand', () => {
     });
 
     it('shows usage when no args provided', async () => {
-        const result = await handleResumeBangCommand('', createMockContext());
+        const result = await handleOpenBangCommand('', createMockContext());
         expect(result.action).toBe('none');
         expect(result.message).toContain('!session');
     });
 
     it('returns error when no session matches prefix', async () => {
-        const result = await handleResumeBangCommand('zzzzz', createMockContext());
+        const result = await handleOpenBangCommand('zzzzz', createMockContext());
         expect(result.action).toBe('none');
         expect(result.message).toContain('未找到');
     });
@@ -65,7 +65,7 @@ describe('handleResumeBangCommand', () => {
         await createTestSession(tempDir, 'C--test', 'aabbccdd-1111-2222-3333-444444444444', '/test', 'msg1');
         await createTestSession(tempDir, 'C--test', 'aabbccdd-2222-3333-4444-555555555555', '/test', 'msg2');
 
-        const result = await handleResumeBangCommand('aabbccdd', createMockContext());
+        const result = await handleOpenBangCommand('aabbccdd', createMockContext());
         expect(result.action).toBe('none');
         expect(result.message).toContain('匹配了 2 个');
     });
@@ -80,7 +80,7 @@ describe('handleResumeBangCommand', () => {
             'utf-8'
         );
 
-        const result = await handleResumeBangCommand('aabbccdd-3333', createMockContext());
+        const result = await handleOpenBangCommand('aabbccdd-3333', createMockContext());
         expect(result.action).toBe('none');
         expect(result.message).toContain('缺少工作目录');
     });
@@ -90,9 +90,9 @@ describe('handleResumeBangCommand', () => {
 
         // This will fail to connect to daemon (not running in test), but we verify
         // the command correctly identifies the session and attempts spawn
-        const result = await handleResumeBangCommand('ffaabbcc', createMockContext());
+        const result = await handleOpenBangCommand('ffaabbcc', createMockContext());
         expect(result.action).toBe('none');
         // Either success message or daemon connection error — both prove the session was matched
-        expect(result.message).toMatch(/恢复会话|恢复会话失败/);
+        expect(result.message).toMatch(/打开会话|打开会话失败/);
     });
 });

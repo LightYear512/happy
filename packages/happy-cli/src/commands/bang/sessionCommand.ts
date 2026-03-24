@@ -2,7 +2,7 @@
  * `!session` bang command — List recoverable Claude Code sessions.
  *
  * Scans ~/.claude/projects/ for JSONL session files and displays them
- * sorted by recency, with short IDs for use with `!resume`.
+ * sorted by recency, with short IDs for use with `!open`.
  */
 
 import { homedir } from 'node:os';
@@ -289,8 +289,8 @@ export async function handleSessionsBangCommand(args: string, ctx: BangCommandCo
     }
 
     messages.push('');
-    messages.push('💡 !resume <id前缀>');
+    messages.push('💡 !open <id前缀>');
 
-    const suggestions = displayed.slice(0, 5).map(s => `!resume ${s.sessionId.slice(0, SHORT_ID_LEN)}`);
+    const suggestions = displayed.slice(0, 5).map(s => `!open ${s.sessionId.slice(0, SHORT_ID_LEN)}`);
     return { message: messages, action: 'none', suggestions };
 }
