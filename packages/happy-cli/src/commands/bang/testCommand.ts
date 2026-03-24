@@ -101,13 +101,21 @@ function testOpen(): string[] {
 
 function testAuth(): string[] {
     return [
-        label('!auth 列表（有组）'),
+        label('!auth 列表（会话内，有组）'),
         '📋 组 "default"',
         SEPARATOR,
         '● hassel',
         '○ chulai',
         SEPARATOR,
         '!auth <名称> → 切换当前会话',
+
+        label('!auth-all 列表（控制台，有组）'),
+        '📋 组 "default"',
+        SEPARATOR,
+        'hassel',
+        'chulai',
+        SEPARATOR,
+        '!auth-all <名称> → 切换全部会话',
 
         label('!auth 列表（无配置）'),
         '📋 当前无 CCS 配置。',

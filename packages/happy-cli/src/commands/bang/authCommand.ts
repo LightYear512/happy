@@ -140,7 +140,34 @@ function listProfiles(isConsole: boolean): BangCommandResult {
     const isShared = currentProfileInfo?.contextMode === 'shared';
     const currentGroup = isShared ? (currentProfileInfo.contextGroup || 'default') : null;
 
-    // Find other profiles in the same shared group
+    // Console: no "current" concept — list all profiles in the group equally
+    if (isConsole) {
+        const groupProfiles = currentGroup
+            ? profiles.filter(p => p.contextMode === 'shared' && (p.contextGroup || 'default') === currentGroup)
+            : [];
+
+        const messages: string[] = [];
+        if (currentGroup) {
+            messages.push(`📋 组 "${currentGroup}"`);
+        }
+        messages.push(SEPARATOR);
+        for (const p of groupProfiles) {
+            const status = getProfileStatus(p);
+            messages.push(status ? `${p.name} ${status}` : p.name);
+        }
+        messages.push(SEPARATOR);
+
+        if (groupProfiles.length > 1) {
+            messages.push('!auth-all <名称> → 切换全部会话');
+            const suggestions = groupProfiles.map(p => `!auth-all ${p.name}`);
+            return { message: messages, action: 'none', suggestions };
+        } else {
+            messages.push('本组无其他账号。');
+            return { message: messages, action: 'none' };
+        }
+    }
+
+    // Normal session: show current profile with ● indicator
     const switchable = currentGroup
         ? profiles.filter(p =>
             p.contextMode === 'shared'
@@ -167,13 +194,9 @@ function listProfiles(isConsole: boolean): BangCommandResult {
             messages.push(status ? `○ ${profile.name} ${status}` : `○ ${profile.name}`);
         }
         messages.push(SEPARATOR);
-        messages.push(isConsole
-            ? '!auth-all <名称> → 切换全部会话'
-            : '!auth <名称> → 切换当前会话');
+        messages.push('!auth <名称> → 切换当前会话');
 
-        const suggestions = switchable.map(p =>
-            isConsole ? `!auth-all ${p.name}` : `!auth ${p.name}`
-        );
+        const suggestions = switchable.map(p => `!auth ${p.name}`);
         return { message: messages, action: 'none', suggestions };
     } else if (currentGroup) {
         messages.push(SEPARATOR);
