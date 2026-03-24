@@ -7,27 +7,24 @@
 
 import { logger } from '@/ui/logger';
 import { spawnDaemonSession } from '@/daemon/controlClient';
-import { scanClaudeSessions } from './sessionCommand';
+import { scanClaudeSessions, type ClaudeSessionInfo } from './sessionCommand';
 import type { BangCommandContext, BangCommandResult } from './types';
 
 /**
  * Handle the `!resume` bang command.
  *
  * - `!resume <id-prefix>` — Resume a session matching the prefix
- * - `!resume` (no args) — Show usage hint
+ * - `!resume` (no args) — Show session list with quick-resume buttons
  */
 export async function handleResumeBangCommand(args: string, ctx: BangCommandContext): Promise<BangCommandResult> {
     const prefix = args.trim().toLowerCase();
 
-    if (!prefix) {
-        return {
-            message: ['用法: !resume <id前缀>', '先使用 !session 查看可用会话'],
-            action: 'none',
-        };
-    }
-
-    // Scan all sessions and find matching ones
+    // Scan all sessions
     const sessions = await scanClaudeSessions();
+
+    if (!prefix) {
+        return buildSessionList(sessions);
+    }
 
     const matches = sessions.filter(s => s.sessionId.toLowerCase().startsWith(prefix));
 
@@ -88,4 +85,35 @@ export async function handleResumeBangCommand(args: string, ctx: BangCommandCont
             action: 'none',
         };
     }
+}
+
+/** Max sessions to show in the quick-resume list */
+const MAX_RESUME_LIST = 8;
+
+/** Short ID length for display and suggestion buttons */
+const SHORT_ID_LEN = 8;
+
+/**
+ * Build a session list with per-session suggestion buttons for quick resume.
+ */
+function buildSessionList(sessions: ClaudeSessionInfo[]): BangCommandResult {
+    if (sessions.length === 0) {
+        return { message: '📭 没有找到可恢复的会话', action: 'none' };
+    }
+
+    const displayed = sessions.slice(0, MAX_RESUME_LIST);
+    const messages: string[] = [`📋 选择要恢复的会话 (${displayed.length}/${sessions.length})`];
+    const suggestions: string[] = [];
+
+    for (const s of displayed) {
+        const shortId = s.sessionId.slice(0, SHORT_ID_LEN);
+        const dir = s.cwd ? s.cwd.replace(/\\/g, '/').split('/').pop() || s.projectDir : s.projectDir;
+        const preview = s.preview ? s.preview.replace(/\n/g, ' ').trim().slice(0, 30) : '';
+        const label = preview ? `${dir} — ${preview}` : dir;
+
+        messages.push(`  [${shortId}] ${label}`);
+        suggestions.push(`!resume ${shortId}`);
+    }
+
+    return { message: messages, action: 'none', suggestions };
 }
