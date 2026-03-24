@@ -171,6 +171,7 @@ function findClaudeCli(): { path: string; needsShell: boolean } | null {
             encoding: 'utf8',
             stdio: ['ignore', 'pipe', 'ignore'],
             timeout: 5000,
+            windowsHide: true,
         }).trim();
 
         const matches = result.split('\n').map(p => p.trim()).filter(Boolean);

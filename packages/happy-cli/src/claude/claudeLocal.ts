@@ -339,6 +339,7 @@ export async function claudeLocal(opts: {
                         cwd: opts.path,
                         env,
                         shell: spawnWithShell,
+                        windowsHide: true,
                     },
                 );
 

@@ -255,7 +255,8 @@ describe.skipIf(!await isServerHealthy())('Daemon Integration Tests', { timeout:
     const secondChild = spawn('yarn', ['tsx', 'src/index.ts', 'daemon', 'start-sync'], {
       cwd: process.cwd(),
       env: process.env,
-      stdio: ['ignore', 'pipe', 'pipe']
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true
     });
 
     let output = '';
