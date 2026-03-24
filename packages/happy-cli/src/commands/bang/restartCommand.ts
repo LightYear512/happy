@@ -7,22 +7,47 @@ import type { BangCommandContext, BangCommandResult } from './types';
 /**
  * Handle the `!restart` bang command.
  *
+ * In normal sessions:
  * - `!restart` — Restart the current session (keep same account)
- * - `!restart all` — Restart all sessions on this machine (keep same account)
+ *
+ * In console:
+ * - `!restart all` — Broadcast restart to all sessions on this machine
  */
 export async function handleRestartBangCommand(args: string, ctx: BangCommandContext): Promise<BangCommandResult> {
     const trimmed = args.trim().toLowerCase();
 
-    if (trimmed === 'all') {
-        return restartAll();
+    if (ctx.isConsoleSession) {
+        // Console: only "all" is valid
+        if (trimmed === 'all') {
+            return restartAll();
+        }
+        return {
+            message: ['用法: !restart all → 重启全部会话'],
+            action: 'none',
+        };
     }
 
+    // Normal session: only no-arg restart is valid
     if (!trimmed) {
+        // Local mode sessions cannot be restarted via bang command
+        if (ctx.session?.mode === 'local') {
+            return {
+                message: 'ℹ️ local 模式下请直接在终端重启，或发消息切换 remote 后 !restart',
+                action: 'none',
+            };
+        }
         return restartCurrent();
     }
 
+    if (trimmed === 'all') {
+        return {
+            message: ['❌ !restart all 仅在控制台中可用'],
+            action: 'none',
+        };
+    }
+
     return {
-        message: ['❌ 用法错误', '!restart → 重启当前会话', '!restart all → 重启全部会话'],
+        message: ['用法: !restart → 重启当前会话'],
         action: 'none',
     };
 }
@@ -42,6 +67,7 @@ function restartCurrent(): BangCommandResult {
 /**
  * Restart all sessions on this machine by writing a timestamp to the
  * restart-signal file. Other sessions detect this via fs.watch and restart.
+ * Console doesn't need restart-session since it has no Claude SDK.
  */
 function restartAll(): BangCommandResult {
     const currentProfile = getCurrentCcsProfile();
@@ -55,10 +81,10 @@ function restartAll(): BangCommandResult {
     } catch (err) {
         logger.debug('[!restart] Failed to write restart signal file:', err);
         return {
-            message: [`🔄 正在重启当前会话${profileLabel}`, '广播到其他会话失败。'],
-            action: 'restart-session',
+            message: ['❌ 广播重启信号失败'],
+            action: 'none',
         };
     }
 
-    return { message: `🔄 正在重启全部会话${profileLabel}`, action: 'restart-session' };
+    return { message: `🔄 已广播重启信号到全部会话${profileLabel}`, action: 'none' };
 }
