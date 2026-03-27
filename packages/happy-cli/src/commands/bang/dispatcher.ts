@@ -1,6 +1,6 @@
 import { logger } from '@/ui/logger';
 import { handleAuthBangCommand, handleAuthAllBangCommand } from './authCommand';
-import { handleAuthCreateBangCommand } from './loginCommand';
+import { handleLoginBangCommand } from './loginCommand';
 import { handleRestartBangCommand, handleRestartAllBangCommand } from './restartCommand';
 import { handleUsageBangCommand } from './usageCommand';
 import { handleSessionsBangCommand } from './sessionCommand';
@@ -19,7 +19,7 @@ export { hasActiveInteractiveSession, handleInteractiveInput } from './interacti
 const commands: Record<string, { handler: BangCommandHandler; desc: string; loadingMsg?: string; sessionOnly?: boolean; consoleOnly?: boolean; hidden?: boolean }> = {
     'auth':        { handler: handleAuthBangCommand,        desc: '切换 CCS 账号', sessionOnly: true },
     'auth-all':    { handler: handleAuthAllBangCommand,     desc: '切换全部会话账号', consoleOnly: true },
-    'login':       { handler: handleAuthCreateBangCommand,  desc: '登录新账号/重新登录旧账号', consoleOnly: true },
+    'login':       { handler: handleLoginBangCommand,       desc: '登录新账号/重新登录旧账号', consoleOnly: true },
     'restart':     { handler: handleRestartBangCommand,     desc: '重启会话', sessionOnly: true },
     'restart-all': { handler: handleRestartAllBangCommand,  desc: '重启全部会话', consoleOnly: true },
     'usage':       { handler: handleUsageBangCommand,       desc: '查看 API 用量' },
@@ -186,7 +186,7 @@ export async function executeBangCommand(text: string, ctx: BangCommandContext):
     } catch (error) {
         logger.debug(`[bang] Command !${name} failed:`, error);
         return {
-            message: `❌ !${name} 失败: ${error instanceof Error ? error.message : 'Unknown error'}`,
+            message: `❌ !${name} 失败: ${error instanceof Error ? error.message : '未知错误'}`,
             action: 'none',
         };
     }

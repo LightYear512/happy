@@ -369,7 +369,7 @@ function cleanupInstance(instancePath: string): void {
             rmSync(instancePath, { recursive: true, force: true });
         }
     } catch (err) {
-        logger.debug('[!auth create] Failed to cleanup instance:', err);
+        logger.debug('[!login] Failed to cleanup instance:', err);
     }
 }
 
@@ -408,7 +408,7 @@ function buildChildEnv(instancePath: string): Record<string, string | undefined>
  * 4. User pastes OAuth key on mobile → piped to Claude's stdin
  * 5. On successful login (.credentials.json appears), register profile
  */
-export async function handleAuthCreateBangCommand(
+export async function handleLoginBangCommand(
     args: string,
     ctx: BangCommandContext,
 ): Promise<BangCommandResult> {
@@ -629,7 +629,7 @@ export async function handleAuthCreateBangCommand(
         const trimmed = text.trim();
 
         if (trimmed === '!cancel' || trimmed === '!取消') {
-            logger.debug('[!auth create] User cancelled login');
+            logger.debug('[!login] User cancelled login');
             unregisterInteractiveSession();
             flushOutput();
             ptyProcess.kill();
@@ -640,15 +640,15 @@ export async function handleAuthCreateBangCommand(
         }
 
         if (exited) {
-            logger.debug('[!auth create] Process already exited, ignoring input');
+            logger.debug('[!login] Process already exited, ignoring input');
             return;
         }
 
-        logger.debug('[!auth create] Feeding input to Claude PTY');
+        logger.debug('[!login] Feeding input to Claude PTY');
         try {
             ptyProcess.write(text + '\r');
         } catch (err) {
-            logger.debug('[!auth create] Failed to write to PTY:', err);
+            logger.debug('[!login] Failed to write to PTY:', err);
         }
     });
 
@@ -678,13 +678,14 @@ export async function handleAuthCreateBangCommand(
                         + `切换账号: !auth ${profileName}`;
                     ctx.client.sendCodexMessage({ type: 'message', message: msg });
                 } catch (err) {
-                    logger.debug('[!auth create] Failed to register profile:', err);
+                    logger.debug('[!login] Failed to register profile:', err);
                     ctx.client.sendCodexMessage({ type: 'message', message: `⚠️ 登录成功但注册失败: ${(err as Error).message}` });
                 }
             }
         } else {
             if (!isRelogin) cleanupInstance(instancePath);
-            ctx.client.sendCodexMessage({ type: 'message', message: `❌ 登录失败或已取消 (退出码: ${exitCode ?? 'unknown'})` });
+            logger.debug(`[!login] Login failed with exit code: ${exitCode ?? 'unknown'}`);
+            ctx.client.sendCodexMessage({ type: 'message', message: `❌ 登录失败或已取消\n\n重新尝试: !login ${profileName}` });
         }
 
         ctx.client.sendSessionEvent({ type: 'ready' });

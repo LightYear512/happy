@@ -34,7 +34,7 @@ export async function handleRestartBangCommand(args: string, ctx: BangCommandCon
     }
 
     return {
-        message: ['用法: !restart → 重启当前会话'],
+        message: ['ℹ️ !restart 不接受参数', '用法: !restart → 重启当前会话'],
         action: 'none',
     };
 }

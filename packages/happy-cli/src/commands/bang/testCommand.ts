@@ -25,7 +25,7 @@ function testHelp(): string[] {
         '!login (!l) → 登录新账号/重新登录旧账号',
         '!restart-all (!ra) → 重启全部会话',
         '!usage (!u) → 查看 API 用量',
-        '!session (!s) → 查看可恢复会话',
+        '!session (!s) → 浏览项目目录和会话',
         '!open (!o) → 打开会话',
         '!help (!h) → 显示帮助',
         SEPARATOR,
@@ -79,9 +79,16 @@ function testSessions(): string[] {
 
 function testOpen(): string[] {
     return [
-        label('!open 无参数'),
-        '用法: !open <id前缀>',
-        '先使用 !session 查看可用会话',
+        label('!open 无参数（有会话）'),
+        '📋 可恢复的会话 (3/5)',
+        '▸ 今天 ━━━━━━━━━━━━━━━━━━━',
+        '  [a1b2c3d4] happy · 5分钟前 — 帮我重构这个组件…',
+        '  [e5f6g7h8] workspace · 2小时前 — list files in this…',
+        '▸ 3天前 ━━━━━━━━━━━━━━━━━━━',
+        '  [i9j0k1l2] project — fix the login bug',
+
+        label('!open 无参数（无会话）'),
+        '📭 没有找到可恢复的会话',
 
         label('!open 未找到'),
         '❌ 未找到匹配 "xyz" 的会话',

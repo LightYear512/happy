@@ -489,7 +489,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 logger.debug('[start] Bang command error:', error);
                 // Same ordering delay as success path (see comment above)
                 await new Promise(resolve => setTimeout(resolve, 100));
-                session.sendSessionEvent({ type: 'message', message: `❌ Command error: ${error}` });
+                session.sendSessionEvent({ type: 'message', message: `❌ 命令执行失败: ${error}` });
                 session.sendSessionEvent({ type: 'ready' });
             });
             return;
