@@ -23,6 +23,36 @@ import { projectPath } from '@/projectPath';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars';
 
+// Restore file persistence for session auto-restore.
+// Only stores immutable spawn params. sessionTag and claudeSessionId come from Server at restore time.
+interface RestoreFileData {
+  directory: string;
+  agent: 'claude' | 'codex' | 'gemini';
+}
+
+function getRestoreDir(): string {
+  return join(configuration.happyHomeDir, 'restore');
+}
+
+function getRestoreFilePath(sessionId: string): string {
+  return join(getRestoreDir(), `${sessionId}.json`);
+}
+
+async function writeRestoreFile(sessionId: string, data: RestoreFileData): Promise<void> {
+  const dir = getRestoreDir();
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(getRestoreFilePath(sessionId), JSON.stringify(data), 'utf-8');
+}
+
+async function readRestoreFile(sessionId: string): Promise<RestoreFileData | null> {
+  try {
+    const content = await fs.readFile(getRestoreFilePath(sessionId), 'utf-8');
+    return JSON.parse(content);
+  } catch {
+    return null;
+  }
+}
+
 // Prepare initial metadata
 export const initialMachineMetadata: MachineMetadata = {
   host: os.hostname(),
@@ -218,6 +248,15 @@ export async function startDaemon(): Promise<void> {
         };
         pidToTrackedSession.set(pid, trackedSession);
         logger.debug(`[DAEMON RUN] Registered externally-started session ${sessionId}`);
+      }
+
+      // Persist restore file for any session (daemon-spawned or external)
+      if (sessionId && sessionMetadata.path) {
+        const agent = (sessionMetadata.flavor === 'codex' ? 'codex' : sessionMetadata.flavor === 'gemini' ? 'gemini' : 'claude') as 'claude' | 'codex' | 'gemini';
+        writeRestoreFile(sessionId, {
+          directory: sessionMetadata.path,
+          agent,
+        }).catch(e => logger.debug(`[DAEMON RUN] Failed to write restore file for ${sessionId}: ${e}`));
       }
     };
 
@@ -527,6 +566,13 @@ export async function startDaemon(): Promise<void> {
                 resolve: (completedSession) => {
                   clearTimeout(timeout);
                   logger.debug(`[DAEMON RUN] Session ${completedSession.happySessionId} fully spawned with webhook (tmux)`);
+                  // Persist restore file for session auto-restore
+                  if (completedSession.happySessionId && !options.consoleSession) {
+                    writeRestoreFile(completedSession.happySessionId, {
+                      directory: options.directory,
+                      agent: options.agent || 'claude',
+                    }).catch(e => logger.debug(`[DAEMON RUN] Failed to write restore file: ${e}`));
+                  }
                   resolve({
                     type: 'success',
                     sessionId: completedSession.happySessionId!
@@ -655,6 +701,13 @@ export async function startDaemon(): Promise<void> {
               resolve: (completedSession) => {
                 clearTimeout(timeout);
                 logger.debug(`[DAEMON RUN] Session ${completedSession.happySessionId} fully spawned with webhook`);
+                // Persist restore file for session auto-restore
+                if (completedSession.happySessionId && !options.consoleSession) {
+                  writeRestoreFile(completedSession.happySessionId, {
+                    directory: options.directory,
+                    agent: options.agent || 'claude',
+                  }).catch(e => logger.debug(`[DAEMON RUN] Failed to write restore file: ${e}`));
+                }
                 resolve({
                   type: 'success',
                   sessionId: completedSession.happySessionId!
@@ -767,11 +820,29 @@ export async function startDaemon(): Promise<void> {
     // Create realtime machine session
     const apiMachine = api.machineSyncClient(machine);
 
+    // Restore a previously closed session by reading persisted restore file + Server-provided params
+    const restoreSession = async (params: { sessionId: string, claudeSessionId: string | null, summary: string | null }): Promise<SpawnSessionResult> => {
+      const restoreData = await readRestoreFile(params.sessionId);
+      if (!restoreData) {
+        return { type: 'error', errorMessage: `No restore file found for session ${params.sessionId}. Use "+" to create a new session.` };
+      }
+
+      logger.debug(`[DAEMON RUN] Restoring session ${params.sessionId} in ${restoreData.directory}`);
+
+      return spawnSession({
+        directory: restoreData.directory,
+        agent: restoreData.agent,
+        resume: params.claudeSessionId || undefined,
+        title: params.summary || undefined,
+      });
+    };
+
     // Set RPC handlers
     apiMachine.setRPCHandlers({
       spawnSession,
       stopSession,
-      requestShutdown: () => requestShutdown('happy-app')
+      requestShutdown: () => requestShutdown('happy-app'),
+      restoreSession,
     });
 
     // Connect to server

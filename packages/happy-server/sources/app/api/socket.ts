@@ -139,7 +139,7 @@ export function startSocket(app: Fastify) {
         }
         rpcHandler(userId, socket, userRpcListeners);
         usageHandler(userId, socket);
-        sessionUpdateHandler(userId, socket, connection);
+        sessionUpdateHandler(userId, socket, connection, userRpcListeners);
         pingHandler(socket);
         machineUpdateHandler(userId, socket);
         artifactUpdateHandler(userId, socket);

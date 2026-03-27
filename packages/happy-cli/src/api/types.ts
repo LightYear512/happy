@@ -122,7 +122,7 @@ export interface ClientToServerEvents {
     mode?: 'local' | 'remote';
   }) => void
   'session-end': (data: { sid: string, time: number }) => void,
-  'update-metadata': (data: { sid: string, expectedVersion: number, metadata: string }, cb: (answer: {
+  'update-metadata': (data: { sid: string, expectedVersion: number, metadata: string, claudeSessionId?: string, summary?: string, machineId?: string }, cb: (answer: {
     result: 'error'
   } | {
     result: 'version-mismatch'

@@ -8,10 +8,102 @@ import { log } from "@/utils/log";
 import { randomKeyNaked } from "@/utils/randomKeyNaked";
 import { Socket } from "socket.io";
 
-export function sessionUpdateHandler(userId: string, socket: Socket, connection: ClientConnection) {
+/** Threshold for detecting zombie sessions (CLI crashed without sending session-end).
+ *  Must be > CACHE_WRITE_INTERVAL(30s) + BATCH_INTERVAL(5s) to avoid false positives. */
+const ZOMBIE_THRESHOLD_MS = 2 * 60 * 1000; // 2 minutes
+
+/** TTL for the restoring lock to prevent duplicate spawn attempts. */
+const RESTORING_LOCK_TTL_MS = 30 * 1000; // 30 seconds
+
+/** In-memory map tracking sessions currently being restored. Value is the timestamp when restore started. */
+const restoringLocks = new Map<string, number>();
+
+/**
+ * Check if a session needs restore (inactive or zombie) and trigger daemon spawn if so.
+ * Returns true if restore was triggered, false otherwise.
+ */
+async function tryRestoreSession(
+    userId: string,
+    session: { id: string, active: boolean, lastActiveAt: Date, accountId: string, claudeSessionId: string | null, summary: string | null, plainMachineId: string | null },
+    rpcListeners: Map<string, Socket>,
+): Promise<boolean> {
+    const now = Date.now();
+    const isInactive = !session.active;
+    const isZombie = session.active && (now - session.lastActiveAt.getTime()) > ZOMBIE_THRESHOLD_MS;
+
+    if (!isInactive && !isZombie) {
+        return false;
+    }
+
+    // Check restoring lock
+    const lockTime = restoringLocks.get(session.id);
+    if (lockTime && (now - lockTime) < RESTORING_LOCK_TTL_MS) {
+        return false; // Already restoring, message is stored in DB and will be pulled by CLI
+    }
+
+    // Set restoring lock
+    restoringLocks.set(session.id, now);
+
+    // If zombie, mark as inactive first
+    if (isZombie) {
+        await db.session.update({
+            where: { id: session.id },
+            data: { active: false },
+        });
+    }
+
+    // Find the correct daemon socket via RPC listeners.
+    // RPC methods are registered with machineId prefix (e.g., "machineId:spawn-happy-session").
+    // If session has plainMachineId, match precisely. Otherwise fall back to first connected daemon.
+    let daemonSocket: Socket | null = null;
+    if (session.plainMachineId) {
+        const machinePrefix = `${session.plainMachineId}:`;
+        for (const [method, sock] of rpcListeners.entries()) {
+            if (method.startsWith(machinePrefix) && sock.connected) {
+                daemonSocket = sock;
+                break;
+            }
+        }
+    } else {
+        // Fallback for sessions created before plainMachineId was added
+        for (const [_method, sock] of rpcListeners.entries()) {
+            if (sock.connected) {
+                daemonSocket = sock;
+                break;
+            }
+        }
+    }
+    if (!daemonSocket) {
+        log({ module: 'restore' }, `No connected daemon found for session ${session.id} (machineId=${session.plainMachineId || 'unknown'})`);
+        restoringLocks.delete(session.id);
+        return false;
+    }
+
+    // Send restore request directly to daemon socket (plaintext, bypasses RPC encryption layer).
+    // Server→Daemon socket is already authenticated (machine-scoped, token verified).
+    log({ module: 'restore' }, `Triggering restore for session ${session.id}`);
+    try {
+        const response: any = await daemonSocket.timeout(20000).emitWithAck('server-restore-session', {
+            sessionId: session.id,
+            claudeSessionId: session.claudeSessionId,
+            summary: session.summary,
+        });
+        if (!response.ok) {
+            throw new Error(response.error || 'Daemon returned error');
+        }
+    } catch (error) {
+        log({ module: 'restore', level: 'error' }, `Restore failed for session ${session.id}: ${error}`);
+        restoringLocks.delete(session.id);
+        return false;
+    }
+
+    return true;
+}
+
+export function sessionUpdateHandler(userId: string, socket: Socket, connection: ClientConnection, rpcListeners: Map<string, Socket>) {
     socket.on('update-metadata', async (data: any, callback: (response: any) => void) => {
         try {
-            const { sid, metadata, expectedVersion } = data;
+            const { sid, metadata, expectedVersion, claudeSessionId, summary, machineId } = data;
 
             // Validate input
             if (!sid || typeof metadata !== 'string' || typeof expectedVersion !== 'number') {
@@ -35,13 +127,23 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                 return null;
             }
 
-            // Update metadata
+            // Update metadata and plaintext fields for restore support
+            const updateData: Record<string, any> = {
+                metadata: metadata,
+                metadataVersion: expectedVersion + 1,
+            };
+            if (typeof claudeSessionId === 'string') {
+                updateData.claudeSessionId = claudeSessionId;
+            }
+            if (typeof summary === 'string') {
+                updateData.summary = summary;
+            }
+            if (typeof machineId === 'string') {
+                updateData.plainMachineId = machineId;
+            }
             const { count } = await db.session.updateMany({
                 where: { id: sid, metadataVersion: expectedVersion },
-                data: {
-                    metadata: metadata,
-                    metadataVersion: expectedVersion + 1
-                }
+                data: updateData,
             });
             if (count === 0) {
                 callback({ result: 'version-mismatch', version: session.metadataVersion, metadata: session.metadata });
@@ -167,6 +269,9 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                 return;
             }
 
+            // Clear restoring lock if session is alive again
+            restoringLocks.delete(sid);
+
             // Queue database update (will only update if time difference is significant)
             activityCache.queueSessionUpdate(sid, t);
 
@@ -237,6 +342,11 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                     payload: updatePayload,
                     recipientFilter: { type: 'all-interested-in-session', sessionId: sid },
                     skipSenderConnection: connection
+                });
+
+                // Try to restore session if inactive or zombie
+                tryRestoreSession(userId, session, rpcListeners).catch((error) => {
+                    log({ module: 'restore', level: 'error' }, `Error in tryRestoreSession: ${error}`);
                 });
             } catch (error) {
                 log({ module: 'websocket', level: 'error' }, `Error in message handler: ${error}`);

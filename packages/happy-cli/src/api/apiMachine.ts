@@ -69,16 +69,24 @@ interface DaemonToServerEvents {
     }) => void) => void;
 }
 
+export interface RestoreSessionParams {
+    sessionId: string;
+    claudeSessionId: string | null;
+    summary: string | null;
+}
+
 type MachineRpcHandlers = {
     spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
     stopSession: (sessionId: string) => boolean;
     requestShutdown: () => void;
+    restoreSession: (params: RestoreSessionParams) => Promise<SpawnSessionResult>;
 }
 
 export class ApiMachineClient {
     private socket!: Socket<ServerToDaemonEvents, DaemonToServerEvents>;
     private keepAliveInterval: NodeJS.Timeout | null = null;
     private rpcHandlerManager: RpcHandlerManager;
+    private restoreSessionHandler: ((params: RestoreSessionParams) => Promise<SpawnSessionResult>) | null = null;
 
     constructor(
         private token: string,
@@ -98,7 +106,8 @@ export class ApiMachineClient {
     setRPCHandlers({
         spawnSession,
         stopSession,
-        requestShutdown
+        requestShutdown,
+        restoreSession
     }: MachineRpcHandlers) {
         // Register spawn session handler
         this.rpcHandlerManager.registerHandler('spawn-happy-session', async (params: any) => {
@@ -158,6 +167,9 @@ export class ApiMachineClient {
 
             return { message: 'Daemon stop request acknowledged, starting shutdown sequence...' };
         });
+
+        // Store restore handler for direct socket event (not encrypted RPC)
+        this.restoreSessionHandler = restoreSession;
     }
 
     /**
@@ -266,6 +278,25 @@ export class ApiMachineClient {
         this.socket.on('rpc-request', async (data: { method: string, params: string }, callback: (response: string) => void) => {
             logger.debugLargeJson(`[API MACHINE] Received RPC request:`, data);
             callback(await this.rpcHandlerManager.handleRequest(data));
+        });
+
+        // Direct (unencrypted) restore-session handler for Server-initiated restore.
+        // Server→Daemon socket is already authenticated (machine-scoped, token verified).
+        // Uses a separate event to bypass RpcHandlerManager's encryption layer.
+        this.socket.on('server-restore-session' as any, async (data: RestoreSessionParams, callback: (response: any) => void) => {
+            logger.debug(`[API MACHINE] Received server-restore-session: sessionId=${data.sessionId}`);
+            if (!this.restoreSessionHandler) {
+                callback({ ok: false, error: 'Restore handler not registered' });
+                return;
+            }
+            try {
+                const result = await this.restoreSessionHandler(data);
+                callback({ ok: true, result });
+            } catch (error) {
+                const msg = error instanceof Error ? error.message : 'Restore failed';
+                logger.debug(`[API MACHINE] Restore failed: ${msg}`);
+                callback({ ok: false, error: msg });
+            }
         });
 
         // Handle update events from server
