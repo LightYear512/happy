@@ -430,7 +430,8 @@ const credentialsSchema = z.object({
   secret: z.string().base64().nullish(), // Legacy
   encryption: z.object({
     publicKey: z.string().base64(),
-    machineKey: z.string().base64()
+    machineKey: z.string().base64(),
+    dataKey: z.string().base64().nullish()
   }).nullish()
 })
 
@@ -439,7 +440,7 @@ export type Credentials = {
   encryption: {
     type: 'legacy', secret: Uint8Array
   } | {
-    type: 'dataKey', publicKey: Uint8Array, machineKey: Uint8Array
+    type: 'dataKey', publicKey: Uint8Array, machineKey: Uint8Array, dataKey?: Uint8Array
   }
 }
 
@@ -464,7 +465,10 @@ export async function readCredentials(): Promise<Credentials | null> {
         encryption: {
           type: 'dataKey',
           publicKey: new Uint8Array(Buffer.from(credentials.encryption.publicKey, 'base64')),
-          machineKey: new Uint8Array(Buffer.from(credentials.encryption.machineKey, 'base64'))
+          machineKey: new Uint8Array(Buffer.from(credentials.encryption.machineKey, 'base64')),
+          dataKey: credentials.encryption.dataKey
+            ? new Uint8Array(Buffer.from(credentials.encryption.dataKey, 'base64'))
+            : undefined
         }
       }
     }
@@ -484,12 +488,16 @@ export async function writeCredentialsLegacy(credentials: { secret: Uint8Array, 
   }, null, 2));
 }
 
-export async function writeCredentialsDataKey(credentials: { publicKey: Uint8Array, machineKey: Uint8Array, token: string }): Promise<void> {
+export async function writeCredentialsDataKey(credentials: { publicKey: Uint8Array, machineKey: Uint8Array, dataKey: Uint8Array, token: string }): Promise<void> {
   if (!existsSync(configuration.happyHomeDir)) {
     await mkdir(configuration.happyHomeDir, { recursive: true })
   }
   await writeFile(configuration.privateKeyFile, JSON.stringify({
-    encryption: { publicKey: encodeBase64(credentials.publicKey), machineKey: encodeBase64(credentials.machineKey) },
+    encryption: {
+      publicKey: encodeBase64(credentials.publicKey),
+      machineKey: encodeBase64(credentials.machineKey),
+      dataKey: encodeBase64(credentials.dataKey)
+    },
     token: credentials.token
   }, null, 2));
 }

@@ -6,6 +6,7 @@ import axios from 'axios';
 import { displayQRCode } from "./qrcode";
 import { delay } from "@/utils/time";
 import { writeCredentialsLegacy, readCredentials, updateSettings, Credentials, writeCredentialsDataKey } from "@/persistence";
+import { ensureDataKey } from "@/utils/ensureDataKey";
 import { generateWebAuthUrl } from "@/api/webAuth";
 import { openBrowser } from "@/utils/browser";
 import { AuthSelector, AuthMethod } from "./ink/AuthSelector";
@@ -183,6 +184,7 @@ async function waitForAuthentication(keypair: tweetnacl.BoxKeyPair): Promise<Cre
                                 const credentials = {
                                     publicKey: decrypted.slice(1, 33),
                                     machineKey: randomBytes(32),
+                                    dataKey: randomBytes(32),
                                     token: token
                                 }
                                 await writeCredentialsDataKey(credentials);
@@ -191,7 +193,8 @@ async function waitForAuthentication(keypair: tweetnacl.BoxKeyPair): Promise<Cre
                                     encryption: {
                                         type: 'dataKey',
                                         publicKey: credentials.publicKey,
-                                        machineKey: credentials.machineKey
+                                        machineKey: credentials.machineKey,
+                                        dataKey: credentials.dataKey
                                     },
                                     token: token
                                 };
@@ -262,6 +265,14 @@ export async function authAndSetupMachineIfNeeded(): Promise<{
         newAuth = true;
     } else {
         logger.debug('[AUTH] Using existing credentials');
+    }
+
+    // Migrate old credentials to include dataKey if missing
+    await ensureDataKey();
+    // Re-read credentials after potential migration
+    const migrated = await readCredentials();
+    if (migrated) {
+        credentials = migrated;
     }
 
     // Make sure we have a machine ID
