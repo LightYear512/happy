@@ -10,6 +10,49 @@ import { sessionDelete } from "@/app/session/sessionDelete";
 
 export function sessionRoutes(app: Fastify) {
 
+    // Get single session by ID (used by CLI session restore/rejoin)
+    app.get('/v1/sessions/:id', {
+        preHandler: app.authenticate,
+        schema: {
+            params: z.object({ id: z.string() })
+        }
+    }, async (request, reply) => {
+        const userId = request.userId;
+        const session = await db.session.findFirst({
+            where: {
+                id: request.params.id,
+                accountId: userId   // Enforce ownership — prevents cross-user access
+            },
+            select: {
+                id: true,
+                seq: true,
+                metadata: true,
+                metadataVersion: true,
+                agentState: true,
+                agentStateVersion: true,
+                dataEncryptionKey: true,
+                lastActiveAt: true,
+            }
+        });
+        if (!session) {
+            return reply.code(404).send({ error: 'Not found' });
+        }
+        return reply.send({
+            session: {
+                id: session.id,
+                seq: session.seq,
+                metadata: session.metadata,
+                metadataVersion: session.metadataVersion,
+                agentState: session.agentState,
+                agentStateVersion: session.agentStateVersion,
+                dataEncryptionKey: session.dataEncryptionKey
+                    ? Buffer.from(session.dataEncryptionKey).toString('base64')
+                    : null,
+                lastActiveAt: session.lastActiveAt.getTime(),
+            }
+        });
+    });
+
     // Sessions API
     app.get('/v1/sessions', {
         preHandler: app.authenticate,

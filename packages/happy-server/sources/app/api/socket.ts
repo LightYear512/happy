@@ -77,6 +77,29 @@ export function startSocket(app: Fastify) {
         const metadata = { clientType: clientType || 'user-scoped', sessionId, machineId };
         let connection: ClientConnection;
         if (metadata.clientType === 'session-scoped' && sessionId) {
+            // Kick stale session-scoped connections for the same sessionId after a grace period.
+            // Delay is needed because Socket.IO reconnection briefly creates overlapping connections
+            // from the SAME client — immediate kick would disrupt the reconnect cycle.
+            const kickSessionId = sessionId;
+            const kickSocketId = socket.id;
+            setTimeout(() => {
+                const existing = eventRouter.getConnections(userId);
+                if (!existing) return;
+                const staleConnections: ClientConnection[] = [];
+                for (const conn of existing) {
+                    if (conn.connectionType === 'session-scoped'
+                        && conn.sessionId === kickSessionId
+                        && conn.socket.id !== kickSocketId
+                        && conn.socket.connected) {
+                        staleConnections.push(conn);
+                    }
+                }
+                for (const conn of staleConnections) {
+                    log({ module: 'websocket' }, `Kicking stale session-scoped socket ${conn.socket.id} for session ${kickSessionId}`);
+                    conn.socket.disconnect(true);
+                }
+            }, 5000);
+
             connection = {
                 connectionType: 'session-scoped',
                 socket,

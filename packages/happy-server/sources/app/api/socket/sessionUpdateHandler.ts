@@ -35,6 +35,11 @@ async function tryRestoreSession(
         return false;
     }
 
+    // Check heartbeat cache — session may be alive but DB hasn't flushed yet
+    if (activityCache.isSessionAlive(session.id)) {
+        return false;
+    }
+
     // Check restoring lock
     const lockTime = restoringLocks.get(session.id);
     if (lockTime && (now - lockTime) < RESTORING_LOCK_TTL_MS) {

@@ -123,6 +123,21 @@ class ActivityCache {
         }
     }
 
+    /**
+     * Check if a session has received a recent heartbeat (pending or flushed within threshold).
+     * Used by tryRestoreSession to avoid restoring sessions that are actually alive
+     * but whose active status hasn't been flushed to DB yet.
+     */
+    isSessionAlive(sessionId: string): boolean {
+        const cached = this.sessionCache.get(sessionId);
+        if (!cached) return false;
+        // Has a pending heartbeat waiting to flush → session is alive
+        if (cached.pendingUpdate) return true;
+        // Last flushed heartbeat was recent (within batch interval + threshold margin)
+        const recency = Date.now() - cached.lastUpdateSent;
+        return recency < this.BATCH_INTERVAL + this.UPDATE_THRESHOLD;
+    }
+
     queueSessionUpdate(sessionId: string, timestamp: number): boolean {
         const cached = this.sessionCache.get(sessionId);
         if (!cached) {
