@@ -178,6 +178,8 @@ export type Session = {
   metadataVersion: number,
   agentState: AgentState | null,
   agentStateVersion: number,
+  /** Last active timestamp from server (used to find pending messages after restore) */
+  lastActiveAt?: number,
 }
 
 /**

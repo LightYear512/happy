@@ -568,6 +568,8 @@ ${chalk.bold('To clean up runaway processes:')} Use ${chalk.cyan('happy doctor c
       } else if (arg === '--yolo') {
         // Shortcut for --dangerously-skip-permissions
         unknownArgs.push('--dangerously-skip-permissions')
+      } else if (arg === '--happy-restore-session') {
+        options.restoreSessionId = args[++i]
       } else if (arg === '--started-by') {
         options.startedBy = args[++i] as 'daemon' | 'terminal'
       } else if (arg === '--profile') {
@@ -715,8 +717,15 @@ ${chalk.bold.cyan('Claude Code Options (from `claude --help`):')}
       })
       daemonProcess.unref();
 
-      // Give daemon a moment to write PID & port file
-      await new Promise(resolve => setTimeout(resolve, 200));
+      // Wait for daemon to be ready (state file written + version matches)
+      // Daemon needs ~2-3s for auth → lock → state write → machine registration
+      for (let i = 0; i < 15; i++) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        if (await isDaemonRunningCurrentlyInstalledHappyVersion()) {
+          logger.debug('Happy background service is ready');
+          break;
+        }
+      }
     }
 
     // Start the CLI

@@ -222,6 +222,18 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     /**
+     * Inject a message into the pending queue (used after restore to deliver
+     * the trigger message that arrived before this socket connected).
+     */
+    injectPendingMessage(message: UserMessage) {
+        if (this.pendingMessageCallback) {
+            this.pendingMessageCallback(message);
+        } else {
+            this.pendingMessages.push(message);
+        }
+    }
+
+    /**
      * Send message to session
      * @param body - Message body (can be MessageContent or raw content for agent messages)
      */

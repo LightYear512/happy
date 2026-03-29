@@ -2,6 +2,7 @@ import os from 'node:os';
 import { randomUUID } from 'node:crypto';
 
 import { ApiClient } from '@/api/api';
+import { decrypt, decodeBase64 } from '@/api/encryption';
 import { logger } from '@/ui/logger';
 import { loop } from '@/claude/loop';
 import { AgentState, Metadata } from '@/api/types';
@@ -49,6 +50,8 @@ export interface StartOptions {
     jsRuntime?: JsRuntime
     /** CCS profile name to use at startup */
     profile?: string
+    /** Session ID to restore (rejoin existing happy session instead of creating new) */
+    restoreSessionId?: string
 }
 
 export async function runClaude(credentials: Credentials, options: StartOptions = {}): Promise<void> {
@@ -132,7 +135,19 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         sandbox: sandboxConfig?.enabled ? sandboxConfig : null,
         dangerouslySkipPermissions,
     };
-    const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
+    // Restore path: rejoin existing session by ID, fallback to creating new session
+    let response;
+    if (options.restoreSessionId) {
+        response = await api.getSessionById(options.restoreSessionId);
+        if (response) {
+            logger.debug(`[CLAUDE] Restored session ${options.restoreSessionId}`);
+        } else {
+            logger.debug(`[CLAUDE] Failed to restore session ${options.restoreSessionId}, creating new session`);
+            response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
+        }
+    } else {
+        response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
+    }
 
     // Handle server unreachable case - run Claude locally with hot reconnection
     // Note: connectionState.notifyOffline() was already called by api.ts with error details
@@ -194,6 +209,10 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         logger.debug('[START] Failed to report to daemon (may not be running):', error);
     }
 
+    // Create realtime session BEFORE extractSDKMetadataAsync to avoid creating
+    // a second session-scoped WebSocket that triggers stale-socket kicking
+    const session = api.sessionSyncClient(response);
+
     // Extract SDK metadata in background and update session when ready
     // Skip for console sessions — they don't use Claude SDK and the SDK query
     // can call process.exit(1) when running in the console directory
@@ -201,8 +220,9 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         extractSDKMetadataAsync(async (sdkMetadata) => {
             logger.debug('[start] SDK metadata extracted, updating session:', sdkMetadata);
             try {
-                // Update session metadata with tools and slash commands
-                api.sessionSyncClient(response).updateMetadata((currentMetadata) => ({
+                // Reuse the existing session client — do NOT create a new one,
+                // as that would open a second WebSocket and trigger stale-socket kicking
+                session.updateMetadata((currentMetadata) => ({
                     ...currentMetadata,
                     tools: sdkMetadata.tools,
                     slashCommands: sdkMetadata.slashCommands
@@ -213,9 +233,6 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             }
         });
     }
-
-    // Create realtime session
-    const session = api.sessionSyncClient(response);
 
     // Console session: set title, send welcome message
     if (isConsoleSession) {
@@ -261,10 +278,9 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         });
     }
 
-    // Forward JSONL history to app when resuming in remote mode
-    // In local mode, Session Scanner handles this. In remote mode there's no scanner,
-    // so we read the JSONL file directly and send historical messages to the app.
-    if (options.startingMode === 'remote' && options.claudeArgs) {
+    // Forward JSONL history to app when resuming in remote mode (new session only).
+    // Skip when restoring — the app already has the old messages for the same happySessionId.
+    if (options.startingMode === 'remote' && !options.restoreSessionId && options.claudeArgs) {
         let resumeSessionId: string | null = null;
         for (let i = 0; i < options.claudeArgs.length; i++) {
             if (options.claudeArgs[i] === '--resume' && i + 1 < options.claudeArgs.length) {
@@ -609,6 +625,46 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     });
 
     registerKillSessionHandler(session.rpcHandlerManager, cleanup);
+
+    // After restore, fetch pending user messages that arrived while CLI was offline.
+    // The trigger message(s) are stored in DB but were broadcast before this CLI connected its socket.
+    if (options.restoreSessionId) {
+        try {
+            const connectTime = Date.now();
+            await session.waitForConnect();
+            const rawMessages = await api.getSessionMessages(options.restoreSessionId);
+            // Messages ordered by createdAt desc. We need to find user messages from App
+            // that haven't been replied to yet (i.e., no agent message after them).
+            // Strategy: scan from newest to oldest. Once we hit an agent/CLI message, stop —
+            // everything before it was already processed by a previous CLI instance.
+            const encryptionKey = response.encryptionKey;
+            const encryptionVariant = response.encryptionVariant;
+            const pendingMessages: { message: any, createdAt: number }[] = [];
+            for (const rawMsg of rawMessages) {
+                if (rawMsg.createdAt >= connectTime) continue; // Will arrive via real-time socket
+                if (!(rawMsg.content && typeof rawMsg.content === 'object' && 'c' in rawMsg.content && rawMsg.content.t === 'encrypted')) continue;
+                const decrypted = decrypt(encryptionKey, encryptionVariant, decodeBase64(rawMsg.content.c as string));
+                if (!decrypted) continue;
+                // Stop at first AI reply (output/acp/codex/session) — everything before was already handled.
+                // Skip event messages (ready/switch/message) as they don't indicate a processed user message.
+                if (decrypted.role === 'agent' && decrypted.content?.type !== 'event') break;
+                if (decrypted.role === 'user' && decrypted.meta?.sentFrom !== 'cli') {
+                    pendingMessages.push({ message: decrypted, createdAt: rawMsg.createdAt });
+                }
+            }
+            // Inject in chronological order (API returns desc, we need asc)
+            pendingMessages.reverse();
+            for (const pending of pendingMessages) {
+                logger.debug(`[START] Injecting pending message from restore: "${pending.message.content?.text?.substring(0, 50)}"`);
+                session.injectPendingMessage(pending.message);
+            }
+            if (pendingMessages.length > 0) {
+                logger.debug(`[START] Injected ${pendingMessages.length} pending message(s) from restore`);
+            }
+        } catch (error) {
+            logger.debug('[START] Failed to fetch pending messages after restore:', error);
+        }
+    }
 
     // Create claude loop
     const exitCode = await loop({

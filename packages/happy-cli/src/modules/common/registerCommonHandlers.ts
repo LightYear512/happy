@@ -123,6 +123,8 @@ export interface SpawnSessionOptions {
     resume?: string;
     /** Title to restore when resuming a session */
     title?: string;
+    /** Happy session ID to restore (rejoin existing session instead of creating new) */
+    restoreSessionId?: string;
     /** Mark this session as the daemon console session (lightweight, bang-command-only) */
     consoleSession?: boolean;
     approvedNewDirectoryCreation?: boolean;

@@ -39,8 +39,8 @@ export class ApiClient {
     let encryptionVariant: 'legacy' | 'dataKey';
     if (this.credential.encryption.type === 'dataKey') {
 
-      // Generate new encryption key
-      encryptionKey = getRandomBytes(32);
+      // Use fixed dataKey from credentials, fallback to random if not yet migrated
+      encryptionKey = this.credential.encryption.dataKey ?? getRandomBytes(32);
       encryptionVariant = 'dataKey';
 
       // Derive and encrypt data encryption key
@@ -270,6 +270,76 @@ export class ApiClient {
 
       // For other errors, rethrow
       throw error;
+    }
+  }
+
+  /**
+   * Get an existing session by ID for restore/rejoin.
+   * Returns null if session not found, not owned by user, or decryption fails (old key).
+   */
+  async getSessionById(sessionId: string): Promise<Session | null> {
+    // Resolve encryption key
+    let encryptionKey: Uint8Array;
+    let encryptionVariant: 'legacy' | 'dataKey';
+    if (this.credential.encryption.type === 'dataKey') {
+      if (!this.credential.encryption.dataKey) return null; // Not yet migrated
+      encryptionKey = this.credential.encryption.dataKey;
+      encryptionVariant = 'dataKey';
+    } else {
+      encryptionKey = this.credential.encryption.secret;
+      encryptionVariant = 'legacy';
+    }
+
+    try {
+      const response = await axios.get(
+        `${configuration.serverUrl}/v1/sessions/${sessionId}`,
+        {
+          headers: {
+            'Authorization': `Bearer ${this.credential.token}`,
+            'Content-Type': 'application/json'
+          },
+          timeout: 10000
+        }
+      );
+
+      const raw = response.data.session;
+      const metadata = decrypt(encryptionKey, encryptionVariant, decodeBase64(raw.metadata));
+      if (!metadata) return null; // Decryption failed — old key, caller should fallback
+
+      return {
+        id: raw.id,
+        seq: raw.seq,
+        metadata,
+        metadataVersion: raw.metadataVersion,
+        agentState: raw.agentState ? decrypt(encryptionKey, encryptionVariant, decodeBase64(raw.agentState)) : null,
+        agentStateVersion: raw.agentStateVersion,
+        encryptionKey,
+        encryptionVariant,
+        lastActiveAt: raw.lastActiveAt,
+      };
+    } catch (error) {
+      logger.debug('[API] [ERROR] Failed to get session by ID:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Get recent messages for a session. Used after restore to find pending user messages
+   * that arrived while the CLI was offline (between session close and restore connect).
+   */
+  async getSessionMessages(sessionId: string): Promise<Array<{ id: string, seq: number, content: any, createdAt: number }>> {
+    try {
+      const response = await axios.get(
+        `${configuration.serverUrl}/v1/sessions/${sessionId}/messages`,
+        {
+          headers: { 'Authorization': `Bearer ${this.credential.token}` },
+          timeout: 10000
+        }
+      );
+      return response.data.messages || [];
+    } catch (error) {
+      logger.debug('[API] [ERROR] Failed to get session messages:', error);
+      return [];
     }
   }
 

@@ -497,7 +497,8 @@ export async function startDaemon(): Promise<void> {
           // Determine agent command - support claude, codex, and gemini
           const agent = options.agent === 'gemini' ? 'gemini' : (options.agent === 'codex' ? 'codex' : 'claude');
           const resumeFlag = options.resume ? ` --resume ${options.resume}` : '';
-          const fullCommand = `node --no-warnings --no-deprecation ${cliPath} ${agent} --happy-starting-mode remote --started-by daemon${resumeFlag}`;
+          const restoreFlag = options.restoreSessionId ? ` --happy-restore-session ${options.restoreSessionId}` : '';
+          const fullCommand = `node --no-warnings --no-deprecation ${cliPath} ${agent} --happy-starting-mode remote --started-by daemon${resumeFlag}${restoreFlag}`;
 
           // Spawn in tmux with environment variables
           // IMPORTANT: Pass complete environment (process.env + extraEnv) because:
@@ -622,6 +623,11 @@ export async function startDaemon(): Promise<void> {
           if (options.resume) {
             args.push('--resume', options.resume);
             logger.debug(`[DAEMON RUN] Adding --resume ${options.resume} to CLI args`);
+          }
+
+          if (options.restoreSessionId) {
+            args.push('--happy-restore-session', options.restoreSessionId);
+            logger.debug(`[DAEMON RUN] Adding --happy-restore-session ${options.restoreSessionId} to CLI args`);
           }
 
           const happyProcess = spawnHappyCLI(args, {
@@ -822,8 +828,23 @@ export async function startDaemon(): Promise<void> {
 
     // Restore a previously closed session by reading persisted restore file + Server-provided params
     const restoreSession = async (params: { sessionId: string, claudeSessionId: string | null, summary: string | null }): Promise<SpawnSessionResult> => {
+      // Check if session is already running — don't restore if an active process exists
+      for (const [pid, tracked] of pidToTrackedSession) {
+        if (tracked.happySessionId === params.sessionId) {
+          try {
+            process.kill(pid, 0); // Check if process is alive (signal 0 = no signal, just check)
+            logger.debug(`[DAEMON RUN] Session ${params.sessionId} already running (PID ${pid}), skipping restore`);
+            return { type: 'success', sessionId: params.sessionId };
+          } catch {
+            // Process is dead, remove stale tracking entry
+            pidToTrackedSession.delete(pid);
+          }
+        }
+      }
+
       const restoreData = await readRestoreFile(params.sessionId);
       if (!restoreData) {
+        logger.debug(`[DAEMON RUN] No restore file found for session ${params.sessionId}`);
         return { type: 'error', errorMessage: `No restore file found for session ${params.sessionId}. Use "+" to create a new session.` };
       }
 
@@ -834,6 +855,7 @@ export async function startDaemon(): Promise<void> {
         agent: restoreData.agent,
         resume: params.claudeSessionId || undefined,
         title: params.summary || undefined,
+        restoreSessionId: params.sessionId,
       });
     };
 
