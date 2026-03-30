@@ -71,10 +71,13 @@ function parseBangCommand(text: string): { name: string; args: string } {
 /**
  * Build the !help output listing all available commands.
  */
+/** Commands hidden from help output (low-frequency commands not worth showing). */
+const helpHidden = new Set(['restart-all', 'session', 'open']);
+
 function buildHelp(isConsole: boolean): BangCommandResult {
     const allCommands: Array<[string, string]> = [
         ...Object.entries(commands)
-            .filter(([, entry]) => !entry.hidden && !(isConsole && entry.sessionOnly) && !(!isConsole && entry.consoleOnly))
+            .filter(([name, entry]) => !entry.hidden && !helpHidden.has(name) && !(isConsole && entry.sessionOnly) && !(!isConsole && entry.consoleOnly))
             .map(([name, { desc }]) => [name, desc] as [string, string]),
         ['help', '显示帮助'],
     ];
@@ -98,7 +101,7 @@ function buildHelp(isConsole: boolean): BangCommandResult {
     return {
         message: messages,
         action: 'none',
-        suggestions: allCommands.filter(([name]) => name !== 'help').map(([name]) => `!${name}`),
+        suggestions: allCommands.map(([name]) => `!${name}`),
     };
 }
 
