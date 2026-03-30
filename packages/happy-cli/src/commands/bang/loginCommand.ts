@@ -449,12 +449,12 @@ export async function handleLoginBangCommand(
     const profileName = parts[0];
 
     if (!profileName) {
-        // No args — list existing accounts (same style as !auth)
+        // No args — list existing accounts and show usage
         const accounts = readAccountNames();
 
         if (accounts.length === 0) {
             return {
-                message: '用法: !login <名称>\n\n创建新账户并登录',
+                message: '用法: !login <账户名>\n\n登录账户',
                 action: 'none',
             };
         }
@@ -465,7 +465,7 @@ export async function handleLoginBangCommand(
             messages.push(name);
         }
         messages.push(SEPARATOR);
-        messages.push('!login <名称> → 重新登录\n!login <新名称> → 创建新账户');
+        messages.push('使用 !login <账户名> 进行登录');
 
         return { message: messages, action: 'none' };
     }

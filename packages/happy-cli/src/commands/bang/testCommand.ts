@@ -23,7 +23,7 @@ function testHelp(): string[] {
         '📖 快捷命令',
         SEPARATOR,
         '!auth-all (!aa) → 切换全部会话账号',
-        '!login (!l) → 登录新账号/重新登录旧账号',
+        '!login (!l) → 登录账户',
         '!restart-all (!ra) → 重启全部会话',
         '!usage (!u) → 查看 API 用量',
         '!session (!s) → 浏览项目目录和会话',
@@ -167,7 +167,7 @@ function testRestart(): string[] {
 function testLogin(): string[] {
     return [
         label('!login 无参（无账户）'),
-        '用法: !login <名称>\n\n创建新账户并登录',
+        '用法: !login <账户名>\n\n登录账户',
 
         label('!login 无参（有账户）'),
         '📋 已有账户',
@@ -175,7 +175,7 @@ function testLogin(): string[] {
         'work',
         'personal',
         SEPARATOR,
-        '!login <名称> → 重新登录\n!login <新名称> → 创建新账户',
+        '使用 !login <账户名> 进行登录',
 
         label('!login 重新登录'),
         '🔐 正在重新登录...\n\n配置: work\n\n请等待登录提示，然后粘贴 OAuth Key\n\n取消: !cancel',
