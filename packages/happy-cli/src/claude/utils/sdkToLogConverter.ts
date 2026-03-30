@@ -13,6 +13,7 @@ import type {
     SDKResultMessage
 } from '@/claude/sdk'
 import type { RawJSONLines } from '@/claude/types'
+import { formatErrorForUser } from '@/claude/utils/errorFormatter'
 
 /**
  * Context for converting SDK messages to log format
@@ -135,10 +136,23 @@ export class SDKToLogConverter {
 
             case 'assistant': {
                 const assistantMsg = sdkMessage as SDKAssistantMessage
+                let message = assistantMsg.message
+
+                // Sanitize synthetic API error messages (isApiErrorMessage: true)
+                if ((sdkMessage as any).isApiErrorMessage && message?.content) {
+                    const content = Array.isArray(message.content) ? message.content : [message.content]
+                    const sanitized = content.map((block: any) =>
+                        block.type === 'text' && block.text
+                            ? { ...block, text: formatErrorForUser(block.text).display }
+                            : block
+                    )
+                    message = { ...message, content: sanitized }
+                }
+
                 logMessage = {
                     ...baseFields,
                     type: 'assistant',
-                    message: assistantMsg.message,
+                    message,
                     // Assistant messages often have additional fields
                     requestId: (assistantMsg as any).requestId,
                     ...(assistantMsg.parent_tool_use_id ? { parent_tool_use_id: assistantMsg.parent_tool_use_id } : {}),
@@ -180,12 +194,15 @@ export class SDKToLogConverter {
                 // Result messages with text content (e.g., /usage, /cost output)
                 // should be forwarded as assistant messages so the mobile app can display them
                 if (resultMsg.result) {
+                    const text = resultMsg.is_error
+                        ? formatErrorForUser(resultMsg.result).display
+                        : resultMsg.result
                     logMessage = {
                         ...baseFields,
                         type: 'assistant',
                         message: {
                             role: 'assistant',
-                            content: [{ type: 'text', text: resultMsg.result }],
+                            content: [{ type: 'text', text }],
                         },
                     }
                 }

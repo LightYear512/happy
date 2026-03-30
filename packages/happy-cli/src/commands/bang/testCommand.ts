@@ -11,6 +11,7 @@
 
 import { SEPARATOR, codeBlock, type BangCommandContext, type BangCommandResult } from './types';
 import { formatUsage, type UsageData } from './usageCommand';
+import { formatErrorForUser } from '@/claude/utils/errorFormatter';
 
 function label(text: string): string {
     return `📌 ${text}`;
@@ -201,6 +202,29 @@ function testEdgeCases(): string[] {
     ];
 }
 
+/** Simulate raw API errors through formatErrorForUser pipeline — verifies app-side rendering. */
+function testErrors(): string[] {
+    const rawErrors = [
+        'API Error: 500 {"type":"error","error":{"type":"api_error","message":"Internal server error"},"request_id":"req_011CZTCHWeLHaHKaXinXdsET"}',
+        'API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}',
+        'API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"Number of request tokens has exceeded your per-minute rate limit"}}',
+        'API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}',
+        'API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"max_tokens: must be positive"}}',
+        'Error: connect ETIMEDOUT 104.18.0.1:443',
+        "Error: ENOENT: no such file or directory, open '/tmp/missing.txt'",
+        'error_max_turns: reached maximum number of turns',
+        'Some completely unknown error with a lot of detail that should be truncated gracefully by the formatter',
+    ];
+
+    const messages: string[] = [];
+    for (const raw of rawErrors) {
+        const { display } = formatErrorForUser(raw);
+        messages.push(label(`原始: ${raw.slice(0, 60)}...`));
+        messages.push(display);
+    }
+    return messages;
+}
+
 const testSuites: Record<string, () => string[]> = {
     help: testHelp,
     usage: testUsage,
@@ -209,6 +233,7 @@ const testSuites: Record<string, () => string[]> = {
     auth: testAuth,
     restart: testRestart,
     login: testLogin,
+    error: testErrors,
 };
 
 /** Send codex-style test messages directly via ctx.client (usage error simulation). */

@@ -28,6 +28,7 @@ import { resolve, join } from 'node:path';
 import { existsSync } from 'node:fs';
 import { startOfflineReconnection, connectionState } from '@/utils/serverConnectionErrors';
 import { readCcsProfiles, getInstancePath, getCurrentCcsProfile } from '@/commands/bang/ccsProfiles';
+import { formatErrorForUser } from '@/claude/utils/errorFormatter';
 import { claudeLocal } from '@/claude/claudeLocal';
 import { createSessionScanner, readSessionLog } from '@/claude/utils/sessionScanner';
 import { getProjectPath } from '@/claude/utils/path';
@@ -505,7 +506,8 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 logger.debug('[start] Bang command error:', error);
                 // Same ordering delay as success path (see comment above)
                 await new Promise(resolve => setTimeout(resolve, 100));
-                session.sendSessionEvent({ type: 'message', message: `❌ 命令执行失败: ${error}` });
+                const { display } = formatErrorForUser(String(error));
+                session.sendSessionEvent({ type: 'message', message: `❌ 命令执行失败: ${display}` });
                 session.sendSessionEvent({ type: 'ready' });
             });
             return;

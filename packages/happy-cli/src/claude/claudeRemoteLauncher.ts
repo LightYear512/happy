@@ -18,6 +18,7 @@ import { OutgoingMessageQueue } from "./utils/OutgoingMessageQueue";
 import { getToolName } from "./utils/getToolName";
 import { configuration } from "@/configuration";
 import { tryGlobalProfileSwitch } from "@/commands/bang/authCommand";
+import { formatErrorForUser } from "@/claude/utils/errorFormatter";
 import { getCurrentCcsProfile } from "@/commands/bang/ccsProfiles";
 
 interface PermissionsField {
@@ -453,8 +454,10 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     },
                     onErrorResult: (message: string) => {
                         session.client.closeClaudeSessionTurn('failed');
+                        const { display, raw } = formatErrorForUser(message);
+                        logger.debug(`[remote] Error result (raw): ${raw}`);
                         const profile = getCurrentCcsProfile();
-                        const displayMsg = profile ? `${message}\n\n[account: ${profile}]` : message;
+                        const displayMsg = profile ? `${display}\n\n[account: ${profile}]` : display;
                         session.client.sendSessionEvent({ type: 'message', message: displayMsg });
                     },
                     signal: abortController.signal,
