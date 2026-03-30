@@ -120,6 +120,31 @@ describe('analyzePtyOutput', () => {
             expect(result).toEqual({ action: 'auto-respond', response: '\r' });
         });
 
+        it('detects "Welcome back" as already-authenticated', () => {
+            const buffer = 'Claude Code v2.1.87\nTips for getting started\nWelcome back!  Run /init to create a CLAUDE.md';
+            const result = analyzePtyOutput(buffer, PRE_LOGIN, false);
+            expect(result).toEqual({ action: 'already-authenticated' });
+        });
+
+        it('detects "Welcome back" with ANSI sequences', () => {
+            const buffer = '\x1B[1mClaude Code v2.1.87\x1B[0m\n\x1B[32mWelcome back\x1B[0m! Run /init';
+            const result = analyzePtyOutput(buffer, PRE_LOGIN, false);
+            expect(result).toEqual({ action: 'already-authenticated' });
+        });
+
+        it('does not detect "Welcome back" after login URL sent (phase 2)', () => {
+            const buffer = 'Welcome back! Login successful';
+            const result = analyzePtyOutput(buffer, true, true);
+            // In phase 2 (loginUrlSent=true), always returns 'forward'
+            expect(result).toEqual({ action: 'forward' });
+        });
+
+        it('prioritizes OAuth URL over "Welcome back"', () => {
+            const buffer = 'Welcome back\nhttps://claude.ai/oauth/authorize?code=true\n';
+            const result = analyzePtyOutput(buffer, PRE_LOGIN, false);
+            expect(result.action).toBe('forward-url');
+        });
+
         it('discards incomplete output', () => {
             expect(analyzePtyOutput('Loading Claude Code...', PRE_LOGIN, false)).toEqual({ action: 'discard' });
             expect(analyzePtyOutput('', PRE_LOGIN, false)).toEqual({ action: 'discard' });

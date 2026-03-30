@@ -13,6 +13,7 @@ import {
 } from './interactiveSession';
 import { SEPARATOR, codeBlock, type BangCommandContext, type BangCommandResult } from './types';
 import { readOAuthToken } from './usageCommand';
+import { readCcsProfiles } from './ccsProfiles';
 
 const PROFILE_NAME_REGEX = /^[a-zA-Z][a-zA-Z0-9_-]*$/;
 
@@ -112,6 +113,7 @@ export function stripAnsiOnly(text: string): string {
 export type PtyAction =
     | { action: 'auto-respond'; response: string }
     | { action: 'forward-url'; url: string }
+    | { action: 'already-authenticated' }
     | { action: 'discard' }
     | { action: 'forward' };
 
@@ -145,6 +147,11 @@ export function analyzePtyOutput(buffer: string, loginUrlSent: boolean, loginCom
             || cleanBuffer.includes('Choose the text style')
         ) {
             return { action: 'auto-respond', response: '\r' };
+        }
+
+        // Already logged in — keychain has valid token, Claude entered main UI
+        if (cleanBuffer.includes('Welcome back')) {
+            return { action: 'already-authenticated' };
         }
 
         return { action: 'discard' };
@@ -605,6 +612,7 @@ export async function handleLoginBangCommand(
 
     let loginUrlSent = false;
     let loginCommandSent = false;
+    let loginSucceeded = false;
 
     ptyProcess.onData((data: string) => {
         outputBuffer += data;
@@ -632,6 +640,15 @@ export async function handleLoginBangCommand(
                 });
                 return;
 
+            case 'already-authenticated':
+                logger.debug('[!login] Already authenticated (keychain has valid token), exiting Claude');
+                loginSucceeded = true;
+                outputBuffer = '';
+                if (flushTimer) clearTimeout(flushTimer);
+                ptyProcess.write('/exit\r');
+                setTimeout(() => { try { ptyProcess.kill(); } catch {} }, 2000);
+                return;
+
             case 'discard':
                 // Keep accumulating — don't clear buffer during phase 1.
                 // The buffer grows until we match a URL or an auto-respond prompt.
@@ -643,6 +660,7 @@ export async function handleLoginBangCommand(
                 // Detect "Login successful" → auto-send Enter, then kill process
                 if (forwardText.includes('Login successful')) {
                     logger.debug('[!login] Login successful detected, sending Enter and finishing');
+                    loginSucceeded = true;
                     outputBuffer = '';
                     if (flushTimer) clearTimeout(flushTimer);
                     ptyProcess.write('\r');
@@ -677,10 +695,11 @@ export async function handleLoginBangCommand(
 
         if (trimmed === '!cancel' || trimmed === '!取消') {
             logger.debug('[!login] User cancelled login');
+            loginSucceeded = false; // Override any prior detection — user explicitly cancelled
             unregisterInteractiveSession();
             flushOutput();
             ptyProcess.kill();
-            cleanupInstance(instancePath);
+            if (!isRelogin) cleanupInstance(instancePath); // Re-login: preserve original instance data
             ctx.client.sendCodexMessage({ type: 'message', message: '❌ 登录已取消' });
             ctx.client.sendSessionEvent({ type: 'ready' });
             return;
@@ -705,12 +724,28 @@ export async function handleLoginBangCommand(
         flushOutput();
         unregisterInteractiveSession();
 
-        const hasCredentials = existsSync(join(instancePath, '.credentials.json'))
-            || readOAuthToken(instancePath) !== null;
+        // Only trust explicit PTY success signals or newly written credential files.
+        // Do NOT check keychain here — it may contain old tokens from before this login attempt.
+        const hasCredentials = loginSucceeded
+            || existsSync(join(instancePath, '.credentials.json'));
 
         if (hasCredentials) {
             if (isRelogin) {
-                ctx.client.sendCodexMessage({ type: 'message', message: `✅ 配置 "${profileName}" 重新登录成功` });
+                // Re-link shared directories in case the instance was rebuilt
+                try {
+                    const { profiles } = readCcsProfiles();
+                    const profile = profiles.find(p => p.name === profileName);
+                    if (profile?.contextMode === 'shared') {
+                        linkSharedDirectories(instancePath);
+                    }
+                } catch (err) {
+                    logger.debug('[!login] Failed to re-link shared directories:', err);
+                }
+                // Distinguish: actual re-login vs credentials were already valid
+                const msg = loginSucceeded && !loginUrlSent
+                    ? `✅ 配置 "${profileName}" 凭据仍然有效`
+                    : `✅ 配置 "${profileName}" 重新登录成功`;
+                ctx.client.sendCodexMessage({ type: 'message', message: msg });
             } else {
                 try {
                     registerProfile(profileName, contextMode, contextGroup);
