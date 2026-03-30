@@ -1,6 +1,6 @@
 import { execSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, renameSync, symlinkSync, copyFileSync, readdirSync, statSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, renameSync, symlinkSync, copyFileSync, readdirSync, statSync, chmodSync, constants as fsConstants, accessSync } from 'node:fs';
+import { join, resolve, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
 import * as pty from 'node-pty';
@@ -12,6 +12,7 @@ import {
     unregisterInteractiveSession,
 } from './interactiveSession';
 import { SEPARATOR, codeBlock, type BangCommandContext, type BangCommandResult } from './types';
+import { readOAuthToken } from './usageCommand';
 
 const PROFILE_NAME_REGEX = /^[a-zA-Z][a-zA-Z0-9_-]*$/;
 
@@ -150,6 +151,29 @@ export function analyzePtyOutput(buffer: string, loginUrlSent: boolean, loginCom
     }
 
     return { action: 'forward' };
+}
+
+/**
+ * Ensure node-pty's spawn-helper has execute permission on macOS/Linux.
+ *
+ * node-pty prebuild tarballs lose the +x bit when extracted by npm/yarn,
+ * causing every pty.spawn() to fail with "posix_spawnp failed.".
+ * This is a no-op on Windows (conpty doesn't use spawn-helper).
+ */
+function ensurePtySpawnHelper(): void {
+    if (process.platform === 'win32') return;
+    try {
+        const ptyIndex = require.resolve('node-pty');
+        const prebuildDir = join(dirname(ptyIndex), '..', 'prebuilds', `${process.platform}-${process.arch}`);
+        const helper = join(prebuildDir, 'spawn-helper');
+        if (!existsSync(helper)) return;
+        try {
+            accessSync(helper, fsConstants.X_OK);
+        } catch {
+            chmodSync(helper, 0o755);
+            logger.debug('[node-pty] Fixed spawn-helper execute permission');
+        }
+    } catch { /* best-effort */ }
 }
 
 /** Find the Claude CLI binary path. */
@@ -524,6 +548,7 @@ export async function handleLoginBangCommand(
     }
 
     // Spawn Claude CLI in a pseudo-TTY so the interactive login prompt works
+    ensurePtySpawnHelper();
     const childEnv = buildChildEnv(instancePath);
     // node-pty needs a clean env record (no undefined values)
     const cleanEnv: Record<string, string> = {};
@@ -658,8 +683,8 @@ export async function handleLoginBangCommand(
         flushOutput();
         unregisterInteractiveSession();
 
-        const credPath = join(instancePath, '.credentials.json');
-        const hasCredentials = existsSync(credPath);
+        const hasCredentials = existsSync(join(instancePath, '.credentials.json'))
+            || readOAuthToken(instancePath) !== null;
 
         if (hasCredentials) {
             if (isRelogin) {
