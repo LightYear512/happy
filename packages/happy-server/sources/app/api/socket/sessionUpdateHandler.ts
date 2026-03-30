@@ -390,6 +390,9 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                 data: { lastActiveAt: new Date(t), active: false }
             });
 
+            // Clear heartbeat cache so tryRestoreSession won't be blocked
+            activityCache.markSessionDead(sid);
+
             // Emit session activity update
             const sessionActivity = buildSessionActivityEphemeral(sid, false, t, false);
             eventRouter.emitEphemeral({

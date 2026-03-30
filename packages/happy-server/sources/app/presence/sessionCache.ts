@@ -138,6 +138,19 @@ class ActivityCache {
         return recency < this.BATCH_INTERVAL + this.UPDATE_THRESHOLD;
     }
 
+    /**
+     * Mark a session as dead in the cache so isSessionAlive() returns false immediately.
+     * Called when session-end is received, to avoid blocking tryRestoreSession
+     * for up to 35s while the cache entry is still considered "recent".
+     */
+    markSessionDead(sessionId: string): void {
+        const cached = this.sessionCache.get(sessionId);
+        if (cached) {
+            cached.pendingUpdate = null;
+            cached.lastUpdateSent = 0;
+        }
+    }
+
     queueSessionUpdate(sessionId: string, timestamp: number): boolean {
         const cached = this.sessionCache.get(sessionId);
         if (!cached) {
