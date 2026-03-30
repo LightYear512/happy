@@ -163,15 +163,22 @@ export function analyzePtyOutput(buffer: string, loginUrlSent: boolean, loginCom
 function ensurePtySpawnHelper(): void {
     if (process.platform === 'win32') return;
     try {
-        const ptyIndex = require.resolve('node-pty');
-        const prebuildDir = join(dirname(ptyIndex), '..', 'prebuilds', `${process.platform}-${process.arch}`);
-        const helper = join(prebuildDir, 'spawn-helper');
-        if (!existsSync(helper)) return;
-        try {
-            accessSync(helper, fsConstants.X_OK);
-        } catch {
-            chmodSync(helper, 0o755);
-            logger.debug('[node-pty] Fixed spawn-helper execute permission');
+        const ptyLib = dirname(require.resolve('node-pty'));
+        const ptyRoot = join(ptyLib, '..');
+        // Match node-pty loadNativeModule search order: build/Release, build/Debug, prebuilds/
+        const candidates = [
+            join(ptyRoot, 'build', 'Release', 'spawn-helper'),
+            join(ptyRoot, 'build', 'Debug', 'spawn-helper'),
+            join(ptyRoot, 'prebuilds', `${process.platform}-${process.arch}`, 'spawn-helper'),
+        ];
+        for (const helper of candidates) {
+            if (!existsSync(helper)) continue;
+            try {
+                accessSync(helper, fsConstants.X_OK);
+            } catch {
+                chmodSync(helper, 0o755);
+                logger.debug(`[node-pty] Fixed spawn-helper execute permission: ${helper}`);
+            }
         }
     } catch { /* best-effort */ }
 }
