@@ -571,7 +571,7 @@ export async function handleLoginBangCommand(
             shell ? ['/c', claudeInfo.path] : [],
             {
                 name: 'xterm-256color',
-                cols: 120,
+                cols: 1000, // Wide enough to prevent PTY line-wrapping mid-URL (OAuth URLs ~400 chars)
                 rows: 30,
                 cwd: homedir(), // Use home dir — no project = no workspace trust prompt
                 env: cleanEnv,
@@ -638,8 +638,9 @@ export async function handleLoginBangCommand(
                 return;
 
             case 'forward': {
-                // Detect "Login successful" → auto-send Enter, then kill process
                 const forwardText = stripAnsiOnly(outputBuffer);
+
+                // Detect "Login successful" → auto-send Enter, then kill process
                 if (forwardText.includes('Login successful')) {
                     logger.debug('[!login] Login successful detected, sending Enter and finishing');
                     outputBuffer = '';
@@ -649,6 +650,20 @@ export async function handleLoginBangCommand(
                     setTimeout(() => { try { ptyProcess.kill(); } catch {} }, 2000);
                     return;
                 }
+
+                // Detect OAuth error (invalid code) → kill process and notify user
+                if (forwardText.includes('OAuth error') || forwardText.includes('Invalid code')) {
+                    logger.debug('[!login] OAuth error detected, terminating login session');
+                    outputBuffer = '';
+                    if (flushTimer) clearTimeout(flushTimer);
+                    unregisterInteractiveSession();
+                    ptyProcess.kill();
+                    cleanupInstance(instancePath);
+                    ctx.client.sendCodexMessage({ type: 'message', message: '❌ 登录失败: 无效的 OAuth Code\n\n请重新使用 !login 登录' });
+                    ctx.client.sendSessionEvent({ type: 'ready' });
+                    return;
+                }
+
                 if (flushTimer) clearTimeout(flushTimer);
                 flushTimer = setTimeout(flushOutput, 300);
                 return;
