@@ -614,6 +614,7 @@ export async function handleLoginBangCommand(
     let loginSucceeded = false;
 
     ptyProcess.onData((data: string) => {
+        if (loginSucceeded) return; // Already finishing — ignore residual PTY output
         outputBuffer += data;
 
         const result = analyzePtyOutput(outputBuffer, loginUrlSent, loginCommandSent);
