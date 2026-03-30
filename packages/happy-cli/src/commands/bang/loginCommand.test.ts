@@ -132,6 +132,13 @@ describe('analyzePtyOutput', () => {
             expect(result).toEqual({ action: 'already-authenticated' });
         });
 
+        it('does not detect "Welcome back" after /login already sent', () => {
+            const buffer = 'Claude Code v2.1.87\nWelcome back! Run /init';
+            const result = analyzePtyOutput(buffer, false, true);
+            // loginCommandSent=true → skip "Welcome back" to avoid loop after forced /login
+            expect(result).toEqual({ action: 'discard' });
+        });
+
         it('does not detect "Welcome back" after login URL sent (phase 2)', () => {
             const buffer = 'Welcome back! Login successful';
             const result = analyzePtyOutput(buffer, true, true);

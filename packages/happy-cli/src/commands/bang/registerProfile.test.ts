@@ -179,4 +179,27 @@ describe('registerProfile — YAML text manipulation', () => {
         // Should be recent (within last minute)
         expect(Date.now() - date.getTime()).toBeLessThan(60_000);
     });
+
+    it('preserves created/last_used/continuity_mode on re-register (upsert)', () => {
+        const configPath = join(ccsDir, 'config.yaml');
+        writeFileSync(configPath, [
+            'version: 8',
+            'accounts:',
+            '  existing:',
+            '    created: "2026-01-15T10:00:00.000Z"',
+            '    last_used: "2026-03-20T08:30:00.000Z"',
+            '    context_mode: shared',
+            '    context_group: my-team',
+            '    continuity_mode: enhanced',
+        ].join('\n'), 'utf-8');
+
+        // Re-register with different mode — should preserve created/last_used/continuity_mode
+        registerProfile('existing', 'isolated');
+
+        const content = readFileSync(configPath, 'utf-8');
+        expect(content).toContain('created: "2026-01-15T10:00:00.000Z"');
+        expect(content).toContain('last_used: "2026-03-20T08:30:00.000Z"');
+        expect(content).toContain('continuity_mode: enhanced');
+        expect(content).toContain('context_mode: isolated');
+    });
 });

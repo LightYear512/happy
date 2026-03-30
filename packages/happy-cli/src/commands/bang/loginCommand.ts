@@ -12,7 +12,6 @@ import {
     unregisterInteractiveSession,
 } from './interactiveSession';
 import { SEPARATOR, codeBlock, type BangCommandContext, type BangCommandResult } from './types';
-import { readCcsProfiles } from './ccsProfiles';
 
 const PROFILE_NAME_REGEX = /^[a-zA-Z][a-zA-Z0-9_-]*$/;
 
@@ -148,8 +147,10 @@ export function analyzePtyOutput(buffer: string, loginUrlSent: boolean, loginCom
             return { action: 'auto-respond', response: '\r' };
         }
 
-        // Already logged in — keychain has valid token, Claude entered main UI
-        if (cleanBuffer.includes('Welcome back')) {
+        // Already logged in — keychain has valid token, Claude entered main UI.
+        // Only detect before /login is sent; after /login the screen may re-render
+        // with "Welcome back" text but we're already in the OAuth flow.
+        if (!loginCommandSent && cleanBuffer.includes('Welcome back')) {
             return { action: 'already-authenticated' };
         }
 
@@ -264,12 +265,13 @@ export function registerProfile(
 
     if (!config.accounts) config.accounts = {};
 
+    const existing = config.accounts[profileName];
     config.accounts[profileName] = {
-        created: new Date().toISOString(),
-        last_used: null,
+        created: existing?.created ?? new Date().toISOString(),
+        last_used: existing?.last_used ?? null,
         context_mode: contextMode,
         ...(contextGroup ? { context_group: contextGroup } : {}),
-        continuity_mode: 'standard',
+        continuity_mode: existing?.continuity_mode ?? 'standard',
     };
 
     const content = yaml.dump(config, { indent: 2, lineWidth: -1, quotingType: '"' });
@@ -292,12 +294,6 @@ function readAccountNames(): string[] {
     } catch { return []; }
 }
 
-/**
- * Check if an account exists in CCS config.yaml.
- */
-function accountExists(profileName: string): boolean {
-    return readAccountNames().includes(profileName);
-}
 
 /**
  * Link shared directories from instance to ~/.ccs/shared/.
@@ -490,9 +486,6 @@ export async function handleLoginBangCommand(
         };
     }
 
-    // Check existing — allow re-login for expired credentials
-    const isRelogin = accountExists(profileName);
-
     // Parse context flags
     const hasIsolated = parts.includes('--isolated');
     const groupIdx = parts.indexOf('--group');
@@ -510,8 +503,9 @@ export async function handleLoginBangCommand(
         };
     }
 
-    // Create instance directory
+    // Create instance directory (track whether it existed for cleanup decisions)
     const instancePath = getInstancePath(profileName);
+    const dirExistedBefore = existsSync(instancePath);
     try {
         mkdirSync(instancePath, { recursive: true });
     } catch (err) {
@@ -584,7 +578,7 @@ export async function handleLoginBangCommand(
             },
         );
     } catch (err) {
-        cleanupInstance(instancePath);
+        if (!dirExistedBefore) cleanupInstance(instancePath);
         return {
             message: `❌ 启动 Claude 失败: ${(err as Error).message}`,
             action: 'none',
@@ -641,12 +635,13 @@ export async function handleLoginBangCommand(
                 return;
 
             case 'already-authenticated':
-                logger.debug('[!login] Already authenticated (keychain has valid token), exiting Claude');
-                loginSucceeded = true;
+                // Claude found existing credentials (keychain), but user asked to login —
+                // always force OAuth flow so they authenticate with the intended account.
+                logger.debug('[!login] Already authenticated — forcing /login for fresh credentials');
                 outputBuffer = '';
                 if (flushTimer) clearTimeout(flushTimer);
-                ptyProcess.write('/exit\r');
-                setTimeout(() => { try { ptyProcess.kill(); } catch {} }, 2000);
+                loginCommandSent = true; // Prevent re-triggering "Welcome back" detection
+                ptyProcess.write('/login\r');
                 return;
 
             case 'discard':
@@ -676,7 +671,7 @@ export async function handleLoginBangCommand(
                     if (flushTimer) clearTimeout(flushTimer);
                     unregisterInteractiveSession();
                     ptyProcess.kill();
-                    if (!isRelogin) cleanupInstance(instancePath);
+                    if (!dirExistedBefore) cleanupInstance(instancePath);
                     ctx.client.sendCodexMessage({ type: 'message', message: '❌ 登录失败: 无效的 OAuth Code\n\n请重新使用 !login 登录' });
                     ctx.client.sendSessionEvent({ type: 'ready' });
                     return;
@@ -699,7 +694,7 @@ export async function handleLoginBangCommand(
             unregisterInteractiveSession();
             flushOutput();
             ptyProcess.kill();
-            if (!isRelogin) cleanupInstance(instancePath); // Re-login: preserve original instance data
+            if (!dirExistedBefore) cleanupInstance(instancePath);
             ctx.client.sendCodexMessage({ type: 'message', message: '❌ 登录已取消' });
             ctx.client.sendSessionEvent({ type: 'ready' });
             return;
@@ -730,42 +725,24 @@ export async function handleLoginBangCommand(
             || existsSync(join(instancePath, '.credentials.json'));
 
         if (hasCredentials) {
-            if (isRelogin) {
-                // Re-link shared directories in case the instance was rebuilt
-                try {
-                    const { profiles } = readCcsProfiles();
-                    const profile = profiles.find(p => p.name === profileName);
-                    if (profile?.contextMode === 'shared') {
-                        linkSharedDirectories(instancePath);
-                    }
-                } catch (err) {
-                    logger.debug('[!login] Failed to re-link shared directories:', err);
+            try {
+                registerProfile(profileName, contextMode, contextGroup);
+                if (contextMode === 'shared') {
+                    linkSharedDirectories(instancePath);
                 }
-                // Distinguish: actual re-login vs credentials were already valid
-                const msg = loginSucceeded && !loginUrlSent
-                    ? `✅ 配置 "${profileName}" 凭据仍然有效`
-                    : `✅ 配置 "${profileName}" 重新登录成功`;
+                const modeDesc = contextMode === 'shared'
+                    ? `共享 (组: ${contextGroup || 'default'})`
+                    : '独立';
+                const msg = `✅ 配置 "${profileName}" 登录成功\n\n`
+                    + `模式: ${modeDesc}\n\n`
+                    + `切换账号: !auth ${profileName}`;
                 ctx.client.sendCodexMessage({ type: 'message', message: msg });
-            } else {
-                try {
-                    registerProfile(profileName, contextMode, contextGroup);
-                    if (contextMode === 'shared') {
-                        linkSharedDirectories(instancePath);
-                    }
-                    const modeDesc = contextMode === 'shared'
-                        ? `共享 (组: ${contextGroup || 'default'})`
-                        : '独立';
-                    const msg = `✅ 配置 "${profileName}" 创建成功\n\n`
-                        + `模式: ${modeDesc}\n\n`
-                        + `切换账号: !auth ${profileName}`;
-                    ctx.client.sendCodexMessage({ type: 'message', message: msg });
-                } catch (err) {
-                    logger.debug('[!login] Failed to register profile:', err);
-                    ctx.client.sendCodexMessage({ type: 'message', message: `⚠️ 登录成功但注册失败: ${(err as Error).message}` });
-                }
+            } catch (err) {
+                logger.debug('[!login] Failed to register profile:', err);
+                ctx.client.sendCodexMessage({ type: 'message', message: `⚠️ 登录成功但注册失败: ${(err as Error).message}` });
             }
         } else {
-            if (!isRelogin) cleanupInstance(instancePath);
+            if (!dirExistedBefore) cleanupInstance(instancePath);
             logger.debug(`[!login] Login failed with exit code: ${exitCode ?? 'unknown'}`);
             ctx.client.sendCodexMessage({ type: 'message', message: `❌ 登录失败或已取消\n\n重新尝试: !login ${profileName}` });
         }
@@ -774,8 +751,8 @@ export async function handleLoginBangCommand(
     });
 
     // Return immediately — the interactive session runs asynchronously
-    const msg = `🔐 正在${isRelogin ? '重新' : ''}登录...\n\n`
-        + `配置: ${profileName}${isRelogin ? '' : ` (${contextMode === 'shared' ? '共享' : '独立'})`}\n\n`
+    const msg = `🔐 正在登录...\n\n`
+        + `配置: ${profileName} (${contextMode === 'shared' ? '共享' : '独立'})\n\n`
         + '请等待登录提示，然后粘贴 OAuth Key\n\n'
         + '取消: !cancel';
     return { message: msg, action: 'none' };
