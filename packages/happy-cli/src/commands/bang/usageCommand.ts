@@ -94,27 +94,20 @@ function readTokenFromKeychain(configDir: string): string | null {
 
     let token: string | null = null;
     const suffix = createHash('sha256').update(configDir).digest('hex').slice(0, 8);
-    // Try suffixed first (CCS instances), then unsuffixed (default ~/.claude instance)
-    const candidates = [
-        `Claude Code-credentials-${suffix}`,
-        'Claude Code-credentials',
-    ];
-    for (const service of candidates) {
-        try {
-            const raw = execFileSync('security', ['find-generic-password', '-s', service, '-w'], {
-                encoding: 'utf-8',
-                timeout: 5000,
-                stdio: ['pipe', 'pipe', 'pipe'],
-            }).trim();
-            const data = JSON.parse(raw);
-            token = data.claudeAiOauth?.accessToken ?? null;
-            if (token) {
-                logger.debug(`[!usage] Keychain service=${service}, token found=true`);
-                break;
-            }
-        } catch {
-            // not found or keychain error, try next candidate
+    const service = `Claude Code-credentials-${suffix}`;
+    try {
+        const raw = execFileSync('security', ['find-generic-password', '-s', service, '-w'], {
+            encoding: 'utf-8',
+            timeout: 5000,
+            stdio: ['pipe', 'pipe', 'pipe'],
+        }).trim();
+        const data = JSON.parse(raw);
+        token = data.claudeAiOauth?.accessToken ?? null;
+        if (token) {
+            logger.debug(`[!usage] Keychain service=${service}, token found=true`);
         }
+    } catch {
+        // not found or keychain error
     }
     keychainCache.set(configDir, { token, ts: Date.now() });
     return token;
