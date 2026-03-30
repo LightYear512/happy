@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -93,19 +93,28 @@ function readTokenFromKeychain(configDir: string): string | null {
     if (cached && Date.now() - cached.ts < KEYCHAIN_CACHE_TTL_MS) return cached.token;
 
     let token: string | null = null;
-    try {
-        const suffix = createHash('sha256').update(configDir).digest('hex').slice(0, 8);
-        const service = `Claude Code-credentials-${suffix}`;
-        const raw = execSync(`security find-generic-password -s "${service}" -w`, {
-            encoding: 'utf-8',
-            timeout: 5000,
-            stdio: ['pipe', 'pipe', 'pipe'],
-        }).trim();
-        const data = JSON.parse(raw);
-        token = data.claudeAiOauth?.accessToken ?? null;
-        logger.debug(`[!usage] Keychain service=${service}, token found=${!!token}`);
-    } catch {
-        // not found or keychain error
+    const suffix = createHash('sha256').update(configDir).digest('hex').slice(0, 8);
+    // Try suffixed first (CCS instances), then unsuffixed (default ~/.claude instance)
+    const candidates = [
+        `Claude Code-credentials-${suffix}`,
+        'Claude Code-credentials',
+    ];
+    for (const service of candidates) {
+        try {
+            const raw = execFileSync('security', ['find-generic-password', '-s', service, '-w'], {
+                encoding: 'utf-8',
+                timeout: 5000,
+                stdio: ['pipe', 'pipe', 'pipe'],
+            }).trim();
+            const data = JSON.parse(raw);
+            token = data.claudeAiOauth?.accessToken ?? null;
+            if (token) {
+                logger.debug(`[!usage] Keychain service=${service}, token found=true`);
+                break;
+            }
+        } catch {
+            // not found or keychain error, try next candidate
+        }
     }
     keychainCache.set(configDir, { token, ts: Date.now() });
     return token;
