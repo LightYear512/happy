@@ -12,7 +12,6 @@ import {
     unregisterInteractiveSession,
 } from './interactiveSession';
 import { SEPARATOR, codeBlock, type BangCommandContext, type BangCommandResult } from './types';
-import { readOAuthToken } from './usageCommand';
 import { readCcsProfiles } from './ccsProfiles';
 
 const PROFILE_NAME_REGEX = /^[a-zA-Z][a-zA-Z0-9_-]*$/;
@@ -676,7 +675,7 @@ export async function handleLoginBangCommand(
                     if (flushTimer) clearTimeout(flushTimer);
                     unregisterInteractiveSession();
                     ptyProcess.kill();
-                    cleanupInstance(instancePath);
+                    if (!isRelogin) cleanupInstance(instancePath);
                     ctx.client.sendCodexMessage({ type: 'message', message: '❌ 登录失败: 无效的 OAuth Code\n\n请重新使用 !login 登录' });
                     ctx.client.sendSessionEvent({ type: 'ready' });
                     return;
