@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { logger } from '@/ui/logger';
 import { readCcsProfiles, getCurrentCcsProfile, type CcsProfileInfo } from './ccsProfiles';
 import { configuration } from '@/configuration';
-import { getCachedUsageSummary } from './usageCommand';
+import { getCachedUsageSummary, readOAuthToken } from './usageCommand';
 import { SEPARATOR, type BangCommandContext, type BangCommandResult } from './types';
 
 /**
@@ -101,16 +101,7 @@ export function tryGlobalProfileSwitch(): boolean {
  */
 function getProfileStatus(profile: CcsProfileInfo): string {
     if (!existsSync(profile.instancePath)) return '⚠';
-
-    try {
-        const credPath = join(profile.instancePath, '.credentials.json');
-        const raw = readFileSync(credPath, 'utf-8');
-        const data = JSON.parse(raw);
-        if (!data.claudeAiOauth?.accessToken) return '⚠';
-    } catch {
-        return '⚠';
-    }
-
+    if (!readOAuthToken(profile.instancePath)) return '⚠';
     return '';
 }
 

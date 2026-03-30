@@ -1,4 +1,6 @@
 import { readFileSync } from 'node:fs';
+import { execSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { ProxyAgent, fetch as undiciFetch } from 'undici';
@@ -43,21 +45,20 @@ function resolveOAuthToken(): { token: string; profileLabel: string; cacheKey: s
 
     // Try CCS profile credentials first
     if (configDir) {
-        const credPath = join(configDir, '.credentials.json');
-        const token = readTokenFromFile(credPath);
-        logger.debug(`[!usage] CCS cred path=${credPath}, token found=${!!token}`);
+        const token = readOAuthToken(configDir);
+        logger.debug(`[!usage] CCS configDir=${configDir}, token found=${!!token}`);
         if (token) {
             const profileName = getCurrentCcsProfile() ?? configDir;
             return { token, profileLabel: profileName, cacheKey: configDir };
         }
     }
 
-    // Fallback to default ~/.claude/.credentials.json
-    const defaultCredPath = join(homedir(), '.claude', '.credentials.json');
-    const token = readTokenFromFile(defaultCredPath);
-    logger.debug(`[!usage] Default cred path=${defaultCredPath}, token found=${!!token}`);
+    // Fallback to default ~/.claude/
+    const defaultDir = join(homedir(), '.claude');
+    const token = readOAuthToken(defaultDir);
+    logger.debug(`[!usage] Default dir=${defaultDir}, token found=${!!token}`);
     if (token) {
-        return { token, profileLabel: 'default', cacheKey: defaultCredPath };
+        return { token, profileLabel: 'default', cacheKey: defaultDir };
     }
 
     return null;
@@ -71,6 +72,54 @@ function readTokenFromFile(path: string): string | null {
     } catch {
         return null;
     }
+}
+
+/**
+ * Read OAuth token from macOS Keychain.
+ * Claude Code (newer versions) stores credentials in the system keychain instead of
+ * `.credentials.json`. The service name follows the pattern:
+ *   "Claude Code-credentials-<sha256(configDir)[0:8]>"
+ * For the default ~/.claude instance, the service name is simply "Claude Code-credentials".
+ *
+ * Results are cached for 60s to avoid repeated subprocess spawns (each ~100ms).
+ */
+const keychainCache = new Map<string, { token: string | null; ts: number }>();
+const KEYCHAIN_CACHE_TTL_MS = 60_000;
+
+function readTokenFromKeychain(configDir: string): string | null {
+    if (process.platform !== 'darwin') return null;
+
+    const cached = keychainCache.get(configDir);
+    if (cached && Date.now() - cached.ts < KEYCHAIN_CACHE_TTL_MS) return cached.token;
+
+    let token: string | null = null;
+    try {
+        const suffix = createHash('sha256').update(configDir).digest('hex').slice(0, 8);
+        const service = `Claude Code-credentials-${suffix}`;
+        const raw = execSync(`security find-generic-password -s "${service}" -w`, {
+            encoding: 'utf-8',
+            timeout: 5000,
+            stdio: ['pipe', 'pipe', 'pipe'],
+        }).trim();
+        const data = JSON.parse(raw);
+        token = data.claudeAiOauth?.accessToken ?? null;
+        logger.debug(`[!usage] Keychain service=${service}, token found=${!!token}`);
+    } catch {
+        // not found or keychain error
+    }
+    keychainCache.set(configDir, { token, ts: Date.now() });
+    return token;
+}
+
+/**
+ * Read OAuth token for a given config directory.
+ * Tries `.credentials.json` file first, then falls back to macOS Keychain.
+ */
+export function readOAuthToken(configDir: string): string | null {
+    const credPath = join(configDir, '.credentials.json');
+    const token = readTokenFromFile(credPath);
+    if (token) return token;
+    return readTokenFromKeychain(configDir);
 }
 
 /**
@@ -261,8 +310,7 @@ export function formatUsage(data: UsageData, profileLabel: string, cachedAt: num
  */
 function resolveOAuthTokenForProfile(profileName: string): { token: string; profileLabel: string; cacheKey: string } | null {
     const instancePath = getInstancePath(profileName);
-    const credPath = join(instancePath, '.credentials.json');
-    const token = readTokenFromFile(credPath);
+    const token = readOAuthToken(instancePath);
     if (token) {
         return { token, profileLabel: profileName, cacheKey: instancePath };
     }
@@ -283,7 +331,7 @@ export async function handleUsageBangCommand(args: string, ctx: BangCommandConte
         const { profiles, defaultProfile } = readCcsProfiles();
         // Only show profiles that have credentials
         const accountProfiles = profiles.filter(p =>
-            readTokenFromFile(join(p.instancePath, '.credentials.json')) !== null
+            readOAuthToken(p.instancePath) !== null
         );
         if (accountProfiles.length === 0) {
             return { message: '❌ 未找到已登录的账户。', action: 'none' };
