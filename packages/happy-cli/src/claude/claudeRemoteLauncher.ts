@@ -20,6 +20,7 @@ import { configuration } from "@/configuration";
 import { tryGlobalProfileSwitch } from "@/commands/bang/authCommand";
 import { formatErrorForUser } from "@/claude/utils/errorFormatter";
 import { getCurrentCcsProfile } from "@/commands/bang/ccsProfiles";
+import { queryRateLimitContext } from "@/commands/bang/usageCommand";
 
 interface PermissionsField {
     date: number;
@@ -454,11 +455,85 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     },
                     onErrorResult: (message: string) => {
                         session.client.closeClaudeSessionTurn('failed');
-                        const { display, raw } = formatErrorForUser(message);
-                        logger.debug(`[remote] Error result (raw): ${raw}`);
+                        const { display, raw, severity, recoverySteps } = formatErrorForUser(message);
+                        logger.debug(`[remote] Error result (raw): ${raw} severity=${severity}`);
                         const profile = getCurrentCcsProfile();
-                        const displayMsg = profile ? `${display}\n\n[account: ${profile}]` : display;
-                        session.client.sendSessionEvent({ type: 'message', message: displayMsg });
+
+                        // Build display message with recovery steps
+                        const parts: string[] = [display];
+                        if (profile) parts.push(`[account: ${profile}]`);
+
+                        // Non-quota errors: show recovery steps immediately
+                        if (severity !== 'quota') {
+                            if (recoverySteps.length > 0) {
+                                parts.push('');
+                                for (const step of recoverySteps) {
+                                    parts.push(`→ ${step}`);
+                                }
+                            }
+                            session.client.sendSessionEvent({ type: 'message', message: parts.join('\n') });
+                            return;
+                        }
+
+                        // Quota errors: fetch usage first, then build unified message
+                        session.client.sendSessionEvent({ type: 'message', message: parts.join('\n') });
+
+                        queryRateLimitContext().then(ctx => {
+                            if (!ctx) return;
+
+                            const lines: string[] = [];
+
+                            // Show current usage data per window
+                            if (ctx.overLimitWindows.length > 0) {
+                                lines.push('📊 当前用量:');
+                                for (const w of ctx.overLimitWindows) {
+                                    lines.push(`  ${w.label}: ${w.utilization.toFixed(0)}% | 重置于 ${w.resetsIn} 后`);
+                                }
+                            }
+
+                            // Recovery actions
+                            lines.push('');
+                            lines.push('可以尝试:');
+                            lines.push('  → 查看用量: !usage');
+                            lines.push('  → 切换账户: !auth');
+
+                            // Show switchable profiles or suggest !login
+                            if (ctx.switchableProfiles.length > 0) {
+                                for (const name of ctx.switchableProfiles) {
+                                    lines.push(`  → 切换到: !auth ${name}`);
+                                }
+                            } else if (ctx.allProfilesOverLimit) {
+                                lines.push('  → 所有已登录账户均已超限，登录新账户: !login <名称>');
+                            } else {
+                                lines.push('  → 使用 !login <名称> 添加新账户');
+                            }
+
+                            if (lines.length > 0) {
+                                session.client.sendSessionEvent({ type: 'message', message: lines.join('\n') });
+                            }
+                        }).catch(e => {
+                            // Usage query failed — show basic recovery steps as fallback
+                            logger.debug(`[remote] Rate limit context query failed: ${e}`);
+                            const fallback = recoverySteps.map(s => `→ ${s}`).join('\n');
+                            if (fallback) {
+                                session.client.sendSessionEvent({ type: 'message', message: fallback });
+                            }
+                        });
+                    },
+                    onRateLimitEvent: (info) => {
+                        // Fire-and-forget: query usage and send to mobile on rate limit
+                        queryRateLimitContext().then(ctx => {
+                            if (!ctx || ctx.overLimitWindows.length === 0) return;
+
+                            const lines: string[] = ['⏳ 速率限制中...'];
+                            lines.push('📊 当前用量:');
+                            for (const w of ctx.overLimitWindows) {
+                                lines.push(`  ${w.label}: ${w.utilization.toFixed(0)}% | 重置于 ${w.resetsIn} 后`);
+                            }
+                            session.client.sendSessionEvent({ type: 'message', message: lines.join('\n') });
+                        }).catch(e => {
+                            logger.debug(`[remote] Rate limit event usage query failed: ${e}`);
+                        });
                     },
                     signal: abortController.signal,
                 });

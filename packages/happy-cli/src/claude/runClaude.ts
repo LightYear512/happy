@@ -29,6 +29,7 @@ import { existsSync } from 'node:fs';
 import { startOfflineReconnection, connectionState } from '@/utils/serverConnectionErrors';
 import { readCcsProfiles, getInstancePath, getCurrentCcsProfile } from '@/commands/bang/ccsProfiles';
 import { formatErrorForUser } from '@/claude/utils/errorFormatter';
+import { queryRateLimitContext } from '@/commands/bang/usageCommand';
 import { claudeLocal } from '@/claude/claudeLocal';
 import { createSessionScanner, readSessionLog } from '@/claude/utils/sessionScanner';
 import { getProjectPath } from '@/claude/utils/path';
@@ -276,6 +277,43 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             logger.debug(`[START] Restored resume title: ${resumeTitle}`);
         }).catch(error => {
             logger.debug('[START] Failed to restore resume title:', error);
+        });
+    }
+
+    // Startup usage warning: check quota levels and warn user before they start working.
+    // Fire-and-forget — must not block session startup. Skip for console sessions.
+    if (!isConsoleSession) {
+        session.waitForConnect().then(async () => {
+            try {
+                const ctx = await queryRateLimitContext();
+                if (!ctx || ctx.overLimitWindows.length === 0) return;
+
+                const topWindow = ctx.overLimitWindows[0];
+                const icon = topWindow.utilization >= 90 ? '🚨' : '⚠️';
+
+                const lines: string[] = [
+                    `${icon} 用量预警: ${topWindow.label}已达 ${topWindow.utilization.toFixed(0)}%`,
+                    `⏰ 重置于 ${topWindow.resetsIn} 后`,
+                ];
+
+                // Show additional windows if any
+                for (const w of ctx.overLimitWindows.slice(1)) {
+                    lines.push(`  ${w.label}: ${w.utilization.toFixed(0)}% — ${w.resetsIn} 后重置`);
+                }
+
+                // Suggest switchable profile or !login
+                if (ctx.switchableProfiles.length > 0) {
+                    lines.push(`💡 建议: !auth ${ctx.switchableProfiles[0]} 切换账户`);
+                } else {
+                    lines.push('💡 建议: !login <名称> 登录新账户');
+                }
+
+                session.sendSessionEvent({ type: 'message', message: lines.join('\n') });
+            } catch (e) {
+                logger.debug('[START] Startup usage check failed:', e);
+            }
+        }).catch(e => {
+            logger.debug('[START] Startup usage warning socket connect failed:', e);
         });
     }
 

@@ -42,6 +42,8 @@ export async function claudeRemote(opts: {
     onSessionReset?: () => void,
     /** Called when Claude returns an error result (rate limit, max turns, etc.) */
     onErrorResult?: (message: string) => void,
+    /** Called when a rate_limit_event is received from the SDK stream */
+    onRateLimitEvent?: (info: { rateLimitType: string; resetsAt: number | null }) => void,
 }) {
 
     // Check if session is valid
@@ -195,12 +197,18 @@ export async function claudeRemote(opts: {
                 }
             }
 
-            // Handle rate_limit_event — forward rate limit info to mobile
+            // Handle rate_limit_event — forward rate limit info to launcher
             if (message.type === 'rate_limit_event') {
                 const info = (message as any).rate_limit_info;
                 if (info && info.status !== 'allowed') {
                     const resetsAt = info.resetsAt ? new Date(info.resetsAt * 1000).toLocaleTimeString() : 'unknown';
                     logger.debug(`[claudeRemote] Rate limit hit: type=${info.rateLimitType}, resets=${resetsAt}`);
+                    if (opts.onRateLimitEvent) {
+                        opts.onRateLimitEvent({
+                            rateLimitType: info.rateLimitType ?? 'unknown',
+                            resetsAt: info.resetsAt ?? null,
+                        });
+                    }
                 }
             }
 

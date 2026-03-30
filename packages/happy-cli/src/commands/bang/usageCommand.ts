@@ -39,7 +39,7 @@ const cache = new Map<string, CachedUsage>();
  * Checks CLAUDE_CONFIG_DIR first (CCS profile), then falls back to ~/.claude/.
  * Returns the token, a display label, and a stable cache key.
  */
-function resolveOAuthToken(): { token: string; profileLabel: string; cacheKey: string } | null {
+export function resolveOAuthToken(): { token: string; profileLabel: string; cacheKey: string } | null {
     const configDir = process.env.CLAUDE_CONFIG_DIR;
     logger.debug(`[!usage] resolveOAuthToken: CLAUDE_CONFIG_DIR=${configDir ?? '(unset)'}`);
 
@@ -166,7 +166,7 @@ function resolveProxy(): string | null {
  * Direct connections from geo-restricted IPs get Cloudflare 403,
  * so we mirror Claude's own proxy settings from settings.json.
  */
-async function fetchUsage(token: string, debugLabel: string): Promise<UsageData> {
+export async function fetchUsage(token: string, debugLabel: string): Promise<UsageData> {
     const tokenPrefix = token.substring(0, 15) + '...';
     const proxy = resolveProxy();
     logger.debug(`[!usage] Calling ${USAGE_API_URL} token=${tokenPrefix} label=${debugLabel} proxy=${proxy ?? '(none)'}`);
@@ -206,7 +206,7 @@ async function fetchUsage(token: string, debugLabel: string): Promise<UsageData>
 /**
  * Format a reset timestamp into a human-readable relative string.
  */
-function formatResetTime(resetsAt: string): string {
+export function formatResetTime(resetsAt: string): string {
     const resetDate = new Date(resetsAt);
     const now = new Date();
     const diffMs = resetDate.getTime() - now.getTime();
@@ -445,4 +445,131 @@ export async function handleUsageBangCommand(args: string, ctx: BangCommandConte
         ctx.client.sendCodexMessage({ type: 'message', message: codeBlock(errorMsg) });
         return { message: [], action: 'none' };
     }
+}
+
+// ============================================================================
+// Programmatic rate-limit usage query (used by claudeRemoteLauncher on 429)
+// ============================================================================
+
+/** Which usage windows are over limit + switchable profiles. */
+export interface RateLimitContext {
+    /** Current profile name */
+    currentProfile: string
+    /** Windows that are at or over 80% utilization, sorted by utilization descending */
+    overLimitWindows: Array<{ label: string; utilization: number; resetsIn: string }>
+    /** Other CCS profiles in the same contextGroup with available quota */
+    switchableProfiles: string[]
+    /** True when all known profiles (same group + credentials) are over limit */
+    allProfilesOverLimit: boolean
+}
+
+/**
+ * Fetch usage for the current profile and find which windows triggered the rate limit.
+ * Also scans other CCS profiles in the same contextGroup for ones with available quota.
+ * Returns null if usage data cannot be fetched (no token, API error, etc.).
+ *
+ * Only profiles that are `shared` in the same `contextGroup` are considered switchable,
+ * matching the constraint enforced by `!auth` (authCommand.ts switchProfile).
+ *
+ * This is a fire-and-forget helper — callers should not block on it.
+ */
+export async function queryRateLimitContext(): Promise<RateLimitContext | null> {
+    const resolved = resolveOAuthToken();
+    if (!resolved) return null;
+
+    const { token, profileLabel, cacheKey } = resolved;
+
+    // Fetch current profile usage (use cache if fresh)
+    let data: UsageData;
+    const cached = cache.get(cacheKey);
+    if (cached && (Date.now() - cached.fetchedAt) < CACHE_TTL_MS) {
+        data = cached.data;
+    } else {
+        try {
+            data = await fetchUsage(token, profileLabel);
+            cache.set(cacheKey, { data, fetchedAt: Date.now() });
+        } catch (e) {
+            logger.debug(`[rateLimitContext] Failed to fetch usage for ${profileLabel}: ${e}`);
+            return null;
+        }
+    }
+
+    // Find windows over 80% utilization
+    const THRESHOLD = 80;
+    const windows: Array<{ label: string; utilization: number; resetsIn: string }> = [];
+    if (data.five_hour && data.five_hour.utilization >= THRESHOLD) {
+        windows.push({ label: '5 小时窗口', utilization: data.five_hour.utilization, resetsIn: formatResetTime(data.five_hour.resets_at) });
+    }
+    if (data.seven_day && data.seven_day.utilization >= THRESHOLD) {
+        windows.push({ label: '7 天总量', utilization: data.seven_day.utilization, resetsIn: formatResetTime(data.seven_day.resets_at) });
+    }
+    if (data.seven_day_opus && data.seven_day_opus.utilization >= THRESHOLD) {
+        windows.push({ label: 'Opus 7天', utilization: data.seven_day_opus.utilization, resetsIn: formatResetTime(data.seven_day_opus.resets_at) });
+    }
+    if (data.seven_day_sonnet && data.seven_day_sonnet.utilization >= THRESHOLD) {
+        windows.push({ label: 'Sonnet 7天', utilization: data.seven_day_sonnet.utilization, resetsIn: formatResetTime(data.seven_day_sonnet.resets_at) });
+    }
+    windows.sort((a, b) => b.utilization - a.utilization);
+
+    // Find switchable profiles: same contextGroup, shared mode, with credentials
+    const currentFiveHour = data.five_hour?.utilization ?? 0;
+    const { profiles } = readCcsProfiles();
+
+    // Determine current profile's contextGroup
+    const currentProfileInfo = profiles.find(p => p.name === profileLabel);
+    const currentGroup = currentProfileInfo?.contextGroup ?? 'default';
+    const currentIsShared = currentProfileInfo?.contextMode === 'shared' || !currentProfileInfo?.contextMode;
+
+    // Only look for switchable profiles if current profile is in a shared group
+    const switchable: string[] = [];
+    let checkedCount = 0;
+    let overLimitCount = 0;
+
+    if (currentIsShared) {
+        for (const p of profiles) {
+            if (p.name === profileLabel) continue;
+            // Must be shared + same contextGroup (mirrors authCommand switchProfile constraints)
+            const pGroup = p.contextGroup ?? 'default';
+            if (p.contextMode === 'isolated' || pGroup !== currentGroup) continue;
+
+            const otherToken = readOAuthToken(p.instancePath);
+            if (!otherToken) continue;
+
+            checkedCount++;
+
+            // Check cached usage for the other profile
+            const otherCached = cache.get(p.instancePath);
+            if (otherCached && (Date.now() - otherCached.fetchedAt) < CACHE_TTL_MS) {
+                const other5h = otherCached.data.five_hour?.utilization ?? 0;
+                if (other5h < currentFiveHour && other5h < THRESHOLD) {
+                    switchable.push(p.name);
+                } else if (other5h >= THRESHOLD) {
+                    overLimitCount++;
+                }
+                continue;
+            }
+
+            // Try fetching usage for the other profile (best-effort)
+            try {
+                const otherData = await fetchUsage(otherToken, p.name);
+                cache.set(p.instancePath, { data: otherData, fetchedAt: Date.now() });
+                const other5h = otherData.five_hour?.utilization ?? 0;
+                if (other5h < currentFiveHour && other5h < THRESHOLD) {
+                    switchable.push(p.name);
+                } else if (other5h >= THRESHOLD) {
+                    overLimitCount++;
+                }
+            } catch (e) {
+                logger.debug(`[rateLimitContext] Failed to fetch usage for ${p.name}: ${e}`);
+                // Don't add — can't verify this profile has available quota
+            }
+        }
+    }
+
+    // All profiles over limit: current must be over threshold + no switchable found
+    // + either no peers exist (single profile) or every checked peer is also over
+    const currentOverLimit = (data.five_hour?.utilization ?? 0) >= THRESHOLD;
+    const allProfilesOverLimit = currentOverLimit && switchable.length === 0 && (checkedCount === 0 || overLimitCount === checkedCount);
+
+    return { currentProfile: profileLabel, overLimitWindows: windows, switchableProfiles: switchable, allProfilesOverLimit };
 }
