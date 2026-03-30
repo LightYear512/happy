@@ -21,4 +21,6 @@ export interface TrackedSession {
   tmuxSessionId?: string;
   /** Claude session ID this process is resuming (set at spawn time for dedup) */
   resumeTarget?: string;
+  /** Whether this is the daemon console session (should not be restorable) */
+  isConsoleSession?: boolean;
 }

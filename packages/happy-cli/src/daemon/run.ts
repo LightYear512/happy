@@ -250,8 +250,10 @@ export async function startDaemon(): Promise<void> {
         logger.debug(`[DAEMON RUN] Registered externally-started session ${sessionId}`);
       }
 
-      // Persist restore file for any session (daemon-spawned or external)
-      if (sessionId && sessionMetadata.path) {
+      // Persist restore file for any session (daemon-spawned or external).
+      // Skip console sessions — they should not be restorable (would cause multiple consoles).
+      const tracked = pidToTrackedSession.get(pid);
+      if (sessionId && sessionMetadata.path && !tracked?.isConsoleSession) {
         const agent = (sessionMetadata.flavor === 'codex' ? 'codex' : sessionMetadata.flavor === 'gemini' ? 'gemini' : 'claude') as 'claude' | 'codex' | 'gemini';
         writeRestoreFile(sessionId, {
           directory: sessionMetadata.path,
@@ -538,6 +540,7 @@ export async function startDaemon(): Promise<void> {
               pid: tmuxResult.pid, // Real PID from tmux -P flag
               tmuxSessionId: tmuxResult.sessionId,
               resumeTarget: options.resume,
+              isConsoleSession: options.consoleSession,
               directoryCreated,
               message: directoryCreated
                 ? `The path '${directory}' did not exist. We created a new folder and spawned a new session in tmux session '${tmuxSessionName}'. Use 'tmux attach -t ${tmuxSessionName}' to view the session.`
@@ -665,6 +668,7 @@ export async function startDaemon(): Promise<void> {
             pid: happyProcess.pid,
             childProcess: happyProcess,
             resumeTarget: options.resume,
+            isConsoleSession: options.consoleSession,
             directoryCreated,
             message: directoryCreated ? `The path '${directory}' did not exist. We created a new folder and spawned a new session there.` : undefined
           };
