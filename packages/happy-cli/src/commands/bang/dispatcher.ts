@@ -102,6 +102,9 @@ function buildHelp(isConsole: boolean): BangCommandResult {
     };
 }
 
+/** Commands hidden from console welcome (available via !help but not shown on launch). */
+const consoleWelcomeHidden = new Set(['restart-all', 'session', 'open']);
+
 /**
  * Build the console welcome message listing key commands.
  * Derived from the commands registry to stay in sync with !help.
@@ -113,9 +116,9 @@ export function buildConsoleWelcome(): BangCommandResult {
         SEPARATOR,
     ];
 
-    // Show commands available in console (consoleOnly + shared, exclude hidden)
+    // Show commands available in console (consoleOnly + shared, exclude hidden and welcome-hidden)
     const consoleCommands = Object.entries(commands)
-        .filter(([, entry]) => !entry.hidden && !entry.sessionOnly);
+        .filter(([name, entry]) => !entry.hidden && !entry.sessionOnly && !consoleWelcomeHidden.has(name));
     for (const [name, { desc }] of consoleCommands) {
         const cmdAliases = Object.entries(aliases)
             .filter(([, target]) => target === name)
@@ -123,6 +126,7 @@ export function buildConsoleWelcome(): BangCommandResult {
         const aliasStr = cmdAliases.length > 0 ? ` (${cmdAliases.join(', ')})` : '';
         messages.push(`!${name}${aliasStr} → ${desc}`);
     }
+    messages.push(`!help (!h) → 显示全部命令`);
 
     messages.push(SEPARATOR);
     messages.push('普通消息不会被处理，请使用 ! 开头的命令');
@@ -130,7 +134,37 @@ export function buildConsoleWelcome(): BangCommandResult {
     return {
         message: messages,
         action: 'none',
-        suggestions: consoleCommands.map(([name]) => `!${name}`),
+        suggestions: [...consoleCommands.map(([name]) => `!${name}`), '!help'],
+    };
+}
+
+/**
+ * Build the session welcome message listing commands available in normal sessions.
+ * Derived from the commands registry to stay in sync with !help.
+ */
+export function buildSessionWelcome(): BangCommandResult {
+    const messages: string[] = [
+        '💡 可用快捷命令',
+        SEPARATOR,
+    ];
+
+    const sessionCommands = Object.entries(commands)
+        .filter(([, entry]) => !entry.hidden && !entry.consoleOnly);
+    for (const [name, { desc }] of sessionCommands) {
+        const cmdAliases = Object.entries(aliases)
+            .filter(([, target]) => target === name)
+            .map(([alias]) => `!${alias}`);
+        const aliasStr = cmdAliases.length > 0 ? ` (${cmdAliases.join(', ')})` : '';
+        messages.push(`!${name}${aliasStr} → ${desc}`);
+    }
+    messages.push(`!help (!h) → 显示帮助`);
+
+    messages.push(SEPARATOR);
+
+    return {
+        message: messages,
+        action: 'none',
+        suggestions: [...sessionCommands.map(([name]) => `!${name}`), '!help'],
     };
 }
 

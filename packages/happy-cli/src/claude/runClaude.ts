@@ -14,7 +14,7 @@ import { hashObject } from '@/utils/deterministicJson';
 import { startCaffeinate, stopCaffeinate } from '@/utils/caffeinate';
 import { extractSDKMetadataAsync } from '@/claude/sdk/metadataExtractor';
 import { parseSpecialCommand } from '@/parsers/specialCommands';
-import { isBangCommand, executeBangCommand, hasActiveInteractiveSession, handleInteractiveInput, buildConsoleWelcome } from '@/commands/bang/dispatcher';
+import { isBangCommand, executeBangCommand, hasActiveInteractiveSession, handleInteractiveInput, buildConsoleWelcome, buildSessionWelcome } from '@/commands/bang/dispatcher';
 import { getEnvironmentInfo } from '@/ui/doctor';
 import { configuration } from '@/configuration';
 import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
@@ -277,6 +277,23 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             logger.debug(`[START] Restored resume title: ${resumeTitle}`);
         }).catch(error => {
             logger.debug('[START] Failed to restore resume title:', error);
+        });
+    }
+
+    // Normal session: send welcome message with available commands
+    if (!isConsoleSession) {
+        session.waitForConnect().then(() => {
+            const welcome = buildSessionWelcome();
+            const welcomeMessages = Array.isArray(welcome.message) ? welcome.message : [welcome.message];
+            for (const msg of welcomeMessages) {
+                session.sendSessionEvent({ type: 'message', message: msg });
+            }
+            if (welcome.suggestions && welcome.suggestions.length > 0) {
+                const options = welcome.suggestions.map(s => `<option>${s}</option>`).join('\n');
+                session.sendCodexMessage({ type: 'message', message: `<options>\n${options}\n</options>` });
+            }
+        }).catch(e => {
+            logger.debug('[START] Session welcome socket connect failed:', e);
         });
     }
 
