@@ -1,5 +1,5 @@
 import { execSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, renameSync, symlinkSync, copyFileSync, readdirSync, statSync, chmodSync, constants as fsConstants, accessSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, renameSync, symlinkSync, copyFileSync, readdirSync, statSync, lstatSync, readlinkSync, realpathSync, chmodSync, constants as fsConstants, accessSync, openSync, readSync, closeSync } from 'node:fs';
 import { join, resolve, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { randomBytes } from 'node:crypto';
@@ -355,27 +355,20 @@ function linkSharedDirectories(instancePath: string): void {
             }
         }
 
-        try {
-            if (item.type === 'directory') {
-                // Windows: use junction (no admin required). Unix: use dir symlink.
-                const symlinkType = isWindows ? 'junction' : 'dir';
-                const linkTarget = isWindows ? resolve(targetPath) : targetPath;
-                symlinkSync(linkTarget, linkPath, symlinkType);
-            } else {
-                symlinkSync(targetPath, linkPath, 'file');
-            }
+        if (item.type === 'directory') {
+            linkDirectoryWithFallback(targetPath, linkPath, isWindows);
             logger.debug(`[!login] Linked ${item.name}: ${linkPath} → ${targetPath}`);
-        } catch (err) {
-            // Windows fallback: copy instead of symlink
-            if (isWindows) {
-                if (item.type === 'directory') {
-                    copyDirectoryRecursive(targetPath, linkPath);
-                } else {
+        } else {
+            try {
+                symlinkSync(targetPath, linkPath, 'file');
+                logger.debug(`[!login] Linked ${item.name}: ${linkPath} → ${targetPath}`);
+            } catch (err) {
+                if (isWindows) {
                     copyFileSync(targetPath, linkPath);
+                    logger.debug(`[!login] Copied ${item.name} (symlink failed): ${(err as Error).message}`);
+                } else {
+                    logger.debug(`[!login] Failed to link ${item.name}: ${(err as Error).message}`);
                 }
-                logger.debug(`[!login] Copied ${item.name} (symlink failed): ${(err as Error).message}`);
-            } else {
-                logger.debug(`[!login] Failed to link ${item.name}: ${(err as Error).message}`);
             }
         }
     }
@@ -393,6 +386,299 @@ function copyDirectoryRecursive(src: string, dest: string): void {
             copyFileSync(srcPath, destPath);
         }
     }
+}
+
+/**
+ * Sync project workspace context based on account policy.
+ *
+ * - shared: instance/projects becomes symlink to shared context group root.
+ * - isolated: instance/projects stays a plain directory.
+ *
+ * Never deletes existing project data without merging first.
+ */
+function syncProjectContext(
+    instancePath: string,
+    contextMode: 'isolated' | 'shared',
+    contextGroup?: string,
+): void {
+    const projectsPath = join(instancePath, 'projects');
+    const isWindows = process.platform === 'win32';
+    const instanceName = instancePath.split(/[\\/]/).pop() || 'unknown';
+
+    if (contextMode === 'isolated') {
+        // Isolated mode: ensure projects is a plain directory (not a symlink)
+        let stat;
+        try {
+            stat = lstatSync(projectsPath);
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+                mkdirSync(projectsPath, { recursive: true, mode: 0o700 });
+                return;
+            }
+            throw err;
+        }
+
+        if (stat.isSymbolicLink()) {
+            // Switching from shared → isolated: materialize old target content
+            const target = readlinkSync(projectsPath);
+            const resolvedTarget = resolve(dirname(projectsPath), target);
+            rmSync(projectsPath, { force: true });
+            mkdirSync(projectsPath, { recursive: true, mode: 0o700 });
+            if (isSafeProjectsMergeSource(resolvedTarget, instanceName)) {
+                mergeProjectsDirectory(resolvedTarget, projectsPath, instanceName);
+            } else {
+                logger.debug(`[!login] Skipping unsafe merge source: ${resolvedTarget}`);
+            }
+            logger.debug(`[!login] Detached projects symlink to isolated directory`);
+        } else if (stat.isDirectory()) {
+            detachLegacyMemoryLinks(projectsPath, instanceName);
+        }
+        return;
+    }
+
+    // Shared mode: link projects → ~/.ccs/shared/context-groups/<group>/projects
+    const group = contextGroup || 'default';
+    const sharedProjectsPath = join(getCcsDir(), 'shared', 'context-groups', group, 'projects');
+    mkdirSync(sharedProjectsPath, { recursive: true, mode: 0o700 });
+
+    // Check current state of instance/projects
+    let currentStat;
+    try {
+        currentStat = lstatSync(projectsPath);
+    } catch {
+        // Doesn't exist — create symlink directly
+        linkDirectoryWithFallback(sharedProjectsPath, projectsPath, isWindows);
+        logger.debug(`[!login] Linked projects (new): ${projectsPath} → ${sharedProjectsPath}`);
+        return;
+    }
+
+    if (currentStat.isSymbolicLink()) {
+        let resolvedCurrent: string;
+        try {
+            resolvedCurrent = realpathSync(projectsPath);
+        } catch {
+            rmSync(projectsPath, { force: true });
+            linkDirectoryWithFallback(sharedProjectsPath, projectsPath, isWindows);
+            logger.debug(`[!login] Replaced broken projects symlink`);
+            return;
+        }
+
+        if (samePath(resolvedCurrent, sharedProjectsPath)) {
+            logger.debug(`[!login] Projects symlink already correct`);
+            return;
+        }
+
+        if (isSafeProjectsMergeSource(resolvedCurrent, instanceName)) {
+            detachLegacyMemoryLinks(resolvedCurrent, instanceName);
+            mergeProjectsDirectory(resolvedCurrent, sharedProjectsPath, instanceName);
+        } else {
+            logger.debug(`[!login] Skipping unsafe merge source: ${resolvedCurrent}`);
+        }
+        rmSync(projectsPath, { force: true });
+        linkDirectoryWithFallback(sharedProjectsPath, projectsPath, isWindows);
+        logger.debug(`[!login] Relinked projects: ${resolvedCurrent} → ${sharedProjectsPath}`);
+        return;
+    }
+
+    if (currentStat.isDirectory()) {
+        detachLegacyMemoryLinks(projectsPath, instanceName);
+        mergeProjectsDirectory(projectsPath, sharedProjectsPath, instanceName);
+        rmSync(projectsPath, { recursive: true, force: true });
+        linkDirectoryWithFallback(sharedProjectsPath, projectsPath, isWindows);
+        logger.debug(`[!login] Merged and linked projects directory → ${sharedProjectsPath}`);
+        return;
+    }
+
+    rmSync(projectsPath, { force: true });
+    linkDirectoryWithFallback(sharedProjectsPath, projectsPath, isWindows);
+    logger.debug(`[!login] Replaced unexpected projects entry with symlink`);
+}
+
+/** Windows/macOS have case-insensitive FS; Linux is case-sensitive. */
+const FS_CASE_INSENSITIVE = process.platform === 'win32' || process.platform === 'darwin';
+
+/** Resolve a path and normalize case for cross-platform comparison. */
+function normalizePath(p: string): string {
+    const resolved = resolve(p);
+    return FS_CASE_INSENSITIVE ? resolved.toLowerCase() : resolved;
+}
+
+/** Compare two paths for equality under the current FS case sensitivity. */
+function samePath(a: string, b: string): boolean {
+    return normalizePath(a) === normalizePath(b);
+}
+
+/**
+ * Check if a path is within CCS-managed directories and therefore safe to
+ * merge from. Prevents merging arbitrary directories that a user may have
+ * manually symlinked into place.
+ */
+function isSafeProjectsMergeSource(sourcePath: string, instanceName: string): boolean {
+    const ccsDir = getCcsDir();
+    const normalizedSource = normalizePath(sourcePath);
+    const sharedRoot = normalizePath(join(ccsDir, 'shared', 'context-groups'));
+    if (normalizedSource.startsWith(sharedRoot)) return true;
+    const instanceRoot = normalizePath(join(ccsDir, 'instances', instanceName, 'projects'));
+    return normalizedSource.startsWith(instanceRoot);
+}
+
+/**
+ * Walk projects/<proj>/memory and, if any of them are symlinks into
+ * ~/.ccs/shared/memory, replace them with real directories containing a
+ * copy of the linked content. Keeps legacy installs from silently sharing
+ * memory state across accounts.
+ */
+function detachLegacyMemoryLinks(projectsPath: string, instanceName?: string): void {
+    let entries;
+    try {
+        entries = readdirSync(projectsPath, { withFileTypes: true });
+    } catch {
+        return;
+    }
+
+    const sharedMemoryRoot = normalizePath(join(getCcsDir(), 'shared', 'memory'));
+
+    for (const entry of entries) {
+        if (!entry.isDirectory()) continue;
+        const memoryPath = join(projectsPath, entry.name, 'memory');
+        try {
+            const memStat = lstatSync(memoryPath);
+            if (!memStat.isSymbolicLink()) continue;
+
+            const memTarget = readlinkSync(memoryPath);
+            const originalTarget = resolve(dirname(memoryPath), memTarget);
+            if (!normalizePath(originalTarget).startsWith(sharedMemoryRoot)) continue;
+
+            rmSync(memoryPath, { force: true });
+            mkdirSync(memoryPath, { recursive: true, mode: 0o700 });
+            mergeProjectsDirectory(originalTarget, memoryPath, instanceName);
+            logger.debug(`[!login] Detached legacy memory link: ${memoryPath}`);
+        } catch {
+            continue;
+        }
+    }
+}
+
+/**
+ * Create a directory symlink, falling back to a Windows junction when
+ * needed. On Windows, falls back to a recursive copy if the OS still
+ * refuses (common on non-dev-mode accounts). On other platforms, symlink
+ * failures propagate — we don't want to silently copy.
+ */
+function linkDirectoryWithFallback(target: string, linkPath: string, isWindows: boolean): void {
+    try {
+        const symlinkType = isWindows ? 'junction' : 'dir';
+        const linkTarget = isWindows ? resolve(target) : target;
+        symlinkSync(linkTarget, linkPath, symlinkType);
+        return;
+    } catch (err) {
+        if (!isWindows) throw err;
+        copyDirectoryRecursive(target, linkPath);
+        logger.debug(`[!login] Copied projects (symlink failed): ${(err as Error).message}`);
+    }
+}
+
+/**
+ * Merge source projects directory into destination, preserving conflicts.
+ *
+ * - Files only in source → copied to dest
+ * - Files identical in both → skipped
+ * - Files differ → dest kept, source saved as `<name>.migrated-from-<instance>`
+ *
+ * No file is ever silently discarded.
+ */
+function mergeProjectsDirectory(src: string, dest: string, instanceName?: string): void {
+    let entries;
+    try {
+        entries = readdirSync(src, { withFileTypes: true });
+    } catch {
+        return;
+    }
+
+    mkdirSync(dest, { recursive: true, mode: 0o700 });
+
+    for (const entry of entries) {
+        const srcPath = join(src, entry.name);
+        const destPath = join(dest, entry.name);
+
+        if (entry.isSymbolicLink()) {
+            logger.debug(`[!login] Skipping symlink during merge: ${srcPath}`);
+            continue;
+        }
+
+        if (entry.isDirectory()) {
+            mergeProjectsDirectory(srcPath, destPath, instanceName);
+            continue;
+        }
+
+        if (!entry.isFile()) continue;
+
+        let destStat;
+        try {
+            destStat = statSync(destPath);
+        } catch {
+            copyFileSync(srcPath, destPath);
+            continue;
+        }
+
+        if (filesAreEqual(srcPath, destPath, destStat.size)) continue;
+
+        const conflictPath = getConflictCopyPath(destPath, instanceName);
+        copyFileSync(srcPath, conflictPath);
+        logger.debug(`[!login] Conflict: saved ${srcPath} as ${conflictPath}`);
+    }
+}
+
+/**
+ * Compare two files by size then content in fixed-size chunks. Avoids
+ * loading large files (e.g. multi-MB session.jsonl) fully into memory.
+ */
+function filesAreEqual(fileA: string, fileB: string, knownSizeB?: number): boolean {
+    let fdA = -1;
+    let fdB = -1;
+    try {
+        const statA = statSync(fileA);
+        const sizeB = knownSizeB ?? statSync(fileB).size;
+        if (statA.size !== sizeB) return false;
+        if (statA.size === 0) return true;
+
+        const CHUNK = 64 * 1024;
+        const bufA = Buffer.allocUnsafe(CHUNK);
+        const bufB = Buffer.allocUnsafe(CHUNK);
+        fdA = openSync(fileA, 'r');
+        fdB = openSync(fileB, 'r');
+        let offset = 0;
+        while (offset < statA.size) {
+            const want = Math.min(CHUNK, statA.size - offset);
+            const readA = readSync(fdA, bufA, 0, want, offset);
+            const readB = readSync(fdB, bufB, 0, want, offset);
+            if (readA !== readB) return false;
+            if (bufA.compare(bufB, 0, readA, 0, readA) !== 0) return false;
+            offset += readA;
+        }
+        return true;
+    } catch {
+        return false;
+    } finally {
+        if (fdA !== -1) { try { closeSync(fdA); } catch { /* ignore */ } }
+        if (fdB !== -1) { try { closeSync(fdB); } catch { /* ignore */ } }
+    }
+}
+
+/**
+ * Build a non-destructive conflict copy path.
+ * e.g., `session.jsonl.migrated-from-alice`, with sequence suffix if needed.
+ */
+function getConflictCopyPath(existingPath: string, instanceName?: string): string {
+    const safeName = (instanceName || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase();
+    const baseSuffix = `.migrated-from-${safeName}`;
+    let candidate = `${existingPath}${baseSuffix}`;
+    let seq = 1;
+    while (existsSync(candidate)) {
+        candidate = `${existingPath}${baseSuffix}-${seq}`;
+        seq++;
+    }
+    return candidate;
 }
 
 /** Remove instance directory on failure. */
@@ -730,6 +1016,7 @@ export async function handleLoginBangCommand(
                 if (contextMode === 'shared') {
                     linkSharedDirectories(instancePath);
                 }
+                syncProjectContext(instancePath, contextMode, contextGroup);
                 const modeDesc = contextMode === 'shared'
                     ? `共享 (组: ${contextGroup || 'default'})`
                     : '独立';
