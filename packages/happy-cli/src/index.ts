@@ -504,7 +504,8 @@ import { handleCodexCommand } from './commands/codexCommand'
       await startDaemon()
       process.exit(0)
     } else if (daemonSubcommand === 'stop') {
-      await stopDaemon()
+      const killSessions = args.includes('--kill-sessions');
+      await stopDaemon(killSessions ? { stopSessions: true } : undefined)
       process.exit(0)
     } else if (daemonSubcommand === 'status') {
       await runDoctorDaemon()

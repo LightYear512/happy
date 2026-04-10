@@ -21,7 +21,7 @@ export function startDaemonControlServer({
   getChildren: () => TrackedSession[];
   stopSession: (sessionId: string) => boolean;
   spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
-  requestShutdown: () => void;
+  requestShutdown: (options?: { stopSessions?: boolean }) => void;
   onHappySessionWebhook: (sessionId: string, metadata: Metadata) => void;
 }): Promise<{ port: number; stop: () => Promise<void> }> {
   return new Promise((resolve) => {
@@ -173,19 +173,23 @@ export function startDaemonControlServer({
     // Stop daemon
     typed.post('/stop', {
       schema: {
+        body: z.object({
+          stopSessions: z.boolean().optional(),
+        }).nullish(),
         response: {
           200: z.object({
             status: z.string()
           })
         }
       }
-    }, async () => {
-      logger.debug('[CONTROL SERVER] Stop daemon request received');
+    }, async (request) => {
+      const stopSessions = request.body?.stopSessions === true;
+      logger.debug('[CONTROL SERVER] Stop daemon request received', { stopSessions });
 
       // Give time for response to arrive
       setTimeout(() => {
-        logger.debug('[CONTROL SERVER] Triggering daemon shutdown');
-        requestShutdown();
+        logger.debug('[CONTROL SERVER] Triggering daemon shutdown', { stopSessions });
+        requestShutdown({ stopSessions });
       }, 50);
 
       return { status: 'stopping' };

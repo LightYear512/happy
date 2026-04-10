@@ -49,10 +49,10 @@ export async function startDaemon(): Promise<void> {
   //
   // In case the setup malfunctions - our signal handlers will not properly
   // shut down. We will force exit the process with code 1.
-  let requestShutdown: (source: 'happy-app' | 'happy-cli' | 'os-signal' | 'exception', errorMessage?: string) => void;
-  let resolvesWhenShutdownRequested = new Promise<({ source: 'happy-app' | 'happy-cli' | 'os-signal' | 'exception', errorMessage?: string })>((resolve) => {
-    requestShutdown = (source, errorMessage) => {
-      logger.debug(`[DAEMON RUN] Requesting shutdown (source: ${source}, errorMessage: ${errorMessage})`);
+  let requestShutdown: (source: 'happy-app' | 'happy-cli' | 'os-signal' | 'exception', errorMessage?: string, options?: { stopSessions?: boolean }) => void;
+  let resolvesWhenShutdownRequested = new Promise<({ source: 'happy-app' | 'happy-cli' | 'os-signal' | 'exception', errorMessage?: string, stopSessions?: boolean })>((resolve) => {
+    requestShutdown = (source, errorMessage, options) => {
+      logger.debug(`[DAEMON RUN] Requesting shutdown (source: ${source}, errorMessage: ${errorMessage}, stopSessions: ${options?.stopSessions})`);
 
       // Fallback - in case startup malfunctions - we will force exit the process with code 1
       setTimeout(async () => {
@@ -65,7 +65,7 @@ export async function startDaemon(): Promise<void> {
       }, 1_000);
 
       // Start graceful shutdown
-      resolve({ source, errorMessage });
+      resolve({ source, errorMessage, stopSessions: options?.stopSessions });
     };
   });
 
@@ -626,7 +626,7 @@ export async function startDaemon(): Promise<void> {
       getChildren: getCurrentChildren,
       stopSession,
       spawnSession,
-      requestShutdown: () => requestShutdown('happy-cli'),
+      requestShutdown: (options) => requestShutdown('happy-cli', undefined, options),
       onHappySessionWebhook
     });
 
@@ -767,13 +767,50 @@ export async function startDaemon(): Promise<void> {
     }, heartbeatIntervalMs); // Every 60 seconds in production
 
     // Setup signal handlers
-    const cleanupAndShutdown = async (source: 'happy-app' | 'happy-cli' | 'os-signal' | 'exception', errorMessage?: string) => {
-      logger.debug(`[DAEMON RUN] Starting proper cleanup (source: ${source}, errorMessage: ${errorMessage})...`);
+    const cleanupAndShutdown = async (source: 'happy-app' | 'happy-cli' | 'os-signal' | 'exception', errorMessage?: string, stopSessions?: boolean) => {
+      logger.debug(`[DAEMON RUN] Starting proper cleanup (source: ${source}, errorMessage: ${errorMessage}, stopSessions: ${stopSessions})...`);
 
       // Clear health check interval
       if (restartOnStaleVersionAndHeartbeat) {
         clearInterval(restartOnStaleVersionAndHeartbeat);
         logger.debug('[DAEMON RUN] Health check interval cleared');
+      }
+
+      if (stopSessions) {
+        // Stop ALL tracked sessions: send session-end for each, then kill
+        const children = getCurrentChildren();
+        logger.debug(`[DAEMON RUN] stopSessions: sending session-end for ${children.length} tracked sessions`);
+        for (const child of children) {
+          if (child.happySessionId) {
+            apiMachine.sendSessionEnd(child.happySessionId);
+            logger.debug(`[DAEMON RUN] Sent session-end for ${child.happySessionId}`);
+          }
+        }
+        // Brief wait so session-end events reach the server
+        await new Promise(resolve => setTimeout(resolve, 300));
+        for (const child of children) {
+          const sessionId = child.happySessionId?.trim() || '';
+          const fallbackId = Number.isFinite(child.pid) && child.pid > 1 ? `PID-${Math.trunc(child.pid)}` : '';
+          const id = sessionId || fallbackId;
+          if (id) {
+            stopSession(id);
+          }
+        }
+      } else {
+        // Default: only close console session via machine socket (SIGTERM doesn't work on Windows -
+        // the process is forcefully killed without running cleanup handlers)
+        if (consoleSessionPid !== null) {
+          const consoleTracked = pidToTrackedSession.get(consoleSessionPid);
+          if (consoleTracked?.happySessionId) {
+            logger.debug(`[DAEMON RUN] Sending session-end for console session ${consoleTracked.happySessionId}`);
+            apiMachine.sendSessionEnd(consoleTracked.happySessionId);
+            // Brief wait so the event reaches the server before we disconnect
+            await new Promise(resolve => setTimeout(resolve, 200));
+          }
+          try {
+            process.kill(consoleSessionPid, 'SIGTERM');
+          } catch {}
+        }
       }
 
       // Update daemon state before shutting down
@@ -801,7 +838,7 @@ export async function startDaemon(): Promise<void> {
 
     // Wait for shutdown request
     const shutdownRequest = await resolvesWhenShutdownRequested;
-    await cleanupAndShutdown(shutdownRequest.source, shutdownRequest.errorMessage);
+    await cleanupAndShutdown(shutdownRequest.source, shutdownRequest.errorMessage, shutdownRequest.stopSessions);
   } catch (error) {
     logger.debug('[DAEMON RUN][FATAL] Failed somewhere unexpectedly - exiting with code 1', error);
     process.exit(1);
