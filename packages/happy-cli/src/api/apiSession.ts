@@ -313,26 +313,37 @@ export class ApiSessionClient extends EventEmitter {
     private async flushOutbox() {
         // Send latest messages first so the user sees recent activity immediately,
         // then backfill older messages in subsequent batches.
+        logger.debug(`[API] flushOutbox: starting, pendingOutbox=${this.pendingOutbox.length}, session=${this.sessionId}`);
         while (this.pendingOutbox.length > 0) {
             const batchSize = Math.min(this.pendingOutbox.length, ApiSessionClient.MAX_OUTBOX_BATCH_SIZE);
             const batch = this.pendingOutbox.splice(-batchSize, batchSize);
 
-            const response = await axios.post<V3PostSessionMessagesResponse>(
-                `${configuration.serverUrl}/v3/sessions/${encodeURIComponent(this.sessionId)}/messages`,
-                {
-                    messages: batch
-                },
-                {
-                    headers: this.authHeaders(),
-                    timeout: 60000
-                }
-            );
+            logger.debug(`[API] flushOutbox: sending batch of ${batch.length} messages`);
+            try {
+                const response = await axios.post<V3PostSessionMessagesResponse>(
+                    `${configuration.serverUrl}/v3/sessions/${encodeURIComponent(this.sessionId)}/messages`,
+                    {
+                        messages: batch
+                    },
+                    {
+                        headers: this.authHeaders(),
+                        timeout: 60000
+                    }
+                );
 
-            const messages = Array.isArray(response.data.messages) ? response.data.messages : [];
-            const maxSeq = messages.reduce((acc, message) => (
-                message.seq > acc ? message.seq : acc
-            ), this.lastSeq);
-            this.lastSeq = maxSeq;
+                const messages = Array.isArray(response.data.messages) ? response.data.messages : [];
+                const maxSeq = messages.reduce((acc, message) => (
+                    message.seq > acc ? message.seq : acc
+                ), this.lastSeq);
+                this.lastSeq = maxSeq;
+                logger.debug(`[API] flushOutbox: success, ${messages.length} messages acknowledged, lastSeq=${maxSeq}`);
+            } catch (error: any) {
+                logger.debug(`[API] flushOutbox: FAILED - ${error.response?.status ?? error.code ?? error.message}, pendingOutbox=${this.pendingOutbox.length}`);
+                if (error.response?.data) {
+                    logger.debug(`[API] flushOutbox: response body:`, error.response.data);
+                }
+                throw error;
+            }
         }
     }
 
