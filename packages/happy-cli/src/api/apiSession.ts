@@ -316,7 +316,9 @@ export class ApiSessionClient extends EventEmitter {
         logger.debug(`[API] flushOutbox: starting, pendingOutbox=${this.pendingOutbox.length}, session=${this.sessionId}`);
         while (this.pendingOutbox.length > 0) {
             const batchSize = Math.min(this.pendingOutbox.length, ApiSessionClient.MAX_OUTBOX_BATCH_SIZE);
-            const batch = this.pendingOutbox.splice(-batchSize, batchSize);
+            // Take from the end (latest messages first) but don't remove yet
+            const startIndex = this.pendingOutbox.length - batchSize;
+            const batch = this.pendingOutbox.slice(startIndex, startIndex + batchSize);
 
             logger.debug(`[API] flushOutbox: sending batch of ${batch.length} messages`);
             try {
@@ -330,6 +332,9 @@ export class ApiSessionClient extends EventEmitter {
                         timeout: 60000
                     }
                 );
+
+                // Only remove from outbox after successful send, using stable index
+                this.pendingOutbox.splice(startIndex, batchSize);
 
                 const messages = Array.isArray(response.data.messages) ? response.data.messages : [];
                 const maxSeq = messages.reduce((acc, message) => (
