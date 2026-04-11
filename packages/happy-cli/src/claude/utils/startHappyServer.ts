@@ -32,8 +32,8 @@ function createMcpServer(handler: (title: string) => Promise<{ success: boolean;
         title: 'Change Chat Title',
         inputSchema: {
             title: z.string().describe('The new title for the chat session'),
-        },
-    }, async (args) => {
+        } as any,
+    }, async (args: any) => {
         const response = await handler(args.title);
         logger.debug('[happyMCP] Response:', response);
 
@@ -41,7 +41,7 @@ function createMcpServer(handler: (title: string) => Promise<{ success: boolean;
             return {
                 content: [
                     {
-                        type: 'text',
+                        type: 'text' as const,
                         text: `Successfully changed chat title to: "${args.title}"`,
                     },
                 ],
@@ -51,7 +51,7 @@ function createMcpServer(handler: (title: string) => Promise<{ success: boolean;
             return {
                 content: [
                     {
-                        type: 'text',
+                        type: 'text' as const,
                         text: `Failed to change chat title: ${response.error || 'Unknown error'}`,
                     },
                 ],
