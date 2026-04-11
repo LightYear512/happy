@@ -7,25 +7,38 @@ export function codeBlock(text: string): string {
 }
 
 import { ApiSessionClient } from '@/api/apiSession';
-import { Session } from '@/claude/session';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { EnhancedMode } from '@/claude/loop';
 
 /**
+ * Minimal session shape consumed by bang command handlers.
+ *
+ * Decoupled from `@/claude/session` so that non-Claude agents (Codex, Gemini)
+ * can supply a structurally compatible value or pass `null`. Only the fields
+ * actually read by handlers belong here.
+ */
+export interface BangSessionLike {
+    /** Local terminal session vs remote-controlled session. */
+    mode: 'local' | 'remote';
+}
+
+/**
  * Context available to bang command handlers.
- * Bang commands are prefixed with `!` and intercepted before reaching Claude.
+ * Bang commands are prefixed with `!` and intercepted before reaching the agent.
  */
 export interface BangCommandContext {
     /** API session client for sending messages back to mobile */
     client: ApiSessionClient;
-    /** Current Claude session (may be null during startup) */
-    session: Session | null;
+    /** Current agent session (may be null for codex/gemini and during startup) */
+    session: BangSessionLike | null;
     /** Message queue for pushing synthetic messages (e.g., /clear) */
     messageQueue: MessageQueue2<EnhancedMode>;
     /** Current enhanced mode for queue operations */
     currentEnhancedMode: EnhancedMode;
     /** Whether this is the daemon console session (lightweight, bang-command-only) */
     isConsoleSession?: boolean;
+    /** Agent flavor — used by handlers that need to branch on backend (e.g., !restart) */
+    flavor?: 'claude' | 'codex' | 'gemini';
 }
 
 export interface BangCommandResult {
@@ -38,3 +51,10 @@ export interface BangCommandResult {
 }
 
 export type BangCommandHandler = (args: string, ctx: BangCommandContext) => Promise<BangCommandResult>;
+
+/** Parse `--codex` flag from args string; returns cleaned args and whether flag was present. */
+export function parseCodexFlag(args: string): { cleanArgs: string; hasCodexFlag: boolean } {
+    const hasCodexFlag = /(?:^|\s)--codex(?:\s|$)/.test(args);
+    const cleanArgs = args.replace(/\s*--codex(?:\s|$)/, ' ').replace(/\s+/g, ' ').trim();
+    return { cleanArgs, hasCodexFlag };
+}

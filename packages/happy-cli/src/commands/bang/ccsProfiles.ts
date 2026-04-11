@@ -1,15 +1,20 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import * as yaml from 'js-yaml';
+import { randomBytes } from 'node:crypto';
 import { logger } from '@/ui/logger';
 
 export interface CcsProfileInfo {
     name: string;
+    /** Claude instance directory (~/.ccs/instances/<profile>/) */
     instancePath: string;
     contextMode?: 'isolated' | 'shared';
     contextGroup?: string;
 }
+
+/** Agent flavor for auth operations. */
+export type AuthFlavor = 'claude' | 'codex' | 'gemini';
 
 export interface CcsProfilesResult {
     profiles: CcsProfileInfo[];
@@ -159,3 +164,184 @@ export function getCurrentCcsProfile(): string | null {
     return profileDirName;
 }
 
+// ---------------------------------------------------------------------------
+// Codex instance management (happy-managed, independent of CCS)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the happy home directory, respecting HAPPY_HOME_DIR override.
+ * Mirrors configuration.ts logic without importing it (side-effects).
+ */
+export function getHappyHome(): string {
+    const raw = process.env.HAPPY_HOME_DIR;
+    return raw ? raw.replace(/^~/, homedir()) : join(homedir(), '.happy');
+}
+
+/** Base directory for all happy-managed codex instances. */
+function getCodexInstancesBase(): string {
+    return join(getHappyHome(), 'codex-instances');
+}
+
+/**
+ * Get the CODEX_HOME-equivalent directory for a given profile name.
+ * Layout: <happyHomeDir>/codex-instances/<sanitized-name>/
+ */
+export function getCodexInstancePath(profileName: string): string {
+    return join(getCodexInstancesBase(), sanitizeName(profileName));
+}
+
+/**
+ * Determine the currently active codex profile by inspecting CODEX_HOME.
+ * Returns null when CODEX_HOME is not set or doesn't point to a happy-managed instance.
+ */
+export function getCurrentCodexProfile(): string | null {
+    const codexHome = process.env.CODEX_HOME;
+    if (!codexHome) return null;
+
+    const base = getCodexInstancesBase();
+    const normalizedHome = codexHome.replace(/\\/g, '/').replace(/\/+$/, '');
+    const normalizedBase = base.replace(/\\/g, '/').replace(/\/+$/, '');
+
+    if (!normalizedHome.startsWith(normalizedBase)) return null;
+
+    const relativePath = normalizedHome.slice(normalizedBase.length + 1);
+    const profileDirName = relativePath.split('/')[0];
+    if (!profileDirName) return null;
+
+    // Reverse-lookup: find CCS profile whose sanitized name matches
+    const { profiles } = readCcsProfiles();
+    for (const profile of profiles) {
+        if (sanitizeName(profile.name) === profileDirName) {
+            return profile.name;
+        }
+    }
+
+    return profileDirName;
+}
+
+/**
+ * Get the current profile name for a given agent flavor.
+ */
+export function getCurrentProfileForFlavor(flavor: AuthFlavor): string | null {
+    switch (flavor) {
+        case 'codex': return getCurrentCodexProfile();
+        case 'claude':
+        default: return getCurrentCcsProfile();
+    }
+}
+
+/**
+ * Perform the env-level switch for a given agent flavor.
+ * - claude: sets CLAUDE_CONFIG_DIR to the CCS instance path
+ * - codex: sets CODEX_HOME to the happy-managed codex instance path (derived from profileName)
+ */
+export function applyProfileSwitch(profileName: string, flavor: AuthFlavor, claudeInstancePath?: string): void {
+    switch (flavor) {
+        case 'codex': {
+            const codexPath = getCodexInstancePath(profileName);
+            process.env.CODEX_HOME = codexPath;
+            logger.debug(`[!auth] Switched CODEX_HOME to: ${codexPath}`);
+            break;
+        }
+        case 'claude':
+        default:
+            if (!claudeInstancePath) {
+                logger.warn(`[!auth] applyProfileSwitch called for ${flavor} without instancePath — skipping`);
+                return;
+            }
+            process.env.CLAUDE_CONFIG_DIR = claudeInstancePath;
+            logger.debug(`[!auth] Switched CLAUDE_CONFIG_DIR to: ${claudeInstancePath}`);
+            break;
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Codex-independent profile management
+// ---------------------------------------------------------------------------
+
+export interface CodexProfileInfo {
+    /** Profile name (directory name under codex-instances/). */
+    name: string;
+    /** Full path to the codex instance directory. */
+    codexHome: string;
+}
+
+/**
+ * Scan ~/.happy-dev/codex-instances/ and return every sub-directory that
+ * contains an auth.json file, representing a logged-in Codex account.
+ */
+export function readCodexProfiles(): CodexProfileInfo[] {
+    const base = getCodexInstancesBase();
+    const results: CodexProfileInfo[] = [];
+    let entries: string[];
+    try {
+        entries = readdirSync(base);
+    } catch {
+        return [];
+    }
+
+    for (const entry of entries) {
+        const dirPath = join(base, entry);
+        try {
+            if (!statSync(dirPath).isDirectory()) continue;
+        } catch {
+            continue;
+        }
+        if (existsSync(join(dirPath, 'auth.json'))) {
+            results.push({ name: entry, codexHome: dirPath });
+        }
+    }
+    return results;
+}
+
+/** Shape of ~/.happy-dev/codex-instances/config.yaml */
+interface CodexInstancesConfig {
+    accounts?: Record<string, {
+        created?: string;
+        context_mode?: 'isolated' | 'shared';
+        context_group?: string;
+        [key: string]: unknown;
+    }>;
+}
+
+/**
+ * Register (or update) a Codex account's metadata in the independent
+ * config file at ~/.happy-dev/codex-instances/config.yaml.
+ *
+ * - Incremental merge: preserves existing `created` and extra fields.
+ * - Atomic write: writes to a temp file then renames.
+ */
+export function registerCodexProfile(
+    profileName: string,
+    contextMode: 'isolated' | 'shared',
+    contextGroup?: string,
+): void {
+    const base = getCodexInstancesBase();
+    mkdirSync(base, { recursive: true });
+
+    const configPath = join(base, 'config.yaml');
+
+    let config: CodexInstancesConfig;
+    try {
+        config = (yaml.load(readFileSync(configPath, 'utf-8')) as CodexInstancesConfig) ?? {};
+    } catch {
+        config = {};
+    }
+
+    if (!config.accounts) config.accounts = {};
+
+    const existing = config.accounts[profileName];
+    config.accounts[profileName] = {
+        ...existing,
+        created: existing?.created ?? new Date().toISOString(),
+        context_mode: contextMode,
+        ...(contextGroup ? { context_group: contextGroup } : {}),
+    };
+
+    const content = yaml.dump(config, { indent: 2, lineWidth: -1, quotingType: '"' });
+    const tmpPath = configPath + '.' + randomBytes(4).toString('hex') + '.tmp';
+    writeFileSync(tmpPath, content, 'utf-8');
+    renameSync(tmpPath, configPath);
+    logger.debug(`[codex] Registered codex profile "${profileName}" in ${configPath}`);
+}

@@ -1,12 +1,12 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { ProxyAgent, fetch as undiciFetch } from 'undici';
 import { logger } from '@/ui/logger';
-import { getCurrentCcsProfile, readCcsProfiles, getInstancePath } from './ccsProfiles';
-import { SEPARATOR, codeBlock, type BangCommandContext, type BangCommandResult } from './types';
+import { getCurrentCcsProfile, readCcsProfiles, getInstancePath, getCurrentCodexProfile, getCodexInstancePath, readCodexProfiles, type AuthFlavor } from './ccsProfiles';
+import { SEPARATOR, codeBlock, parseCodexFlag, type BangCommandContext, type BangCommandResult } from './types';
 
 const USAGE_API_URL = 'https://api.anthropic.com/api/oauth/usage';
 const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
@@ -169,7 +169,7 @@ export async function fetchUsage(token: string, debugLabel: string): Promise<Usa
             'Authorization': `Bearer ${token}`,
             'anthropic-beta': 'oauth-2025-04-20',
         },
-        signal: AbortSignal.timeout(10_000),
+        signal: AbortSignal.timeout(5_000),
     };
 
     if (proxy) {
@@ -235,13 +235,63 @@ function usageBar(utilization: number): string {
 export function getCachedUsageSummary(cacheKey: string): string | null {
     const cached = cache.get(cacheKey);
     if (!cached || (Date.now() - cached.fetchedAt) >= CACHE_TTL_MS) return null;
+    return formatClaudeUsageSummary(cached.data);
+}
 
-    const { data } = cached;
+/**
+ * Fetch a one-line usage summary for a profile, respecting cache.
+ * Returns a short string like "📊 5h: 23% · 7d: 45%" or null on failure.
+ * Timeout: 5s per request. Cache: reuses existing CACHE_TTL_MS data.
+ */
+export async function fetchProfileUsageSummary(profileName: string, flavor: AuthFlavor): Promise<string | null> {
+    try {
+        if (flavor === 'codex') {
+            const codexHome = getCodexInstancePath(profileName);
+            const cached = codexCache.get(codexHome);
+            if (cached && (Date.now() - cached.fetchedAt) < CACHE_TTL_MS) {
+                return formatCodexUsageSummary(cached.data);
+            }
+            const token = readCodexAccessToken(codexHome);
+            if (!token) return null;
+            const data = await Promise.race([
+                fetchCodexUsage(token, profileName),
+                new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000)),
+            ]);
+            codexCache.set(codexHome, { data, fetchedAt: Date.now() });
+            return formatCodexUsageSummary(data);
+        }
+
+        // Claude
+        const instancePath = getInstancePath(profileName);
+        const cached = cache.get(instancePath);
+        if (cached && (Date.now() - cached.fetchedAt) < CACHE_TTL_MS) {
+            return formatClaudeUsageSummary(cached.data);
+        }
+        const token = readOAuthToken(instancePath);
+        if (!token) return null;
+        const data = await Promise.race([
+            fetchUsage(token, profileName),
+            new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000)),
+        ]);
+        cache.set(instancePath, { data, fetchedAt: Date.now() });
+        return formatClaudeUsageSummary(data);
+    } catch (err) {
+        logger.debug(`[!usage] fetchProfileUsageSummary failed for ${profileName}:`, err);
+        return null;
+    }
+}
+
+function formatClaudeUsageSummary(data: UsageData): string | null {
     const parts: string[] = [];
-
     if (data.five_hour) parts.push(`5h: ${data.five_hour.utilization.toFixed(0)}%`);
     if (data.seven_day) parts.push(`7d: ${data.seven_day.utilization.toFixed(0)}%`);
+    return parts.length > 0 ? `📊 ${parts.join(' · ')}` : null;
+}
 
+function formatCodexUsageSummary(data: CodexUsageData): string | null {
+    const parts: string[] = [];
+    if (data.primaryWindow) parts.push(`5h: ${data.primaryWindow.usedPercent.toFixed(0)}%`);
+    if (data.secondaryWindow) parts.push(`7d: ${data.secondaryWindow.usedPercent.toFixed(0)}%`);
     return parts.length > 0 ? `📊 ${parts.join(' · ')}` : null;
 }
 
@@ -319,6 +369,229 @@ function resolveOAuthTokenForProfile(profileName: string): { token: string; prof
     return null;
 }
 
+// ---------------------------------------------------------------------------
+// Codex usage (OpenAI wham/usage API)
+// ---------------------------------------------------------------------------
+
+const CODEX_USAGE_API_URL = 'https://chatgpt.com/backend-api/wham/usage';
+
+interface CodexUsageData {
+    planType?: string;
+    /** 5-hour primary window */
+    primaryWindow?: { usedPercent: number; resetAt: number };
+    /** 7-day secondary window */
+    secondaryWindow?: { usedPercent: number; resetAt: number };
+    /** Code review rate limit (null when not available) */
+    codeReviewWindow?: { usedPercent: number; resetAt: number };
+}
+
+interface CachedCodexUsage {
+    data: CodexUsageData;
+    fetchedAt: number;
+}
+
+const codexCache = new Map<string, CachedCodexUsage>();
+
+/** Read access_token from a codex auth.json file. */
+function readCodexAccessToken(codexHome: string): string | null {
+    const authPath = join(codexHome, 'auth.json');
+    try {
+        const raw = readFileSync(authPath, 'utf-8');
+        const data = JSON.parse(raw);
+        return data?.tokens?.access_token ?? null;
+    } catch {
+        return null;
+    }
+}
+
+/** Resolve codex auth token for the current session or a named profile. */
+function resolveCodexToken(profileName?: string): { token: string; profileLabel: string; cacheKey: string } | null {
+    if (profileName) {
+        const codexHome = getCodexInstancePath(profileName);
+        const token = readCodexAccessToken(codexHome);
+        if (token) return { token, profileLabel: profileName, cacheKey: codexHome };
+        return null;
+    }
+
+    // Current session: only resolve via CODEX_HOME (no fallback to ~/.codex)
+    const codexHome = process.env.CODEX_HOME;
+    if (!codexHome) return null;
+
+    const token = readCodexAccessToken(codexHome);
+    if (token) {
+        const label = getCurrentCodexProfile() ?? 'default';
+        return { token, profileLabel: label, cacheKey: codexHome };
+    }
+    return null;
+}
+
+/** Fetch usage from OpenAI wham/usage API. */
+async function fetchCodexUsage(token: string, debugLabel: string): Promise<CodexUsageData> {
+    const proxy = resolveProxy();
+    logger.debug(`[!usage:codex] Calling ${CODEX_USAGE_API_URL} label=${debugLabel} proxy=${proxy ?? '(none)'}`);
+
+    const fetchOptions: Parameters<typeof undiciFetch>[1] = {
+        headers: {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(5_000),
+    };
+    if (proxy) {
+        (fetchOptions as Record<string, unknown>).dispatcher = new ProxyAgent(proxy);
+    }
+
+    const response = await undiciFetch(CODEX_USAGE_API_URL, fetchOptions);
+    if (!response.ok) {
+        const text = await response.text().catch(() => '');
+        logger.debug(`[!usage:codex] API error: ${response.status} ${text}`);
+        if (response.status === 401) throw new Error('Codex OAuth 令牌已过期。请 !login 重新登录。');
+        if (response.status === 403) throw new Error('无 Codex 访问权限或请求被拒绝 (403)。');
+        throw new Error(`API 返回 ${response.status}: ${text}`);
+    }
+
+    const raw = await response.json() as Record<string, unknown>;
+
+    // Parse wham/usage response — actual shape:
+    // { plan_type, rate_limit: { primary_window: { used_percent, reset_at }, secondary_window: {...} }, code_review_rate_limit, ... }
+    const result: CodexUsageData = { planType: raw.plan_type as string | undefined };
+    const rateLimit = raw.rate_limit as Record<string, { used_percent?: number; reset_at?: number }> | undefined;
+    if (rateLimit?.primary_window) {
+        result.primaryWindow = {
+            usedPercent: rateLimit.primary_window.used_percent ?? 0,
+            resetAt: rateLimit.primary_window.reset_at ?? 0,
+        };
+    }
+    if (rateLimit?.secondary_window) {
+        result.secondaryWindow = {
+            usedPercent: rateLimit.secondary_window.used_percent ?? 0,
+            resetAt: rateLimit.secondary_window.reset_at ?? 0,
+        };
+    }
+    const codeReview = raw.code_review_rate_limit as { used_percent?: number; reset_at?: number } | null;
+    if (codeReview) {
+        result.codeReviewWindow = {
+            usedPercent: codeReview.used_percent ?? 0,
+            resetAt: codeReview.reset_at ?? 0,
+        };
+    }
+    return result;
+}
+
+/** Convert a Unix timestamp (seconds) to an ISO string for formatResetTime. */
+function unixToIso(ts: number): string {
+    return new Date(ts * 1000).toISOString();
+}
+
+/** Format codex usage data into readable messages. */
+function formatCodexUsage(data: CodexUsageData, profileLabel: string, cachedAt: number): string[] {
+    const planLabel = data.planType ? ` (${data.planType})` : '';
+    const messages: string[] = [`📊 Codex 用量 — ${profileLabel}${planLabel}`];
+
+    if (data.primaryWindow) {
+        messages.push([
+            '⏱ 5 小时窗口',
+            usageBar(data.primaryWindow.usedPercent),
+            data.primaryWindow.resetAt ? `${formatResetTime(unixToIso(data.primaryWindow.resetAt))} 后重置` : '',
+        ].filter(Boolean).join('\n'));
+    }
+
+    if (data.secondaryWindow) {
+        messages.push([
+            '📅 周限额',
+            usageBar(data.secondaryWindow.usedPercent),
+            data.secondaryWindow.resetAt ? `${formatResetTime(unixToIso(data.secondaryWindow.resetAt))} 后重置` : '',
+        ].filter(Boolean).join('\n'));
+    }
+
+    if (data.codeReviewWindow) {
+        messages.push([
+            '🔍 Code Review',
+            usageBar(data.codeReviewWindow.usedPercent),
+            data.codeReviewWindow.resetAt ? `${formatResetTime(unixToIso(data.codeReviewWindow.resetAt))} 后重置` : '',
+        ].filter(Boolean).join('\n'));
+    }
+
+    if (!data.primaryWindow && !data.secondaryWindow && !data.codeReviewWindow) {
+        messages.push('暂无用量数据');
+    }
+
+    const ageMs = Date.now() - cachedAt;
+    const ageSec = Math.floor(ageMs / 1000);
+    if (ageSec > 5) {
+        const ageMin = Math.floor(ageSec / 60);
+        const ageStr = ageMin > 0 ? `${ageMin} 分钟前` : `${ageSec} 秒前`;
+        const remainMs = CACHE_TTL_MS - ageMs;
+        const remainMin = Math.ceil(remainMs / 60000);
+        messages.push(`ℹ️ 缓存于 ${ageStr}（${remainMin} 分钟后刷新）`);
+    }
+
+    return messages;
+}
+
+/** Handle !usage for codex flavor. */
+async function handleCodexUsage(profileArg: string, ctx: BangCommandContext): Promise<BangCommandResult> {
+    // Console without profile arg: list Codex accounts
+    if (ctx.isConsoleSession && !profileArg) {
+        const codexProfiles = readCodexProfiles();
+
+        if (codexProfiles.length === 0) {
+            return { message: '❌ 未找到已登录的 Codex 账户。', action: 'none' };
+        }
+
+        const messages: string[] = ['📊 请选择要查询的 Codex 账户:', SEPARATOR];
+        for (const p of codexProfiles) {
+            messages.push(p.name);
+        }
+        messages.push(SEPARATOR);
+        messages.push('用法: !usage <账户名> --codex');
+
+        const suggestions = codexProfiles.slice(0, 3).map(p => `!usage ${p.name} --codex`);
+        return { message: messages, action: 'none', suggestions };
+    }
+
+    const resolved = resolveCodexToken(profileArg || undefined);
+    if (!resolved) {
+        return {
+            message: profileArg
+                ? `❌ 未找到 Codex 账户 "${profileArg}" 的凭证。`
+                : '❌ 未找到 Codex 凭证。请先 !login 登录。',
+            action: 'none',
+        };
+    }
+
+    ctx.client.sendSessionEvent({ type: 'message', message: '⏳ 正在查询 Codex 用量...' });
+
+    const { token, profileLabel, cacheKey } = resolved;
+    const cached = codexCache.get(cacheKey);
+    if (cached && (Date.now() - cached.fetchedAt) < CACHE_TTL_MS) {
+        return { message: formatCodexUsage(cached.data, profileLabel, cached.fetchedAt), action: 'none' };
+    }
+
+    try {
+        const data = await fetchCodexUsage(token, profileLabel);
+        const now = Date.now();
+        codexCache.set(cacheKey, { data, fetchedAt: now });
+        return { message: formatCodexUsage(data, profileLabel, now), action: 'none' };
+    } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : 'Unknown error';
+        logger.debug(`[!usage:codex] Failed: ${errorMsg}`);
+
+        if (cached) {
+            const messages = [...formatCodexUsage(cached.data, profileLabel, cached.fetchedAt), '⚠️ 无法获取最新数据'];
+            for (const msg of messages) {
+                ctx.client.sendSessionEvent({ type: 'message', message: msg });
+            }
+            ctx.client.sendCodexMessage({ type: 'message', message: codeBlock(errorMsg) });
+            return { message: [], action: 'none' };
+        }
+
+        ctx.client.sendSessionEvent({ type: 'message', message: '❌ 获取 Codex 用量失败' });
+        ctx.client.sendCodexMessage({ type: 'message', message: codeBlock(errorMsg) });
+        return { message: [], action: 'none' };
+    }
+}
+
 /**
  * Handle the `!usage` bang command.
  *
@@ -326,30 +599,33 @@ function resolveOAuthTokenForProfile(profileName: string): { token: string; prof
  * - `!usage <profile>` — Show usage for a specific CCS profile
  */
 export async function handleUsageBangCommand(args: string, ctx: BangCommandContext): Promise<BangCommandResult> {
-    const profileArg = args.trim();
+    const { cleanArgs: profileArg, hasCodexFlag } = parseCodexFlag(args);
 
-    // Console session without args: list available profiles
+    // Codex flavor (from session) or explicit --codex flag: delegate to codex handler
+    if (ctx.flavor === 'codex' || hasCodexFlag) {
+        return handleCodexUsage(profileArg, ctx);
+    }
+
+    // Console session without args: list Claude profiles only
     if (ctx.isConsoleSession && !profileArg) {
         const { profiles, defaultProfile } = readCcsProfiles();
-        // Only show profiles that have credentials
-        const accountProfiles = profiles.filter(p =>
-            readOAuthToken(p.instancePath) !== null
-        );
-        if (accountProfiles.length === 0) {
-            return { message: '❌ 未找到已登录的账户。', action: 'none' };
+        const claudeProfiles = profiles.filter(p => readOAuthToken(p.instancePath) !== null);
+
+        if (claudeProfiles.length === 0) {
+            return { message: '❌ 未找到已登录的 Claude 账户。', action: 'none' };
         }
-        const messages = ['📊 请选择要查询的账户:', SEPARATOR];
-        for (const p of accountProfiles) {
+
+        const messages: string[] = ['📊 请选择要查询的 Claude 账户:', SEPARATOR];
+
+        for (const p of claudeProfiles) {
             const marker = p.name === defaultProfile ? ' (默认)' : '';
             messages.push(`${p.name}${marker}`);
         }
         messages.push(SEPARATOR);
         messages.push('用法: !usage <账户名>');
-        return {
-            message: messages,
-            action: 'none',
-            suggestions: accountProfiles.slice(0, 3).map(p => `!usage ${p.name}`),
-        };
+
+        const suggestions = claudeProfiles.slice(0, 3).map(p => `!usage ${p.name}`);
+        return { message: messages, action: 'none', suggestions };
     }
 
     // Resolve token: by profile name arg, or current session

@@ -12,6 +12,7 @@ import {
     unregisterInteractiveSession,
 } from './interactiveSession';
 import { SEPARATOR, codeBlock, type BangCommandContext, type BangCommandResult } from './types';
+import { getCodexInstancePath, getHappyHome, registerCodexProfile } from './ccsProfiles';
 
 const PROFILE_NAME_REGEX = /^[a-zA-Z][a-zA-Z0-9_-]*$/;
 
@@ -191,20 +192,11 @@ function ensurePtySpawnHelper(): void {
 }
 
 /** Find the Claude CLI binary path. */
-function findClaudeCli(): { path: string; needsShell: boolean } | null {
-    // Check CCS_CLAUDE_PATH override first
-    if (process.env.CCS_CLAUDE_PATH) {
-        const ccsPath = process.env.CCS_CLAUDE_PATH;
-        if (existsSync(ccsPath)) {
-            const needsShell = process.platform === 'win32' && /\.(cmd|bat)$/i.test(ccsPath);
-            return { path: ccsPath, needsShell };
-        }
-    }
-
+/** Locate a CLI binary by name using `where.exe` (Windows) or `which` (Unix). */
+function findCliBinary(name: string): { path: string; needsShell: boolean } | null {
     const isWindows = process.platform === 'win32';
-
     try {
-        const cmd = isWindows ? 'where.exe claude' : 'which claude';
+        const cmd = isWindows ? `where.exe ${name}` : `which ${name}`;
         const result = execSync(cmd, {
             encoding: 'utf8',
             stdio: ['ignore', 'pipe', 'ignore'],
@@ -213,19 +205,73 @@ function findClaudeCli(): { path: string; needsShell: boolean } | null {
         }).trim();
 
         const matches = result.split('\n').map(p => p.trim()).filter(Boolean);
-
         if (isWindows) {
             const withExt = matches.find(p => /\.(exe|cmd|bat)$/i.test(p));
-            const claudePath = withExt || matches[0];
-            if (claudePath && existsSync(claudePath)) {
-                return { path: claudePath, needsShell: /\.(cmd|bat)$/i.test(claudePath) };
+            const binPath = withExt || matches[0];
+            if (binPath && existsSync(binPath)) {
+                return { path: binPath, needsShell: /\.(cmd|bat)$/i.test(binPath) };
             }
         } else if (matches[0] && existsSync(matches[0])) {
             return { path: matches[0], needsShell: false };
         }
-    } catch { /* claude not in PATH */ }
-
+    } catch { /* not in PATH */ }
     return null;
+}
+
+/** Find Claude CLI, respecting CCS_CLAUDE_PATH override. */
+function findClaudeCli(): { path: string; needsShell: boolean } | null {
+    if (process.env.CCS_CLAUDE_PATH) {
+        const ccsPath = process.env.CCS_CLAUDE_PATH;
+        if (existsSync(ccsPath)) {
+            const needsShell = process.platform === 'win32' && /\.(cmd|bat)$/i.test(ccsPath);
+            return { path: ccsPath, needsShell };
+        }
+    }
+    return findCliBinary('claude');
+}
+
+/** Find Codex CLI. */
+function findCodexCli(): { path: string; needsShell: boolean } | null {
+    return findCliBinary('codex');
+}
+
+/**
+ * Analyze PTY output from `codex login` and decide what action to take.
+ *
+ * Codex login flow:
+ * 1. Outputs an OAuth URL (Google/OpenAI auth)
+ * 2. User opens URL in browser
+ * 3. Codex auto-detects completion via redirect callback
+ * 4. Writes auth.json and exits
+ */
+export type CodexLoginAction =
+    | { action: 'forward-url'; url: string }
+    | { action: 'success' }
+    | { action: 'error'; message: string }
+    | { action: 'discard' };
+
+export function analyzeCodexPtyOutput(buffer: string): CodexLoginAction {
+    const clean = stripTerminalOutput(buffer);
+    const continuous = stripAnsiOnly(buffer);
+
+    // Detect OAuth URL — codex uses auth.openai.com for its OAuth flow
+    const urlMatch = continuous.match(/https:\/\/[^\s]*(auth\.openai\.com|auth0\.openai\.com|accounts\.google\.com)[^\s]*/);
+    if (urlMatch) {
+        const url = urlMatch[0].replace(/>+$/, '');
+        return { action: 'forward-url', url };
+    }
+
+    // Detect success — codex outputs "Logged in" or "Successfully logged in" on completion
+    if (/logged in/i.test(clean)) {
+        return { action: 'success' };
+    }
+
+    // Detect fatal path/config errors (e.g., CODEX_HOME not found)
+    if (clean.includes('does not exist') || clean.includes('Error loading configuration')) {
+        return { action: 'error', message: clean.trim() };
+    }
+
+    return { action: 'discard' };
 }
 
 /** Minimal shape of a CCS config.yaml for the fields we read/write. */
@@ -749,7 +795,7 @@ export async function handleLoginBangCommand(
 
         if (accounts.length === 0) {
             return {
-                message: '用法: !login <账户名>\n\n登录账户',
+                message: '用法: !login <账户名> [--codex] [--isolated] [--group <组>]\n\n登录账户（--codex 登录 Codex 账号）',
                 action: 'none',
             };
         }
@@ -760,7 +806,8 @@ export async function handleLoginBangCommand(
             messages.push(name);
         }
         messages.push(SEPARATOR);
-        messages.push('使用 !login <账户名> 进行登录');
+        messages.push('!login <账户名> 登录 Claude');
+        messages.push('!login <账户名> --codex 登录 Codex');
 
         return { message: messages, action: 'none' };
     }
@@ -772,13 +819,21 @@ export async function handleLoginBangCommand(
         };
     }
 
-    // Parse context flags
+    // Parse context and agent flags
     const hasIsolated = parts.includes('--isolated');
+    const hasCodexFlag = parts.includes('--codex');
     const groupIdx = parts.indexOf('--group');
     const contextGroup = groupIdx !== -1 && parts[groupIdx + 1]
         ? parts[groupIdx + 1]
         : (hasIsolated ? undefined : 'default');
     const contextMode: 'isolated' | 'shared' = hasIsolated ? 'isolated' : 'shared';
+
+    // Resolve target agent: explicit --codex flag overrides session flavor
+    const targetAgent = hasCodexFlag ? 'codex' : (ctx.flavor || 'claude');
+
+    if (targetAgent === 'codex') {
+        return performCodexLogin(profileName, contextMode, contextGroup, ctx);
+    }
 
     // Find Claude CLI
     const claudeInfo = findClaudeCli();
@@ -1041,6 +1096,483 @@ export async function handleLoginBangCommand(
     const msg = `🔐 正在登录...\n\n`
         + `配置: ${profileName} (${contextMode === 'shared' ? '共享' : '独立'})\n\n`
         + '请等待登录提示，然后粘贴 OAuth Key\n\n'
+        + '取消: !cancel';
+    return { message: msg, action: 'none' };
+}
+
+// ---------------------------------------------------------------------------
+// Codex shared-directory linking (mirrors linkSharedDirectories for Claude)
+// ---------------------------------------------------------------------------
+
+/**
+ * Get the base directory for shared Codex resources across profiles.
+ * Layout: <happyHomeDir>/codex-shared/
+ */
+function getCodexSharedDir(): string {
+    return join(getHappyHome(), 'codex-shared');
+}
+
+/**
+ * Link shared directories from a Codex instance to ~/.happy/codex-shared/.
+ * Replicates the CCS SharedManager.linkSharedDirectories() pattern for
+ * Codex instances, ensuring config and skills stay in sync across profiles
+ * within the same shared context group.
+ *
+ * Shared items:
+ * - config.toml — proxy/trust settings (all profiles should use the same proxy)
+ * - .env — environment variables (proxy, custom vars)
+ * - skills/ — user-defined Codex skills
+ *
+ * NOT shared (per-instance):
+ * - auth.json, sessions/, history.jsonl, state_*.sqlite, logs_*.sqlite,
+ *   cap_sid, .sandbox*, models_cache.json, version.json
+ *
+ * On Windows: uses junction for directories and falls back to copy if symlink
+ * fails (mirrors linkSharedDirectories behaviour).
+ */
+function linkCodexSharedDirectories(codexInstancePath: string): void {
+    const sharedDir = getCodexSharedDir();
+    const isWindows = process.platform === 'win32';
+
+    const sharedItems: Array<{ name: string; type: 'directory' | 'file' }> = [
+        { name: 'skills', type: 'directory' },
+        { name: 'config.toml', type: 'file' },
+        { name: '.env', type: 'file' },
+    ];
+
+    // Ensure shared directory exists.
+    // Seed initial content from the instance being linked (first profile wins).
+    mkdirSync(sharedDir, { recursive: true });
+    for (const item of sharedItems) {
+        const sharedPath = join(sharedDir, item.name);
+        const instanceSource = join(codexInstancePath, item.name);
+
+        if (!existsSync(sharedPath)) {
+            if (item.type === 'directory') {
+                if (existsSync(instanceSource) && statSync(instanceSource).isDirectory()) {
+                    copyDirectoryRecursive(instanceSource, sharedPath);
+                } else {
+                    mkdirSync(sharedPath, { recursive: true });
+                }
+            } else if (existsSync(instanceSource)) {
+                copyFileSync(instanceSource, sharedPath);
+            }
+            // If neither shared nor instance copy exists, skip — don't create empty files
+        }
+    }
+
+    // Create instance → shared links (replacing existing files/directories)
+    for (const item of sharedItems) {
+        const linkPath = join(codexInstancePath, item.name);
+        const targetPath = join(sharedDir, item.name);
+
+        // Only create a link when the shared target exists
+        if (!existsSync(targetPath)) continue;
+
+        // Remove whatever currently sits at the link path
+        try {
+            const st = lstatSync(linkPath);
+            if (st.isSymbolicLink() || !st.isDirectory()) {
+                rmSync(linkPath, { force: true });
+            } else {
+                rmSync(linkPath, { recursive: true, force: true });
+            }
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+                try { rmSync(linkPath, { force: true }); } catch { /* ignore */ }
+            }
+        }
+
+        if (item.type === 'directory') {
+            linkDirectoryWithFallback(targetPath, linkPath, isWindows);
+            logger.debug(`[!login:codex] Linked ${item.name}: ${linkPath} → ${targetPath}`);
+        } else {
+            try {
+                symlinkSync(targetPath, linkPath, 'file');
+                logger.debug(`[!login:codex] Linked ${item.name}: ${linkPath} → ${targetPath}`);
+            } catch (err) {
+                if (isWindows) {
+                    // Windows file symlinks need developer-mode; fall back to copy
+                    copyFileSync(targetPath, linkPath);
+                    logger.debug(`[!login:codex] Copied ${item.name} (symlink failed): ${(err as Error).message}`);
+                } else {
+                    logger.debug(`[!login:codex] Failed to link ${item.name}: ${(err as Error).message}`);
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Sync Codex session history for shared-mode profiles.
+ *
+ * Codex sessions are date-layered JSONL files with unique UUIDs in the filename
+ * (e.g. sessions/2026/04/10/rollout-2026-04-10T11-05-43-<UUID>.jsonl), so
+ * merging into a shared directory is safe — no naming collisions.
+ *
+ * Shared layout:
+ *   ~/.happy/codex-shared/context-groups/<group>/sessions/   (symlinked)
+ *   ~/.happy/codex-shared/context-groups/<group>/history.jsonl (symlinked)
+ *
+ * state_*.sqlite is intentionally NOT shared — it is a rebuildable index and
+ * sharing it would cause SQLite lock contention across concurrent profiles.
+ */
+function syncCodexSessionSharing(
+    codexInstancePath: string,
+    contextMode: 'isolated' | 'shared',
+    contextGroup?: string,
+): void {
+    const isWindows = process.platform === 'win32';
+
+    if (contextMode === 'isolated') {
+        // Isolated: ensure sessions/ is a plain directory (detach if previously shared)
+        const sessionsPath = join(codexInstancePath, 'sessions');
+        try {
+            const st = lstatSync(sessionsPath);
+            if (st.isSymbolicLink()) {
+                const target = realpathSync(sessionsPath);
+                rmSync(sessionsPath, { force: true });
+                mkdirSync(sessionsPath, { recursive: true });
+                // Merge back from shared → isolated
+                mergeSessionsDirectory(target, sessionsPath);
+                logger.debug('[!login:codex] Detached sessions symlink to isolated directory');
+            }
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+                mkdirSync(sessionsPath, { recursive: true });
+            }
+        }
+        return;
+    }
+
+    // Shared mode: link sessions → shared context-group directory
+    const group = contextGroup || 'default';
+    const sharedGroupDir = join(getCodexSharedDir(), 'context-groups', group);
+    const sharedSessionsPath = join(sharedGroupDir, 'sessions');
+    const sharedHistoryPath = join(sharedGroupDir, 'history.jsonl');
+    mkdirSync(sharedSessionsPath, { recursive: true });
+
+    // --- sessions/ ---
+    const instanceSessions = join(codexInstancePath, 'sessions');
+    try {
+        const st = lstatSync(instanceSessions);
+        if (st.isSymbolicLink()) {
+            // Already a symlink — verify it points to the correct target
+            let resolved: string;
+            try { resolved = realpathSync(instanceSessions); } catch {
+                rmSync(instanceSessions, { force: true });
+                linkDirectoryWithFallback(sharedSessionsPath, instanceSessions, isWindows);
+                logger.debug('[!login:codex] Replaced broken sessions symlink');
+                return;
+            }
+            if (samePath(resolved, sharedSessionsPath)) {
+                logger.debug('[!login:codex] Sessions symlink already correct');
+            } else {
+                // Pointing to a different group — merge and relink
+                mergeSessionsDirectory(resolved, sharedSessionsPath);
+                rmSync(instanceSessions, { force: true });
+                linkDirectoryWithFallback(sharedSessionsPath, instanceSessions, isWindows);
+                logger.debug(`[!login:codex] Relinked sessions: ${resolved} → ${sharedSessionsPath}`);
+            }
+        } else if (st.isDirectory()) {
+            // Plain directory with existing sessions — merge into shared, then link
+            mergeSessionsDirectory(instanceSessions, sharedSessionsPath);
+            rmSync(instanceSessions, { recursive: true, force: true });
+            linkDirectoryWithFallback(sharedSessionsPath, instanceSessions, isWindows);
+            logger.debug(`[!login:codex] Merged and linked sessions → ${sharedSessionsPath}`);
+        }
+    } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+            linkDirectoryWithFallback(sharedSessionsPath, instanceSessions, isWindows);
+            logger.debug(`[!login:codex] Linked sessions (new) → ${sharedSessionsPath}`);
+        }
+    }
+
+    // --- history.jsonl ---
+    const instanceHistory = join(codexInstancePath, 'history.jsonl');
+    // Seed shared history from instance if it exists and shared doesn't
+    if (!existsSync(sharedHistoryPath)) {
+        if (existsSync(instanceHistory)) {
+            try {
+                const st = lstatSync(instanceHistory);
+                if (!st.isSymbolicLink()) {
+                    copyFileSync(instanceHistory, sharedHistoryPath);
+                    logger.debug('[!login:codex] Seeded shared history.jsonl from instance');
+                }
+            } catch (err) {
+                logger.debug(`[!login:codex] Failed to seed history: ${(err as Error).message}`);
+            }
+        }
+    } else if (existsSync(instanceHistory)) {
+        // Both exist — append instance entries not already in shared
+        try {
+            const st = lstatSync(instanceHistory);
+            if (!st.isSymbolicLink()) {
+                const instanceContent = readFileSync(instanceHistory, 'utf-8').trim();
+                const sharedContent = readFileSync(sharedHistoryPath, 'utf-8').trim();
+                if (instanceContent && instanceContent !== sharedContent) {
+                    const sharedLines = new Set(sharedContent.split('\n').filter(Boolean));
+                    const newLines = instanceContent.split('\n').filter(l => l && !sharedLines.has(l));
+                    if (newLines.length > 0) {
+                        writeFileSync(sharedHistoryPath, sharedContent + '\n' + newLines.join('\n') + '\n', 'utf-8');
+                        logger.debug(`[!login:codex] Merged ${newLines.length} history entries`);
+                    }
+                }
+            }
+        } catch (err) {
+            logger.debug(`[!login:codex] History merge failed: ${(err as Error).message}`);
+        }
+    }
+
+    // Replace instance history with symlink
+    try {
+        const st = lstatSync(instanceHistory);
+        if (!st.isSymbolicLink()) rmSync(instanceHistory, { force: true });
+        else if (samePath(realpathSync(instanceHistory), sharedHistoryPath)) return; // already correct
+        else rmSync(instanceHistory, { force: true });
+    } catch { /* doesn't exist yet — fine */ }
+
+    if (existsSync(sharedHistoryPath)) {
+        try {
+            symlinkSync(sharedHistoryPath, instanceHistory, 'file');
+            logger.debug(`[!login:codex] Linked history.jsonl → ${sharedHistoryPath}`);
+        } catch (err) {
+            if (isWindows) {
+                try { copyFileSync(sharedHistoryPath, instanceHistory); } catch { /* ignore */ }
+                logger.debug(`[!login:codex] Copied history.jsonl (symlink failed): ${(err as Error).message}`);
+            }
+        }
+    }
+}
+
+/**
+ * Recursively merge Codex session files from src into dest.
+ * Sessions use unique UUID filenames, so conflicts are extremely unlikely.
+ * If a file already exists in dest, it is skipped (not overwritten).
+ */
+function mergeSessionsDirectory(src: string, dest: string): void {
+    let entries;
+    try { entries = readdirSync(src, { withFileTypes: true }); } catch { return; }
+
+    for (const entry of entries) {
+        const srcPath = join(src, entry.name);
+        const destPath = join(dest, entry.name);
+
+        if (entry.isDirectory()) {
+            mkdirSync(destPath, { recursive: true });
+            mergeSessionsDirectory(srcPath, destPath);
+        } else if (!existsSync(destPath)) {
+            try {
+                copyFileSync(srcPath, destPath);
+            } catch (err) {
+                logger.debug(`[!login:codex] Failed to merge session ${entry.name}: ${(err as Error).message}`);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Codex-specific login flow
+// ---------------------------------------------------------------------------
+
+/**
+ * Handle `!login <name>` for Codex backend.
+ *
+ * Flow:
+ * 1. Create codex instance directory (~/.happy/codex-instances/<name>/)
+ * 2. Copy config.toml + .env from current CODEX_HOME (if available)
+ * 3. Spawn `codex login` with CODEX_HOME pointing to the new instance
+ * 4. Detect OAuth URL from output → forward to mobile
+ * 5. Codex auto-completes OAuth via browser redirect → writes auth.json
+ * 6. On exit: check auth.json → register CCS profile + success message
+ */
+function performCodexLogin(
+    profileName: string,
+    contextMode: 'isolated' | 'shared',
+    contextGroup: string | undefined,
+    ctx: BangCommandContext,
+): BangCommandResult {
+    const codexInfo = findCodexCli();
+    if (!codexInfo) {
+        return {
+            message: '❌ 未找到 Codex CLI\n\n请先安装: npm install -g @openai/codex',
+            action: 'none',
+        };
+    }
+
+    const codexInstancePath = getCodexInstancePath(profileName);
+    const dirExistedBefore = existsSync(codexInstancePath);
+    try {
+        mkdirSync(codexInstancePath, { recursive: true });
+    } catch (err) {
+        return {
+            message: `❌ 创建 Codex 实例目录失败: ${(err as Error).message}`,
+            action: 'none',
+        };
+    }
+
+    // Seed config from current CODEX_HOME so proxy/trust settings carry over
+    const currentCodexHome = process.env.CODEX_HOME || join(homedir(), '.codex');
+    for (const file of ['config.toml', '.env'] as const) {
+        const destFile = join(codexInstancePath, file);
+        if (!existsSync(destFile)) {
+            const srcFile = join(currentCodexHome, file);
+            if (existsSync(srcFile)) {
+                try { copyFileSync(srcFile, destFile); } catch { /* best-effort */ }
+            }
+        }
+    }
+
+    // Build env for codex login — point CODEX_HOME to the new instance
+    const childEnv: Record<string, string> = {};
+    for (const [k, v] of Object.entries(process.env)) {
+        if (v !== undefined) childEnv[k] = v;
+    }
+    childEnv.CODEX_HOME = codexInstancePath;
+    // Remove ambient provider variables that might confuse codex
+    delete childEnv.ANTHROPIC_AUTH_TOKEN;
+    delete childEnv.CLAUDE_CODE_OAUTH_TOKEN;
+
+    // Spawn codex login via PTY
+    ensurePtySpawnHelper();
+    let ptyProcess: pty.IPty;
+    try {
+        const shell = process.platform === 'win32' && codexInfo.needsShell;
+        ptyProcess = pty.spawn(
+            shell ? process.env.COMSPEC || 'cmd.exe' : codexInfo.path,
+            shell ? ['/c', codexInfo.path, 'login'] : ['login'],
+            {
+                name: 'xterm-256color',
+                cols: 1000,
+                rows: 30,
+                cwd: homedir(),
+                env: childEnv,
+            },
+        );
+    } catch (err) {
+        if (!dirExistedBefore) cleanupInstance(codexInstancePath);
+        return {
+            message: `❌ 启动 Codex 登录失败: ${(err as Error).message}`,
+            action: 'none',
+        };
+    }
+
+    let outputBuffer = '';
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    let exited = false;
+    let loginUrlSent = false;
+    let loginSucceeded = false;
+
+    const flushOutput = (): void => {
+        if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+        const text = stripTerminalOutput(outputBuffer).trim();
+        outputBuffer = '';
+        if (text) {
+            ctx.client.sendCodexMessage({ type: 'message', message: codeBlock(text) });
+        }
+    };
+
+    ptyProcess.onData((data: string) => {
+        if (loginSucceeded) return;
+        outputBuffer += data;
+
+        const result = analyzeCodexPtyOutput(outputBuffer);
+        logger.debug(`[!login:codex] onData action=${result.action} bufLen=${outputBuffer.length}`);
+
+        switch (result.action) {
+            case 'forward-url':
+                loginUrlSent = true;
+                outputBuffer = '';
+                if (flushTimer) clearTimeout(flushTimer);
+                ctx.client.sendCodexMessage({ type: 'message', message:
+                    '🔗 请在浏览器中打开以下链接登录 Codex:\n\n' + codeBlock(result.url) + '\n\n登录完成后将自动检测'
+                });
+                return;
+
+            case 'success':
+                loginSucceeded = true;
+                outputBuffer = '';
+                if (flushTimer) clearTimeout(flushTimer);
+                logger.debug('[!login:codex] Login success detected');
+                setTimeout(() => { try { ptyProcess.kill(); } catch {} }, 1000);
+                return;
+
+            case 'error':
+                outputBuffer = '';
+                if (flushTimer) clearTimeout(flushTimer);
+                unregisterInteractiveSession();
+                ptyProcess.kill();
+                if (!dirExistedBefore) cleanupInstance(codexInstancePath);
+                ctx.client.sendCodexMessage({ type: 'message', message: `❌ Codex 登录失败\n\n${result.message}` });
+                ctx.client.sendSessionEvent({ type: 'ready' });
+                return;
+
+            case 'discard':
+                if (flushTimer) clearTimeout(flushTimer);
+                flushTimer = setTimeout(flushOutput, 500);
+                return;
+        }
+    });
+
+    // Register interactive input handler (for !cancel support)
+    registerInteractiveSession((text: string) => {
+        const trimmed = text.trim();
+        if (trimmed === '!cancel' || trimmed === '!取消') {
+            logger.debug('[!login:codex] User cancelled login');
+            loginSucceeded = false;
+            unregisterInteractiveSession();
+            flushOutput();
+            ptyProcess.kill();
+            if (!dirExistedBefore) cleanupInstance(codexInstancePath);
+            ctx.client.sendCodexMessage({ type: 'message', message: '❌ 登录已取消' });
+            ctx.client.sendSessionEvent({ type: 'ready' });
+            return;
+        }
+        if (exited) return;
+        // Forward any other input to PTY (in case codex prompts for something)
+        try { ptyProcess.write(text + '\r'); } catch {}
+    });
+
+    ptyProcess.onExit(({ exitCode }) => {
+        exited = true;
+        flushOutput();
+        unregisterInteractiveSession();
+
+        const hasAuth = loginSucceeded
+            || existsSync(join(codexInstancePath, 'auth.json'));
+
+        if (hasAuth) {
+            try {
+                // Register in CCS so !auth can discover the profile
+                registerCodexProfile(profileName, contextMode, contextGroup);
+                // Link shared resources and session history — mirrors Claude login pattern
+                if (contextMode === 'shared') {
+                    linkCodexSharedDirectories(codexInstancePath);
+                }
+                syncCodexSessionSharing(codexInstancePath, contextMode, contextGroup);
+                const modeDesc = contextMode === 'shared'
+                    ? `共享 (组: ${contextGroup || 'default'})`
+                    : '独立';
+                const msg = `✅ Codex 配置 "${profileName}" 登录成功\n\n`
+                    + `模式: ${modeDesc}\n\n`
+                    + `切换账号: !auth ${profileName}`;
+                ctx.client.sendCodexMessage({ type: 'message', message: msg });
+            } catch (err) {
+                logger.debug('[!login:codex] Failed to register profile:', err);
+                ctx.client.sendCodexMessage({ type: 'message', message: `⚠️ 登录成功但注册失败: ${(err as Error).message}` });
+            }
+        } else {
+            if (!dirExistedBefore) cleanupInstance(codexInstancePath);
+            logger.debug(`[!login:codex] Login failed with exit code: ${exitCode ?? 'unknown'}`);
+            ctx.client.sendCodexMessage({ type: 'message', message: `❌ Codex 登录失败或已取消\n\n重新尝试: !login ${profileName}` });
+        }
+
+        ctx.client.sendSessionEvent({ type: 'ready' });
+    });
+
+    const msg = `🔐 正在登录 Codex...\n\n`
+        + `配置: ${profileName} (${contextMode === 'shared' ? '共享' : '独立'})\n\n`
+        + '请等待 OAuth 链接，然后在浏览器中打开\n\n'
         + '取消: !cancel';
     return { message: msg, action: 'none' };
 }

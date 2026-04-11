@@ -1,10 +1,22 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { logger } from '@/ui/logger';
-import { readCcsProfiles, getCurrentCcsProfile, type CcsProfileInfo } from './ccsProfiles';
+import {
+    readCcsProfiles,
+    getCurrentProfileForFlavor,
+    applyProfileSwitch,
+    readCodexProfiles,
+    type CcsProfileInfo,
+    type AuthFlavor,
+} from './ccsProfiles';
 import { configuration } from '@/configuration';
-import { getCachedUsageSummary, readOAuthToken } from './usageCommand';
-import { SEPARATOR, type BangCommandContext, type BangCommandResult } from './types';
+import { getCachedUsageSummary, readOAuthToken, fetchProfileUsageSummary } from './usageCommand';
+import { SEPARATOR, parseCodexFlag, type BangCommandContext, type BangCommandResult } from './types';
+
+/** Map context flavor to the auth-relevant subset (gemini/undefined → claude). */
+function resolveAuthFlavor(ctx: BangCommandContext): AuthFlavor {
+    return ctx.flavor === 'codex' ? 'codex' : 'claude';
+}
 
 /**
  * Handle the `!auth` bang command.
@@ -17,10 +29,12 @@ import { SEPARATOR, type BangCommandContext, type BangCommandResult } from './ty
  * - `!auth` — List available CCS profiles (use !auth-all to switch all sessions)
  */
 export async function handleAuthBangCommand(args: string, ctx: BangCommandContext): Promise<BangCommandResult> {
-    const trimmed = args.trim();
+    const { cleanArgs, hasCodexFlag } = parseCodexFlag(args);
+    // In console: no ctx.flavor, use --codex flag; in session: ctx.flavor takes precedence
+    const flavor: AuthFlavor = hasCodexFlag ? 'codex' : resolveAuthFlavor(ctx);
 
-    if (!trimmed) {
-        return listProfiles(!!ctx.isConsoleSession);
+    if (!cleanArgs) {
+        return listProfiles(!!ctx.isConsoleSession, flavor);
     }
 
     if (ctx.isConsoleSession) {
@@ -31,7 +45,7 @@ export async function handleAuthBangCommand(args: string, ctx: BangCommandContex
         };
     }
 
-    return switchProfile(trimmed);
+    return switchProfile(cleanArgs, flavor);
 }
 
 /**
@@ -40,14 +54,15 @@ export async function handleAuthBangCommand(args: string, ctx: BangCommandContex
  * - `!auth-all` — List available CCS profiles
  * - `!auth-all <name>` — Switch all sessions on this machine to the specified profile
  */
-export async function handleAuthAllBangCommand(args: string, _ctx: BangCommandContext): Promise<BangCommandResult> {
-    const trimmed = args.trim();
+export async function handleAuthAllBangCommand(args: string, ctx: BangCommandContext): Promise<BangCommandResult> {
+    const { cleanArgs, hasCodexFlag } = parseCodexFlag(args);
+    const flavor: AuthFlavor = hasCodexFlag ? 'codex' : resolveAuthFlavor(ctx);
 
-    if (!trimmed) {
-        return listProfiles(true);
+    if (!cleanArgs) {
+        return listProfiles(true, flavor);
     }
 
-    return switchAllProfiles(trimmed);
+    return switchAllProfiles(cleanArgs, flavor);
 }
 
 /**
@@ -55,7 +70,7 @@ export async function handleAuthAllBangCommand(args: string, _ctx: BangCommandCo
  * Called by the fs.watch handler in claudeRemoteLauncher when the file changes.
  * Returns true if a switch occurred, false otherwise.
  */
-export function tryGlobalProfileSwitch(): boolean {
+export function tryGlobalProfileSwitch(flavor: AuthFlavor = 'claude'): boolean {
     try {
         const filePath = configuration.activeProfileFile;
         if (!existsSync(filePath)) return false;
@@ -63,7 +78,7 @@ export function tryGlobalProfileSwitch(): boolean {
         const profileName = readFileSync(filePath, 'utf-8').trim();
         if (!profileName) return false;
 
-        const currentProfile = getCurrentCcsProfile();
+        const currentProfile = getCurrentProfileForFlavor(flavor);
         if (profileName === currentProfile) return false;
 
         const { profiles } = readCcsProfiles();
@@ -81,13 +96,19 @@ export function tryGlobalProfileSwitch(): boolean {
             return false;
         }
 
-        if (!existsSync(target.instancePath)) {
-            logger.warn(`[!auth] Global switch: profile "${profileName}" instance not initialized (${target.instancePath}), skipping`);
-            return false;
+        if (flavor === 'codex') {
+            if (!readCodexProfiles().some(p => p.name === profileName)) {
+                logger.warn(`[!auth] Global switch: codex profile "${profileName}" has no auth.json, skipping`);
+                return false;
+            }
+        } else {
+            if (!existsSync(target.instancePath)) {
+                logger.warn(`[!auth] Global switch: profile "${profileName}" instance not initialized (${target.instancePath}), skipping`);
+                return false;
+            }
         }
 
-        process.env.CLAUDE_CONFIG_DIR = target.instancePath;
-        logger.debug(`[!auth] Global switch: switched CLAUDE_CONFIG_DIR to "${profileName}" (${target.instancePath})`);
+        applyProfileSwitch(profileName, flavor, target.instancePath);
         return true;
     } catch (err) {
         logger.debug('[!auth] Global profile switch error:', err);
@@ -96,30 +117,64 @@ export function tryGlobalProfileSwitch(): boolean {
 }
 
 /**
- * Check whether a profile's OAuth token is available and likely valid.
+ * Check whether a profile's auth is available and likely valid.
  * Returns a status indicator: '' (ok), '⚠' (no token / not initialized).
  */
-function getProfileStatus(profile: CcsProfileInfo): string {
+function getProfileStatus(profile: CcsProfileInfo, flavor: AuthFlavor = 'claude', codexNames?: Set<string>): string {
+    if (flavor === 'codex') {
+        const names = codexNames ?? new Set(readCodexProfiles().map(p => p.name));
+        return names.has(profile.name) ? '' : '⚠';
+    }
     if (!existsSync(profile.instancePath)) return '⚠';
     if (!readOAuthToken(profile.instancePath)) return '⚠';
     return '';
 }
 
-function listProfiles(isConsole: boolean): BangCommandResult {
+/**
+ * Fetch usage summaries for a list of profiles in parallel.
+ * Each call is individually bounded by a 5s timeout inside fetchProfileUsageSummary.
+ */
+async function fetchUsageSummaries(profileNames: string[], flavor: AuthFlavor): Promise<Map<string, string>> {
+    const results = await Promise.all(
+        profileNames.map(async name => ({
+            name,
+            summary: await fetchProfileUsageSummary(name, flavor),
+        }))
+    );
+    const map = new Map<string, string>();
+    for (const { name, summary } of results) {
+        if (summary) map.set(name, summary);
+    }
+    return map;
+}
+
+/** Format a profile line with optional usage summary. */
+function profileLine(marker: string, name: string, status: string, usage: string | undefined): string {
+    const parts = [marker, name];
+    if (status) parts.push(status);
+    if (usage) parts.push(usage);
+    return parts.filter(Boolean).join(' ');
+}
+
+async function listProfiles(isConsole: boolean, flavor: AuthFlavor = 'claude'): Promise<BangCommandResult> {
     const { profiles } = readCcsProfiles();
-    const currentProfile = getCurrentCcsProfile();
+    const currentProfile = getCurrentProfileForFlavor(flavor);
+    const codexNames = flavor === 'codex' ? new Set(readCodexProfiles().map(p => p.name)) : undefined;
     const currentProfileInfo = currentProfile
         ? profiles.find(p => p.name === currentProfile) ?? null
         : null;
 
+    const flavorLabel = flavor === 'codex' ? 'Codex' : 'Claude';
+
     // No active CCS profile (session not started via CCS)
     if (!currentProfile) {
-        const messages: string[] = ['📋 当前无 CCS 配置。'];
+        const messages: string[] = [`📋 当前无 CCS 配置。(${flavorLabel})`];
         if (profiles.length > 0) {
+            const usageMap = await fetchUsageSummaries(profiles.map(p => p.name), flavor);
             messages.push(SEPARATOR);
             for (const p of profiles) {
-                const status = getProfileStatus(p);
-                messages.push(status ? `○ ${p.name} ${status}` : `○ ${p.name}`);
+                const status = getProfileStatus(p, flavor, codexNames);
+                messages.push(profileLine('○', p.name, status, usageMap.get(p.name)));
             }
             messages.push(SEPARATOR);
         } else {
@@ -137,20 +192,22 @@ function listProfiles(isConsole: boolean): BangCommandResult {
             ? profiles.filter(p => p.contextMode === 'shared' && (p.contextGroup || 'default') === currentGroup)
             : [];
 
+        const usageMap = await fetchUsageSummaries(groupProfiles.map(p => p.name), flavor);
+        const codexFlag = flavor === 'codex' ? ' --codex' : '';
         const messages: string[] = [];
         if (currentGroup) {
-            messages.push(`📋 组 "${currentGroup}"`);
+            messages.push(`📋 组 "${currentGroup}" (${flavorLabel})`);
         }
         messages.push(SEPARATOR);
         for (const p of groupProfiles) {
-            const status = getProfileStatus(p);
-            messages.push(status ? `${p.name} ${status}` : p.name);
+            const status = getProfileStatus(p, flavor, codexNames);
+            messages.push(profileLine('', p.name, status, usageMap.get(p.name)));
         }
         messages.push(SEPARATOR);
 
         if (groupProfiles.length > 1) {
-            messages.push('!auth-all <名称> → 切换全部会话');
-            const suggestions = groupProfiles.map(p => `!auth-all ${p.name}`);
+            messages.push(`!auth-all <名称>${codexFlag} → 切换全部会话`);
+            const suggestions = groupProfiles.map(p => `!auth-all ${p.name}${codexFlag}`);
             return { message: messages, action: 'none', suggestions };
         } else {
             messages.push('本组无其他账号。');
@@ -166,23 +223,25 @@ function listProfiles(isConsole: boolean): BangCommandResult {
             && p.name !== currentProfile)
         : [];
 
+    const allInGroup = [currentProfile, ...switchable.map(p => p.name)];
+    const usageMap = await fetchUsageSummaries(allInGroup, flavor);
     const messages: string[] = [];
 
     if (currentGroup) {
-        messages.push(`📋 组 "${currentGroup}"`);
+        messages.push(`📋 组 "${currentGroup}" (${flavorLabel})`);
     } else {
-        messages.push(`📋 ${currentProfile} (独立)`);
+        messages.push(`📋 ${currentProfile} (独立, ${flavorLabel})`);
     }
 
-    const currentStatus = currentProfileInfo ? getProfileStatus(currentProfileInfo) : '';
+    const currentStatus = currentProfileInfo ? getProfileStatus(currentProfileInfo, flavor, codexNames) : '';
 
     messages.push(SEPARATOR);
-    messages.push(currentStatus ? `● ${currentProfile} ${currentStatus}` : `● ${currentProfile}`);
+    messages.push(profileLine('●', currentProfile, currentStatus, usageMap.get(currentProfile)));
 
     if (currentGroup && switchable.length > 0) {
         for (const profile of switchable) {
-            const status = getProfileStatus(profile);
-            messages.push(status ? `○ ${profile.name} ${status}` : `○ ${profile.name}`);
+            const status = getProfileStatus(profile, flavor, codexNames);
+            messages.push(profileLine('○', profile.name, status, usageMap.get(profile.name)));
         }
         messages.push(SEPARATOR);
         messages.push('!auth <名称> → 切换当前会话');
@@ -215,9 +274,9 @@ function isSharedContext(
     return sourceGroup === targetGroup;
 }
 
-function switchProfile(profileName: string): BangCommandResult {
+function switchProfile(profileName: string, flavor: AuthFlavor = 'claude'): BangCommandResult {
     const { profiles } = readCcsProfiles();
-    const currentProfile = getCurrentCcsProfile();
+    const currentProfile = getCurrentProfileForFlavor(flavor);
 
     // Find the target profile
     const target = profiles.find(p => p.name === profileName);
@@ -252,16 +311,21 @@ function switchProfile(profileName: string): BangCommandResult {
         };
     }
 
-    // Verify instance directory exists
-    if (!existsSync(target.instancePath)) {
-        return { message: `❌ 配置 "${profileName}" 未初始化。`, action: 'none' };
+    // Verify the relevant instance directory exists
+    if (flavor === 'codex') {
+        if (!readCodexProfiles().some(p => p.name === profileName)) {
+            return { message: `❌ Codex 配置 "${profileName}" 未初始化（无 auth.json）。`, action: 'none' };
+        }
+    } else {
+        if (!existsSync(target.instancePath)) {
+            return { message: `❌ 配置 "${profileName}" 未初始化。`, action: 'none' };
+        }
     }
 
-    // Perform the switch — shared context, no session reset needed
-    process.env.CLAUDE_CONFIG_DIR = target.instancePath;
-    logger.debug(`[!auth] Switched CLAUDE_CONFIG_DIR to: ${target.instancePath}`);
+    // Perform the env-level switch
+    applyProfileSwitch(profileName, flavor, target.instancePath);
 
-    const usageLine = getCachedUsageSummary(target.instancePath);
+    const usageLine = flavor !== 'codex' ? getCachedUsageSummary(target.instancePath) : null;
     const messages = [`✅ 已切换到 "${profileName}"`];
     if (usageLine) messages.push(usageLine);
     return { message: messages, action: 'restart-session' };
@@ -272,9 +336,9 @@ function switchProfile(profileName: string): BangCommandResult {
  * Validates and switches the current session, then writes the profile name
  * to a global file so other sessions pick it up via fs.watch.
  */
-function switchAllProfiles(profileName: string): BangCommandResult {
+function switchAllProfiles(profileName: string, flavor: AuthFlavor = 'claude'): BangCommandResult {
     const { profiles } = readCcsProfiles();
-    const currentProfile = getCurrentCcsProfile();
+    const currentProfile = getCurrentProfileForFlavor(flavor);
     const target = profiles.find(p => p.name === profileName);
 
     if (!target) {

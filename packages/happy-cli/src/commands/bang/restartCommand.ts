@@ -1,6 +1,6 @@
 import { writeFileSync } from 'node:fs';
 import { logger } from '@/ui/logger';
-import { getCurrentCcsProfile } from './ccsProfiles';
+import { getCurrentCcsProfile, getCurrentCodexProfile } from './ccsProfiles';
 import { configuration } from '@/configuration';
 import type { BangCommandContext, BangCommandResult } from './types';
 
@@ -30,7 +30,7 @@ export async function handleRestartBangCommand(args: string, ctx: BangCommandCon
                 action: 'none',
             };
         }
-        return restartCurrent();
+        return restartCurrent(ctx.flavor);
     }
 
     return {
@@ -51,11 +51,11 @@ export async function handleRestartAllBangCommand(_args: string, _ctx: BangComma
 /**
  * Restart the current session only.
  */
-function restartCurrent(): BangCommandResult {
-    const currentProfile = getCurrentCcsProfile();
+function restartCurrent(flavor?: 'claude' | 'codex' | 'gemini'): BangCommandResult {
+    const currentProfile = flavor === 'codex' ? getCurrentCodexProfile() : getCurrentCcsProfile();
     const profileLabel = currentProfile ? ` (${currentProfile})` : '';
 
-    logger.debug(`[!restart] Restarting current session${profileLabel}`);
+    logger.debug(`[!restart] Restarting current session${profileLabel} [flavor=${flavor ?? 'claude'}]`);
 
     return { message: `🔄 正在重启会话${profileLabel}`, action: 'restart-session' };
 }

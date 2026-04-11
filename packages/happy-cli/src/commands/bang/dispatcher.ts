@@ -3,9 +3,8 @@ import { handleAuthBangCommand, handleAuthAllBangCommand } from './authCommand';
 import { handleLoginBangCommand } from './loginCommand';
 import { handleRestartBangCommand, handleRestartAllBangCommand } from './restartCommand';
 import { handleUsageBangCommand } from './usageCommand';
-import { handleSessionsBangCommand } from './sessionCommand';
-import { handleOpenBangCommand } from './openCommand';
 import { handleTestBangCommand } from './testCommand';
+import { handleTitleBangCommand } from './titleCommand';
 import { SEPARATOR, type BangCommandContext, type BangCommandHandler, type BangCommandResult } from './types';
 
 export { SEPARATOR };
@@ -13,19 +12,21 @@ export { hasActiveInteractiveSession, handleInteractiveInput } from './interacti
 
 /**
  * Registry of bang commands with descriptions for !help.
- * sessionOnly: only available in normal Claude sessions (not console)
- * consoleOnly: only available in console sessions (not normal Claude sessions)
+ * sessionOnly: only available in normal agent sessions (not console)
+ * consoleOnly: only available in console sessions (not normal agent sessions)
  */
-const commands: Record<string, { handler: BangCommandHandler; desc: string; loadingMsg?: string; sessionOnly?: boolean; consoleOnly?: boolean; hidden?: boolean }> = {
+const commands: Record<string, { handler: BangCommandHandler; desc: string; loadingMsg?: string; sessionOnly?: boolean; consoleOnly?: boolean; hidden?: boolean; flavorOnly?: BangCommandContext['flavor'] }> = {
     'auth':        { handler: handleAuthBangCommand,        desc: '切换 CCS 账号', sessionOnly: true },
     'auth-all':    { handler: handleAuthAllBangCommand,     desc: '切换全部会话账号', consoleOnly: true },
     'login':       { handler: handleLoginBangCommand,       desc: '登录账户' },
     'restart':     { handler: handleRestartBangCommand,     desc: '重启会话', sessionOnly: true },
     'restart-all': { handler: handleRestartAllBangCommand,  desc: '重启全部会话', consoleOnly: true },
     'usage':       { handler: handleUsageBangCommand,       desc: '查看 API 用量' },
-    'session':     { handler: handleSessionsBangCommand,    desc: '浏览项目目录和会话', loadingMsg: '⏳ 正在扫描会话...', consoleOnly: true },
-    'open':        { handler: handleOpenBangCommand,        desc: '打开会话', loadingMsg: '⏳ 正在打开会话...', consoleOnly: true },
+    // TODO: !session / !open 暂停使用，待 multi-backend 会话浏览重构后恢复。实现保留在 sessionCommand.ts / openCommand.ts。
+    // 'session':     { handler: handleSessionsBangCommand,    desc: '浏览项目目录和会话', loadingMsg: '⏳ 正在扫描会话...', consoleOnly: true },
+    // 'open':        { handler: handleOpenBangCommand,        desc: '打开会话', loadingMsg: '⏳ 正在打开会话...', consoleOnly: true },
     'test':        { handler: handleTestBangCommand,        desc: '测试命令输出', consoleOnly: true, hidden: true },
+    'title':       { handler: handleTitleBangCommand,       desc: '修改会话标题', sessionOnly: true, flavorOnly: 'codex' },
 };
 
 /** Short aliases for convenience on mobile keyboards. */
@@ -33,12 +34,13 @@ const aliases: Record<string, string> = {
     a: 'auth',
     aa: 'auth-all',
     l: 'login',
-    o: 'open',
+    // o: 'open', // TODO: 暂停使用
     r: 'restart',
     ra: 'restart-all',
+    t: 'title',
     u: 'usage',
     h: 'help',
-    s: 'session',
+    // s: 'session', // TODO: 暂停使用
 };
 
 /**
@@ -72,12 +74,12 @@ function parseBangCommand(text: string): { name: string; args: string } {
  * Build the !help output listing all available commands.
  */
 /** Commands hidden from help output (low-frequency commands not worth showing). */
-const helpHidden = new Set(['restart-all', 'session', 'open']);
+const helpHidden = new Set(['restart-all']);
 
-function buildHelp(isConsole: boolean): BangCommandResult {
+function buildHelp(isConsole: boolean, flavor?: string): BangCommandResult {
     const allCommands: Array<[string, string]> = [
         ...Object.entries(commands)
-            .filter(([name, entry]) => !entry.hidden && !helpHidden.has(name) && !(isConsole && entry.sessionOnly) && !(!isConsole && entry.consoleOnly))
+            .filter(([name, entry]) => !entry.hidden && !helpHidden.has(name) && !(isConsole && entry.sessionOnly) && !(!isConsole && entry.consoleOnly) && (!entry.flavorOnly || entry.flavorOnly === flavor))
             .map(([name, { desc }]) => [name, desc] as [string, string]),
         ['help', '显示帮助'],
     ];
@@ -106,7 +108,7 @@ function buildHelp(isConsole: boolean): BangCommandResult {
 }
 
 /** Commands hidden from console welcome (available via !help but not shown on launch). */
-const consoleWelcomeHidden = new Set(['restart-all', 'session', 'open']);
+const consoleWelcomeHidden = new Set(['restart-all']);
 
 /**
  * Build the console welcome message listing key commands.
@@ -119,6 +121,13 @@ export function buildConsoleWelcome(): BangCommandResult {
         SEPARATOR,
     ];
 
+    // Commands that support --codex flag, with their codex-specific descriptions
+    const codexVariants: Record<string, string> = {
+        'login':    '登录 Codex 账号',
+        'usage':    '查看 Codex 用量',
+        'auth-all': '切换全部会话 Codex 账号',
+    };
+
     // Show commands available in console (consoleOnly + shared, exclude hidden and welcome-hidden)
     const consoleCommands = Object.entries(commands)
         .filter(([name, entry]) => !entry.hidden && !entry.sessionOnly && !consoleWelcomeHidden.has(name));
@@ -128,16 +137,20 @@ export function buildConsoleWelcome(): BangCommandResult {
             .map(([alias]) => `!${alias}`);
         const aliasStr = cmdAliases.length > 0 ? ` (${cmdAliases.join(', ')})` : '';
         messages.push(`!${name}${aliasStr} → ${desc}`);
+        if (codexVariants[name]) {
+            messages.push(`!${name} --codex → ${codexVariants[name]}`);
+        }
     }
     messages.push(`!help (!h) → 显示全部命令`);
 
     messages.push(SEPARATOR);
     messages.push('普通消息不会被处理，请使用 ! 开头的命令');
 
+    const codexSuggestions = Object.keys(codexVariants).map(name => `!${name} --codex`);
     return {
         message: messages,
         action: 'none',
-        suggestions: [...consoleCommands.map(([name]) => `!${name}`), '!help'],
+        suggestions: [...consoleCommands.map(([name]) => `!${name}`), ...codexSuggestions, '!help'],
     };
 }
 
@@ -145,14 +158,14 @@ export function buildConsoleWelcome(): BangCommandResult {
  * Build the session welcome message listing commands available in normal sessions.
  * Derived from the commands registry to stay in sync with !help.
  */
-export function buildSessionWelcome(): BangCommandResult {
+export function buildSessionWelcome(flavor?: string): BangCommandResult {
     const messages: string[] = [
         '💡 可用快捷命令',
         SEPARATOR,
     ];
 
     const sessionCommands = Object.entries(commands)
-        .filter(([, entry]) => !entry.hidden && !entry.consoleOnly);
+        .filter(([, entry]) => !entry.hidden && !entry.consoleOnly && (!entry.flavorOnly || entry.flavorOnly === flavor));
     for (const [name, { desc }] of sessionCommands) {
         const cmdAliases = Object.entries(aliases)
             .filter(([, target]) => target === name)
@@ -185,7 +198,7 @@ export async function executeBangCommand(text: string, ctx: BangCommandContext):
 
     // Built-in help command
     if (name === 'help') {
-        return buildHelp(!!ctx.isConsoleSession);
+        return buildHelp(!!ctx.isConsoleSession, ctx.flavor);
     }
 
     // !cancel without an active interactive session
@@ -205,12 +218,17 @@ export async function executeBangCommand(text: string, ctx: BangCommandContext):
 
     // Block session-only commands in console
     if (ctx.isConsoleSession && entry.sessionOnly) {
-        return { message: `ℹ️ !${name} 仅在 Claude 会话中可用`, action: 'none' };
+        return { message: `ℹ️ !${name} 仅在会话中可用`, action: 'none' };
     }
 
     // Block console-only commands in normal sessions
     if (!ctx.isConsoleSession && entry.consoleOnly) {
         return { message: `ℹ️ !${name} 仅在控制台中可用`, action: 'none' };
+    }
+
+    // Block flavor-restricted commands in wrong backend
+    if (entry.flavorOnly && entry.flavorOnly !== ctx.flavor) {
+        return { message: `ℹ️ !${name} 仅在 ${entry.flavorOnly} 会话中可用`, action: 'none' };
     }
 
     // Send loading indicator before async commands
