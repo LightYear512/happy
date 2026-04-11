@@ -14,33 +14,33 @@ export function resolveCodexExecutionPolicy(
         };
     }
 
+    // Use 'on-request' for most modes — it lets the model auto-execute MCP tool calls while
+    // still routing shell command approvals via standard MCP ElicitRequest (handled by CodexPermissionHandler).
+    // Avoid 'untrusted' which triggers non-standard codex/event elicitation for MCP tool calls
+    // that cannot be responded to in headless/remote mode.
     const approvalPolicy: CodexApprovalPolicy = (() => {
         switch (permissionMode) {
-            // Codex native modes
-            case 'default': return 'untrusted';                    // Ask for non-trusted commands
-            case 'read-only': return 'never';                      // Never ask, read-only enforced by sandbox
-            case 'safe-yolo': return 'on-failure';                 // Auto-run, ask only on failure
-            case 'yolo': return 'on-failure';                      // Auto-run, ask only on failure
-            // Defensive fallback for Claude-specific modes (backward compatibility)
-            case 'bypassPermissions': return 'on-failure';         // Full access: map to yolo behavior
-            case 'acceptEdits': return 'on-request';               // Let model decide (closest to auto-approve edits)
-            case 'plan': return 'untrusted';                       // Conservative: ask for non-trusted
-            default: return 'untrusted';                           // Safe fallback
+            case 'default': return 'on-request';
+            case 'read-only': return 'never';
+            case 'safe-yolo': return 'on-failure';
+            case 'yolo': return 'on-failure';
+            case 'bypassPermissions': return 'on-failure';
+            case 'acceptEdits': return 'on-request';
+            case 'plan': return 'on-request';
+            default: return 'on-request';
         }
     })();
 
     const sandbox: CodexSandboxMode = (() => {
         switch (permissionMode) {
-            // Codex native modes
-            case 'default': return 'workspace-write';              // Can write in workspace
-            case 'read-only': return 'read-only';                  // Read-only filesystem
-            case 'safe-yolo': return 'workspace-write';            // Can write in workspace
-            case 'yolo': return 'danger-full-access';              // Full system access
-            // Defensive fallback for Claude-specific modes
-            case 'bypassPermissions': return 'danger-full-access'; // Full access: map to yolo
-            case 'acceptEdits': return 'workspace-write';          // Can edit files in workspace
-            case 'plan': return 'workspace-write';                 // Can write for planning
-            default: return 'workspace-write';                     // Safe default
+            case 'default': return 'workspace-write';
+            case 'read-only': return 'read-only';
+            case 'safe-yolo': return 'workspace-write';
+            case 'yolo': return 'danger-full-access';
+            case 'bypassPermissions': return 'danger-full-access';
+            case 'acceptEdits': return 'workspace-write';
+            case 'plan': return 'workspace-write';
+            default: return 'workspace-write';
         }
     })();
 

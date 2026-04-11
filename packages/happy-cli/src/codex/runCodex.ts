@@ -1,6 +1,7 @@
 import { render } from "ink";
 import React from "react";
 import { ApiClient } from '@/api/api';
+import { fetchAndInjectPendingMessages } from '@/utils/fetchPendingMessages';
 import { CodexMcpClient } from './codexMcpClient';
 import { CodexPermissionHandler } from './utils/permissionHandler';
 import { ReasoningProcessor } from './utils/reasoningProcessor';
@@ -33,6 +34,14 @@ import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
 import type { ApiSessionClient } from '@/api/apiSession';
 import { resolveCodexExecutionPolicy } from './executionPolicy';
 import { mapCodexMcpMessageToSessionEnvelopes, mapCodexProcessorMessageToSessionEnvelopes } from './utils/sessionProtocolMapper';
+import {
+    isBangCommand,
+    executeBangCommand,
+    hasActiveInteractiveSession,
+    handleInteractiveInput,
+    buildSessionWelcome,
+} from '@/commands/bang/dispatcher';
+import type { EnhancedMode as ClaudeEnhancedMode } from '@/claude/loop';
 
 type ReadyEventOptions = {
     pending: unknown;
@@ -69,6 +78,7 @@ export async function runCodex(opts: {
     credentials: Credentials;
     startedBy?: 'daemon' | 'terminal';
     noSandbox?: boolean;
+    restoreSessionId?: string;
 }): Promise<void> {
     // Use shared PermissionMode type for cross-agent compatibility
     type PermissionMode = import('@/api/types').PermissionMode;
@@ -118,7 +128,20 @@ export async function runCodex(opts: {
         startedBy: opts.startedBy,
         sandbox: sandboxConfig,
     });
-    const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
+
+    // Restore path: rejoin existing session by ID, fallback to creating new session
+    let response;
+    if (opts.restoreSessionId) {
+        response = await api.getSessionById(opts.restoreSessionId);
+        if (response) {
+            logger.debug(`[Codex] Restored session ${opts.restoreSessionId}`);
+        } else {
+            logger.debug(`[Codex] Failed to restore session ${opts.restoreSessionId}, creating new session`);
+            response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
+        }
+    } else {
+        response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
+    }
 
     // Handle server unreachable case - create offline stub with hot reconnection
     let session: ApiSessionClient;
@@ -191,7 +214,67 @@ export async function runCodex(opts: {
             permissionMode: messagePermissionMode || 'default',
             model: messageModel,
         };
-        messageQueue.push(message.content.text, enhancedMode);
+
+        const text = message.content.text;
+
+        // Route input to active interactive session (e.g., !login OAuth flow)
+        if (hasActiveInteractiveSession()) {
+            handleInteractiveInput(text);
+            return;
+        }
+
+        // Check for bang commands (! prefix) - handle without invoking Codex model
+        if (isBangCommand(text)) {
+            const claudeShapedMode: ClaudeEnhancedMode = {
+                permissionMode: enhancedMode.permissionMode,
+                model: enhancedMode.model,
+            };
+            executeBangCommand(text, {
+                client: session,
+                // Codex has no Claude Session wrapper; pass a minimal shape so handlers
+                // that read `mode` (e.g., !restart) still work — codex is always remote.
+                session: { mode: 'remote' },
+                messageQueue: messageQueue as unknown as MessageQueue2<ClaudeEnhancedMode>,
+                currentEnhancedMode: claudeShapedMode,
+                isConsoleSession: false,
+                flavor: 'codex',
+            }).then(async result => {
+                // Delay ensures mobile client receives messages in correct order —
+                // it sorts by createdAt timestamp, so rapid events can arrive out of order.
+                await new Promise(resolve => setTimeout(resolve, 200));
+                const messages = Array.isArray(result.message) ? result.message : [result.message];
+                for (const msg of messages) {
+                    session.sendSessionEvent({ type: 'message', message: msg });
+                    await new Promise(resolve => setTimeout(resolve, 50));
+                }
+                if (result.suggestions && result.suggestions.length > 0) {
+                    const options = result.suggestions.map(s => `<option>${s}</option>`).join('\n');
+                    session.sendCodexMessage({ type: 'message', message: `<options>\n${options}\n</options>` });
+                    await new Promise(resolve => setTimeout(resolve, 50));
+                }
+                session.sendSessionEvent({ type: 'ready' });
+
+                if (result.action === 'restart-session') {
+                    // P1 work item: align with codex abort+resume restart semantics.
+                    // For now, surface a clear hint instead of silently dropping the action.
+                    logger.debug('[Codex] Bang command requested session restart — not yet supported on codex backend');
+                    session.sendSessionEvent({
+                        type: 'message',
+                        message: 'ℹ️ Codex 后端暂不支持 !restart，请手动结束当前会话后重新启动 happy codex',
+                    });
+                }
+            }).catch(error => {
+                logger.warn('[Codex] Bang command failed:', error);
+                session.sendSessionEvent({
+                    type: 'message',
+                    message: `❌ 命令执行失败: ${(error as Error).message}`,
+                });
+                session.sendSessionEvent({ type: 'ready' });
+            });
+            return;
+        }
+
+        messageQueue.push(text, enhancedMode);
     });
     let thinking = false;
     let currentTurnId: string | null = null;
@@ -422,8 +505,15 @@ export async function runCodex(opts: {
         logger.debug(`[Codex] MCP message: ${JSON.stringify(msg)}`);
 
         // Add messages to the ink UI buffer based on message type
+        // Also send agent_message directly to server — the session protocol mapper doesn't
+        // handle this type, so without this fallback the app never sees the AI response.
         if (msg.type === 'agent_message') {
             messageBuffer.addMessage(msg.message, 'assistant');
+            session.sendCodexMessage({
+                type: 'message',
+                message: msg.message,
+                id: randomUUID()
+            });
         } else if (msg.type === 'agent_reasoning_delta') {
             // Skip reasoning deltas in the UI to reduce noise
         } else if (msg.type === 'agent_reasoning') {
@@ -441,6 +531,18 @@ export async function runCodex(opts: {
             messageBuffer.addMessage('Starting task...', 'status');
         } else if (msg.type === 'task_complete') {
             messageBuffer.addMessage('Task completed', 'status');
+            // Auto-update session title on first task completion
+            if (first && msg.last_agent_message) {
+                const title = String(msg.last_agent_message).substring(0, 80).replace(/\n/g, ' ').trim();
+                if (title) {
+                    logger.debug(`[Codex] Auto-setting session title: ${title}`);
+                    session.sendClaudeSessionMessage({
+                        type: 'summary',
+                        summary: title,
+                        leafUuid: randomUUID(),
+                    });
+                }
+            }
             sendReady();
         } else if (msg.type === 'turn_aborted') {
             messageBuffer.addMessage('Turn aborted', 'status');
@@ -506,7 +608,9 @@ export async function runCodex(opts: {
 
         // Convert Codex MCP events into the unified session-protocol envelope stream.
         // Reasoning deltas are handled by ReasoningProcessor to avoid duplicate text output.
-        if (msg.type !== 'agent_reasoning_delta' && msg.type !== 'agent_reasoning' && msg.type !== 'agent_reasoning_section_break' && msg.type !== 'turn_diff') {
+        // agent_message is excluded because it's already sent via sendCodexMessage above
+        // (the protocol envelope path works but app can't render it; sendCodexMessage is the working path).
+        if (msg.type !== 'agent_reasoning_delta' && msg.type !== 'agent_reasoning' && msg.type !== 'agent_reasoning_section_break' && msg.type !== 'turn_diff' && msg.type !== 'agent_message') {
             const mapped = mapCodexMcpMessageToSessionEnvelopes(msg, {
                 currentTurnId,
                 startedSubagents: codexStartedSubagents,
@@ -523,21 +627,46 @@ export async function runCodex(opts: {
         }
     });
 
-    // Start Happy MCP server (HTTP) and prepare STDIO bridge config for Codex
+    // Start Happy MCP server (HTTP) for bang command RPC, but do NOT inject into codex session.
+    // Codex MCP mode sends elicitation_request for MCP tool calls via codex/event notification
+    // which cannot be responded to programmatically. Codex app-server mode (used by happier)
+    // supports mcpServer/elicitation/request with responses, but we use MCP mode.
+    // TODO: Migrate to codex app-server protocol to enable MCP tool injection.
     const happyServer = await startHappyServer(session);
-    const bridgeCommand = join(projectPath(), 'bin', 'happy-mcp.mjs');
-    const mcpServers = {
-        happy: {
-            command: bridgeCommand,
-            args: ['--url', happyServer.url]
-        }
-    } as const;
+    const mcpServers = {} as const;
     let first = true;
 
     try {
         logger.debug('[codex]: client.connect begin');
         await client.connect();
         logger.debug('[codex]: client.connect done');
+
+        // Send welcome message with available bang commands
+        {
+            const welcome = buildSessionWelcome('codex');
+            const msgs = Array.isArray(welcome.message) ? welcome.message : [welcome.message];
+            for (const msg of msgs) {
+                session.sendSessionEvent({ type: 'message', message: msg });
+            }
+            if (welcome.suggestions && welcome.suggestions.length > 0) {
+                const options = welcome.suggestions.map(s => `<option>${s}</option>`).join('\n');
+                session.sendCodexMessage({ type: 'message', message: `<options>\n${options}\n</options>` });
+            }
+        }
+
+        // After restore, fetch pending user messages that arrived while CLI was offline.
+        if (opts.restoreSessionId && response) {
+            try {
+                await fetchAndInjectPendingMessages(
+                    api, session, opts.restoreSessionId,
+                    response.encryptionKey, response.encryptionVariant,
+                    '[Codex]',
+                );
+            } catch (error) {
+                logger.debug('[Codex] Failed to fetch pending messages after restore:', error);
+            }
+        }
+
         let wasCreated = false;
         let currentModeHash: string | null = null;
         let pending: { message: string; mode: EnhancedMode; isolate: boolean; hash: string } | null = null;
@@ -615,7 +744,7 @@ export async function runCodex(opts: {
 
                 if (!wasCreated) {
                     const startConfig: CodexSessionConfig = {
-                        prompt: first ? message.message + '\n\n' + CHANGE_TITLE_INSTRUCTION : message.message,
+                        prompt: message.message,
                         sandbox: executionPolicy.sandbox,
                         'approval-policy': executionPolicy.approvalPolicy,
                         config: { mcp_servers: mcpServers }

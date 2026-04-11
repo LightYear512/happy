@@ -73,9 +73,10 @@ export class CodexMcpClient {
             params: z.object({
                 msg: z.any()
             })
-        }).passthrough(), (data) => {
+        }).passthrough() as any, (data: any) => {
             const msg = data.params.msg;
             this.updateIdentifiersFromEvent(msg);
+
             this.handler?.(msg);
         });
     }
@@ -186,13 +187,29 @@ export class CodexMcpClient {
     }
 
     private registerPermissionHandlers(): void {
-        // Register handler for exec command approval requests
+        // Register handler for shell command elicitation requests (elicitation/create).
+        // MCP tool call elicitations use a different codex protocol (mcpServer/elicitation/request)
+        // which only works in app-server mode, not MCP mode. With on-request approval policy,
+        // codex auto-executes MCP tool calls without elicitation.
+        // MCP SDK ElicitResultSchema requires { action: 'accept' | 'decline' | 'cancel' }.
         this.client.setRequestHandler(
             ElicitRequestSchema,
             async (request) => {
-                console.log('[CodexMCP] Received elicitation request:', request.params);
+                logger.debug('[CodexMCP] Received elicitation request:', JSON.stringify(request.params));
 
-                // Load params
+                // Detect approval kind from _meta
+                const meta = (request.params as any)?._meta;
+                const approvalKind = meta?.codex_approval_kind;
+
+                // Auto-approve MCP tool calls — these are our own happy MCP server tools
+                if (approvalKind === 'mcp_tool_call') {
+                    logger.debug(`[CodexMCP] Auto-approving MCP tool call: ${meta?.tool_title}`);
+                    return {
+                        action: 'accept' as const,
+                    };
+                }
+
+                // Shell command approvals
                 const params = request.params as unknown as {
                     message: string,
                     codex_elicitation: string,
@@ -204,16 +221,14 @@ export class CodexMcpClient {
                 }
                 const toolName = 'CodexBash';
 
-                // If no permission handler set, deny by default
                 if (!this.permissionHandler) {
-                    logger.debug('[CodexMCP] No permission handler set, denying by default');
+                    logger.debug('[CodexMCP] No permission handler set, declining by default');
                     return {
-                        decision: 'denied' as const,
+                        action: 'decline' as const,
                     };
                 }
 
                 try {
-                    // Request permission through the handler
                     const result = await this.permissionHandler.handleToolCall(
                         params.codex_call_id,
                         toolName,
@@ -224,14 +239,14 @@ export class CodexMcpClient {
                     );
 
                     logger.debug('[CodexMCP] Permission result:', result);
+                    // Map our permission handler result to MCP ElicitResult format
                     return {
-                        decision: result.decision
+                        action: (result.decision === 'approved' ? 'accept' : 'decline') as 'accept' | 'decline',
                     }
                 } catch (error) {
                     logger.debug('[CodexMCP] Error handling permission request:', error);
                     return {
-                        decision: 'denied' as const,
-                        reason: error instanceof Error ? error.message : 'Permission request failed'
+                        action: 'decline' as const,
                     };
                 }
             }
