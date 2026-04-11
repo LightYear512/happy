@@ -1,6 +1,5 @@
 import fs from 'fs/promises';
 import os from 'os';
-import * as tmp from 'tmp';
 
 import { ApiClient } from '@/api/api';
 import { TrackedSession } from './types';
@@ -22,6 +21,7 @@ import { join } from 'path';
 import { projectPath } from '@/projectPath';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars';
+import { getCodexInstancePath } from '@/commands/bang/ccsProfiles';
 
 // Restore file persistence for session auto-restore.
 // Only stores immutable spawn params. sessionTag and claudeSessionId come from Server at restore time.
@@ -329,15 +329,22 @@ export async function startDaemon(): Promise<void> {
         const authEnv: Record<string, string> = {};
         if (options.token) {
           if (options.agent === 'codex') {
+            // Persist codex auth to a stable instance directory so auth survives
+            // process restarts and aligns with !auth / !login paths.
+            // Derive instance name from account_id in the token JSON (falls back to "default").
+            let instanceName = 'default';
+            try {
+              const parsed = JSON.parse(options.token);
+              if (parsed?.tokens?.account_id) {
+                instanceName = parsed.tokens.account_id;
+              }
+            } catch { /* use default */ }
 
-            // Create a temporary directory for Codex
-            const codexHomeDir = tmp.dirSync();
-
-            // Write the token to the temporary directory
-            fs.writeFile(join(codexHomeDir.name, 'auth.json'), options.token);
-
-            // Set the environment variable for Codex
-            authEnv.CODEX_HOME = codexHomeDir.name;
+            const codexHome = getCodexInstancePath(instanceName);
+            await fs.mkdir(codexHome, { recursive: true });
+            await fs.writeFile(join(codexHome, 'auth.json'), options.token);
+            authEnv.CODEX_HOME = codexHome;
+            logger.debug(`[DAEMON RUN] Wrote codex auth to persistent instance: ${codexHome}`);
           } else { // Assuming claude
             authEnv.CLAUDE_CODE_OAUTH_TOKEN = options.token;
           }
