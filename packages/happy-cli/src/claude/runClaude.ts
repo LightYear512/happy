@@ -2,7 +2,7 @@ import os from 'node:os';
 import { randomUUID } from 'node:crypto';
 
 import { ApiClient } from '@/api/api';
-import { decrypt, decodeBase64 } from '@/api/encryption';
+import { fetchAndInjectPendingMessages } from '@/utils/fetchPendingMessages';
 import { logger } from '@/ui/logger';
 import { loop } from '@/claude/loop';
 import { AgentState, Metadata } from '@/api/types';
@@ -283,7 +283,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // Normal session: send welcome message with available commands
     if (!isConsoleSession) {
         session.waitForConnect().then(() => {
-            const welcome = buildSessionWelcome();
+            const welcome = buildSessionWelcome('claude');
             const welcomeMessages = Array.isArray(welcome.message) ? welcome.message : [welcome.message];
             for (const msg of welcomeMessages) {
                 session.sendSessionEvent({ type: 'message', message: msg });
@@ -684,40 +684,13 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     registerKillSessionHandler(session.rpcHandlerManager, cleanup);
 
     // After restore, fetch pending user messages that arrived while CLI was offline.
-    // The trigger message(s) are stored in DB but were broadcast before this CLI connected its socket.
     if (options.restoreSessionId) {
         try {
-            const connectTime = Date.now();
-            await session.waitForConnect();
-            const rawMessages = await api.getSessionMessages(options.restoreSessionId);
-            // Messages ordered by createdAt desc. We need to find user messages from App
-            // that haven't been replied to yet (i.e., no agent message after them).
-            // Strategy: scan from newest to oldest. Once we hit an agent/CLI message, stop —
-            // everything before it was already processed by a previous CLI instance.
-            const encryptionKey = response.encryptionKey;
-            const encryptionVariant = response.encryptionVariant;
-            const pendingMessages: { message: any, createdAt: number }[] = [];
-            for (const rawMsg of rawMessages) {
-                if (rawMsg.createdAt >= connectTime) continue; // Will arrive via real-time socket
-                if (!(rawMsg.content && typeof rawMsg.content === 'object' && 'c' in rawMsg.content && rawMsg.content.t === 'encrypted')) continue;
-                const decrypted = decrypt(encryptionKey, encryptionVariant, decodeBase64(rawMsg.content.c as string));
-                if (!decrypted) continue;
-                // Stop at first AI reply (output/acp/codex/session) — everything before was already handled.
-                // Skip event messages (ready/switch/message) as they don't indicate a processed user message.
-                if (decrypted.role === 'agent' && decrypted.content?.type !== 'event') break;
-                if (decrypted.role === 'user' && decrypted.meta?.sentFrom !== 'cli') {
-                    pendingMessages.push({ message: decrypted, createdAt: rawMsg.createdAt });
-                }
-            }
-            // Inject in chronological order (API returns desc, we need asc)
-            pendingMessages.reverse();
-            for (const pending of pendingMessages) {
-                logger.debug(`[START] Injecting pending message from restore: "${pending.message.content?.text?.substring(0, 50)}"`);
-                session.injectPendingMessage(pending.message);
-            }
-            if (pendingMessages.length > 0) {
-                logger.debug(`[START] Injected ${pendingMessages.length} pending message(s) from restore`);
-            }
+            await fetchAndInjectPendingMessages(
+                api, session, options.restoreSessionId,
+                response.encryptionKey, response.encryptionVariant,
+                '[START]',
+            );
         } catch (error) {
             logger.debug('[START] Failed to fetch pending messages after restore:', error);
         }
