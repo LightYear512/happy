@@ -495,12 +495,10 @@ export async function runGemini(opts: {
 
   const happyServer = await startHappyServer(session);
   const bridgeCommand = join(projectPath(), 'bin', 'happy-mcp.mjs');
-  const mcpServers = {
-    happy: {
-      command: bridgeCommand,
-      args: ['--url', happyServer.url]
-    }
-  };
+  // On Windows, .mjs files cannot be executed directly (Win32 error 193).
+  const mcpServers = process.platform === 'win32'
+    ? { happy: { command: 'node', args: [bridgeCommand, '--url', happyServer.url] } }
+    : { happy: { command: bridgeCommand, args: ['--url', happyServer.url] } };
 
   // Create permission handler for tool approval (variable declared earlier for onSessionSwap)
   permissionHandler = new GeminiPermissionHandler(session);

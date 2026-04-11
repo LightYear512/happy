@@ -518,12 +518,11 @@ export async function runAcp(opts: {
   let sawModels = false;
 
   const happyServer = await startHappyServer(session);
-  const mcpServers = {
-    happy: {
-      command: join(projectPath(), 'bin', 'happy-mcp.mjs'),
-      args: ['--url', happyServer.url],
-    },
-  };
+  const bridgeCommand = join(projectPath(), 'bin', 'happy-mcp.mjs');
+  // On Windows, .mjs files cannot be executed directly (Win32 error 193).
+  const mcpServers = process.platform === 'win32'
+    ? { happy: { command: 'node', args: [bridgeCommand, '--url', happyServer.url] } }
+    : { happy: { command: bridgeCommand, args: ['--url', happyServer.url] } };
 
   const backend = new AcpBackend({
     agentName: opts.agentName,
