@@ -7,6 +7,7 @@ import { CodexPermissionHandler } from './utils/permissionHandler';
 import { ReasoningProcessor } from './utils/reasoningProcessor';
 import { DiffProcessor } from './utils/diffProcessor';
 import { randomUUID } from 'node:crypto';
+import { execSync } from 'node:child_process';
 import { logger } from '@/ui/logger';
 import { Credentials, readSettings } from '@/persistence';
 import { initialMachineMetadata } from '@/daemon/run';
@@ -24,13 +25,16 @@ import { MessageBuffer } from "@/ui/ink/messageBuffer";
 import { CodexDisplay } from "@/ui/ink/CodexDisplay";
 import { trimIdent } from "@/utils/trimIdent";
 import type { CodexSessionConfig } from './types';
-import { CHANGE_TITLE_INSTRUCTION } from '@/gemini/constants';
+import { readCodexDefaultProfile, getCodexInstancePath, getCurrentCodexProfile } from '@/commands/bang/ccsProfiles';
+import { watchCodexProfileFile } from '@/commands/bang/authCommand';
+import type { FSWatcher } from 'node:fs';
 import { notifyDaemonSessionStarted } from "@/daemon/controlClient";
 import { registerKillSessionHandler } from "@/claude/registerKillSessionHandler";
 import { delay } from "@/utils/time";
 import { stopCaffeinate } from "@/utils/caffeinate";
 import { connectionState } from '@/utils/serverConnectionErrors';
 import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
+import { registerShutdownHandlers } from '@/utils/shutdownHandlers';
 import type { ApiSessionClient } from '@/api/apiSession';
 import { resolveCodexExecutionPolicy } from './executionPolicy';
 import { mapCodexMcpMessageToSessionEnvelopes, mapCodexProcessorMessageToSessionEnvelopes } from './utils/sessionProtocolMapper';
@@ -42,6 +46,25 @@ import {
     buildSessionWelcome,
 } from '@/commands/bang/dispatcher';
 import type { EnhancedMode as ClaudeEnhancedMode } from '@/claude/loop';
+
+// ---------------------------------------------------------------------------
+// App-server mode detection
+// ---------------------------------------------------------------------------
+
+async function shouldUseAppServer(): Promise<boolean> {
+    const envMode = process.env.HAPPY_CODEX_BACKEND_MODE;
+    if (envMode === 'mcp') return false;
+    if (envMode === 'appServer' || envMode === 'app-server') return true;
+
+    // Default: try app-server, fall back to mcp
+    try {
+        execSync('codex --version', { encoding: 'utf8', windowsHide: true }).trim();
+        // codex app-server available since ~0.100.0
+        return true;
+    } catch {
+        return false;
+    }
+}
 
 type ReadyEventOptions = {
     pending: unknown;
@@ -79,12 +102,35 @@ export async function runCodex(opts: {
     startedBy?: 'daemon' | 'terminal';
     noSandbox?: boolean;
     restoreSessionId?: string;
+    /** Codex session ID from previous run — used to find transcript file for experimental_resume */
+    codexSessionId?: string;
 }): Promise<void> {
+    // Route to app-server backend when available
+    const useAppServer = await shouldUseAppServer();
+    if (useAppServer) {
+        logger.debug('[codex] Using app-server backend');
+        const { runCodexWithAppServer } = await import('./runCodexAppServer');
+        return runCodexWithAppServer(opts);
+    }
+    logger.debug('[codex] Using MCP backend');
+
     // Use shared PermissionMode type for cross-agent compatibility
     type PermissionMode = import('@/api/types').PermissionMode;
     interface EnhancedMode {
         permissionMode: PermissionMode;
         model?: string;
+    }
+
+    //
+    // Apply default codex profile if CODEX_HOME is not set
+    //
+
+    if (!process.env.CODEX_HOME) {
+        const defaultProfile = readCodexDefaultProfile();
+        if (defaultProfile) {
+            process.env.CODEX_HOME = getCodexInstancePath(defaultProfile);
+            logger.debug(`[codex] Applied default codex profile "${defaultProfile}": ${process.env.CODEX_HOME}`);
+        }
     }
 
     //
@@ -277,6 +323,7 @@ export async function runCodex(opts: {
         messageQueue.push(text, enhancedMode);
     });
     let thinking = false;
+    let codexSessionIdStored = false;
     let currentTurnId: string | null = null;
     let codexStartedSubagents = new Set<string>();
     let codexActiveSubagents = new Set<string>();
@@ -328,6 +375,9 @@ export async function runCodex(opts: {
     let abortController = new AbortController();
     let shouldExit = false;
     let storedSessionIdForResume: string | null = null;
+    // Set by the codex profile watcher when !auth-all --codex broadcasts a switch.
+    // Consumed at top-of-loop: triggers subprocess reconnect with new CODEX_HOME.
+    let pendingAccountSwap: string | null = null;
 
     /**
      * Handles aborting the current task/inference without exiting the process.
@@ -446,6 +496,33 @@ export async function runCodex(opts: {
 
     const client = new CodexMcpClient(sandboxConfig);
 
+    // Without this, SIGTERM has no path to reach forceCloseSession() and
+    // codex.exe orphans. forceCloseSession()/disconnect() is idempotent, so
+    // it's safe if the finally block runs it again.
+    const removeShutdownHandlers = registerShutdownHandlers(async () => {
+        logger.debug('[codex] Received shutdown signal, force-closing MCP client and flushing');
+        try {
+            await client.forceCloseSession();
+        } catch (error) {
+            logger.debug('[codex] Error force-closing client on signal:', error);
+        }
+        try {
+            session.sendSessionDeath();
+            await session.flush();
+        } catch {}
+    });
+
+    // Watch for !auth-all --codex broadcasts. On switch we flag pendingAccountSwap
+    // and interrupt any active turn via handleAbort(). The loop top consumes the
+    // flag and triggers the actual subprocess reconnect.
+    const codexProfileWatcher: FSWatcher | null = watchCodexProfileFile(() => {
+        const target = getCurrentCodexProfile() || 'unknown';
+        logger.debug(`[codex] Account swap signaled: ${target}`);
+        pendingAccountSwap = target;
+        // Fire-and-forget; handleAbort's internal try/catch handles errors.
+        void handleAbort();
+    });
+
     // Helper: find Codex session transcript for a given sessionId
     function findCodexResumeFile(sessionId: string | null): string | null {
         if (!sessionId) return null;
@@ -555,6 +632,18 @@ export async function runCodex(opts: {
                 thinking = true;
                 session.keepAlive(thinking, 'remote');
             }
+            // Store codex session ID in metadata.claudeSessionId (field is misnamed —
+            // it holds the backend agent session ID for any agent type, not just Claude).
+            // This lets the daemon pass it via --resume on restore.
+            const codexSid = client.getSessionId();
+            if (codexSid && !codexSessionIdStored) {
+                codexSessionIdStored = true;
+                session.updateMetadata((metadata) => ({
+                    ...metadata,
+                    claudeSessionId: codexSid,
+                }));
+                logger.debug(`[Codex] Stored codex session ID in metadata: ${codexSid}`);
+            }
         }
         if (msg.type === 'task_complete' || msg.type === 'turn_aborted') {
             if (thinking) {
@@ -634,7 +723,8 @@ export async function runCodex(opts: {
     // TODO: Migrate to codex app-server protocol to enable MCP tool injection.
     const happyServer = await startHappyServer(session);
     const mcpServers = {} as const;
-    let first = true;
+    // Restored sessions already have a title — skip auto-title on first task_complete
+    let first = !opts.restoreSessionId;
 
     try {
         logger.debug('[codex]: client.connect begin');
@@ -675,6 +765,41 @@ export async function runCodex(opts: {
 
         while (!shouldExit) {
             logActiveHandles('loop-top');
+
+            // Consume pending !auth-all --codex account swap before handling any message.
+            // The watcher already updated process.env.CODEX_HOME via tryGlobalProfileSwitch
+            // and called handleAbort() (which stored sessionId for resume). We now rebuild
+            // the MCP subprocess with the new env; the next iteration's startSession will
+            // pick up storedSessionIdForResume and resume the conversation via symlinked
+            // shared sessions/ directory.
+            if (pendingAccountSwap) {
+                const target = pendingAccountSwap;
+                pendingAccountSwap = null;
+                try {
+                    await client.reconnect();
+                    client.clearSession();
+                    wasCreated = false;
+                    currentModeHash = null;
+                    permissionHandler.reset();
+                    reasoningProcessor.abort();
+                    diffProcessor.reset();
+                    thinking = false;
+                    session.keepAlive(thinking, 'remote');
+                    const msg = `🔄 Switched to "${target}" (via !auth-all --codex)`;
+                    messageBuffer.addMessage(msg, 'status');
+                    session.sendSessionEvent({ type: 'message', message: msg });
+                    logger.debug(`[codex] Account swap complete → ${target}`);
+                } catch (err) {
+                    logger.warn('[codex] Account swap failed:', err);
+                    const errMsg = `⚠ 切换账号失败: ${(err as Error).message || 'unknown error'}`;
+                    messageBuffer.addMessage(errMsg, 'status');
+                    session.sendSessionEvent({ type: 'message', message: errMsg });
+                    shouldExit = true;
+                    break;
+                }
+                continue;
+            }
+
             // Get next batch; respect mode boundaries like Claude
             let message: { message: string; mode: EnhancedMode; isolate: boolean; hash: string } | null = pending;
             pending = null;
@@ -755,9 +880,21 @@ export async function runCodex(opts: {
                     
                     // Check for resume file from multiple sources
                     let resumeFile: string | null = null;
-                    
+
+                    // Priority 0: Resume from daemon restore (codex session ID passed via --resume)
+                    if (!resumeFile && opts.codexSessionId) {
+                        const restoreResumeFile = findCodexResumeFile(opts.codexSessionId);
+                        if (restoreResumeFile) {
+                            resumeFile = restoreResumeFile;
+                            logger.debug('[Codex] Using resume file from session restore:', resumeFile);
+                            messageBuffer.addMessage('Resuming previous conversation…', 'status');
+                        } else {
+                            logger.debug(`[Codex] No resume file found for restored session ${opts.codexSessionId}`);
+                        }
+                    }
+
                     // Priority 1: Explicit resume file from mode change
-                    if (nextExperimentalResume) {
+                    if (!resumeFile && nextExperimentalResume) {
                         resumeFile = nextExperimentalResume;
                         nextExperimentalResume = null; // consume once
                         logger.debug('[Codex] Using resume file from mode change:', resumeFile);
@@ -831,6 +968,8 @@ export async function runCodex(opts: {
         // Clean up resources when main loop exits
         logger.debug('[codex]: Final cleanup start');
         logActiveHandles('cleanup-start');
+        removeShutdownHandlers();
+        try { codexProfileWatcher?.close(); } catch { /* best effort */ }
 
         // Cancel offline reconnection if still running
         if (reconnectionHandle) {

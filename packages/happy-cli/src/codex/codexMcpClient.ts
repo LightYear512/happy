@@ -50,7 +50,7 @@ function getCodexMcpCommand(): string | null {
 }
 
 export class CodexMcpClient {
-    private client: Client;
+    private client!: Client;
     private transport: StdioClientTransport | null = null;
     private connected: boolean = false;
     private sessionId: string | null = null;
@@ -63,6 +63,16 @@ export class CodexMcpClient {
 
     constructor(sandboxConfig?: SandboxConfig) {
         this.sandboxConfig = sandboxConfig;
+        this.initInternalClient();
+    }
+
+    /**
+     * (Re)initialize the underlying MCP SDK Client. Called from the constructor
+     * and from `reconnect()` after the previous client has been closed —
+     * MCP Client instances are single-use so we must create a fresh one to
+     * re-spawn the codex subprocess.
+     */
+    private initInternalClient(): void {
         this.client = new Client(
             { name: 'happy-codex-client', version: '1.0.0' },
             { capabilities: { elicitation: {} } }
@@ -79,6 +89,23 @@ export class CodexMcpClient {
 
             this.handler?.(msg);
         });
+    }
+
+    /**
+     * Disconnect from the current codex subprocess and reconnect with the
+     * current environment (CODEX_HOME, etc). Used by !auth-all --codex to
+     * swap accounts without tearing down the happy session.
+     *
+     * Handler registrations on `this` (handler, permissionHandler) persist
+     * across the reconnect — only the internal MCP client and subprocess are
+     * recreated.
+     */
+    async reconnect(): Promise<void> {
+        logger.debug('[CodexMCP] Reconnect requested');
+        await this.disconnect();
+        this.initInternalClient();
+        await this.connect();
+        logger.debug('[CodexMCP] Reconnect complete');
     }
 
     setHandler(handler: ((event: any) => void) | null): void {

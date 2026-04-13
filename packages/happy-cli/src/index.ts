@@ -105,19 +105,22 @@ import { extractNoSandboxFlag } from './utils/sandboxFlags'
       // Parse codex-specific arguments
       let startedBy: 'daemon' | 'terminal' | undefined = undefined;
       let restoreSessionId: string | undefined = undefined;
+      let codexSessionId: string | undefined = undefined;
       const codexArgs = extractNoSandboxFlag(args.slice(1));
       for (let i = 0; i < codexArgs.args.length; i++) {
         if (codexArgs.args[i] === '--started-by') {
           startedBy = codexArgs.args[++i] as 'daemon' | 'terminal';
         } else if (codexArgs.args[i] === '--happy-restore-session') {
           restoreSessionId = codexArgs.args[++i];
+        } else if (codexArgs.args[i] === '--resume') {
+          codexSessionId = codexArgs.args[++i];
         }
       }
 
       const {
         credentials
       } = await authAndSetupMachineIfNeeded();
-      await runCodex({credentials, startedBy, noSandbox: codexArgs.noSandbox, restoreSessionId});
+      await runCodex({credentials, startedBy, noSandbox: codexArgs.noSandbox, restoreSessionId, codexSessionId});
       // Do not force exit here; allow instrumentation to show lingering handles
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
