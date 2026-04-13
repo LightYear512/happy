@@ -170,9 +170,9 @@ function buildSessionListViewData(
         }
     });
 
-    // Sort sessions by updated date (newest first)
-    activeSessions.sort((a, b) => b.updatedAt - a.updatedAt);
-    inactiveSessions.sort((a, b) => b.updatedAt - a.updatedAt);
+    // Sort by creation date (newest first) — matches applySessions behavior
+    activeSessions.sort((a, b) => b.createdAt - a.createdAt);
+    inactiveSessions.sort((a, b) => b.createdAt - a.createdAt);
 
     // Build unified list view data
     const listData: SessionListViewItem[] = [];
@@ -191,7 +191,7 @@ function buildSessionListViewData(
     let currentDateString: string | null = null;
 
     for (const session of inactiveSessions) {
-        const sessionDate = new Date(session.updatedAt);
+        const sessionDate = new Date(session.createdAt);
         const dateString = sessionDate.toDateString();
 
         if (currentDateString !== dateString) {
