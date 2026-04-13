@@ -323,7 +323,8 @@ export type Metadata = {
     updatedAt: number
   },
   machineId?: string,
-  claudeSessionId?: string, // Claude Code session ID
+  /** Backend agent session ID (Claude, Codex, or Gemini). Named "claude" for historical reasons — used by all agent types. */
+  claudeSessionId?: string,
   tools?: string[],
   slashCommands?: string[],
   homeDir: string,
