@@ -6,7 +6,7 @@
  */
 
 import psList from 'ps-list';
-import spawn from 'cross-spawn';
+import { killProcessTree } from '@/utils/processKill';
 
 /**
  * Find all Happy CLI processes (including current process)
@@ -89,24 +89,19 @@ export async function killRunawayHappyProcesses(): Promise<{ killed: number, err
     try {
       console.log(`Killing runaway process PID ${pid}: ${command}`);
       
-      if (process.platform === 'win32') {
-        // Windows: use taskkill
-        const result = spawn.sync('taskkill', ['/F', '/PID', pid.toString()], { stdio: 'pipe' });
-        if (result.error) throw result.error;
-        if (result.status !== 0) throw new Error(`taskkill exited with code ${result.status}`);
-      } else {
-        // Unix: try SIGTERM first
-        process.kill(pid, 'SIGTERM');
-        
-        // Wait a moment
+      // Kill entire process tree (Windows: taskkill /T, Unix: pgroup SIGTERM).
+      // This is critical for happy-cli parents that have codex/claude grandchildren.
+      killProcessTree(pid);
+
+      if (process.platform !== 'win32') {
+        // Unix: SIGTERM is polite — verify exit and escalate to SIGKILL if needed
         await new Promise(resolve => setTimeout(resolve, 1000));
-        
-        // Check if still alive
         const processes = await psList();
         const stillAlive = processes.find(p => p.pid === pid);
         if (stillAlive) {
-          console.log(`Process PID ${pid} ignored SIGTERM, using SIGKILL`);
-          process.kill(pid, 'SIGKILL');
+          console.log(`Process PID ${pid} ignored SIGTERM, escalating to SIGKILL`);
+          try { process.kill(-pid, 'SIGKILL'); } catch { /* pgroup send may fail */ }
+          try { process.kill(pid, 'SIGKILL'); } catch { /* already dead */ }
         }
       }
       

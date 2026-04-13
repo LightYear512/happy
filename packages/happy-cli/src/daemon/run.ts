@@ -1,6 +1,8 @@
 import fs from 'fs/promises';
 import os from 'os';
 
+import { killProcessTree } from '@/utils/processKill';
+
 import { ApiClient } from '@/api/api';
 import { TrackedSession } from './types';
 import { MachineMetadata, DaemonState, Metadata } from '@/api/types';
@@ -443,14 +445,13 @@ export async function startDaemon(): Promise<void> {
           for (const [pid, session] of staleEntries) {
             logger.debug(`[DAEMON RUN] Killing stale session PID ${pid} before resume ${options.resume}`);
             try {
+              killProcessTree(pid);
               if (session.startedBy === 'daemon' && session.childProcess) {
-                session.childProcess.kill('SIGTERM');
                 await Promise.race([
                   new Promise<void>(resolve => session.childProcess!.once('exit', resolve)),
                   new Promise<void>(resolve => setTimeout(resolve, 3000)),
                 ]);
               } else {
-                process.kill(pid, 'SIGTERM');
                 await new Promise<void>(resolve => setTimeout(resolve, 1000));
               }
             } catch {
@@ -762,21 +763,11 @@ export async function startDaemon(): Promise<void> {
         if (session.happySessionId === sessionId ||
           (sessionId.startsWith('PID-') && pid === parseInt(sessionId.replace('PID-', '')))) {
 
-          if (session.startedBy === 'daemon' && session.childProcess) {
-            try {
-              session.childProcess.kill('SIGTERM');
-              logger.debug(`[DAEMON RUN] Sent SIGTERM to daemon-spawned session ${sessionId}`);
-            } catch (error) {
-              logger.debug(`[DAEMON RUN] Failed to kill session ${sessionId}:`, error);
-            }
-          } else {
-            // For externally started sessions, try to kill by PID
-            try {
-              process.kill(pid, 'SIGTERM');
-              logger.debug(`[DAEMON RUN] Sent SIGTERM to external session PID ${pid}`);
-            } catch (error) {
-              logger.debug(`[DAEMON RUN] Failed to kill external session PID ${pid}:`, error);
-            }
+          try {
+            killProcessTree(pid);
+            logger.debug(`[DAEMON RUN] Killed session tree for ${sessionId} (pid ${pid}, startedBy=${session.startedBy})`);
+          } catch (error) {
+            logger.debug(`[DAEMON RUN] Failed to kill session tree ${sessionId} (pid ${pid}):`, error);
           }
 
           pidToTrackedSession.delete(pid);
@@ -1062,7 +1053,7 @@ export async function startDaemon(): Promise<void> {
             await new Promise(resolve => setTimeout(resolve, 200));
           }
           try {
-            process.kill(consoleSessionPid, 'SIGTERM');
+            killProcessTree(consoleSessionPid);
           } catch {}
         }
       }
