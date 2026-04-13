@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { analyzePtyOutput, stripAnsiOnly, type PtyAction } from './loginCommand';
+import { analyzePtyOutput, analyzeCodexPtyOutput, stripAnsiOnly, parseLoginArgs, type PtyAction } from './loginCommand';
 
 // Real OAuth URL from actual Claude Code login flow
 const REAL_OAUTH_URL = 'https://claude.ai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference+user%3Asessions%3Aclaude_code+user%3Amcp_servers+user%3Afile_upload&code_challenge=9wvqXasXp7FespyUXZRRUy7pzFl6NfFQR0bO-vCLBr4&code_challenge_method=S256&state=2ppMXLEutGbkjDlq3aZdYUJqF3-sU7RUX1xODTviPkE';
@@ -168,6 +168,184 @@ describe('analyzePtyOutput', () => {
         it('forwards all output', () => {
             expect(analyzePtyOutput('Login successful!', true, true)).toEqual({ action: 'forward' });
             expect(analyzePtyOutput('1. Option\n2. Option\n', true, true)).toEqual({ action: 'forward' });
+        });
+    });
+});
+
+describe('analyzeCodexPtyOutput', () => {
+    // Real capture from `codex login --device-auth` (codex-cli 0.118.0), see
+    // packages/happy-cli/src/commands/bang/loginCommand.ts for JSDoc on the flow.
+    const REAL_DEVICE_AUTH_BUFFER =
+        '\u001b[?9001h\u001b[?1004h\u001b[?25l\u001b[2J\u001b[m\u001b[H\u001b]0;cmd.exe\u0007\u001b[?25h\r\n'
+        + '\u001b[?25lWelcome to Codex [v\u001b[90m0.118.0\u001b[m]\u001b[90m\r\n'
+        + 'OpenAI\'s command-line coding agent\u001b[m'
+        + '\u001b[5;1HFollow these steps to sign in with ChatGPT using device code authorization:'
+        + '\u001b[7;1H1. Open this link in your browser and sign in to your account\r\n'
+        + '   \u001b[94mhttps://auth.openai.com/codex/device\u001b[m'
+        + '\u001b[10;1H2. Enter this one-time code \u001b[90m(expires in 15 minutes)\u001b[m\r\n'
+        + '   \u001b[94mEZVG-FFQFL\u001b[90m'
+        + '\u001b[13;1HDevice codes are a common phishing target. Never share this code.'
+        + '\u001b[15;1H\u001b[?25h\u001b[?9001l\u001b[?1004l\u001b[m';
+
+    describe('device-auth flow', () => {
+        it('extracts both URL and one-time code from real device-auth output', () => {
+            const result = analyzeCodexPtyOutput(REAL_DEVICE_AUTH_BUFFER);
+            expect(result.action).toBe('forward-url');
+            if (result.action !== 'forward-url') return;
+            expect(result.url).toBe('https://auth.openai.com/codex/device');
+            expect(result.code).toBe('EZVG-FFQFL');
+        });
+
+        it('waits (discard) when URL rendered but code not yet flushed', () => {
+            const partial =
+                'Follow these steps to sign in with ChatGPT using device code authorization:\n'
+                + '1. Open this link in your browser and sign in to your account\n'
+                + '   https://auth.openai.com/codex/device\n'
+                + '2. Enter this one-time code (expires in 15 minutes)\n'
+                + '   '; // code chunk hasn't arrived yet
+            expect(analyzeCodexPtyOutput(partial)).toEqual({ action: 'discard' });
+        });
+
+        it('extracts code with 4-4 pattern as well as 4-5', () => {
+            const buf =
+                'Enter this one-time code\n'
+                + 'https://auth.openai.com/codex/device\n'
+                + 'ABCD-1234\n';
+            const result = analyzeCodexPtyOutput(buf);
+            expect(result.action).toBe('forward-url');
+            if (result.action !== 'forward-url') return;
+            expect(result.code).toBe('ABCD-1234');
+        });
+
+        it('does not treat arbitrary uppercase tokens as codes in legacy flow', () => {
+            // Legacy (non-device) flow: URL without any "one-time code" / "/device" marker.
+            // Any random TOKEN-LIKE string in adjacent UI chrome must NOT be harvested as a code.
+            const buf = 'Open https://auth.openai.com/oauth/authorize?x=1 to continue\nABCD-12345 unrelated';
+            const result = analyzeCodexPtyOutput(buf);
+            expect(result.action).toBe('forward-url');
+            if (result.action !== 'forward-url') return;
+            expect(result.code).toBeUndefined();
+        });
+    });
+
+    describe('success / error / discard', () => {
+        it('detects "Logged in" as success', () => {
+            expect(analyzeCodexPtyOutput('Successfully logged in!\n')).toEqual({ action: 'success' });
+        });
+
+        it('detects config load error', () => {
+            const result = analyzeCodexPtyOutput('Error loading configuration from ~/.codex/config.toml');
+            expect(result.action).toBe('error');
+        });
+
+        it('discards incomplete output', () => {
+            expect(analyzeCodexPtyOutput('Welcome to Codex\n')).toEqual({ action: 'discard' });
+        });
+    });
+});
+
+describe('parseLoginArgs', () => {
+    describe('no-args branch', () => {
+        it('empty args → claude list', () => {
+            expect(parseLoginArgs('', 'claude')).toEqual({
+                kind: 'ok',
+                profileName: undefined,
+                targetAgent: 'claude',
+                contextMode: 'shared',
+            });
+        });
+
+        it('empty args with codex flavor → codex list', () => {
+            const r = parseLoginArgs('', 'codex');
+            expect(r).toMatchObject({ kind: 'ok', profileName: undefined, targetAgent: 'codex' });
+        });
+
+        it('--codex alone → codex list (flag-only)', () => {
+            const r = parseLoginArgs('--codex', 'claude');
+            expect(r).toMatchObject({ kind: 'ok', profileName: undefined, targetAgent: 'codex' });
+        });
+
+        it('gemini flavor → falls back to claude', () => {
+            const r = parseLoginArgs('', 'gemini');
+            expect(r).toMatchObject({ kind: 'ok', targetAgent: 'claude' });
+        });
+
+        it('undefined flavor → falls back to claude', () => {
+            const r = parseLoginArgs('', undefined);
+            expect(r).toMatchObject({ kind: 'ok', targetAgent: 'claude' });
+        });
+    });
+
+    describe('positional + flag combinations', () => {
+        it('name only → claude, shared', () => {
+            expect(parseLoginArgs('abc', 'claude')).toEqual({
+                kind: 'ok',
+                profileName: 'abc',
+                targetAgent: 'claude',
+                contextMode: 'shared',
+            });
+        });
+
+        it('name --codex (flag after) → codex', () => {
+            expect(parseLoginArgs('abc --codex', 'claude')).toMatchObject({
+                kind: 'ok', profileName: 'abc', targetAgent: 'codex',
+            });
+        });
+
+        it('--codex name (flag before) → codex, same result', () => {
+            expect(parseLoginArgs('--codex abc', 'claude')).toMatchObject({
+                kind: 'ok', profileName: 'abc', targetAgent: 'codex',
+            });
+        });
+
+        it('name --isolated → isolated mode', () => {
+            expect(parseLoginArgs('abc --isolated', 'claude')).toEqual({
+                kind: 'ok',
+                profileName: 'abc',
+                targetAgent: 'claude',
+                contextMode: 'isolated',
+            });
+        });
+
+        it('explicit --codex overrides codex flavor session', () => {
+            expect(parseLoginArgs('abc --codex', 'codex')).toMatchObject({ targetAgent: 'codex' });
+        });
+
+        it('codex flavor session without --codex flag still picks codex', () => {
+            expect(parseLoginArgs('abc', 'codex')).toMatchObject({ targetAgent: 'codex' });
+        });
+    });
+
+    describe('validation errors', () => {
+        it('invalid profileName → error', () => {
+            expect(parseLoginArgs('bad!name', 'claude')).toEqual({
+                kind: 'error',
+                message: expect.stringContaining('无效的配置名称'),
+            });
+        });
+
+        it('profileName starting with digit → error', () => {
+            expect(parseLoginArgs('1abc', 'claude')).toMatchObject({ kind: 'error' });
+        });
+    });
+
+    describe('edge cases', () => {
+        it('unknown flag --foo is silently ignored, positional still wins', () => {
+            expect(parseLoginArgs('--foo abc', 'claude')).toMatchObject({
+                kind: 'ok', profileName: 'abc', targetAgent: 'claude',
+            });
+        });
+
+        it('tolerates extra whitespace', () => {
+            expect(parseLoginArgs('   abc   --codex   ', 'claude')).toMatchObject({
+                kind: 'ok', profileName: 'abc', targetAgent: 'codex',
+            });
+        });
+
+        it('duplicate profileName tokens → first wins silently', () => {
+            expect(parseLoginArgs('first second', 'claude')).toMatchObject({
+                kind: 'ok', profileName: 'first',
+            });
         });
     });
 });

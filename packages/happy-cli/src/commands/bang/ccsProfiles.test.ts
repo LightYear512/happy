@@ -56,7 +56,7 @@ describe('readCcsProfiles', () => {
 
         mockReadFileSync.mockReturnValue(JSON.stringify({
             default: 'work',
-            work: { type: 'account', context_mode: 'shared', context_group: 'default' },
+            work: { type: 'account', context_mode: 'shared' },
             personal: { type: 'account', context_mode: 'isolated' },
         }));
 
@@ -67,13 +67,11 @@ describe('readCcsProfiles', () => {
             name: 'work',
             instancePath: join(ccsDir, 'instances', 'work'),
             contextMode: 'shared',
-            contextGroup: 'default',
         });
         expect(result.profiles[1]).toEqual({
             name: 'personal',
             instancePath: join(ccsDir, 'instances', 'personal'),
             contextMode: 'isolated',
-            contextGroup: undefined,
         });
     });
 

@@ -33,7 +33,7 @@ describe('registerProfile — YAML text manipulation', () => {
     });
 
     it('creates config.yaml from scratch when file does not exist', () => {
-        registerProfile('test-account', 'shared', 'default');
+        registerProfile('test-account', 'shared');
 
         const configPath = join(ccsDir, 'config.yaml');
         expect(existsSync(configPath)).toBe(true);
@@ -42,7 +42,6 @@ describe('registerProfile — YAML text manipulation', () => {
         expect(content).toContain('accounts:');
         expect(content).toContain('  test-account:');
         expect(content).toContain('    context_mode: shared');
-        expect(content).toContain('    context_group: default');
         expect(content).toContain('    continuity_mode: standard');
         expect(content).toContain('    created:');
         expect(content).toContain('    last_used: null');
@@ -87,7 +86,7 @@ describe('registerProfile — YAML text manipulation', () => {
             '  theme: dark',
         ].join('\n'), 'utf-8');
 
-        registerProfile('first-user', 'shared', 'default');
+        registerProfile('first-user', 'shared');
 
         const content = readFileSync(configPath, 'utf-8');
         expect(content).toContain('accounts:');
@@ -119,19 +118,12 @@ describe('registerProfile — YAML text manipulation', () => {
         expect(settingsIdx).toBeGreaterThan(betaIdx);
     });
 
-    it('omits context_group when not provided', () => {
+    it('never writes context_group (single-default-group model)', () => {
         registerProfile('no-group', 'isolated');
 
         const content = readFileSync(join(ccsDir, 'config.yaml'), 'utf-8');
         expect(content).toContain('  no-group:');
         expect(content).not.toContain('context_group');
-    });
-
-    it('includes context_group when provided', () => {
-        registerProfile('with-group', 'shared', 'my-team');
-
-        const content = readFileSync(join(ccsDir, 'config.yaml'), 'utf-8');
-        expect(content).toContain('    context_group: my-team');
     });
 
     it('handles config.yaml with trailing newline', () => {
@@ -189,7 +181,6 @@ describe('registerProfile — YAML text manipulation', () => {
             '    created: "2026-01-15T10:00:00.000Z"',
             '    last_used: "2026-03-20T08:30:00.000Z"',
             '    context_mode: shared',
-            '    context_group: my-team',
             '    continuity_mode: enhanced',
         ].join('\n'), 'utf-8');
 

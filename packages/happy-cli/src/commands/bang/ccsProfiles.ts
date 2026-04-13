@@ -10,7 +10,6 @@ export interface CcsProfileInfo {
     /** Claude instance directory (~/.ccs/instances/<profile>/) */
     instancePath: string;
     contextMode?: 'isolated' | 'shared';
-    contextGroup?: string;
 }
 
 /** Agent flavor for auth operations. */
@@ -84,7 +83,6 @@ export function readCcsProfiles(): CcsProfilesResult {
                     name,
                     instancePath,
                     contextMode: profileMeta.context_mode as 'isolated' | 'shared' | undefined,
-                    contextGroup: profileMeta.context_group as string | undefined,
                 });
             }
         } catch (error) {
@@ -115,9 +113,6 @@ export function readCcsProfiles(): CcsProfilesResult {
                             if (props.context_mode === 'shared' || props.context_mode === 'isolated') {
                                 profile.contextMode = props.context_mode;
                             }
-                            if (typeof props.context_group === 'string') {
-                                profile.contextGroup = props.context_group;
-                            }
                         }
                         result.profiles.push(profile);
                     }
@@ -129,6 +124,57 @@ export function readCcsProfiles(): CcsProfilesResult {
     }
 
     return result;
+}
+
+/**
+ * Persist the default CCS profile name.
+ * Writes to config.yaml (unified, takes precedence) and legacy profiles.json
+ * if present, so both read paths in readCcsProfiles() stay consistent.
+ * Atomic: tmp file + rename.
+ */
+export function setCcsDefaultProfile(profileName: string): void {
+    const ccsDir = getCcsDir();
+    let wrote = false;
+
+    const configYamlPath = join(ccsDir, 'config.yaml');
+    try {
+        const raw = readFileSync(configYamlPath, 'utf-8');
+        const config = (yaml.load(raw) as Record<string, unknown>) ?? {};
+        config.default = profileName;
+        const content = yaml.dump(config, { indent: 2, lineWidth: -1, quotingType: '"' });
+        const tmpPath = configYamlPath + '.' + randomBytes(4).toString('hex') + '.tmp';
+        writeFileSync(tmpPath, content, 'utf-8');
+        renameSync(tmpPath, configYamlPath);
+        logger.debug(`[ccs] Set default CCS profile to "${profileName}" (config.yaml)`);
+        wrote = true;
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException)?.code;
+        if (code !== 'ENOENT') {
+            throw error;
+        }
+    }
+
+    const profilesJsonPath = join(ccsDir, 'profiles.json');
+    try {
+        const raw = readFileSync(profilesJsonPath, 'utf-8');
+        const data = JSON.parse(raw) as Record<string, unknown>;
+        data.default = profileName;
+        const content = JSON.stringify(data, null, 2);
+        const tmpPath = profilesJsonPath + '.' + randomBytes(4).toString('hex') + '.tmp';
+        writeFileSync(tmpPath, content, 'utf-8');
+        renameSync(tmpPath, profilesJsonPath);
+        logger.debug(`[ccs] Set default CCS profile to "${profileName}" (profiles.json)`);
+        wrote = true;
+    } catch (error) {
+        const code = (error as NodeJS.ErrnoException)?.code;
+        if (code !== 'ENOENT') {
+            logger.debug('[ccs] Failed to update profiles.json default:', error);
+        }
+    }
+
+    if (!wrote) {
+        throw new Error(`No CCS config file found in ${ccsDir} (expected config.yaml or profiles.json)`);
+    }
 }
 
 /**
@@ -179,12 +225,12 @@ export function getHappyHome(): string {
 
 /** Base directory for all happy-managed codex instances. */
 function getCodexInstancesBase(): string {
-    return join(getHappyHome(), 'codex-instances');
+    return join(getHappyHome(), 'auth', 'codex', 'instances');
 }
 
 /**
  * Get the CODEX_HOME-equivalent directory for a given profile name.
- * Layout: <happyHomeDir>/codex-instances/<sanitized-name>/
+ * Layout: <happyHomeDir>/auth/codex/instances/<sanitized-name>/
  */
 export function getCodexInstancePath(profileName: string): string {
     return join(getCodexInstancesBase(), sanitizeName(profileName));
@@ -261,14 +307,15 @@ export function applyProfileSwitch(profileName: string, flavor: AuthFlavor, clau
 // ---------------------------------------------------------------------------
 
 export interface CodexProfileInfo {
-    /** Profile name (directory name under codex-instances/). */
+    /** Profile name (directory name under auth/codex/instances/). */
     name: string;
     /** Full path to the codex instance directory. */
     codexHome: string;
+    contextMode?: 'isolated' | 'shared';
 }
 
 /**
- * Scan ~/.happy-dev/codex-instances/ and return every sub-directory that
+ * Scan ~/.happy-dev/auth/codex/instances/ and return every sub-directory that
  * contains an auth.json file, representing a logged-in Codex account.
  */
 export function readCodexProfiles(): CodexProfileInfo[] {
@@ -281,6 +328,16 @@ export function readCodexProfiles(): CodexProfileInfo[] {
         return [];
     }
 
+    // Read config.yaml for contextMode metadata
+    let accountsMeta: Record<string, Record<string, unknown>> = {};
+    try {
+        const configPath = join(base, 'config.yaml');
+        const config = yaml.load(readFileSync(configPath, 'utf-8')) as CodexInstancesConfig | null;
+        if (config?.accounts) {
+            accountsMeta = config.accounts as Record<string, Record<string, unknown>>;
+        }
+    } catch { /* no config.yaml */ }
+
     for (const entry of entries) {
         const dirPath = join(base, entry);
         try {
@@ -289,34 +346,33 @@ export function readCodexProfiles(): CodexProfileInfo[] {
             continue;
         }
         if (existsSync(join(dirPath, 'auth.json'))) {
-            results.push({ name: entry, codexHome: dirPath });
+            const meta = accountsMeta[entry];
+            results.push({
+                name: entry,
+                codexHome: dirPath,
+                contextMode: meta?.context_mode === 'shared' || meta?.context_mode === 'isolated'
+                    ? meta.context_mode : undefined,
+            });
         }
     }
     return results;
 }
 
-/** Shape of ~/.happy-dev/codex-instances/config.yaml */
+/** Shape of ~/.happy-dev/auth/codex/instances/config.yaml */
 interface CodexInstancesConfig {
+    default?: string;
     accounts?: Record<string, {
         created?: string;
         context_mode?: 'isolated' | 'shared';
-        context_group?: string;
         [key: string]: unknown;
     }>;
 }
 
 /**
- * Register (or update) a Codex account's metadata in the independent
- * config file at ~/.happy-dev/codex-instances/config.yaml.
- *
- * - Incremental merge: preserves existing `created` and extra fields.
- * - Atomic write: writes to a temp file then renames.
+ * Atomic read-modify-write for ~/.happy-dev/auth/codex/instances/config.yaml.
+ * Reads the current config, applies `mutate`, then writes atomically (tmp + rename).
  */
-export function registerCodexProfile(
-    profileName: string,
-    contextMode: 'isolated' | 'shared',
-    contextGroup?: string,
-): void {
+function updateCodexConfig(mutate: (config: CodexInstancesConfig) => void): void {
     const base = getCodexInstancesBase();
     mkdirSync(base, { recursive: true });
 
@@ -329,19 +385,57 @@ export function registerCodexProfile(
         config = {};
     }
 
-    if (!config.accounts) config.accounts = {};
-
-    const existing = config.accounts[profileName];
-    config.accounts[profileName] = {
-        ...existing,
-        created: existing?.created ?? new Date().toISOString(),
-        context_mode: contextMode,
-        ...(contextGroup ? { context_group: contextGroup } : {}),
-    };
+    mutate(config);
 
     const content = yaml.dump(config, { indent: 2, lineWidth: -1, quotingType: '"' });
     const tmpPath = configPath + '.' + randomBytes(4).toString('hex') + '.tmp';
     writeFileSync(tmpPath, content, 'utf-8');
     renameSync(tmpPath, configPath);
-    logger.debug(`[codex] Registered codex profile "${profileName}" in ${configPath}`);
+}
+
+/**
+ * Register (or update) a Codex account's metadata in the independent
+ * config file at ~/.happy-dev/auth/codex/instances/config.yaml.
+ *
+ * Re-register replaces the entry — preserves `created` from the existing entry
+ * but drops any stray legacy fields (e.g., context_group from older versions),
+ * matching registerProfile (claude) for symmetric upsert semantics.
+ */
+export function registerCodexProfile(
+    profileName: string,
+    contextMode: 'isolated' | 'shared',
+): void {
+    updateCodexConfig(config => {
+        if (!config.accounts) config.accounts = {};
+        const existing = config.accounts[profileName];
+        config.accounts[profileName] = {
+            created: existing?.created ?? new Date().toISOString(),
+            context_mode: contextMode,
+        };
+    });
+    logger.debug(`[codex] Registered codex profile "${profileName}"`);
+}
+
+/**
+ * Read the default Codex profile name from config.yaml.
+ * Returns null when no default is set or the file doesn't exist.
+ */
+export function readCodexDefaultProfile(): string | null {
+    const configPath = join(getCodexInstancesBase(), 'config.yaml');
+    try {
+        const config = yaml.load(readFileSync(configPath, 'utf-8')) as CodexInstancesConfig | null;
+        return config?.default ?? null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Persist the default Codex profile name in config.yaml.
+ */
+export function setCodexDefaultProfile(profileName: string): void {
+    updateCodexConfig(config => {
+        config.default = profileName;
+    });
+    logger.debug(`[codex] Set default codex profile to "${profileName}"`);
 }

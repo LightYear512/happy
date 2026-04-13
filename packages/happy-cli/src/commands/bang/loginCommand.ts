@@ -11,10 +11,64 @@ import {
     registerInteractiveSession,
     unregisterInteractiveSession,
 } from './interactiveSession';
-import { SEPARATOR, codeBlock, type BangCommandContext, type BangCommandResult } from './types';
-import { getCodexInstancePath, getHappyHome, registerCodexProfile } from './ccsProfiles';
+import { SEPARATOR, codeBlock, parseCodexFlag, rejectCodexFlagInSession, type BangCommandContext, type BangCommandResult } from './types';
+import { getCodexInstancePath, getHappyHome, registerCodexProfile, readCodexDefaultProfile, setCodexDefaultProfile, readCodexProfiles, type AuthFlavor } from './ccsProfiles';
 
 const PROFILE_NAME_REGEX = /^[a-zA-Z][a-zA-Z0-9_-]*$/;
+
+/**
+ * Parsed result of `!login` bang args. `kind: 'ok'` with `profileName: undefined`
+ * signals the no-args branch (caller renders an account list).
+ */
+export type ParsedLoginArgs =
+    | {
+        kind: 'ok';
+        profileName: string | undefined;
+        targetAgent: AuthFlavor;
+        contextMode: 'isolated' | 'shared';
+    }
+    | { kind: 'error'; message: string };
+
+/**
+ * Pure parser for `!login` args — no PTY, no fs, no ctx.client side effects,
+ * so it can be unit-tested independently. See loginCommand.test.ts.
+ */
+export function parseLoginArgs(
+    args: string,
+    ctxFlavor: 'claude' | 'codex' | 'gemini' | undefined,
+): ParsedLoginArgs {
+    const { cleanArgs, hasCodexFlag } = parseCodexFlag(args);
+    const parts = cleanArgs.split(/\s+/).filter(Boolean);
+
+    let profileName: string | undefined;
+    let hasIsolated = false;
+    for (const p of parts) {
+        if (p === '--isolated') {
+            hasIsolated = true;
+        } else if (!p.startsWith('--') && profileName === undefined) {
+            profileName = p;
+        }
+    }
+
+    if (profileName !== undefined && !PROFILE_NAME_REGEX.test(profileName)) {
+        return {
+            kind: 'error',
+            message: '❌ 无效的配置名称\n\n字母开头，仅含字母/数字/_/-',
+        };
+    }
+
+    // gemini/undefined fall back to claude — matches authCommand.resolveAuthFlavor contract
+    const targetAgent: AuthFlavor = hasCodexFlag
+        ? 'codex'
+        : (ctxFlavor === 'codex' ? 'codex' : 'claude');
+
+    return {
+        kind: 'ok',
+        profileName,
+        targetAgent,
+        contextMode: hasIsolated ? 'isolated' : 'shared',
+    };
+}
 
 function getCcsDir(): string {
     if (process.env.CCS_DIR) return process.env.CCS_DIR;
@@ -236,28 +290,50 @@ function findCodexCli(): { path: string; needsShell: boolean } | null {
 }
 
 /**
- * Analyze PTY output from `codex login` and decide what action to take.
+ * Analyze PTY output from `codex login --device-auth` and decide what action to take.
  *
- * Codex login flow:
- * 1. Outputs an OAuth URL (Google/OpenAI auth)
- * 2. User opens URL in browser
- * 3. Codex auto-detects completion via redirect callback
- * 4. Writes auth.json and exits
+ * Device-code flow (codex 0.118+):
+ * 1. Codex prints URL `https://auth.openai.com/codex/device` + one-time code (e.g. `EZVG-FFQFL`)
+ * 2. User opens URL, signs in, pastes the code
+ * 3. Codex polls the OAuth server, writes `auth.json` and exits with "Logged in"
+ *
+ * Legacy browser flow (without --device-auth) still matches the same URL regex and
+ * falls through to `{ action: 'forward-url' }` without a code — kept for backward compat.
  */
 export type CodexLoginAction =
-    | { action: 'forward-url'; url: string }
+    | { action: 'forward-url'; url: string; code?: string }
     | { action: 'success' }
     | { action: 'error'; message: string }
     | { action: 'discard' };
 
+// Device codes are printed as "XXXX-XXXX" / "XXXX-XXXXX" in uppercase A-Z/0-9.
+// Anchored between word boundaries to avoid matching hex-ish noise.
+const CODEX_DEVICE_CODE_RE = /\b[A-Z0-9]{4}-[A-Z0-9]{4,6}\b/;
+
 export function analyzeCodexPtyOutput(buffer: string): CodexLoginAction {
     const clean = stripTerminalOutput(buffer);
-    const continuous = stripAnsiOnly(buffer);
 
-    // Detect OAuth URL — codex uses auth.openai.com for its OAuth flow
-    const urlMatch = continuous.match(/https:\/\/[^\s]*(auth\.openai\.com|auth0\.openai\.com|accounts\.google\.com)[^\s]*/);
+    // Detect OAuth URL. Use `clean` (which converts cursor-positioning escapes to newlines)
+    // rather than the continuous variant: codex's device-auth URL is short enough that
+    // line-wrapping is never an issue, and using `clean` prevents the URL from greedily
+    // concatenating with the next TUI line (e.g. "...device2. Enter this one-time code").
+    const urlMatch = clean.match(/https:\/\/[^\s]*(auth\.openai\.com|auth0\.openai\.com|accounts\.google\.com)[^\s]*/);
     if (urlMatch) {
         const url = urlMatch[0].replace(/>+$/, '');
+
+        // Device-auth flow prints a one-time code below the URL. Only harvest the code
+        // when the marker text "one-time code" (or "device code") is present, so we don't
+        // accidentally grab unrelated uppercase tokens from the legacy flow.
+        const isDeviceFlow = /one-time code|device code/i.test(clean) || /\/device\b/.test(url);
+        if (isDeviceFlow) {
+            const codeMatch = clean.match(CODEX_DEVICE_CODE_RE);
+            if (codeMatch) {
+                return { action: 'forward-url', url, code: codeMatch[0] };
+            }
+            // URL seen but code hasn't rendered yet — wait for more data.
+            return { action: 'discard' };
+        }
+
         return { action: 'forward-url', url };
     }
 
@@ -281,7 +357,6 @@ interface CcsConfig {
         created?: string;
         last_used?: string | null;
         context_mode?: string;
-        context_group?: string;
         continuity_mode?: string;
         [key: string]: unknown;
     }>;
@@ -296,7 +371,6 @@ interface CcsConfig {
 export function registerProfile(
     profileName: string,
     contextMode: 'isolated' | 'shared',
-    contextGroup?: string,
 ): void {
     const ccsDir = getCcsDir();
     const configPath = join(ccsDir, 'config.yaml');
@@ -316,7 +390,6 @@ export function registerProfile(
         created: existing?.created ?? new Date().toISOString(),
         last_used: existing?.last_used ?? null,
         context_mode: contextMode,
-        ...(contextGroup ? { context_group: contextGroup } : {}),
         continuity_mode: existing?.continuity_mode ?? 'standard',
     };
 
@@ -445,7 +518,6 @@ function copyDirectoryRecursive(src: string, dest: string): void {
 function syncProjectContext(
     instancePath: string,
     contextMode: 'isolated' | 'shared',
-    contextGroup?: string,
 ): void {
     const projectsPath = join(instancePath, 'projects');
     const isWindows = process.platform === 'win32';
@@ -482,9 +554,8 @@ function syncProjectContext(
         return;
     }
 
-    // Shared mode: link projects → ~/.ccs/shared/context-groups/<group>/projects
-    const group = contextGroup || 'default';
-    const sharedProjectsPath = join(getCcsDir(), 'shared', 'context-groups', group, 'projects');
+    // Shared mode: link projects → ~/.ccs/shared/context-groups/default/projects
+    const sharedProjectsPath = join(getCcsDir(), 'shared', 'context-groups', 'default', 'projects');
     mkdirSync(sharedProjectsPath, { recursive: true, mode: 0o700 });
 
     // Check current state of instance/projects
@@ -777,6 +848,9 @@ export async function handleLoginBangCommand(
     args: string,
     ctx: BangCommandContext,
 ): Promise<BangCommandResult> {
+    const codexReject = rejectCodexFlagInSession(args, ctx);
+    if (codexReject) return codexReject;
+
     if (hasActiveInteractiveSession()) {
         return {
             message: '❌ 已有登录流程进行中\n\n发送 `!cancel` 取消当前流程',
@@ -784,55 +858,42 @@ export async function handleLoginBangCommand(
         };
     }
 
-    // Parse: <name> [--isolated] [--group <group>]
-    // Default: shared context mode (most useful for mobile profile switching)
-    const parts = args.split(/\s+/).filter(Boolean);
-    const profileName = parts[0];
+    const parsed = parseLoginArgs(args, ctx.flavor);
+    if (parsed.kind === 'error') {
+        return { message: parsed.message, action: 'none' };
+    }
+    const { profileName, targetAgent, contextMode } = parsed;
 
     if (!profileName) {
-        // No args — list existing accounts and show usage
-        const accounts = readAccountNames();
+        const accounts = targetAgent === 'codex'
+            ? readCodexProfiles().map(p => p.name)
+            : readAccountNames();
 
         if (accounts.length === 0) {
             return {
-                message: '用法: !login <账户名> [--codex] [--isolated] [--group <组>]\n\n登录账户（--codex 登录 Codex 账号）',
+                message: '用法: !login <账户名> [--codex] [--isolated]\n\n登录账户（--codex 登录 Codex 账号）',
                 action: 'none',
             };
         }
 
-        const messages: string[] = ['📋 已有账户'];
+        const messages: string[] = [targetAgent === 'codex' ? '📋 已有 Codex 账户' : '📋 已有账户'];
         messages.push(SEPARATOR);
         for (const name of accounts) {
             messages.push(name);
         }
         messages.push(SEPARATOR);
-        messages.push('!login <账户名> 登录 Claude');
-        messages.push('!login <账户名> --codex 登录 Codex');
+        if (targetAgent === 'codex') {
+            messages.push('!login <账户名> --codex 登录 Codex');
+        } else {
+            messages.push('!login <账户名> 登录 Claude');
+            messages.push('!login <账户名> --codex 登录 Codex');
+        }
 
         return { message: messages, action: 'none' };
     }
 
-    if (!PROFILE_NAME_REGEX.test(profileName)) {
-        return {
-            message: '❌ 无效的配置名称\n\n字母开头，仅含字母/数字/_/-',
-            action: 'none',
-        };
-    }
-
-    // Parse context and agent flags
-    const hasIsolated = parts.includes('--isolated');
-    const hasCodexFlag = parts.includes('--codex');
-    const groupIdx = parts.indexOf('--group');
-    const contextGroup = groupIdx !== -1 && parts[groupIdx + 1]
-        ? parts[groupIdx + 1]
-        : (hasIsolated ? undefined : 'default');
-    const contextMode: 'isolated' | 'shared' = hasIsolated ? 'isolated' : 'shared';
-
-    // Resolve target agent: explicit --codex flag overrides session flavor
-    const targetAgent = hasCodexFlag ? 'codex' : (ctx.flavor || 'claude');
-
     if (targetAgent === 'codex') {
-        return performCodexLogin(profileName, contextMode, contextGroup, ctx);
+        return performCodexLogin(profileName, contextMode, ctx);
     }
 
     // Find Claude CLI
@@ -1067,14 +1128,12 @@ export async function handleLoginBangCommand(
 
         if (hasCredentials) {
             try {
-                registerProfile(profileName, contextMode, contextGroup);
+                registerProfile(profileName, contextMode);
                 if (contextMode === 'shared') {
                     linkSharedDirectories(instancePath);
                 }
-                syncProjectContext(instancePath, contextMode, contextGroup);
-                const modeDesc = contextMode === 'shared'
-                    ? `共享 (组: ${contextGroup || 'default'})`
-                    : '独立';
+                syncProjectContext(instancePath, contextMode);
+                const modeDesc = contextMode === 'shared' ? '共享' : '独立';
                 const msg = `✅ 配置 "${profileName}" 登录成功\n\n`
                     + `模式: ${modeDesc}\n\n`
                     + `切换账号: !auth ${profileName}`;
@@ -1106,14 +1165,14 @@ export async function handleLoginBangCommand(
 
 /**
  * Get the base directory for shared Codex resources across profiles.
- * Layout: <happyHomeDir>/codex-shared/
+ * Layout: <happyHomeDir>/auth/codex/shared/
  */
 function getCodexSharedDir(): string {
-    return join(getHappyHome(), 'codex-shared');
+    return join(getHappyHome(), 'auth', 'codex', 'shared');
 }
 
 /**
- * Link shared directories from a Codex instance to ~/.happy/codex-shared/.
+ * Link shared directories from a Codex instance to ~/.happy/auth/codex/shared/.
  * Replicates the CCS SharedManager.linkSharedDirectories() pattern for
  * Codex instances, ensuring config and skills stay in sync across profiles
  * within the same shared context group.
@@ -1136,6 +1195,7 @@ function linkCodexSharedDirectories(codexInstancePath: string): void {
 
     const sharedItems: Array<{ name: string; type: 'directory' | 'file' }> = [
         { name: 'skills', type: 'directory' },
+        { name: 'prompts', type: 'directory' },
         { name: 'config.toml', type: 'file' },
         { name: '.env', type: 'file' },
     ];
@@ -1211,8 +1271,8 @@ function linkCodexSharedDirectories(codexInstancePath: string): void {
  * merging into a shared directory is safe — no naming collisions.
  *
  * Shared layout:
- *   ~/.happy/codex-shared/context-groups/<group>/sessions/   (symlinked)
- *   ~/.happy/codex-shared/context-groups/<group>/history.jsonl (symlinked)
+ *   ~/.happy/auth/codex/shared/context-groups/default/sessions/   (symlinked)
+ *   ~/.happy/auth/codex/shared/context-groups/default/history.jsonl (symlinked)
  *
  * state_*.sqlite is intentionally NOT shared — it is a rebuildable index and
  * sharing it would cause SQLite lock contention across concurrent profiles.
@@ -1220,7 +1280,6 @@ function linkCodexSharedDirectories(codexInstancePath: string): void {
 function syncCodexSessionSharing(
     codexInstancePath: string,
     contextMode: 'isolated' | 'shared',
-    contextGroup?: string,
 ): void {
     const isWindows = process.platform === 'win32';
 
@@ -1245,9 +1304,8 @@ function syncCodexSessionSharing(
         return;
     }
 
-    // Shared mode: link sessions → shared context-group directory
-    const group = contextGroup || 'default';
-    const sharedGroupDir = join(getCodexSharedDir(), 'context-groups', group);
+    // Shared mode: link sessions → shared default context-group directory
+    const sharedGroupDir = join(getCodexSharedDir(), 'context-groups', 'default');
     const sharedSessionsPath = join(sharedGroupDir, 'sessions');
     const sharedHistoryPath = join(sharedGroupDir, 'history.jsonl');
     mkdirSync(sharedSessionsPath, { recursive: true });
@@ -1378,18 +1436,24 @@ function mergeSessionsDirectory(src: string, dest: string): void {
 /**
  * Handle `!login <name>` for Codex backend.
  *
- * Flow:
- * 1. Create codex instance directory (~/.happy/codex-instances/<name>/)
+ * Flow (device-auth mode, codex-cli 0.118+):
+ * 1. Create codex instance directory (~/.happy/auth/codex/instances/<name>/)
  * 2. Copy config.toml + .env from current CODEX_HOME (if available)
- * 3. Spawn `codex login` with CODEX_HOME pointing to the new instance
- * 4. Detect OAuth URL from output → forward to mobile
- * 5. Codex auto-completes OAuth via browser redirect → writes auth.json
- * 6. On exit: check auth.json → register CCS profile + success message
+ * 3. Spawn `codex login --device-auth` with CODEX_HOME pointing to the new instance
+ * 4. Detect OAuth URL + one-time code from output → forward both to mobile
+ * 5. User signs in via browser, pastes the code; codex polls the OAuth server
+ * 6. Codex writes auth.json and prints "Logged in" → PTY exits
+ * 7. On exit: check auth.json → register CCS profile + success message
+ *
+ * Device-auth requires the user to have enabled "Device code authorization" in their
+ * ChatGPT security settings (personal) or workspace admin panel (team). If disabled,
+ * codex falls back to the legacy localhost:1455 browser callback — that path is
+ * currently unreachable in headless/remote environments and will hang. We surface a
+ * hint in the mobile message so the user knows where to enable it.
  */
 function performCodexLogin(
     profileName: string,
     contextMode: 'isolated' | 'shared',
-    contextGroup: string | undefined,
     ctx: BangCommandContext,
 ): BangCommandResult {
     const codexInfo = findCodexCli();
@@ -1440,7 +1504,9 @@ function performCodexLogin(
         const shell = process.platform === 'win32' && codexInfo.needsShell;
         ptyProcess = pty.spawn(
             shell ? process.env.COMSPEC || 'cmd.exe' : codexInfo.path,
-            shell ? ['/c', codexInfo.path, 'login'] : ['login'],
+            shell
+                ? ['/c', codexInfo.path, 'login', '--device-auth']
+                : ['login', '--device-auth'],
             {
                 name: 'xterm-256color',
                 cols: 1000,
@@ -1462,6 +1528,9 @@ function performCodexLogin(
     let exited = false;
     let loginUrlSent = false;
     let loginSucceeded = false;
+    // Ring buffer of the last ~4KB of raw PTY output — survives discard/flush so
+    // onExit can dump the final codex stderr/stdout when login fails.
+    let recentOutput = '';
 
     const flushOutput = (): void => {
         if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
@@ -1475,18 +1544,39 @@ function performCodexLogin(
     ptyProcess.onData((data: string) => {
         if (loginSucceeded) return;
         outputBuffer += data;
+        recentOutput = (recentOutput + data).slice(-4096);
 
         const result = analyzeCodexPtyOutput(outputBuffer);
-        logger.debug(`[!login:codex] onData action=${result.action} bufLen=${outputBuffer.length}`);
+        logger.info(`[!login:codex] onData action=${result.action} bufLen=${outputBuffer.length} stripped=${JSON.stringify(stripTerminalOutput(outputBuffer).slice(0, 300))}`);
 
         switch (result.action) {
             case 'forward-url':
                 loginUrlSent = true;
                 outputBuffer = '';
                 if (flushTimer) clearTimeout(flushTimer);
-                ctx.client.sendCodexMessage({ type: 'message', message:
-                    '🔗 请在浏览器中打开以下链接登录 Codex:\n\n' + codeBlock(result.url) + '\n\n登录完成后将自动检测'
-                });
+                {
+                    const lines: string[] = [];
+                    if (result.code) {
+                        lines.push('🔗 请在浏览器中打开以下链接登录 Codex:');
+                        lines.push('');
+                        lines.push(codeBlock(result.url));
+                        lines.push('');
+                        lines.push('🔢 然后在页面上输入一次性 code（15 分钟内有效）:');
+                        lines.push('');
+                        lines.push(codeBlock(result.code));
+                        lines.push('');
+                        lines.push('> 如果页面提示找不到 code 输入框，请先在 ChatGPT 账号的 Security settings 里启用 "Device code authorization"。');
+                        lines.push('');
+                        lines.push('登录完成后将自动检测');
+                    } else {
+                        lines.push('🔗 请在浏览器中打开以下链接登录 Codex:');
+                        lines.push('');
+                        lines.push(codeBlock(result.url));
+                        lines.push('');
+                        lines.push('登录完成后将自动检测');
+                    }
+                    ctx.client.sendCodexMessage({ type: 'message', message: lines.join('\n') });
+                }
                 return;
 
             case 'success':
@@ -1543,19 +1633,24 @@ function performCodexLogin(
 
         if (hasAuth) {
             try {
+                // Check before register to avoid redundant config.yaml read-after-write
+                const isFirstProfile = !readCodexDefaultProfile();
                 // Register in CCS so !auth can discover the profile
-                registerCodexProfile(profileName, contextMode, contextGroup);
+                registerCodexProfile(profileName, contextMode);
+                if (isFirstProfile) {
+                    setCodexDefaultProfile(profileName);
+                    logger.debug(`[!login:codex] Auto-set default codex profile to "${profileName}" (first profile)`);
+                }
                 // Link shared resources and session history — mirrors Claude login pattern
                 if (contextMode === 'shared') {
                     linkCodexSharedDirectories(codexInstancePath);
                 }
-                syncCodexSessionSharing(codexInstancePath, contextMode, contextGroup);
-                const modeDesc = contextMode === 'shared'
-                    ? `共享 (组: ${contextGroup || 'default'})`
-                    : '独立';
+                syncCodexSessionSharing(codexInstancePath, contextMode);
+                const modeDesc = contextMode === 'shared' ? '共享' : '独立';
+                const defaultNote = isFirstProfile ? '\n已自动设为默认账户' : '';
                 const msg = `✅ Codex 配置 "${profileName}" 登录成功\n\n`
-                    + `模式: ${modeDesc}\n\n`
-                    + `切换账号: !auth ${profileName}`;
+                    + `模式: ${modeDesc}${defaultNote}\n\n`
+                    + `切换账号: !auth-all ${profileName} --codex`;
                 ctx.client.sendCodexMessage({ type: 'message', message: msg });
             } catch (err) {
                 logger.debug('[!login:codex] Failed to register profile:', err);
@@ -1563,8 +1658,11 @@ function performCodexLogin(
             }
         } else {
             if (!dirExistedBefore) cleanupInstance(codexInstancePath);
-            logger.debug(`[!login:codex] Login failed with exit code: ${exitCode ?? 'unknown'}`);
-            ctx.client.sendCodexMessage({ type: 'message', message: `❌ Codex 登录失败或已取消\n\n重新尝试: !login ${profileName}` });
+            const finalStripped = stripTerminalOutput(recentOutput).slice(-1000);
+            logger.info(`[!login:codex] Login failed with exit code: ${exitCode ?? 'unknown'} finalOutput=${JSON.stringify(finalStripped)}`);
+            const tail = finalStripped.trim();
+            const detail = tail ? `\n\nCodex 输出:\n${codeBlock(tail)}` : '';
+            ctx.client.sendCodexMessage({ type: 'message', message: `❌ Codex 登录失败或已取消${detail}\n\n重新尝试: !login ${profileName} --codex` });
         }
 
         ctx.client.sendSessionEvent({ type: 'ready' });

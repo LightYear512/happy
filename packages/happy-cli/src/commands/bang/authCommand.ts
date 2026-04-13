@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, watch, type FSWatcher } from 'node:fs';
 import { join } from 'node:path';
 import { logger } from '@/ui/logger';
 import {
@@ -6,15 +6,28 @@ import {
     getCurrentProfileForFlavor,
     applyProfileSwitch,
     readCodexProfiles,
+    readCodexDefaultProfile,
+    setCodexDefaultProfile,
+    setCcsDefaultProfile,
     type CcsProfileInfo,
     type AuthFlavor,
 } from './ccsProfiles';
 import { configuration } from '@/configuration';
-import { getCachedUsageSummary, readOAuthToken, fetchProfileUsageSummary } from './usageCommand';
-import { SEPARATOR, parseCodexFlag, type BangCommandContext, type BangCommandResult } from './types';
+import { getCachedUsageSummary, readOAuthToken, fetchProfileUsageSummary, type ProfileUsageEntry } from './usageCommand';
+import { formatRelativeTime } from './relativeTime';
+import { SEPARATOR, parseCodexFlag, rejectCodexFlagInSession, type BangCommandContext, type BangCommandResult } from './types';
+
+/** Convert CodexProfileInfo[] to CcsProfileInfo[] for unified profile handling. */
+function codexToCcsProfiles(codexProfiles: ReturnType<typeof readCodexProfiles>): CcsProfileInfo[] {
+    return codexProfiles.map(cp => ({
+        name: cp.name,
+        instancePath: cp.codexHome,
+        contextMode: cp.contextMode,
+    }));
+}
 
 /** Map context flavor to the auth-relevant subset (gemini/undefined → claude). */
-function resolveAuthFlavor(ctx: BangCommandContext): AuthFlavor {
+export function resolveAuthFlavor(ctx: BangCommandContext): AuthFlavor {
     return ctx.flavor === 'codex' ? 'codex' : 'claude';
 }
 
@@ -29,6 +42,9 @@ function resolveAuthFlavor(ctx: BangCommandContext): AuthFlavor {
  * - `!auth` — List available CCS profiles (use !auth-all to switch all sessions)
  */
 export async function handleAuthBangCommand(args: string, ctx: BangCommandContext): Promise<BangCommandResult> {
+    const codexReject = rejectCodexFlagInSession(args, ctx);
+    if (codexReject) return codexReject;
+
     const { cleanArgs, hasCodexFlag } = parseCodexFlag(args);
     // In console: no ctx.flavor, use --codex flag; in session: ctx.flavor takes precedence
     const flavor: AuthFlavor = hasCodexFlag ? 'codex' : resolveAuthFlavor(ctx);
@@ -72,7 +88,9 @@ export async function handleAuthAllBangCommand(args: string, ctx: BangCommandCon
  */
 export function tryGlobalProfileSwitch(flavor: AuthFlavor = 'claude'): boolean {
     try {
-        const filePath = configuration.activeProfileFile;
+        const filePath = flavor === 'codex'
+            ? configuration.activeCodexProfileFile
+            : configuration.activeProfileFile;
         if (!existsSync(filePath)) return false;
 
         const profileName = readFileSync(filePath, 'utf-8').trim();
@@ -81,7 +99,10 @@ export function tryGlobalProfileSwitch(flavor: AuthFlavor = 'claude'): boolean {
         const currentProfile = getCurrentProfileForFlavor(flavor);
         if (profileName === currentProfile) return false;
 
-        const { profiles } = readCcsProfiles();
+        const { profiles: ccsProfiles } = readCcsProfiles();
+        const profiles: CcsProfileInfo[] = flavor === 'codex'
+            ? codexToCcsProfiles(readCodexProfiles())
+            : ccsProfiles;
         const target = profiles.find(p => p.name === profileName);
         if (!target) {
             logger.debug(`[!auth] Global switch: profile "${profileName}" not found`);
@@ -92,12 +113,13 @@ export function tryGlobalProfileSwitch(flavor: AuthFlavor = 'claude'): boolean {
             ? profiles.find(p => p.name === currentProfile) ?? null
             : null;
         if (!isSharedContext(currentProfileInfo, target)) {
-            logger.debug(`[!auth] Global switch: "${profileName}" not in same context group, ignoring`);
+            logger.debug(`[!auth] Global switch: "${profileName}" not in shared mode, ignoring`);
             return false;
         }
 
         if (flavor === 'codex') {
-            if (!readCodexProfiles().some(p => p.name === profileName)) {
+            // profiles already built from readCodexProfiles() — no need to re-read
+            if (!profiles.some(p => p.name === profileName)) {
                 logger.warn(`[!auth] Global switch: codex profile "${profileName}" has no auth.json, skipping`);
                 return false;
             }
@@ -133,33 +155,68 @@ function getProfileStatus(profile: CcsProfileInfo, flavor: AuthFlavor = 'claude'
 /**
  * Fetch usage summaries for a list of profiles in parallel.
  * Each call is individually bounded by a 5s timeout inside fetchProfileUsageSummary.
+ * The returned map carries both summary and authExpired status so callers can
+ * surface a refresh hint when a profile's OAuth token has expired.
  */
-async function fetchUsageSummaries(profileNames: string[], flavor: AuthFlavor): Promise<Map<string, string>> {
+async function fetchUsageSummaries(profileNames: string[], flavor: AuthFlavor): Promise<Map<string, ProfileUsageEntry>> {
     const results = await Promise.all(
         profileNames.map(async name => ({
             name,
-            summary: await fetchProfileUsageSummary(name, flavor),
+            entry: await fetchProfileUsageSummary(name, flavor),
         }))
     );
-    const map = new Map<string, string>();
-    for (const { name, summary } of results) {
-        if (summary) map.set(name, summary);
+    const map = new Map<string, ProfileUsageEntry>();
+    for (const { name, entry } of results) {
+        map.set(name, entry);
     }
     return map;
 }
 
-/** Format a profile line with optional usage summary. */
-function profileLine(marker: string, name: string, status: string, usage: string | undefined): string {
+/** Format a profile line with optional usage summary, stale marker, auth-expired marker and default indicator. */
+function profileLine(marker: string, name: string, status: string, entry: ProfileUsageEntry | undefined, isDefault?: boolean): string {
     const parts = [marker, name];
+    if (isDefault) parts.push('(默认)');
     if (status) parts.push(status);
-    if (usage) parts.push(usage);
+    if (entry?.summary) {
+        parts.push(entry.summary);
+        if (entry.stale && entry.cachedAt) {
+            parts.push(`⏳ ${formatRelativeTime(entry.cachedAt)}`);
+        }
+        if (entry.authExpired) {
+            parts.push('🔒 令牌过期');
+        }
+    } else if (entry?.authExpired) {
+        parts.push('🔒 令牌过期');
+    }
     return parts.filter(Boolean).join(' ');
 }
 
+/** True if any profile entry in the map has an expired OAuth token. */
+function hasAuthExpired(map: Map<string, ProfileUsageEntry>): boolean {
+    for (const entry of map.values()) {
+        if (entry.authExpired) return true;
+    }
+    return false;
+}
+
+const REFRESH_HINT = '💡 令牌过期：切换到该账号并发送任意消息即可刷新令牌';
+
 async function listProfiles(isConsole: boolean, flavor: AuthFlavor = 'claude'): Promise<BangCommandResult> {
-    const { profiles } = readCcsProfiles();
+    const { profiles: ccsProfiles } = readCcsProfiles();
+    const codexProfiles = flavor === 'codex' ? readCodexProfiles() : [];
+
+    if (flavor === 'codex' && codexProfiles.length === 0) {
+        return { message: '❌ 未找到已登录的 Codex 账户。', action: 'none' };
+    }
+
+    // For codex flavor, build CcsProfileInfo from codex profiles (which carry contextMode from codex config.yaml)
+    const profiles: CcsProfileInfo[] = flavor === 'codex'
+        ? codexToCcsProfiles(codexProfiles)
+        : ccsProfiles;
+
     const currentProfile = getCurrentProfileForFlavor(flavor);
-    const codexNames = flavor === 'codex' ? new Set(readCodexProfiles().map(p => p.name)) : undefined;
+    const codexNames = flavor === 'codex' ? new Set(codexProfiles.map(p => p.name)) : undefined;
+    const codexDefault = flavor === 'codex' ? readCodexDefaultProfile() : null;
     const currentProfileInfo = currentProfile
         ? profiles.find(p => p.name === currentProfile) ?? null
         : null;
@@ -174,9 +231,10 @@ async function listProfiles(isConsole: boolean, flavor: AuthFlavor = 'claude'): 
             messages.push(SEPARATOR);
             for (const p of profiles) {
                 const status = getProfileStatus(p, flavor, codexNames);
-                messages.push(profileLine('○', p.name, status, usageMap.get(p.name)));
+                messages.push(profileLine('○', p.name, status, usageMap.get(p.name), p.name === codexDefault));
             }
             messages.push(SEPARATOR);
+            if (hasAuthExpired(usageMap)) messages.push(REFRESH_HINT);
         } else {
             messages.push('未找到 CCS 配置。');
         }
@@ -184,51 +242,44 @@ async function listProfiles(isConsole: boolean, flavor: AuthFlavor = 'claude'): 
     }
 
     const isShared = currentProfileInfo?.contextMode === 'shared';
-    const currentGroup = isShared ? (currentProfileInfo.contextGroup || 'default') : null;
 
-    // Console: no "current" concept — list all profiles in the group equally
+    // Console: no "current" concept — list all shared profiles equally
     if (isConsole) {
-        const groupProfiles = currentGroup
-            ? profiles.filter(p => p.contextMode === 'shared' && (p.contextGroup || 'default') === currentGroup)
-            : [];
+        const sharedProfiles = isShared ? profiles.filter(p => p.contextMode === 'shared') : [];
 
-        const usageMap = await fetchUsageSummaries(groupProfiles.map(p => p.name), flavor);
+        const usageMap = await fetchUsageSummaries(sharedProfiles.map(p => p.name), flavor);
         const codexFlag = flavor === 'codex' ? ' --codex' : '';
-        const messages: string[] = [];
-        if (currentGroup) {
-            messages.push(`📋 组 "${currentGroup}" (${flavorLabel})`);
-        }
+        const messages: string[] = [`📋 共享账号 (${flavorLabel})`];
         messages.push(SEPARATOR);
-        for (const p of groupProfiles) {
+        for (const p of sharedProfiles) {
             const status = getProfileStatus(p, flavor, codexNames);
-            messages.push(profileLine('', p.name, status, usageMap.get(p.name)));
+            messages.push(profileLine('', p.name, status, usageMap.get(p.name), p.name === codexDefault));
         }
         messages.push(SEPARATOR);
 
-        if (groupProfiles.length > 1) {
+        if (sharedProfiles.length > 1) {
             messages.push(`!auth-all <名称>${codexFlag} → 切换全部会话`);
-            const suggestions = groupProfiles.map(p => `!auth-all ${p.name}${codexFlag}`);
+            if (hasAuthExpired(usageMap)) messages.push(REFRESH_HINT);
+            const suggestions = sharedProfiles.map(p => `!auth-all ${p.name}${codexFlag}`);
             return { message: messages, action: 'none', suggestions };
         } else {
-            messages.push('本组无其他账号。');
+            messages.push('暂无其他可切换账号。');
+            if (hasAuthExpired(usageMap)) messages.push(REFRESH_HINT);
             return { message: messages, action: 'none' };
         }
     }
 
     // Normal session: show current profile with ● indicator
-    const switchable = currentGroup
-        ? profiles.filter(p =>
-            p.contextMode === 'shared'
-            && (p.contextGroup || 'default') === currentGroup
-            && p.name !== currentProfile)
+    const switchable = isShared
+        ? profiles.filter(p => p.contextMode === 'shared' && p.name !== currentProfile)
         : [];
 
-    const allInGroup = [currentProfile, ...switchable.map(p => p.name)];
-    const usageMap = await fetchUsageSummaries(allInGroup, flavor);
+    const allShared = [currentProfile, ...switchable.map(p => p.name)];
+    const usageMap = await fetchUsageSummaries(allShared, flavor);
     const messages: string[] = [];
 
-    if (currentGroup) {
-        messages.push(`📋 组 "${currentGroup}" (${flavorLabel})`);
+    if (isShared) {
+        messages.push(`📋 共享账号 (${flavorLabel})`);
     } else {
         messages.push(`📋 ${currentProfile} (独立, ${flavorLabel})`);
     }
@@ -236,46 +287,49 @@ async function listProfiles(isConsole: boolean, flavor: AuthFlavor = 'claude'): 
     const currentStatus = currentProfileInfo ? getProfileStatus(currentProfileInfo, flavor, codexNames) : '';
 
     messages.push(SEPARATOR);
-    messages.push(profileLine('●', currentProfile, currentStatus, usageMap.get(currentProfile)));
+    messages.push(profileLine('●', currentProfile, currentStatus, usageMap.get(currentProfile), currentProfile === codexDefault));
 
-    if (currentGroup && switchable.length > 0) {
+    if (isShared && switchable.length > 0) {
         for (const profile of switchable) {
             const status = getProfileStatus(profile, flavor, codexNames);
-            messages.push(profileLine('○', profile.name, status, usageMap.get(profile.name)));
+            messages.push(profileLine('○', profile.name, status, usageMap.get(profile.name), profile.name === codexDefault));
         }
         messages.push(SEPARATOR);
         messages.push('!auth <名称> → 切换当前会话');
+        if (hasAuthExpired(usageMap)) messages.push(REFRESH_HINT);
 
         const suggestions = switchable.map(p => `!auth ${p.name}`);
         return { message: messages, action: 'none', suggestions };
-    } else if (currentGroup) {
+    } else if (isShared) {
         messages.push(SEPARATOR);
-        messages.push('本组无其他账号。');
+        messages.push('暂无其他可切换账号。');
+        if (hasAuthExpired(usageMap)) messages.push(REFRESH_HINT);
     } else {
         messages.push(SEPARATOR);
         messages.push('无法切换。');
+        if (hasAuthExpired(usageMap)) messages.push(REFRESH_HINT);
     }
 
     return { message: messages, action: 'none' };
 }
 
 /**
- * Check whether two profiles share the same context (both shared mode, same group).
- * When context is shared, switching profiles should NOT reset the session.
+ * True when both source and target are in shared mode — switching between
+ * them should NOT reset the session. Single-default-group model: all shared
+ * profiles live in the same group, so mode equality is sufficient.
  */
 function isSharedContext(
     source: CcsProfileInfo | null,
     target: CcsProfileInfo,
 ): boolean {
-    if (!source) return false;
-    if (source.contextMode !== 'shared' || target.contextMode !== 'shared') return false;
-    const sourceGroup = source.contextGroup || 'default';
-    const targetGroup = target.contextGroup || 'default';
-    return sourceGroup === targetGroup;
+    return source?.contextMode === 'shared' && target.contextMode === 'shared';
 }
 
 function switchProfile(profileName: string, flavor: AuthFlavor = 'claude'): BangCommandResult {
-    const { profiles } = readCcsProfiles();
+    const { profiles: ccsProfiles } = readCcsProfiles();
+    const profiles: CcsProfileInfo[] = flavor === 'codex'
+        ? codexToCcsProfiles(readCodexProfiles())
+        : ccsProfiles;
     const currentProfile = getCurrentProfileForFlavor(flavor);
 
     // Find the target profile
@@ -299,13 +353,11 @@ function switchProfile(profileName: string, flavor: AuthFlavor = 'claude'): Bang
         : null;
 
     if (!isSharedContext(currentProfileInfo, target)) {
-        const describeMode = (p: CcsProfileInfo | null): string =>
-            !p || p.contextMode !== 'shared' ? '独立' : `组 "${p.contextGroup || 'default'}"`;
         return {
             message: [
                 '❌ 无法切换',
-                `"${currentProfile || 'unknown'}" → ${describeMode(currentProfileInfo)}`,
-                `"${profileName}" → ${describeMode(target)}`,
+                `"${currentProfile || 'unknown'}" → ${describeContextMode(currentProfileInfo)}`,
+                `"${profileName}" → ${describeContextMode(target)}`,
             ],
             action: 'none',
         };
@@ -313,7 +365,8 @@ function switchProfile(profileName: string, flavor: AuthFlavor = 'claude'): Bang
 
     // Verify the relevant instance directory exists
     if (flavor === 'codex') {
-        if (!readCodexProfiles().some(p => p.name === profileName)) {
+        // profiles already built from readCodexProfiles() — no need to re-read
+        if (!profiles.some(p => p.name === profileName)) {
             return { message: `❌ Codex 配置 "${profileName}" 未初始化（无 auth.json）。`, action: 'none' };
         }
     } else {
@@ -324,11 +377,37 @@ function switchProfile(profileName: string, flavor: AuthFlavor = 'claude'): Bang
 
     // Perform the env-level switch
     applyProfileSwitch(profileName, flavor, target.instancePath);
+    const defaultUpdated = tryPersistDefaultProfile(profileName, flavor);
 
     const usageLine = flavor !== 'codex' ? getCachedUsageSummary(target.instancePath) : null;
     const messages = [`✅ 已切换到 "${profileName}"`];
+    messages.push(defaultProfileMessage(profileName, defaultUpdated));
     if (usageLine) messages.push(usageLine);
     return { message: messages, action: 'restart-session' };
+}
+
+/**
+ * Persist the selected profile as the default so newly-spawned sessions
+ * pick up the new account without waiting for the fs.watch broadcast.
+ */
+function tryPersistDefaultProfile(profileName: string, flavor: AuthFlavor): boolean {
+    try {
+        if (flavor === 'codex') {
+            setCodexDefaultProfile(profileName);
+        } else {
+            setCcsDefaultProfile(profileName);
+        }
+        return true;
+    } catch (err) {
+        logger.debug('[!auth] Failed to update default profile:', err);
+        return false;
+    }
+}
+
+function defaultProfileMessage(profileName: string, updated: boolean): string {
+    return updated
+        ? `默认账号已更新 → 新会话将使用 "${profileName}"`
+        : '⚠ 默认账号未更新（新会话仍使用旧默认）';
 }
 
 /**
@@ -337,7 +416,10 @@ function switchProfile(profileName: string, flavor: AuthFlavor = 'claude'): Bang
  * to a global file so other sessions pick it up via fs.watch.
  */
 function switchAllProfiles(profileName: string, flavor: AuthFlavor = 'claude'): BangCommandResult {
-    const { profiles } = readCcsProfiles();
+    const { profiles: ccsProfiles } = readCcsProfiles();
+    const profiles: CcsProfileInfo[] = flavor === 'codex'
+        ? codexToCcsProfiles(readCodexProfiles())
+        : ccsProfiles;
     const currentProfile = getCurrentProfileForFlavor(flavor);
     const target = profiles.find(p => p.name === profileName);
 
@@ -353,13 +435,11 @@ function switchAllProfiles(profileName: string, flavor: AuthFlavor = 'claude'): 
         : null;
 
     if (!isSharedContext(currentProfileInfo, target)) {
-        const describeMode = (p: CcsProfileInfo | null): string =>
-            !p || p.contextMode !== 'shared' ? '独立' : `组 "${p.contextGroup || 'default'}"`;
         return {
             message: [
                 '❌ 无法切换',
-                `"${currentProfile || 'unknown'}" → ${describeMode(currentProfileInfo)}`,
-                `"${profileName}" → ${describeMode(target)}`,
+                `"${currentProfile || 'unknown'}" → ${describeContextMode(currentProfileInfo)}`,
+                `"${profileName}" → ${describeContextMode(target)}`,
             ],
             action: 'none',
         };
@@ -369,12 +449,13 @@ function switchAllProfiles(profileName: string, flavor: AuthFlavor = 'claude'): 
         return { message: `❌ 配置 "${profileName}" 未初始化。`, action: 'none' };
     }
 
-    const groupName = currentProfileInfo?.contextGroup || 'default';
-
     // Write global file so other sessions pick up the change via fs.watch
+    const broadcastFile = flavor === 'codex'
+        ? configuration.activeCodexProfileFile
+        : configuration.activeProfileFile;
     try {
-        writeFileSync(configuration.activeProfileFile, profileName, 'utf-8');
-        logger.debug(`[!auth] Wrote global active profile: ${profileName}`);
+        writeFileSync(broadcastFile, profileName, 'utf-8');
+        logger.debug(`[!auth] Wrote global active profile (${flavor}): ${profileName}`);
     } catch (err) {
         logger.debug('[!auth] Failed to write global profile file:', err);
         return {
@@ -383,8 +464,51 @@ function switchAllProfiles(profileName: string, flavor: AuthFlavor = 'claude'): 
         };
     }
 
+    const defaultUpdated = tryPersistDefaultProfile(profileName, flavor);
+
     const usageLine = getCachedUsageSummary(target.instancePath);
-    const messages = [`✅ 已广播切换到 "${profileName}"`, `组 "${groupName}" 中的所有会话`];
+    const messages = [`✅ 已广播切换到 "${profileName}"`, '所有共享会话'];
+    messages.push(defaultProfileMessage(profileName, defaultUpdated));
     if (usageLine) messages.push(usageLine);
     return { message: messages, action: 'none' };
+}
+
+/** Render a profile's context mode for error messages. */
+function describeContextMode(p: CcsProfileInfo | null): string {
+    return p?.contextMode === 'shared' ? '共享' : '独立';
+}
+
+/**
+ * Watch the global codex profile broadcast file and invoke `onSwitch` whenever
+ * a valid profile switch was applied (env updated, same context group).
+ *
+ * Mirrors the claude-side fs.watch wiring in claudeRemoteLauncher but targets
+ * `active-codex-profile`. Callers get a notification after the env has already
+ * been updated by `tryGlobalProfileSwitch('codex')` — they only need to react
+ * (abort turn, restart subprocess, etc.).
+ *
+ * Returns null when the watcher could not be set up (errors are logged).
+ * Callers must `.close()` the returned watcher during cleanup.
+ */
+export function watchCodexProfileFile(onSwitch: () => void): FSWatcher | null {
+    let debounceTimer: NodeJS.Timeout | null = null;
+    try {
+        const watcher = watch(configuration.happyHomeDir, (_event, filename) => {
+            if (filename !== 'active-codex-profile') return;
+            if (debounceTimer) clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(() => {
+                const switched = tryGlobalProfileSwitch('codex');
+                if (switched) {
+                    onSwitch();
+                }
+            }, 200);
+        });
+        watcher.on('error', (err) => {
+            logger.debug('[!auth] Codex profile watcher error:', err);
+        });
+        return watcher;
+    } catch (err) {
+        logger.debug('[!auth] Failed to set up codex profile watcher:', err);
+        return null;
+    }
 }

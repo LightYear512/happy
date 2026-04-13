@@ -58,3 +58,18 @@ export function parseCodexFlag(args: string): { cleanArgs: string; hasCodexFlag:
     const cleanArgs = args.replace(/\s*--codex(?:\s|$)/, ' ').replace(/\s+/g, ' ').trim();
     return { cleanArgs, hasCodexFlag };
 }
+
+/**
+ * Reject `--codex` flag in non-console contexts. Normal sessions are flavor-pinned
+ * by `ctx.flavor` — cross-flavor management belongs in the console.
+ *
+ * Returns null when the call is allowed, an error result when it should be blocked.
+ */
+export function rejectCodexFlagInSession(args: string, ctx: BangCommandContext): BangCommandResult | null {
+    if (ctx.isConsoleSession) return null;
+    if (!/(?:^|\s)--codex(?:\s|$)/.test(args)) return null;
+    return {
+        message: '❌ 普通会话不支持 --codex 标志\n\n跨 flavor 管理请在控制台中操作；codex 会话内直接使用命令即可（无需 --codex）',
+        action: 'none',
+    };
+}

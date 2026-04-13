@@ -98,44 +98,41 @@ describe('handleAuthBangCommand', () => {
             expect(msg).toContain('work');
         });
 
-        it('should list same-group profiles when in a shared group', async () => {
+        it('should list other shared profiles when in shared mode', async () => {
             mockCcsProfiles({
-                work: { type: 'account', context_mode: 'shared', context_group: 'team' },
-                personal: { type: 'account', context_mode: 'shared', context_group: 'team' },
-                other: { type: 'account', context_mode: 'shared', context_group: 'solo' },
+                work: { type: 'account', context_mode: 'shared' },
+                personal: { type: 'account', context_mode: 'shared' },
             });
             process.env.CLAUDE_CONFIG_DIR = join(ccsDir, 'instances', 'work');
 
             const result = await handleAuthBangCommand('', createMockContext());
             expect(result.action).toBe('none');
             const msg = flatMsg(result.message);
-            expect(msg).toMatch(/组 "team"|Group "team"/);
+            expect(msg).toContain('共享账号');
             expect(msg).toContain('work');
             expect(msg).toContain('personal');
-            // Should NOT show profile from a different group
-            expect(msg).not.toContain('other');
             expect(msg).toContain('!auth');
         });
 
-        it('should show no switchable when alone in shared group', async () => {
+        it('should show no switchable when alone in shared mode', async () => {
             mockCcsProfiles({
-                work: { type: 'account', context_mode: 'shared', context_group: 'team' },
+                work: { type: 'account', context_mode: 'shared' },
             });
             process.env.CLAUDE_CONFIG_DIR = join(ccsDir, 'instances', 'work');
 
             const result = await handleAuthBangCommand('', createMockContext());
             const msg = flatMsg(result.message);
-            // Only one profile in group — shows the group but only the current profile
+            // Only one shared profile — shows the current profile and no switchable
             expect(msg).toContain('work');
-            expect(msg).toMatch(/组 "team"|Group "team"/);
+            expect(msg).toContain('共享账号');
         });
     });
 
     describe('!auth <name> (switch profile)', () => {
-        it('should switch between profiles in the same shared group', async () => {
+        it('should switch between shared profiles', async () => {
             mockCcsProfiles({
-                work: { type: 'account', context_mode: 'shared', context_group: 'team' },
-                personal: { type: 'account', context_mode: 'shared', context_group: 'team' },
+                work: { type: 'account', context_mode: 'shared' },
+                personal: { type: 'account', context_mode: 'shared' },
             });
             process.env.CLAUDE_CONFIG_DIR = join(ccsDir, 'instances', 'work');
 
@@ -146,26 +143,9 @@ describe('handleAuthBangCommand', () => {
             expect(process.env.CLAUDE_CONFIG_DIR).toBe(join(ccsDir, 'instances', 'personal'));
         });
 
-        it('should reject switching to a profile in a different group', async () => {
-            mockCcsProfiles({
-                work: { type: 'account', context_mode: 'shared', context_group: 'team' },
-                other: { type: 'account', context_mode: 'shared', context_group: 'solo' },
-            });
-            process.env.CLAUDE_CONFIG_DIR = join(ccsDir, 'instances', 'work');
-
-            const result = await handleAuthBangCommand('other', createMockContext());
-            expect(result.action).toBe('none');
-            const msg = flatMsg(result.message);
-            expect(msg).toMatch(/无法切换|Cannot switch/);
-            expect(msg).toContain('"team"');
-            expect(msg).toContain('"solo"');
-            // Should NOT have changed CLAUDE_CONFIG_DIR
-            expect(process.env.CLAUDE_CONFIG_DIR).toBe(join(ccsDir, 'instances', 'work'));
-        });
-
         it('should reject switching to an isolated profile', async () => {
             mockCcsProfiles({
-                work: { type: 'account', context_mode: 'shared', context_group: 'team' },
+                work: { type: 'account', context_mode: 'shared' },
                 isolated: { type: 'account' },
             });
             process.env.CLAUDE_CONFIG_DIR = join(ccsDir, 'instances', 'work');
@@ -179,7 +159,7 @@ describe('handleAuthBangCommand', () => {
         it('should reject switching when current profile is not shared', async () => {
             mockCcsProfiles({
                 work: { type: 'account' },
-                personal: { type: 'account', context_mode: 'shared', context_group: 'team' },
+                personal: { type: 'account', context_mode: 'shared' },
             });
             process.env.CLAUDE_CONFIG_DIR = join(ccsDir, 'instances', 'work');
 
@@ -192,7 +172,7 @@ describe('handleAuthBangCommand', () => {
 
         it('should skip switch when already on same profile', async () => {
             mockCcsProfiles({
-                work: { type: 'account', context_mode: 'shared', context_group: 'team' },
+                work: { type: 'account', context_mode: 'shared' },
             });
             process.env.CLAUDE_CONFIG_DIR = join(ccsDir, 'instances', 'work');
 
@@ -221,8 +201,8 @@ describe('handleAuthBangCommand', () => {
             });
 
             mockReadFileSync.mockReturnValue(JSON.stringify({
-                work: { type: 'account', context_mode: 'shared', context_group: 'team' },
-                personal: { type: 'account', context_mode: 'shared', context_group: 'team' },
+                work: { type: 'account', context_mode: 'shared' },
+                personal: { type: 'account', context_mode: 'shared' },
             }));
             process.env.CLAUDE_CONFIG_DIR = join(ccsDir, 'instances', 'work');
 
@@ -230,6 +210,29 @@ describe('handleAuthBangCommand', () => {
             expect(result.action).toBe('none');
             const msg = flatMsg(result.message);
             expect(msg).toMatch(/未初始化|not initialized/i);
+        });
+    });
+
+    describe('--codex flag rejection (normal session)', () => {
+        it('rejects --codex when ctx is not a console session', async () => {
+            mockCcsProfiles({
+                work: { type: 'account', context_mode: 'shared' },
+            });
+            process.env.CLAUDE_CONFIG_DIR = join(ccsDir, 'instances', 'work');
+
+            const result = await handleAuthBangCommand('xxx --codex', createMockContext());
+            expect(result.action).toBe('none');
+            const msg = flatMsg(result.message);
+            expect(msg).toContain('普通会话不支持 --codex');
+        });
+
+        it('accepts --codex in console session', async () => {
+            // Console mode + --codex should NOT be rejected by the codex-flag guard.
+            // (It may still error on other grounds — we only assert the guard isn't tripped.)
+            const consoleCtx: BangCommandContext = { ...createMockContext(), isConsoleSession: true };
+            const result = await handleAuthBangCommand('--codex', consoleCtx);
+            const msg = flatMsg(result.message);
+            expect(msg).not.toContain('普通会话不支持 --codex');
         });
     });
 });

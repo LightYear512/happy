@@ -17,11 +17,11 @@ export { hasActiveInteractiveSession, handleInteractiveInput } from './interacti
  */
 const commands: Record<string, { handler: BangCommandHandler; desc: string; loadingMsg?: string; sessionOnly?: boolean; consoleOnly?: boolean; hidden?: boolean; flavorOnly?: BangCommandContext['flavor'] }> = {
     'auth':        { handler: handleAuthBangCommand,        desc: '切换 CCS 账号', sessionOnly: true },
-    'auth-all':    { handler: handleAuthAllBangCommand,     desc: '切换全部会话账号', consoleOnly: true },
     'login':       { handler: handleLoginBangCommand,       desc: '登录账户' },
+    'usage':       { handler: handleUsageBangCommand,       desc: '查看 API 用量' },
+    'auth-all':    { handler: handleAuthAllBangCommand,     desc: '切换全部会话账号', consoleOnly: true },
     'restart':     { handler: handleRestartBangCommand,     desc: '重启会话', sessionOnly: true },
     'restart-all': { handler: handleRestartAllBangCommand,  desc: '重启全部会话', consoleOnly: true },
-    'usage':       { handler: handleUsageBangCommand,       desc: '查看 API 用量' },
     // TODO: !session / !open 暂停使用，待 multi-backend 会话浏览重构后恢复。实现保留在 sessionCommand.ts / openCommand.ts。
     // 'session':     { handler: handleSessionsBangCommand,    desc: '浏览项目目录和会话', loadingMsg: '⏳ 正在扫描会话...', consoleOnly: true },
     // 'open':        { handler: handleOpenBangCommand,        desc: '打开会话', loadingMsg: '⏳ 正在打开会话...', consoleOnly: true },
@@ -76,34 +76,49 @@ function parseBangCommand(text: string): { name: string; args: string } {
 /** Commands hidden from help output (low-frequency commands not worth showing). */
 const helpHidden = new Set(['restart-all']);
 
+/** Commands that support --codex flag, with their codex-specific descriptions. */
+const codexVariants: Record<string, string> = {
+    'auth':     '切换当前会话 Codex 账号',
+    'auth-all': '切换全部会话 Codex 账号',
+    'login':    '登录 Codex 账号',
+    'usage':    '查看 Codex 用量',
+};
+
 function buildHelp(isConsole: boolean, flavor?: string): BangCommandResult {
-    const allCommands: Array<[string, string]> = [
-        ...Object.entries(commands)
-            .filter(([name, entry]) => !entry.hidden && !helpHidden.has(name) && !(isConsole && entry.sessionOnly) && !(!isConsole && entry.consoleOnly) && (!entry.flavorOnly || entry.flavorOnly === flavor))
-            .map(([name, { desc }]) => [name, desc] as [string, string]),
-        ['help', '显示帮助'],
-    ];
+    const baseCommands: Array<[string, string]> = Object.entries(commands)
+        .filter(([name, entry]) => !entry.hidden && !helpHidden.has(name) && !(isConsole && entry.sessionOnly) && !(!isConsole && entry.consoleOnly) && (!entry.flavorOnly || entry.flavorOnly === flavor))
+        .map(([name, { desc }]) => [name, desc] as [string, string]);
 
     const messages: string[] = [
         '📖 快捷命令',
         SEPARATOR,
     ];
 
-    for (const [name, desc] of allCommands) {
+    const suggestions: string[] = [];
+
+    for (const [name, desc] of baseCommands) {
         const cmdAliases = Object.entries(aliases)
             .filter(([, target]) => target === name)
             .map(([alias]) => `!${alias}`);
 
         const aliasStr = cmdAliases.length > 0 ? ` (${cmdAliases.join(', ')})` : '';
         messages.push(`!${name}${aliasStr} → ${desc}`);
+        suggestions.push(`!${name}`);
+        if (isConsole && codexVariants[name]) {
+            messages.push(`!${name} --codex → ${codexVariants[name]}`);
+            suggestions.push(`!${name} --codex`);
+        }
     }
+
+    messages.push(`!help (!h) → 显示帮助`);
+    suggestions.push('!help');
 
     messages.push(SEPARATOR);
 
     return {
         message: messages,
         action: 'none',
-        suggestions: allCommands.map(([name]) => `!${name}`),
+        suggestions,
     };
 }
 
@@ -121,36 +136,33 @@ export function buildConsoleWelcome(): BangCommandResult {
         SEPARATOR,
     ];
 
-    // Commands that support --codex flag, with their codex-specific descriptions
-    const codexVariants: Record<string, string> = {
-        'login':    '登录 Codex 账号',
-        'usage':    '查看 Codex 用量',
-        'auth-all': '切换全部会话 Codex 账号',
-    };
-
     // Show commands available in console (consoleOnly + shared, exclude hidden and welcome-hidden)
     const consoleCommands = Object.entries(commands)
         .filter(([name, entry]) => !entry.hidden && !entry.sessionOnly && !consoleWelcomeHidden.has(name));
+
+    const suggestions: string[] = [];
     for (const [name, { desc }] of consoleCommands) {
         const cmdAliases = Object.entries(aliases)
             .filter(([, target]) => target === name)
             .map(([alias]) => `!${alias}`);
         const aliasStr = cmdAliases.length > 0 ? ` (${cmdAliases.join(', ')})` : '';
         messages.push(`!${name}${aliasStr} → ${desc}`);
+        suggestions.push(`!${name}`);
         if (codexVariants[name]) {
             messages.push(`!${name} --codex → ${codexVariants[name]}`);
+            suggestions.push(`!${name} --codex`);
         }
     }
     messages.push(`!help (!h) → 显示全部命令`);
+    suggestions.push('!help');
 
     messages.push(SEPARATOR);
     messages.push('普通消息不会被处理，请使用 ! 开头的命令');
 
-    const codexSuggestions = Object.keys(codexVariants).map(name => `!${name} --codex`);
     return {
         message: messages,
         action: 'none',
-        suggestions: [...consoleCommands.map(([name]) => `!${name}`), ...codexSuggestions, '!help'],
+        suggestions,
     };
 }
 

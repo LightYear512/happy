@@ -12,6 +12,7 @@ import { existsSync } from 'node:fs';
 import { logger } from '@/ui/logger';
 import { configuration } from '@/configuration';
 import { SEPARATOR, type BangCommandContext, type BangCommandResult } from './types';
+import { formatRelativeTime } from './relativeTime';
 
 /** Represents a discovered Claude session file */
 export interface ClaudeSessionInfo {
@@ -194,22 +195,6 @@ const BAR = '━';
 const GROUP_BAR_LEN = 19;
 
 /**
- * Format relative time from a Date to now.
- */
-function relativeTime(date: Date): string {
-    const diffMs = Date.now() - date.getTime();
-    const diffMin = Math.floor(diffMs / 60_000);
-    const diffHour = Math.floor(diffMs / 3_600_000);
-    const diffDay = Math.floor(diffMs / 86_400_000);
-
-    if (diffMin < 1) return '刚刚';
-    if (diffMin < 60) return `${diffMin}分钟前`;
-    if (diffHour < 24) return `${diffHour}小时前`;
-    if (diffDay < 30) return `${diffDay}天前`;
-    return `${Math.floor(diffDay / 30)}月前`;
-}
-
-/**
  * Determine the time group label for a session.
  */
 function timeGroupLabel(date: Date): string {
@@ -339,7 +324,7 @@ function formatDirectoryListing(sessions: ClaudeSessionInfo[]): BangCommandResul
             messages.push(`▸ ${group} ${BAR.repeat(GROUP_BAR_LEN)}`);
         }
 
-        const time = relativeTime(d.mtime);
+        const time = formatRelativeTime(d.mtime, { justNow: true });
         const name = displayNames.get(d.cwd) || shortenPath(d.cwd);
         messages.push(`  ${name} · ${d.count}个会话 · ${time}`);
     }
@@ -370,7 +355,7 @@ export function formatAllSessionsListing(sessions: ClaudeSessionInfo[]): BangCom
         }
 
         const shortId = s.sessionId.slice(0, SHORT_ID_LEN);
-        const time = relativeTime(s.mtime);
+        const time = formatRelativeTime(s.mtime, { justNow: true });
         const dir = s.cwd ? shortenPath(s.cwd) : s.projectDir;
         const cleanMsg = s.preview ? s.preview.replace(/\n/g, ' ').trim() : '';
         const msg = cleanMsg.slice(0, 35);
@@ -425,7 +410,7 @@ function formatSessionListing(sessions: ClaudeSessionInfo[], rawFilter: string):
         }
 
         const shortId = s.sessionId.slice(0, SHORT_ID_LEN);
-        const time = relativeTime(s.mtime);
+        const time = formatRelativeTime(s.mtime, { justNow: true });
         const cleanMsg = s.preview ? s.preview.replace(/\n/g, ' ').trim() : '';
         const msg = cleanMsg.slice(0, 35);
         const msgSuffix = cleanMsg.length > 35 ? '…' : '';

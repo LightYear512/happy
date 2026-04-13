@@ -1,15 +1,20 @@
-import { existsSync, readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { ProxyAgent, fetch as undiciFetch } from 'undici';
 import { logger } from '@/ui/logger';
+import { configuration } from '@/configuration';
 import { getCurrentCcsProfile, readCcsProfiles, getInstancePath, getCurrentCodexProfile, getCodexInstancePath, readCodexProfiles, type AuthFlavor } from './ccsProfiles';
-import { SEPARATOR, codeBlock, parseCodexFlag, type BangCommandContext, type BangCommandResult } from './types';
+import { SEPARATOR, codeBlock, parseCodexFlag, rejectCodexFlagInSession, type BangCommandContext, type BangCommandResult } from './types';
+import { formatRelativeTime } from './relativeTime';
 
 const USAGE_API_URL = 'https://api.anthropic.com/api/oauth/usage';
+/** Fresh TTL: cache is considered authoritative within this window (no revalidate). */
 const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+/** Stale TTL: beyond fresh but within stale — cached value is still shown with ⏳ marker, and a background revalidate fires. */
+const STALE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 export interface UsageData {
     five_hour: { utilization: number; resets_at: string } | null;
@@ -238,46 +243,142 @@ export function getCachedUsageSummary(cacheKey: string): string | null {
     return formatClaudeUsageSummary(cached.data);
 }
 
-/**
- * Fetch a one-line usage summary for a profile, respecting cache.
- * Returns a short string like "📊 5h: 23% · 7d: 45%" or null on failure.
- * Timeout: 5s per request. Cache: reuses existing CACHE_TTL_MS data.
- */
-export async function fetchProfileUsageSummary(profileName: string, flavor: AuthFlavor): Promise<string | null> {
-    try {
-        if (flavor === 'codex') {
-            const codexHome = getCodexInstancePath(profileName);
-            const cached = codexCache.get(codexHome);
-            if (cached && (Date.now() - cached.fetchedAt) < CACHE_TTL_MS) {
-                return formatCodexUsageSummary(cached.data);
-            }
+/** Usage summary result for !auth profile list. */
+export interface ProfileUsageEntry {
+    /** Formatted one-line summary if available (may come from stale cache). */
+    summary: string | null;
+    /** True when the fetch failed because the OAuth token is expired/invalid (401/403). */
+    authExpired: boolean;
+    /** True when the summary was served from the stale-TTL window (fresh expired but still within STALE_TTL_MS). */
+    stale: boolean;
+    /** Unix ms when the underlying data was fetched, or null if no data. */
+    cachedAt: number | null;
+}
+
+/** Detect whether a thrown fetch error is an auth-expired error (401/403). */
+function isAuthExpiredError(err: unknown): boolean {
+    if (!(err instanceof Error)) return false;
+    return err.message.includes('令牌已过期') || err.message.includes('令牌已过期或无效');
+}
+
+/** In-flight background revalidations (dedupe by cache key). */
+const inflightRevalidate = new Set<string>();
+
+/** Fire-and-forget background refresh for a Claude profile whose cache is stale. */
+function backgroundRevalidateClaude(instancePath: string, profileName: string): void {
+    if (inflightRevalidate.has(`claude:${instancePath}`)) return;
+    inflightRevalidate.add(`claude:${instancePath}`);
+    void (async () => {
+        try {
+            const token = readOAuthToken(instancePath);
+            if (!token) return;
+            const data = await Promise.race([
+                fetchUsage(token, profileName),
+                new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000)),
+            ]);
+            setClaudeCache(instancePath, { data, fetchedAt: Date.now() });
+            logger.debug(`[!usage] background revalidate succeeded for ${profileName}`);
+        } catch (err) {
+            logger.debug(`[!usage] background revalidate failed for ${profileName}:`, err);
+        } finally {
+            inflightRevalidate.delete(`claude:${instancePath}`);
+        }
+    })();
+}
+
+/** Fire-and-forget background refresh for a Codex profile whose cache is stale. */
+function backgroundRevalidateCodex(codexHome: string, profileName: string): void {
+    if (inflightRevalidate.has(`codex:${codexHome}`)) return;
+    inflightRevalidate.add(`codex:${codexHome}`);
+    void (async () => {
+        try {
             const token = readCodexAccessToken(codexHome);
-            if (!token) return null;
+            if (!token) return;
             const data = await Promise.race([
                 fetchCodexUsage(token, profileName),
                 new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000)),
             ]);
-            codexCache.set(codexHome, { data, fetchedAt: Date.now() });
-            return formatCodexUsageSummary(data);
+            setCodexCache(codexHome, { data, fetchedAt: Date.now() });
+            logger.debug(`[!usage] codex background revalidate succeeded for ${profileName}`);
+        } catch (err) {
+            logger.debug(`[!usage] codex background revalidate failed for ${profileName}:`, err);
+        } finally {
+            inflightRevalidate.delete(`codex:${codexHome}`);
+        }
+    })();
+}
+
+/**
+ * Fetch a one-line usage summary for a profile, respecting cache.
+ *
+ * Cache strategy (stale-while-revalidate):
+ *   - Fresh hit (age < CACHE_TTL_MS): return cached summary with `stale=false`.
+ *   - Stale hit (CACHE_TTL_MS ≤ age < STALE_TTL_MS): return cached summary with
+ *     `stale=true`, trigger a fire-and-forget background revalidate so the next
+ *     call sees fresh data. If revalidate fails (e.g. token expired), the same
+ *     stale value keeps serving until STALE_TTL_MS elapses.
+ *   - Miss / expired beyond stale: synchronous network fetch (5s timeout).
+ *
+ * Returns `{ summary, authExpired, stale, cachedAt }` so callers can distinguish
+ * "no data yet" from "token expired and needs refresh via any cc message", and
+ * render a "⏳ N 分钟前" marker when the data is stale.
+ */
+export async function fetchProfileUsageSummary(profileName: string, flavor: AuthFlavor): Promise<ProfileUsageEntry> {
+    ensureHydrated();
+    const isCodex = flavor === 'codex';
+    const cacheKey = isCodex ? getCodexInstancePath(profileName) : getInstancePath(profileName);
+    try {
+        if (isCodex) {
+            const cached = codexCache.get(cacheKey);
+            const age = cached ? Date.now() - cached.fetchedAt : Infinity;
+            if (cached && age < CACHE_TTL_MS) {
+                return { summary: formatCodexUsageSummary(cached.data), authExpired: false, stale: false, cachedAt: cached.fetchedAt };
+            }
+            if (cached && age < STALE_TTL_MS) {
+                backgroundRevalidateCodex(cacheKey, profileName);
+                return { summary: formatCodexUsageSummary(cached.data), authExpired: false, stale: true, cachedAt: cached.fetchedAt };
+            }
+            const token = readCodexAccessToken(cacheKey);
+            if (!token) return { summary: null, authExpired: false, stale: false, cachedAt: null };
+            const data = await Promise.race([
+                fetchCodexUsage(token, profileName),
+                new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000)),
+            ]);
+            setCodexCache(cacheKey, { data, fetchedAt: Date.now() });
+            return { summary: formatCodexUsageSummary(data), authExpired: false, stale: false, cachedAt: Date.now() };
         }
 
         // Claude
-        const instancePath = getInstancePath(profileName);
-        const cached = cache.get(instancePath);
-        if (cached && (Date.now() - cached.fetchedAt) < CACHE_TTL_MS) {
-            return formatClaudeUsageSummary(cached.data);
+        const cached = cache.get(cacheKey);
+        const age = cached ? Date.now() - cached.fetchedAt : Infinity;
+        if (cached && age < CACHE_TTL_MS) {
+            return { summary: formatClaudeUsageSummary(cached.data), authExpired: false, stale: false, cachedAt: cached.fetchedAt };
         }
-        const token = readOAuthToken(instancePath);
-        if (!token) return null;
+        if (cached && age < STALE_TTL_MS) {
+            backgroundRevalidateClaude(cacheKey, profileName);
+            return { summary: formatClaudeUsageSummary(cached.data), authExpired: false, stale: true, cachedAt: cached.fetchedAt };
+        }
+        const token = readOAuthToken(cacheKey);
+        if (!token) return { summary: null, authExpired: false, stale: false, cachedAt: null };
         const data = await Promise.race([
             fetchUsage(token, profileName),
             new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000)),
         ]);
-        cache.set(instancePath, { data, fetchedAt: Date.now() });
-        return formatClaudeUsageSummary(data);
+        setClaudeCache(cacheKey, { data, fetchedAt: Date.now() });
+        return { summary: formatClaudeUsageSummary(data), authExpired: false, stale: false, cachedAt: Date.now() };
     } catch (err) {
         logger.debug(`[!usage] fetchProfileUsageSummary failed for ${profileName}:`, err);
-        return null;
+        // Fetch failed → fall back to any cached value still within stale window, so users
+        // keep seeing their last-known usage alongside the 🔒 / 💡 refresh hint.
+        const authExpired = isAuthExpiredError(err);
+        const cached = isCodex ? codexCache.get(cacheKey) : cache.get(cacheKey);
+        if (cached && (Date.now() - cached.fetchedAt) < STALE_TTL_MS) {
+            const summary = isCodex
+                ? formatCodexUsageSummary((cached as CachedCodexUsage).data)
+                : formatClaudeUsageSummary((cached as CachedUsage).data);
+            return { summary, authExpired, stale: true, cachedAt: cached.fetchedAt };
+        }
+        return { summary: null, authExpired, stale: false, cachedAt: null };
     }
 }
 
@@ -345,13 +446,9 @@ export function formatUsage(data: UsageData, profileLabel: string, cachedAt: num
 
     // Cache info
     const ageMs = Date.now() - cachedAt;
-    const ageSec = Math.floor(ageMs / 1000);
-    if (ageSec > 5) {
-        const ageMin = Math.floor(ageSec / 60);
-        const ageStr = ageMin > 0 ? `${ageMin} 分钟前` : `${ageSec} 秒前`;
-        const remainMs = CACHE_TTL_MS - ageMs;
-        const remainMin = Math.ceil(remainMs / 60000);
-        messages.push(`ℹ️ 缓存于 ${ageStr}（${remainMin} 分钟后刷新）`);
+    if (ageMs >= 6000) {
+        const remainMin = Math.ceil((CACHE_TTL_MS - ageMs) / 60000);
+        messages.push(`ℹ️ 缓存于 ${formatRelativeTime(cachedAt)}（${remainMin} 分钟后刷新）`);
     }
 
     return messages;
@@ -391,6 +488,98 @@ interface CachedCodexUsage {
 }
 
 const codexCache = new Map<string, CachedCodexUsage>();
+
+// ---------------------------------------------------------------------------
+// Disk persistence (stale-while-revalidate support)
+// ---------------------------------------------------------------------------
+//
+// Both `cache` (Claude) and `codexCache` (Codex) are mirrored to a single
+// JSON file under `$HAPPY_HOME_DIR/usage-cache.json`. Load is lazy (first
+// access), save is debounced (`PERSIST_DEBOUNCE_MS` after any mutation).
+//
+// Format:
+// {
+//   "version": 1,
+//   "claude": { "<instancePath>": { "data": {...}, "fetchedAt": 1234567890 } },
+//   "codex":  { "<codexHome>":    { "data": {...}, "fetchedAt": 1234567890 } }
+// }
+
+const USAGE_CACHE_FILE = join(configuration.happyHomeDir, 'usage-cache.json');
+const USAGE_CACHE_VERSION = 1;
+const PERSIST_DEBOUNCE_MS = 500;
+
+let hydrated = false;
+let persistTimer: NodeJS.Timeout | null = null;
+
+function ensureHydrated(): void {
+    if (hydrated) return;
+    hydrated = true;
+    let raw: string;
+    try {
+        raw = readFileSync(USAGE_CACHE_FILE, 'utf-8');
+    } catch (err) {
+        // Missing file on first run is the expected path — ignore silently.
+        if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+            logger.debug('[!usage] failed to read usage-cache:', err);
+        }
+        return;
+    }
+    try {
+        const parsed = JSON.parse(raw) as {
+            version?: number;
+            claude?: Record<string, CachedUsage>;
+            codex?: Record<string, CachedCodexUsage>;
+        };
+        if (parsed.version !== USAGE_CACHE_VERSION) {
+            logger.debug(`[!usage] usage-cache version mismatch (${parsed.version} vs ${USAGE_CACHE_VERSION}), ignoring`);
+            return;
+        }
+        const now = Date.now();
+        for (const [key, entry] of Object.entries(parsed.claude ?? {})) {
+            if (!entry || typeof entry.fetchedAt !== 'number') continue;
+            if ((now - entry.fetchedAt) >= STALE_TTL_MS) continue; // drop ancient entries
+            cache.set(key, entry);
+        }
+        for (const [key, entry] of Object.entries(parsed.codex ?? {})) {
+            if (!entry || typeof entry.fetchedAt !== 'number') continue;
+            if ((now - entry.fetchedAt) >= STALE_TTL_MS) continue;
+            codexCache.set(key, entry);
+        }
+        logger.debug(`[!usage] hydrated usage-cache: claude=${cache.size} codex=${codexCache.size}`);
+    } catch (err) {
+        logger.debug('[!usage] failed to hydrate usage-cache:', err);
+    }
+}
+
+function schedulePersist(): void {
+    if (persistTimer) return;
+    persistTimer = setTimeout(() => {
+        persistTimer = null;
+        try {
+            const payload = {
+                version: USAGE_CACHE_VERSION,
+                claude: Object.fromEntries(cache.entries()),
+                codex: Object.fromEntries(codexCache.entries()),
+            };
+            writeFileSync(USAGE_CACHE_FILE, JSON.stringify(payload), 'utf-8');
+        } catch (err) {
+            logger.debug('[!usage] failed to persist usage-cache:', err);
+        }
+    }, PERSIST_DEBOUNCE_MS);
+    persistTimer.unref?.();
+}
+
+/** Write to the Claude usage cache and schedule a debounced disk flush. */
+function setClaudeCache(key: string, entry: CachedUsage): void {
+    cache.set(key, entry);
+    schedulePersist();
+}
+
+/** Write to the Codex usage cache and schedule a debounced disk flush. */
+function setCodexCache(key: string, entry: CachedCodexUsage): void {
+    codexCache.set(key, entry);
+    schedulePersist();
+}
 
 /** Read access_token from a codex auth.json file. */
 function readCodexAccessToken(codexHome: string): string | null {
@@ -571,7 +760,7 @@ async function handleCodexUsage(profileArg: string, ctx: BangCommandContext): Pr
     try {
         const data = await fetchCodexUsage(token, profileLabel);
         const now = Date.now();
-        codexCache.set(cacheKey, { data, fetchedAt: now });
+        setCodexCache(cacheKey, { data, fetchedAt: now });
         return { message: formatCodexUsage(data, profileLabel, now), action: 'none' };
     } catch (error) {
         const errorMsg = error instanceof Error ? error.message : 'Unknown error';
@@ -599,6 +788,9 @@ async function handleCodexUsage(profileArg: string, ctx: BangCommandContext): Pr
  * - `!usage <profile>` — Show usage for a specific CCS profile
  */
 export async function handleUsageBangCommand(args: string, ctx: BangCommandContext): Promise<BangCommandResult> {
+    const codexReject = rejectCodexFlagInSession(args, ctx);
+    if (codexReject) return codexReject;
+
     const { cleanArgs: profileArg, hasCodexFlag } = parseCodexFlag(args);
 
     // Codex flavor (from session) or explicit --codex flag: delegate to codex handler
@@ -667,7 +859,7 @@ export async function handleUsageBangCommand(args: string, ctx: BangCommandConte
         const data = await fetchUsage(token, profileLabel);
         const now = Date.now();
 
-        cache.set(cacheKey, { data, fetchedAt: now });
+        setClaudeCache(cacheKey, { data, fetchedAt: now });
 
         return {
             message: formatUsage(data, profileLabel, now),
@@ -688,7 +880,7 @@ export async function handleUsageBangCommand(args: string, ctx: BangCommandConte
                 try {
                     const data = await fetchUsage(refreshed.token, refreshed.profileLabel);
                     const now = Date.now();
-                    cache.set(refreshed.cacheKey, { data, fetchedAt: now });
+                    setClaudeCache(refreshed.cacheKey, { data, fetchedAt: now });
                     return {
                         message: formatUsage(data, refreshed.profileLabel, now),
                         action: 'none',
@@ -726,19 +918,19 @@ export interface RateLimitContext {
     currentProfile: string
     /** Windows that are at or over 80% utilization, sorted by utilization descending */
     overLimitWindows: Array<{ label: string; utilization: number; resetsIn: string }>
-    /** Other CCS profiles in the same contextGroup with available quota */
+    /** Other shared CCS profiles with available quota */
     switchableProfiles: string[]
-    /** True when all known profiles (same group + credentials) are over limit */
+    /** True when all known shared profiles with credentials are over limit */
     allProfilesOverLimit: boolean
 }
 
 /**
  * Fetch usage for the current profile and find which windows triggered the rate limit.
- * Also scans other CCS profiles in the same contextGroup for ones with available quota.
+ * Also scans other shared CCS profiles for ones with available quota.
  * Returns null if usage data cannot be fetched (no token, API error, etc.).
  *
- * Only profiles that are `shared` in the same `contextGroup` are considered switchable,
- * matching the constraint enforced by `!auth` (authCommand.ts switchProfile).
+ * Only profiles in `shared` mode are considered switchable, matching the
+ * constraint enforced by `!auth` (authCommand.ts switchProfile).
  *
  * This is a fire-and-forget helper — callers should not block on it.
  */
@@ -756,7 +948,7 @@ export async function queryRateLimitContext(): Promise<RateLimitContext | null> 
     } else {
         try {
             data = await fetchUsage(token, profileLabel);
-            cache.set(cacheKey, { data, fetchedAt: Date.now() });
+            setClaudeCache(cacheKey, { data, fetchedAt: Date.now() });
         } catch (e) {
             logger.debug(`[rateLimitContext] Failed to fetch usage for ${profileLabel}: ${e}`);
             return null;
@@ -780,16 +972,14 @@ export async function queryRateLimitContext(): Promise<RateLimitContext | null> 
     }
     windows.sort((a, b) => b.utilization - a.utilization);
 
-    // Find switchable profiles: same contextGroup, shared mode, with credentials
+    // Find switchable profiles: shared mode, with credentials
     const currentFiveHour = data.five_hour?.utilization ?? 0;
     const { profiles } = readCcsProfiles();
 
-    // Determine current profile's contextGroup
     const currentProfileInfo = profiles.find(p => p.name === profileLabel);
-    const currentGroup = currentProfileInfo?.contextGroup ?? 'default';
     const currentIsShared = currentProfileInfo?.contextMode === 'shared' || !currentProfileInfo?.contextMode;
 
-    // Only look for switchable profiles if current profile is in a shared group
+    // Only look for switchable profiles if current profile is shared
     const switchable: string[] = [];
     let checkedCount = 0;
     let overLimitCount = 0;
@@ -797,9 +987,8 @@ export async function queryRateLimitContext(): Promise<RateLimitContext | null> 
     if (currentIsShared) {
         for (const p of profiles) {
             if (p.name === profileLabel) continue;
-            // Must be shared + same contextGroup (mirrors authCommand switchProfile constraints)
-            const pGroup = p.contextGroup ?? 'default';
-            if (p.contextMode === 'isolated' || pGroup !== currentGroup) continue;
+            // Must be shared (mirrors authCommand switchProfile constraints)
+            if (p.contextMode === 'isolated') continue;
 
             const otherToken = readOAuthToken(p.instancePath);
             if (!otherToken) continue;
@@ -821,7 +1010,7 @@ export async function queryRateLimitContext(): Promise<RateLimitContext | null> 
             // Try fetching usage for the other profile (best-effort)
             try {
                 const otherData = await fetchUsage(otherToken, p.name);
-                cache.set(p.instancePath, { data: otherData, fetchedAt: Date.now() });
+                setClaudeCache(p.instancePath, { data: otherData, fetchedAt: Date.now() });
                 const other5h = otherData.five_hour?.utilization ?? 0;
                 if (other5h < currentFiveHour && other5h < THRESHOLD) {
                     switchable.push(p.name);
