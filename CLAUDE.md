@@ -53,6 +53,20 @@ When spawning subagents (Agent/Task tool), the routing block is automatically in
 - Write artifacts (code, configs, PRDs) to FILES — never return them as inline text. Return only: file path + 1-line description.
 - When indexing content, use descriptive source labels so others can `ctx_search(source: "label")` later.
 
+## Windows symlink/junction rules
+
+On Windows, Git Bash `ln -s` creates a **copy**, not a real symlink. You MUST use PowerShell for filesystem links:
+
+- **Directory links** → use Junction (no admin required):
+  ```powershell
+  powershell.exe -Command "New-Item -ItemType Junction -Path '<link>' -Target '<target>'"
+  ```
+- **File symlinks** → require admin or Developer Mode enabled. Fall back to copy if unavailable:
+  ```powershell
+  powershell.exe -Command "New-Item -ItemType SymbolicLink -Path '<link>' -Target '<target>'"
+  ```
+- When iterating in bash loops, do NOT embed `$bash_var` inside PowerShell `-Command` strings — the variable won't expand. Build the full path string in bash first, then pass literal paths to PowerShell.
+
 ## ctx commands
 
 | Command | Action |
@@ -60,3 +74,10 @@ When spawning subagents (Agent/Task tool), the routing block is automatically in
 | `ctx stats` | Call the `ctx_stats` MCP tool and display the full output verbatim |
 | `ctx doctor` | Call the `ctx_doctor` MCP tool, run the returned shell command, display as checklist |
 | `ctx upgrade` | Call the `ctx_upgrade` MCP tool, run the returned shell command, display as checklist |
+
+## Debugging Codex/Claude CLI Sessions
+
+- CLI logs: `~/.happy/logs/YYYY-MM-DD-HH-MM-SS-pid-NNNN.log` (daemon suffix `-daemon.log`)
+- Look at log evidence BEFORE modifying code — one build/test cycle is expensive; cover all branches with diagnostic `logger.debug` dumps in a single pass
+- Validate envelopes against app schema: write a temp `sources/xxx-temp.ts` under `packages/happy-app/`, call `RawRecordSchema.safeParse()` / `normalizeRawMessage()` / `reducer()`, run with `npx tsx`, delete after
+- Reference impl for codex app-server migration: `E:/happy-claude/workspace/happier/apps/cli/src/backends/codex/appServer/`

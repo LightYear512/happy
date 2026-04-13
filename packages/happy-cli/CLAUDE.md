@@ -153,9 +153,44 @@ HAPPY_SERVER_URL=http://localhost:3005 ./bin/happy.mjs daemon start
 ./bin/happy.mjs daemon status
 ```
 
-## Daemon Logs
-- Daemon logs are stored in `~/.happy-dev/logs/` (or `$HAPPY_HOME_DIR/logs/`)
-- Named with format: `YYYY-MM-DD-HH-MM-SS-daemon.log`
+## Logs
+- Stored in `~/.happy/logs/` (or `$HAPPY_HOME_DIR/logs/`)
+- CLI process: `YYYY-MM-DD-HH-MM-SS-pid-NNNN.log`
+- Daemon: `YYYY-MM-DD-HH-MM-SS-pid-NNNN-daemon.log`
+
+# Testing
+
+- `npx vitest run <path>` — 单文件测试（必须带 `run`，否则进 watch 模式卡死）
+- 调试 interactive CLI：node-pty spawn + `CODEX_HOME=/tmp/xxx` + setTimeout kill，用 `JSON.stringify(output)` 保留 ANSI 方便写回放用例
+- Windows node-pty 会打印 `AttachConsole failed` 警告，无害，不影响 PTY 捕获
+
+# PTY Output Parsing (loginCommand.ts)
+
+- `stripTerminalOutput(buf)` → cursor-positioning escapes 变 `\n`，适合**短 URL / 按行识别关键词**（防止贪婪正则吞入下一行 TUI 文本）
+- `stripAnsiOnly(buf)` → ANSI 全删但不加空白，适合**长 URL 跨 PTY 换行拼接**（Claude `/oauth/authorize` 在 80/120 列被拆）
+- Codex device-auth URL 短（`auth.openai.com/codex/device`），用前者；Claude OAuth URL 长，用后者
+
+# Codex CLI Gotchas
+
+- `codex login --device-auth`（0.118+）输出：URL `https://auth.openai.com/codex/device` + 独立行 `[A-Z0-9]{4}-[A-Z0-9]{4,6}` 一次性 code，15 分钟有效
+- Device-auth 需用户先在 ChatGPT Security settings 启用；未启用时 codex 回退到 localhost:1455 浏览器回调，headless 环境会挂
+- `codex login --help` 可快速确认当前版本是否支持 `--device-auth`
+
+# Codex Backends
+
+Happy CLI supports two codex backends selected by `HAPPY_CODEX_BACKEND_MODE`:
+- `appServer` (default when codex available) — `codex app-server` JSONRPC over stdio, true session resume via `thread/resume`
+- `mcp` — `codex mcp-server` (legacy, `experimental_resume` only, partial context injection)
+
+Key files: `src/codex/runCodexAppServer.ts`, `src/codex/codexAppServerClient.ts`, `src/codex/appServerStreamBridge.ts`. Reference impl: `../../../happier/apps/cli/src/backends/codex/appServer/`.
+
+## App-Server Protocol Gotchas
+- `turn/start` RPC is **non-blocking** — returns immediately with turnId; await `turn/completed` notification via pending-turn promise
+- `approvalPolicy` must be `{granular: {mcp_elicitations, rules, sandbox_approval}}` — string values wait for TUI approval and hang headless sessions
+- `sandboxPolicy` is a tagged enum object `{type: 'workspaceWrite', writableRoots, ...}`, not a string
+- MCP elicitation response format: `{action: 'accept', content: {}}` (not `{decision}`)
+- Config overrides use `-c key=value` CLI args, not `--config` or `--config-override`
+- Windows `.cmd` shim spawn needs `cmd.exe /d /s /c` wrapping + `escapeCmdArgument()` + `windowsVerbatimArguments: true`. Do NOT use `shell: true` — it mangles TOML array values in config overrides
 
 # Claude `--resume` Behavior
 

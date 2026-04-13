@@ -496,3 +496,15 @@ const MyComponent = () => {
 - **Web is considered a secondary platform** - avoid web-specific implementations unless explicitly requested
 - Keep dev/debug pages without i18n translations
 - **No backward compatibility** unless explicitly stated
+
+## Session Protocol — Tool Call Dual Path
+
+Tool calls arrive through two independent content paths in `sync/typesRaw.ts`:
+- `content.type === 'codex'` with `data.type: 'tool-call'` — legacy path, supported since Version 4
+- `content.type === 'session'` with `ev.t: 'tool-call-start'` — newer session-protocol envelopes (added Feb 2026)
+
+Older deployed OTA builds only parse the codex path. CLI sends tool-call events on both paths for backwards compatibility.
+
+`mcp__happy__change_title` is intercepted by `reducer/messageToEvent.ts` and rendered as a status event ("Title changed to X"), not a tool card — this is intentional.
+
+`CodexBashView` requires `input.parsed_cmd[0]` to render anything useful; falls back to `input.command.join(' ')` (requires array, not string). CLI must map codex's `commandActions` → `parsed_cmd` and wrap `command` as an array.
