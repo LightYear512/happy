@@ -9,7 +9,6 @@ export interface CcsProfileInfo {
     name: string;
     /** Claude instance directory (~/.ccs/instances/<profile>/) */
     instancePath: string;
-    contextMode?: 'isolated' | 'shared';
 }
 
 /** Agent flavor for auth operations. */
@@ -82,7 +81,6 @@ export function readCcsProfiles(): CcsProfilesResult {
                 result.profiles.push({
                     name,
                     instancePath,
-                    contextMode: profileMeta.context_mode as 'isolated' | 'shared' | undefined,
                 });
             }
         } catch (error) {
@@ -103,18 +101,12 @@ export function readCcsProfiles(): CcsProfilesResult {
                 const accounts = config.accounts as Record<string, Record<string, unknown> | null> | undefined;
                 if (accounts && typeof accounts === 'object') {
                     const existingNames = new Set(result.profiles.map(p => p.name));
-                    for (const [name, props] of Object.entries(accounts)) {
+                    for (const name of Object.keys(accounts)) {
                         if (existingNames.has(name)) continue;
-                        const profile: CcsProfileInfo = {
+                        result.profiles.push({
                             name,
                             instancePath: getInstancePath(name),
-                        };
-                        if (props) {
-                            if (props.context_mode === 'shared' || props.context_mode === 'isolated') {
-                                profile.contextMode = props.context_mode;
-                            }
-                        }
-                        result.profiles.push(profile);
+                        });
                     }
                 }
             }
@@ -311,7 +303,6 @@ export interface CodexProfileInfo {
     name: string;
     /** Full path to the codex instance directory. */
     codexHome: string;
-    contextMode?: 'isolated' | 'shared';
 }
 
 /**
@@ -328,16 +319,6 @@ export function readCodexProfiles(): CodexProfileInfo[] {
         return [];
     }
 
-    // Read config.yaml for contextMode metadata
-    let accountsMeta: Record<string, Record<string, unknown>> = {};
-    try {
-        const configPath = join(base, 'config.yaml');
-        const config = yaml.load(readFileSync(configPath, 'utf-8')) as CodexInstancesConfig | null;
-        if (config?.accounts) {
-            accountsMeta = config.accounts as Record<string, Record<string, unknown>>;
-        }
-    } catch { /* no config.yaml */ }
-
     for (const entry of entries) {
         const dirPath = join(base, entry);
         try {
@@ -346,12 +327,9 @@ export function readCodexProfiles(): CodexProfileInfo[] {
             continue;
         }
         if (existsSync(join(dirPath, 'auth.json'))) {
-            const meta = accountsMeta[entry];
             results.push({
                 name: entry,
                 codexHome: dirPath,
-                contextMode: meta?.context_mode === 'shared' || meta?.context_mode === 'isolated'
-                    ? meta.context_mode : undefined,
             });
         }
     }
@@ -363,7 +341,6 @@ interface CodexInstancesConfig {
     default?: string;
     accounts?: Record<string, {
         created?: string;
-        context_mode?: 'isolated' | 'shared';
         [key: string]: unknown;
     }>;
 }
@@ -401,16 +378,12 @@ function updateCodexConfig(mutate: (config: CodexInstancesConfig) => void): void
  * but drops any stray legacy fields (e.g., context_group from older versions),
  * matching registerProfile (claude) for symmetric upsert semantics.
  */
-export function registerCodexProfile(
-    profileName: string,
-    contextMode: 'isolated' | 'shared',
-): void {
+export function registerCodexProfile(profileName: string): void {
     updateCodexConfig(config => {
         if (!config.accounts) config.accounts = {};
         const existing = config.accounts[profileName];
         config.accounts[profileName] = {
             created: existing?.created ?? new Date().toISOString(),
-            context_mode: contextMode,
         };
     });
     logger.debug(`[codex] Registered codex profile "${profileName}"`);
