@@ -143,11 +143,6 @@ function testAuth(): string[] {
         '❌ 未找到配置 "foo"。',
         '使用 !auth 查看可用账号。',
 
-        label('!auth 无法切换'),
-        '❌ 无法切换',
-        '"hassel" → 组 "default"',
-        '"isolated" → 独立',
-
         label('!auth-all 成功'),
         '✅ 已广播切换到 "chulai"',
         '组 "default" 中的所有会话',
@@ -181,7 +176,7 @@ function testLogin(): string[] {
         '🔐 正在重新登录...\n\n配置: work\n\n请等待登录提示，然后粘贴 OAuth Key\n\n取消: !cancel',
 
         label('!login 新建'),
-        '🔐 正在登录...\n\n配置: newaccount (共享)\n\n请等待登录提示，然后粘贴 OAuth Key\n\n取消: !cancel',
+        '🔐 正在登录...\n\n配置: newaccount\n\n请等待登录提示，然后粘贴 OAuth Key\n\n取消: !cancel',
     ];
 }
 

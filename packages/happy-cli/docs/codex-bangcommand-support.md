@@ -56,7 +56,7 @@ BangCommand（`!login` `!auth` `!help` `!usage` 等）此前仅在 Claude 运行
   4. 检测 OAuth URL → 推送到移动端
   5. Codex 浏览器 OAuth 回调自动完成 → 写入 auth.json
   6. 退出后注册 CCS profile
-- 新增 `--codex` flag：`!login myaccount --codex` 在控制台或 claude 会话中强制走 codex 登录
+- 新增 `--codex` flag：`!login --codex myaccount` 在控制台或 claude 会话中强制走 codex 登录
 - `handleLoginBangCommand` 按 `targetAgent`（flag > ctx.flavor > 'claude'）分流
 
 ### 6. daemon CODEX_HOME 持久化（daemon/run.ts）
