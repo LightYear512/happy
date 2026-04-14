@@ -836,7 +836,6 @@ export async function handleLoginBangCommand(
             messages.push('!login --codex <账户名> 登录 Codex');
         } else {
             messages.push('!login <账户名> 登录 Claude');
-            messages.push('!login --codex <账户名> 登录 Codex');
         }
 
         return { message: messages, action: 'none' };
