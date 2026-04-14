@@ -809,7 +809,7 @@ export async function runCodexWithAppServer(opts: {
 
         // Send welcome message
         {
-            const welcome = buildSessionWelcome('codex');
+            const welcome = buildSessionWelcome();
             const msgs = Array.isArray(welcome.message) ? welcome.message : [welcome.message];
             for (const msg of msgs) {
                 session.sendSessionEvent({ type: 'message', message: msg });

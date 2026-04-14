@@ -283,7 +283,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // Normal session: send welcome message with available commands
     if (!isConsoleSession) {
         session.waitForConnect().then(() => {
-            const welcome = buildSessionWelcome('claude');
+            const welcome = buildSessionWelcome();
             const welcomeMessages = Array.isArray(welcome.message) ? welcome.message : [welcome.message];
             for (const msg of welcomeMessages) {
                 session.sendSessionEvent({ type: 'message', message: msg });

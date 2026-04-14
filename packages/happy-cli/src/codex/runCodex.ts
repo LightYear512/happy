@@ -733,7 +733,7 @@ export async function runCodex(opts: {
 
         // Send welcome message with available bang commands
         {
-            const welcome = buildSessionWelcome('codex');
+            const welcome = buildSessionWelcome();
             const msgs = Array.isArray(welcome.message) ? welcome.message : [welcome.message];
             for (const msg of msgs) {
                 session.sendSessionEvent({ type: 'message', message: msg });
