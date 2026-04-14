@@ -91,7 +91,7 @@ export async function killRunawayHappyProcesses(): Promise<{ killed: number, err
       
       // Kill entire process tree (Windows: taskkill /T, Unix: pgroup SIGTERM).
       // This is critical for happy-cli parents that have codex/claude grandchildren.
-      killProcessTree(pid);
+      await killProcessTree(pid);
 
       if (process.platform !== 'win32') {
         // Unix: SIGTERM is polite — verify exit and escalate to SIGKILL if needed
