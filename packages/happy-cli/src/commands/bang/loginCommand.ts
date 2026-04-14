@@ -1623,6 +1623,90 @@ function performCodexLogin(
     delete childEnv.ANTHROPIC_AUTH_TOKEN;
     delete childEnv.CLAUDE_CODE_OAUTH_TOKEN;
 
+    // Inject proxy from ~/.codex/.env if happy daemon's own env doesn't have it.
+    // Verified empirically (round 6): codex CLI 0.118 does NOT load .env into reqwest's
+    // HTTP client at runtime — reqwest's proxy is read once from real process env at
+    // Client::builder() time, before any dotenvy loading. So a ~/.codex/.env containing
+    // http_proxy/https_proxy is silently ignored unless we materialize it into the
+    // child process env BEFORE spawning codex.
+    //
+    // This matters because: a happy daemon launched without proxy env (e.g. autostart,
+    // explorer-launched) will spawn codex with no proxy → codex direct-connects to
+    // auth.openai.com → intermittent failure ("error sending request" / 403 Forbidden).
+    //
+    // INVARIANT: we still never overwrite a value that's already in childEnv. The
+    // .env file is a fallback source, not a force-override.
+    const dotenvSource = join(defaultCodexHome, '.env');
+    const dotenvInjectReport: Record<string, string> = {};
+    if (existsSync(dotenvSource)) {
+        try {
+            const dotenvText = readFileSync(dotenvSource, 'utf-8');
+            const PROXY_KEYS_LOWER = ['http_proxy', 'https_proxy', 'no_proxy', 'all_proxy'];
+            for (const rawLine of dotenvText.split(/\r?\n/)) {
+                const line = rawLine.trim();
+                if (!line || line.startsWith('#')) continue;
+                const eq = line.indexOf('=');
+                if (eq < 0) continue;
+                const key = line.slice(0, eq).trim();
+                let val = line.slice(eq + 1).trim();
+                // Strip surrounding quotes (.env style: KEY="value" or KEY='value')
+                if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+                    val = val.slice(1, -1);
+                }
+                const keyLower = key.toLowerCase();
+                if (!PROXY_KEYS_LOWER.includes(keyLower)) continue;
+                const upperKey = keyLower.toUpperCase();
+                // Only inject if neither case is already present in childEnv
+                if (childEnv[keyLower] === undefined && childEnv[upperKey] === undefined) {
+                    childEnv[keyLower] = val;
+                    childEnv[upperKey] = val;
+                    dotenvInjectReport[`${keyLower}/${upperKey}`] = `injected from ${dotenvSource}`;
+                } else {
+                    dotenvInjectReport[keyLower] = 'skipped (already in childEnv)';
+                }
+            }
+        } catch (err) {
+            logger.warn(`[!login:codex] failed to parse ${dotenvSource}: ${(err as Error).message}`);
+        }
+    }
+    if (Object.keys(dotenvInjectReport).length > 0) {
+        logger.info(`[!login:codex] dotenv proxy inject: ${JSON.stringify(dotenvInjectReport)}`);
+    }
+
+    // Mirror upper↔lower proxy env vars. Reqwest (codex's Rust HTTP client) on some
+    // versions only honors lowercase `http_proxy`/`https_proxy`/`no_proxy`/`all_proxy`,
+    // while Windows/cmd typically only sets the uppercase variants. Without mirroring,
+    // codex's HTTP requests bypass the user's proxy entirely and fail with cryptic
+    // "Invalid request" errors at the OAuth token endpoint.
+    //
+    // INVARIANT: never overwrite a value the user explicitly set (in either case);
+    // only fill in the missing case from the present one.
+    const proxyKeyPairs: Array<[upper: string, lower: string]> = [
+        ['HTTPS_PROXY', 'https_proxy'],
+        ['HTTP_PROXY', 'http_proxy'],
+        ['NO_PROXY', 'no_proxy'],
+        ['ALL_PROXY', 'all_proxy'],
+    ];
+    const proxyMirrorReport: Record<string, string> = {};
+    for (const [upper, lower] of proxyKeyPairs) {
+        const upperVal = childEnv[upper];
+        const lowerVal = childEnv[lower];
+        if (upperVal && !lowerVal) {
+            childEnv[lower] = upperVal;
+            proxyMirrorReport[lower] = `mirrored ← ${upper}`;
+        } else if (lowerVal && !upperVal) {
+            childEnv[upper] = lowerVal;
+            proxyMirrorReport[upper] = `mirrored ← ${lower}`;
+        } else if (upperVal && lowerVal) {
+            proxyMirrorReport[`${upper}/${lower}`] = upperVal === lowerVal
+                ? 'both set, identical (no-op)'
+                : 'both set, DIFFERENT (left as-is, user explicit)';
+        }
+    }
+    if (Object.keys(proxyMirrorReport).length > 0) {
+        logger.info(`[!login:codex] proxy env mirror: ${JSON.stringify(proxyMirrorReport)}`);
+    }
+
     // Diagnostic dump: log what codex actually sees so we can debug OAuth failures
     // (proxy mishandling, stale env vars, missing locale, etc). Values for sensitive
     // keys are length-only; auth vars and proxy auth are masked. Filtered to keys
