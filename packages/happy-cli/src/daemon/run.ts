@@ -107,19 +107,29 @@ export async function startDaemon(): Promise<void> {
   // In case the setup malfunctions - our signal handlers will not properly
   // shut down. We will force exit the process with code 1.
   let requestShutdown: (source: 'happy-app' | 'happy-cli' | 'os-signal' | 'exception', errorMessage?: string, options?: { stopSessions?: boolean }) => void;
+  // Cancelled by cleanupAndShutdown when it actually starts running (indicating
+  // graceful shutdown is in progress). A separate hard-exit watchdog with a more
+  // generous timeout covers the case where cleanup itself wedges.
+  let startupMalfunctionTimer: NodeJS.Timeout | null = null;
+  // Set true by cleanupAndShutdown so restoreSession RPC from server rejects
+  // new work during the shutdown window.
+  let shuttingDown = false;
   let resolvesWhenShutdownRequested = new Promise<({ source: 'happy-app' | 'happy-cli' | 'os-signal' | 'exception', errorMessage?: string, stopSessions?: boolean })>((resolve) => {
     requestShutdown = (source, errorMessage, options) => {
       logger.debug(`[DAEMON RUN] Requesting shutdown (source: ${source}, errorMessage: ${errorMessage}, stopSessions: ${options?.stopSessions})`);
 
-      // Fallback - in case startup malfunctions - we will force exit the process with code 1
-      setTimeout(async () => {
-        logger.debug('[DAEMON RUN] Startup malfunctioned, forcing exit with code 1');
+      // Fallback - in case graceful cleanup never kicks in (e.g. signal arrived
+      // before startup finished), we will force exit. Bumped to 15s so a normal
+      // --kill-sessions path with taskkill + session-end flush has room to run.
+      // cleanupAndShutdown clears this timer on entry so the happy path is free.
+      startupMalfunctionTimer = setTimeout(async () => {
+        logger.debug('[DAEMON RUN] Shutdown watchdog fired, forcing exit with code 1');
 
         // Give time for logs to be flushed
         await new Promise(resolve => setTimeout(resolve, 100))
 
         process.exit(1);
-      }, 1_000);
+      }, 15_000);
 
       // Start graceful shutdown
       resolve({ source, errorMessage, stopSessions: options?.stopSessions });
@@ -445,7 +455,7 @@ export async function startDaemon(): Promise<void> {
           for (const [pid, session] of staleEntries) {
             logger.debug(`[DAEMON RUN] Killing stale session PID ${pid} before resume ${options.resume}`);
             try {
-              killProcessTree(pid);
+              await killProcessTree(pid);
               if (session.startedBy === 'daemon' && session.childProcess) {
                 await Promise.race([
                   new Promise<void>(resolve => session.childProcess!.once('exit', resolve)),
@@ -755,7 +765,7 @@ export async function startDaemon(): Promise<void> {
     };
 
     // Stop a session by sessionId or PID fallback
-    const stopSession = (sessionId: string): boolean => {
+    const stopSession = async (sessionId: string): Promise<boolean> => {
       logger.debug(`[DAEMON RUN] Attempting to stop session ${sessionId}`);
 
       // Try to find by sessionId first
@@ -763,14 +773,14 @@ export async function startDaemon(): Promise<void> {
         if (session.happySessionId === sessionId ||
           (sessionId.startsWith('PID-') && pid === parseInt(sessionId.replace('PID-', '')))) {
 
+          // Remove from tracking first so concurrent callers don't double-kill
+          pidToTrackedSession.delete(pid);
           try {
-            killProcessTree(pid);
+            await killProcessTree(pid);
             logger.debug(`[DAEMON RUN] Killed session tree for ${sessionId} (pid ${pid}, startedBy=${session.startedBy})`);
           } catch (error) {
             logger.debug(`[DAEMON RUN] Failed to kill session tree ${sessionId} (pid ${pid}):`, error);
           }
-
-          pidToTrackedSession.delete(pid);
           logger.debug(`[DAEMON RUN] Removed session ${sessionId} from tracking`);
           return true;
         }
@@ -830,6 +840,12 @@ export async function startDaemon(): Promise<void> {
 
     // Restore a previously closed session by reading persisted restore file + Server-provided params
     const restoreSession = async (params: { sessionId: string, claudeSessionId: string | null, summary: string | null }): Promise<SpawnSessionResult> => {
+      // Reject during shutdown so server-triggered tryRestoreSession doesn't race
+      // into spawning a new child process inside the kill-sessions window.
+      if (shuttingDown) {
+        logger.debug(`[DAEMON RUN] Rejecting restoreSession ${params.sessionId} — daemon is shutting down`);
+        return { type: 'error', errorMessage: 'Daemon is shutting down' };
+      }
       // Check if session is already running — don't restore if an active process exists
       for (const [pid, tracked] of pidToTrackedSession) {
         if (tracked.happySessionId === params.sessionId) {
@@ -1016,47 +1032,64 @@ export async function startDaemon(): Promise<void> {
       logger.debug(`[DAEMON RUN] Starting proper cleanup (source: ${source}, errorMessage: ${errorMessage}, stopSessions: ${stopSessions})...`);
 
       // Clear health check interval
+      // Cancel the startup watchdog now that graceful cleanup is actually running.
+      // It was only a fallback for the "signal arrives before startup completes" case.
+      if (startupMalfunctionTimer) {
+        clearTimeout(startupMalfunctionTimer);
+        startupMalfunctionTimer = null;
+        logger.debug('[DAEMON RUN] Shutdown watchdog cleared (graceful path engaged)');
+      }
+
+      // Flip the shutdown flag so restoreSession RPC from server rejects new
+      // work instead of racing to spawn children inside the shutdown window.
+      shuttingDown = true;
+
       if (restartOnStaleVersionAndHeartbeat) {
         clearInterval(restartOnStaleVersionAndHeartbeat);
         logger.debug('[DAEMON RUN] Health check interval cleared');
       }
 
+      // Collect targets: everything except the console session (daemon-internal,
+      // uniformly closed below) when --kill-sessions is requested.
+      const killTargets: Array<{ id: string; pid: number }> = [];
       if (stopSessions) {
-        // Stop ALL tracked sessions: send session-end for each, then kill
-        const children = getCurrentChildren();
-        logger.debug(`[DAEMON RUN] stopSessions: sending session-end for ${children.length} tracked sessions`);
-        for (const child of children) {
+        const userChildren = getCurrentChildren().filter(c => !c.isConsoleSession);
+        logger.debug(`[DAEMON RUN] stopSessions: sending session-end for ${userChildren.length} user sessions`);
+        for (const child of userChildren) {
           if (child.happySessionId) {
             apiMachine.sendSessionEnd(child.happySessionId);
             logger.debug(`[DAEMON RUN] Sent session-end for ${child.happySessionId}`);
           }
-        }
-        // Brief wait so session-end events reach the server
-        await new Promise(resolve => setTimeout(resolve, 300));
-        for (const child of children) {
           const sessionId = child.happySessionId?.trim() || '';
           const fallbackId = Number.isFinite(child.pid) && child.pid > 1 ? `PID-${Math.trunc(child.pid)}` : '';
           const id = sessionId || fallbackId;
           if (id) {
-            stopSession(id);
+            killTargets.push({ id, pid: child.pid });
           }
-        }
-      } else {
-        // Default: only close console session via machine socket (SIGTERM doesn't work on Windows -
-        // the process is forcefully killed without running cleanup handlers)
-        if (consoleSessionPid !== null) {
-          const consoleTracked = pidToTrackedSession.get(consoleSessionPid);
-          if (consoleTracked?.happySessionId) {
-            logger.debug(`[DAEMON RUN] Sending session-end for console session ${consoleTracked.happySessionId}`);
-            apiMachine.sendSessionEnd(consoleTracked.happySessionId);
-            // Brief wait so the event reaches the server before we disconnect
-            await new Promise(resolve => setTimeout(resolve, 200));
-          }
-          try {
-            killProcessTree(consoleSessionPid);
-          } catch {}
         }
       }
+
+      // Console session always sends its own session-end before kill.
+      if (consoleSessionPid !== null) {
+        const consoleTracked = pidToTrackedSession.get(consoleSessionPid);
+        if (consoleTracked?.happySessionId) {
+          logger.debug(`[DAEMON RUN] Sending session-end for console session ${consoleTracked.happySessionId}`);
+          apiMachine.sendSessionEnd(consoleTracked.happySessionId);
+        }
+        killTargets.push({ id: `PID-${consoleSessionPid}`, pid: consoleSessionPid });
+      }
+
+      // Give Socket.IO a full second (event loop stays free because we no longer
+      // spawnSync) for all session-end emits to drain to the wire.
+      if (killTargets.length > 0) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+
+      // Kill all targets in parallel — killProcessTree is now async and doesn't
+      // block the event loop, so apiMachine keeps servicing pending sends.
+      await Promise.all(killTargets.map(t => stopSession(t.id).catch(error => {
+        logger.debug(`[DAEMON RUN] stopSession ${t.id} failed:`, error);
+      })));
 
       // Update daemon state before shutting down
       await apiMachine.updateDaemonState((state: DaemonState | null) => ({
