@@ -1,8 +1,7 @@
 # Stage 1: install dependencies with workspace context
 FROM node:20-slim AS deps
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y python3 ffmpeg make g++ build-essential && rm -rf /var/lib/apt/lists/*
+# No build deps needed — sharp ships prebuilt binaries; add back if a node-gyp dep appears
 
 WORKDIR /repo
 
@@ -34,8 +33,7 @@ FROM node:20-slim AS runner
 
 WORKDIR /repo
 
-# Runtime dependencies
-RUN apt-get update && apt-get install -y python3 ffmpeg && rm -rf /var/lib/apt/lists/*
+# Runtime needs no apt packages — pure Node.js
 
 # Set environment to production
 ENV NODE_ENV=production
