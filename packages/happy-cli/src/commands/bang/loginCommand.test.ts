@@ -251,7 +251,6 @@ describe('parseLoginArgs', () => {
                 kind: 'ok',
                 profileName: undefined,
                 targetAgent: 'claude',
-                contextMode: 'shared',
             });
         });
 
@@ -277,12 +276,11 @@ describe('parseLoginArgs', () => {
     });
 
     describe('positional + flag combinations', () => {
-        it('name only → claude, shared', () => {
+        it('name only → claude', () => {
             expect(parseLoginArgs('abc', 'claude')).toEqual({
                 kind: 'ok',
                 profileName: 'abc',
                 targetAgent: 'claude',
-                contextMode: 'shared',
             });
         });
 
@@ -295,15 +293,6 @@ describe('parseLoginArgs', () => {
         it('--codex name (flag before) → codex, same result', () => {
             expect(parseLoginArgs('--codex abc', 'claude')).toMatchObject({
                 kind: 'ok', profileName: 'abc', targetAgent: 'codex',
-            });
-        });
-
-        it('name --isolated → isolated mode', () => {
-            expect(parseLoginArgs('abc --isolated', 'claude')).toEqual({
-                kind: 'ok',
-                profileName: 'abc',
-                targetAgent: 'claude',
-                contextMode: 'isolated',
             });
         });
 

@@ -33,7 +33,7 @@ describe('registerProfile — YAML text manipulation', () => {
     });
 
     it('creates config.yaml from scratch when file does not exist', () => {
-        registerProfile('test-account', 'shared');
+        registerProfile('test-account');
 
         const configPath = join(ccsDir, 'config.yaml');
         expect(existsSync(configPath)).toBe(true);
@@ -41,7 +41,7 @@ describe('registerProfile — YAML text manipulation', () => {
         const content = readFileSync(configPath, 'utf-8');
         expect(content).toContain('accounts:');
         expect(content).toContain('  test-account:');
-        expect(content).toContain('    context_mode: shared');
+        expect(content).not.toContain('context_mode');
         expect(content).toContain('    continuity_mode: standard');
         expect(content).toContain('    created:');
         expect(content).toContain('    last_used: null');
@@ -58,20 +58,18 @@ describe('registerProfile — YAML text manipulation', () => {
             '  existing-user:',
             '    created: "2026-01-01T00:00:00.000Z"',
             '    last_used: null',
-            '    context_mode: shared',
             '    continuity_mode: standard',
             '',
             'settings:',
             '  theme: dark',
         ].join('\n'), 'utf-8');
 
-        registerProfile('new-user', 'isolated');
+        registerProfile('new-user');
 
         const content = readFileSync(configPath, 'utf-8');
         // Both accounts should exist
         expect(content).toContain('  existing-user:');
         expect(content).toContain('  new-user:');
-        expect(content).toContain('    context_mode: isolated');
         // settings section should still be intact after accounts
         expect(content).toContain('settings:');
         expect(content).toContain('  theme: dark');
@@ -86,7 +84,7 @@ describe('registerProfile — YAML text manipulation', () => {
             '  theme: dark',
         ].join('\n'), 'utf-8');
 
-        registerProfile('first-user', 'shared');
+        registerProfile('first-user');
 
         const content = readFileSync(configPath, 'utf-8');
         expect(content).toContain('accounts:');
@@ -94,7 +92,7 @@ describe('registerProfile — YAML text manipulation', () => {
         expect(content).toContain('settings:');
     });
 
-    it('inserts account before next top-level key', () => {
+    it('inserts account alongside existing ones', () => {
         const configPath = join(ccsDir, 'config.yaml');
         writeFileSync(configPath, [
             'version: 8',
@@ -102,35 +100,32 @@ describe('registerProfile — YAML text manipulation', () => {
             '  alpha:',
             '    created: "2026-01-01T00:00:00.000Z"',
             '    last_used: null',
-            '    context_mode: shared',
             'settings:',
             '  log_level: debug',
         ].join('\n'), 'utf-8');
 
-        registerProfile('beta', 'shared');
+        registerProfile('beta');
 
         const content = readFileSync(configPath, 'utf-8');
-        const lines = content.split('\n');
-        const betaIdx = lines.findIndex(l => l.includes('beta:'));
-        const settingsIdx = lines.findIndex(l => l.startsWith('settings:'));
-        // beta should be inserted before settings
-        expect(betaIdx).toBeGreaterThan(-1);
-        expect(settingsIdx).toBeGreaterThan(betaIdx);
+        expect(content).toContain('  alpha:');
+        expect(content).toContain('  beta:');
+        expect(content).toContain('settings:');
     });
 
-    it('never writes context_group (single-default-group model)', () => {
-        registerProfile('no-group', 'isolated');
+    it('never writes context_group or context_mode', () => {
+        registerProfile('no-group');
 
         const content = readFileSync(join(ccsDir, 'config.yaml'), 'utf-8');
         expect(content).toContain('  no-group:');
         expect(content).not.toContain('context_group');
+        expect(content).not.toContain('context_mode');
     });
 
     it('handles config.yaml with trailing newline', () => {
         const configPath = join(ccsDir, 'config.yaml');
-        writeFileSync(configPath, 'version: 8\n\naccounts:\n  old:\n    created: "2026-01-01"\n    last_used: null\n    context_mode: shared\n\n', 'utf-8');
+        writeFileSync(configPath, 'version: 8\n\naccounts:\n  old:\n    created: "2026-01-01"\n    last_used: null\n\n', 'utf-8');
 
-        registerProfile('new-account', 'shared');
+        registerProfile('new-account');
 
         const content = readFileSync(configPath, 'utf-8');
         expect(content).toContain('  old:');
@@ -145,12 +140,11 @@ describe('registerProfile — YAML text manipulation', () => {
             '  primary:',
             '    created: "2026-01-01"',
             '    last_used: null',
-            '    context_mode: shared',
             'settings:',
             '  theme: dark',
         ].join('\n'), 'utf-8');
 
-        registerProfile('secondary', 'shared');
+        registerProfile('secondary');
 
         const content = readFileSync(configPath, 'utf-8');
         expect(content).toContain('primary:');
@@ -161,7 +155,7 @@ describe('registerProfile — YAML text manipulation', () => {
     });
 
     it('created timestamp is valid ISO string', () => {
-        registerProfile('ts-test', 'shared');
+        registerProfile('ts-test');
 
         const content = readFileSync(join(ccsDir, 'config.yaml'), 'utf-8');
         const match = content.match(/created: "([^"]+)"/);
@@ -180,17 +174,16 @@ describe('registerProfile — YAML text manipulation', () => {
             '  existing:',
             '    created: "2026-01-15T10:00:00.000Z"',
             '    last_used: "2026-03-20T08:30:00.000Z"',
-            '    context_mode: shared',
             '    continuity_mode: enhanced',
         ].join('\n'), 'utf-8');
 
-        // Re-register with different mode — should preserve created/last_used/continuity_mode
-        registerProfile('existing', 'isolated');
+        // Re-register — should preserve created/last_used/continuity_mode
+        registerProfile('existing');
 
         const content = readFileSync(configPath, 'utf-8');
         expect(content).toContain('created: "2026-01-15T10:00:00.000Z"');
         expect(content).toContain('last_used: "2026-03-20T08:30:00.000Z"');
         expect(content).toContain('continuity_mode: enhanced');
-        expect(content).toContain('context_mode: isolated');
+        expect(content).not.toContain('context_mode');
     });
 });

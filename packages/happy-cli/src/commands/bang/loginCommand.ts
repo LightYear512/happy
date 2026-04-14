@@ -25,7 +25,6 @@ export type ParsedLoginArgs =
         kind: 'ok';
         profileName: string | undefined;
         targetAgent: AuthFlavor;
-        contextMode: 'isolated' | 'shared';
     }
     | { kind: 'error'; message: string };
 
@@ -41,11 +40,8 @@ export function parseLoginArgs(
     const parts = cleanArgs.split(/\s+/).filter(Boolean);
 
     let profileName: string | undefined;
-    let hasIsolated = false;
     for (const p of parts) {
-        if (p === '--isolated') {
-            hasIsolated = true;
-        } else if (!p.startsWith('--') && profileName === undefined) {
+        if (!p.startsWith('--') && profileName === undefined) {
             profileName = p;
         }
     }
@@ -66,7 +62,6 @@ export function parseLoginArgs(
         kind: 'ok',
         profileName,
         targetAgent,
-        contextMode: hasIsolated ? 'isolated' : 'shared',
     };
 }
 
@@ -356,7 +351,6 @@ interface CcsConfig {
     accounts?: Record<string, {
         created?: string;
         last_used?: string | null;
-        context_mode?: string;
         continuity_mode?: string;
         [key: string]: unknown;
     }>;
@@ -368,10 +362,7 @@ interface CcsConfig {
  * Uses js-yaml for reliable YAML round-tripping.
  */
 /** Exported for testing. */
-export function registerProfile(
-    profileName: string,
-    contextMode: 'isolated' | 'shared',
-): void {
+export function registerProfile(profileName: string): void {
     const ccsDir = getCcsDir();
     const configPath = join(ccsDir, 'config.yaml');
 
@@ -389,7 +380,6 @@ export function registerProfile(
     config.accounts[profileName] = {
         created: existing?.created ?? new Date().toISOString(),
         last_used: existing?.last_used ?? null,
-        context_mode: contextMode,
         continuity_mode: existing?.continuity_mode ?? 'standard',
     };
 
@@ -508,53 +498,16 @@ function copyDirectoryRecursive(src: string, dest: string): void {
 }
 
 /**
- * Sync project workspace context based on account policy.
- *
- * - shared: instance/projects becomes symlink to shared context group root.
- * - isolated: instance/projects stays a plain directory.
- *
- * Never deletes existing project data without merging first.
+ * Link instance/projects to the shared context group root. Merges any pre-existing
+ * project data before replacing the directory with a symlink. Never deletes data
+ * without merging first.
  */
-function syncProjectContext(
-    instancePath: string,
-    contextMode: 'isolated' | 'shared',
-): void {
+function syncProjectContext(instancePath: string): void {
     const projectsPath = join(instancePath, 'projects');
     const isWindows = process.platform === 'win32';
     const instanceName = instancePath.split(/[\\/]/).pop() || 'unknown';
 
-    if (contextMode === 'isolated') {
-        // Isolated mode: ensure projects is a plain directory (not a symlink)
-        let stat;
-        try {
-            stat = lstatSync(projectsPath);
-        } catch (err) {
-            if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-                mkdirSync(projectsPath, { recursive: true, mode: 0o700 });
-                return;
-            }
-            throw err;
-        }
-
-        if (stat.isSymbolicLink()) {
-            // Switching from shared → isolated: materialize old target content
-            const target = readlinkSync(projectsPath);
-            const resolvedTarget = resolve(dirname(projectsPath), target);
-            rmSync(projectsPath, { force: true });
-            mkdirSync(projectsPath, { recursive: true, mode: 0o700 });
-            if (isSafeProjectsMergeSource(resolvedTarget, instanceName)) {
-                mergeProjectsDirectory(resolvedTarget, projectsPath, instanceName);
-            } else {
-                logger.debug(`[!login] Skipping unsafe merge source: ${resolvedTarget}`);
-            }
-            logger.debug(`[!login] Detached projects symlink to isolated directory`);
-        } else if (stat.isDirectory()) {
-            detachLegacyMemoryLinks(projectsPath, instanceName);
-        }
-        return;
-    }
-
-    // Shared mode: link projects → ~/.ccs/shared/context-groups/default/projects
+    // Link projects → ~/.ccs/shared/context-groups/default/projects
     const sharedProjectsPath = join(getCcsDir(), 'shared', 'context-groups', 'default', 'projects');
     mkdirSync(sharedProjectsPath, { recursive: true, mode: 0o700 });
 
@@ -862,38 +815,35 @@ export async function handleLoginBangCommand(
     if (parsed.kind === 'error') {
         return { message: parsed.message, action: 'none' };
     }
-    const { profileName, targetAgent, contextMode } = parsed;
+    const { profileName, targetAgent } = parsed;
 
     if (!profileName) {
         const accounts = targetAgent === 'codex'
             ? readCodexProfiles().map(p => p.name)
             : readAccountNames();
 
-        if (accounts.length === 0) {
-            return {
-                message: '用法: !login <账户名> [--codex] [--isolated]\n\n登录账户（--codex 登录 Codex 账号）',
-                action: 'none',
-            };
-        }
-
-        const messages: string[] = [targetAgent === 'codex' ? '📋 已有 Codex 账户' : '📋 已有账户'];
+        const messages: string[] = [targetAgent === 'codex' ? '📋 Codex 账户' : '📋 Claude 账户'];
         messages.push(SEPARATOR);
-        for (const name of accounts) {
-            messages.push(name);
+        if (accounts.length === 0) {
+            messages.push('（暂无账户）');
+        } else {
+            for (const name of accounts) {
+                messages.push(name);
+            }
         }
         messages.push(SEPARATOR);
         if (targetAgent === 'codex') {
-            messages.push('!login <账户名> --codex 登录 Codex');
+            messages.push('!login --codex <账户名> 登录 Codex');
         } else {
             messages.push('!login <账户名> 登录 Claude');
-            messages.push('!login <账户名> --codex 登录 Codex');
+            messages.push('!login --codex <账户名> 登录 Codex');
         }
 
         return { message: messages, action: 'none' };
     }
 
     if (targetAgent === 'codex') {
-        return performCodexLogin(profileName, contextMode, ctx);
+        return performCodexLogin(profileName, ctx);
     }
 
     // Find Claude CLI
@@ -1128,14 +1078,10 @@ export async function handleLoginBangCommand(
 
         if (hasCredentials) {
             try {
-                registerProfile(profileName, contextMode);
-                if (contextMode === 'shared') {
-                    linkSharedDirectories(instancePath);
-                }
-                syncProjectContext(instancePath, contextMode);
-                const modeDesc = contextMode === 'shared' ? '共享' : '独立';
+                registerProfile(profileName);
+                linkSharedDirectories(instancePath);
+                syncProjectContext(instancePath);
                 const msg = `✅ 配置 "${profileName}" 登录成功\n\n`
-                    + `模式: ${modeDesc}\n\n`
                     + `切换账号: !auth ${profileName}`;
                 ctx.client.sendCodexMessage({ type: 'message', message: msg });
             } catch (err) {
@@ -1153,7 +1099,7 @@ export async function handleLoginBangCommand(
 
     // Return immediately — the interactive session runs asynchronously
     const msg = `🔐 正在登录...\n\n`
-        + `配置: ${profileName} (${contextMode === 'shared' ? '共享' : '独立'})\n\n`
+        + `配置: ${profileName}\n\n`
         + '请等待登录提示，然后粘贴 OAuth Key\n\n'
         + '取消: !cancel';
     return { message: msg, action: 'none' };
@@ -1264,7 +1210,7 @@ function linkCodexSharedDirectories(codexInstancePath: string): void {
 }
 
 /**
- * Sync Codex session history for shared-mode profiles.
+ * Link a Codex instance's session history into the shared cross-profile directory.
  *
  * Codex sessions are date-layered JSONL files with unique UUIDs in the filename
  * (e.g. sessions/2026/04/10/rollout-2026-04-10T11-05-43-<UUID>.jsonl), so
@@ -1277,34 +1223,10 @@ function linkCodexSharedDirectories(codexInstancePath: string): void {
  * state_*.sqlite is intentionally NOT shared — it is a rebuildable index and
  * sharing it would cause SQLite lock contention across concurrent profiles.
  */
-function syncCodexSessionSharing(
-    codexInstancePath: string,
-    contextMode: 'isolated' | 'shared',
-): void {
+function syncCodexSessionSharing(codexInstancePath: string): void {
     const isWindows = process.platform === 'win32';
 
-    if (contextMode === 'isolated') {
-        // Isolated: ensure sessions/ is a plain directory (detach if previously shared)
-        const sessionsPath = join(codexInstancePath, 'sessions');
-        try {
-            const st = lstatSync(sessionsPath);
-            if (st.isSymbolicLink()) {
-                const target = realpathSync(sessionsPath);
-                rmSync(sessionsPath, { force: true });
-                mkdirSync(sessionsPath, { recursive: true });
-                // Merge back from shared → isolated
-                mergeSessionsDirectory(target, sessionsPath);
-                logger.debug('[!login:codex] Detached sessions symlink to isolated directory');
-            }
-        } catch (err) {
-            if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-                mkdirSync(sessionsPath, { recursive: true });
-            }
-        }
-        return;
-    }
-
-    // Shared mode: link sessions → shared default context-group directory
+    // Link sessions → shared default context-group directory
     const sharedGroupDir = join(getCodexSharedDir(), 'context-groups', 'default');
     const sharedSessionsPath = join(sharedGroupDir, 'sessions');
     const sharedHistoryPath = join(sharedGroupDir, 'history.jsonl');
@@ -1453,7 +1375,6 @@ function mergeSessionsDirectory(src: string, dest: string): void {
  */
 function performCodexLogin(
     profileName: string,
-    contextMode: 'isolated' | 'shared',
     ctx: BangCommandContext,
 ): BangCommandResult {
     const codexInfo = findCodexCli();
@@ -1636,21 +1557,17 @@ function performCodexLogin(
                 // Check before register to avoid redundant config.yaml read-after-write
                 const isFirstProfile = !readCodexDefaultProfile();
                 // Register in CCS so !auth can discover the profile
-                registerCodexProfile(profileName, contextMode);
+                registerCodexProfile(profileName);
                 if (isFirstProfile) {
                     setCodexDefaultProfile(profileName);
                     logger.debug(`[!login:codex] Auto-set default codex profile to "${profileName}" (first profile)`);
                 }
                 // Link shared resources and session history — mirrors Claude login pattern
-                if (contextMode === 'shared') {
-                    linkCodexSharedDirectories(codexInstancePath);
-                }
-                syncCodexSessionSharing(codexInstancePath, contextMode);
-                const modeDesc = contextMode === 'shared' ? '共享' : '独立';
+                linkCodexSharedDirectories(codexInstancePath);
+                syncCodexSessionSharing(codexInstancePath);
                 const defaultNote = isFirstProfile ? '\n已自动设为默认账户' : '';
-                const msg = `✅ Codex 配置 "${profileName}" 登录成功\n\n`
-                    + `模式: ${modeDesc}${defaultNote}\n\n`
-                    + `切换账号: !auth-all ${profileName} --codex`;
+                const msg = `✅ Codex 配置 "${profileName}" 登录成功${defaultNote}\n\n`
+                    + `切换账号: !auth-all --codex ${profileName}`;
                 ctx.client.sendCodexMessage({ type: 'message', message: msg });
             } catch (err) {
                 logger.debug('[!login:codex] Failed to register profile:', err);
@@ -1662,14 +1579,14 @@ function performCodexLogin(
             logger.info(`[!login:codex] Login failed with exit code: ${exitCode ?? 'unknown'} finalOutput=${JSON.stringify(finalStripped)}`);
             const tail = finalStripped.trim();
             const detail = tail ? `\n\nCodex 输出:\n${codeBlock(tail)}` : '';
-            ctx.client.sendCodexMessage({ type: 'message', message: `❌ Codex 登录失败或已取消${detail}\n\n重新尝试: !login ${profileName} --codex` });
+            ctx.client.sendCodexMessage({ type: 'message', message: `❌ Codex 登录失败或已取消${detail}\n\n重新尝试: !login --codex ${profileName}` });
         }
 
         ctx.client.sendSessionEvent({ type: 'ready' });
     });
 
     const msg = `🔐 正在登录 Codex...\n\n`
-        + `配置: ${profileName} (${contextMode === 'shared' ? '共享' : '独立'})\n\n`
+        + `配置: ${profileName}\n\n`
         + '请等待 OAuth 链接，然后在浏览器中打开\n\n'
         + '取消: !cancel';
     return { message: msg, action: 'none' };
