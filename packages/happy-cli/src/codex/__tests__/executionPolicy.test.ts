@@ -11,11 +11,11 @@ describe('resolveCodexExecutionPolicy', () => {
         });
     });
 
-    it('maps codex default mode to untrusted + workspace-write without managed sandbox', () => {
+    it('maps codex default mode to on-request + workspace-write without managed sandbox', () => {
         const policy = resolveCodexExecutionPolicy('default', false);
 
         expect(policy).toEqual({
-            approvalPolicy: 'untrusted',
+            approvalPolicy: 'on-request',
             sandbox: 'workspace-write',
         });
     });
