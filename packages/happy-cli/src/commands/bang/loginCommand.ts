@@ -1373,6 +1373,81 @@ function mergeSessionsDirectory(src: string, dest: string): void {
  * currently unreachable in headless/remote environments and will hang. We surface a
  * hint in the mobile message so the user knows where to enable it.
  */
+type AcquireCodexLoginLockResult =
+    | { kind: 'acquired'; started: string }
+    | { kind: 'busy' }
+    | { kind: 'error'; error: Error };
+
+/**
+ * Atomically acquire the codex login lock in `phase='started'` using O_EXCL
+ * (Node `flag: 'wx'`). The lock has a two-phase lifecycle:
+ *
+ *   1. acquireCodexLoginLock          → phase='started'   (no fs side effects yet)
+ *   2. updateCodexLoginLockToSpawned  → phase='spawned'   (right before spawning codex)
+ *   3. release (rmSync lockPath)      → fully cleaned
+ *
+ * Recovery uses the phase to disambiguate two crash scenarios:
+ *   - phase='started' → codex never ran; defaultAuthPath is untouched
+ *   - phase='spawned' → codex may have written; restore from backup or delete leftover
+ *
+ * This two-phase design eliminates the family of races where partial fs effects
+ * (mkdir, seed, backup) were observable to concurrent processes BEFORE the lock was
+ * held. With this scheme, the lock is the very first observable side effect on
+ * ~/.codex; everything else happens strictly inside the lock-protected window.
+ *
+ * Exposed at module scope so unit tests can exercise the busy/error paths without
+ * spawning a real PTY / OAuth flow.
+ */
+export function acquireCodexLoginLock(
+    lockPath: string,
+    info: { profileName: string },
+): AcquireCodexLoginLockResult {
+    const started = new Date().toISOString();
+    try {
+        writeFileSync(
+            lockPath,
+            JSON.stringify({
+                profileName: info.profileName,
+                pid: process.pid,
+                started,
+                phase: 'started',
+                hadOriginal: false,
+            }),
+            { flag: 'wx', encoding: 'utf-8' },
+        );
+        return { kind: 'acquired', started };
+    } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === 'EEXIST') return { kind: 'busy' };
+        return { kind: 'error', error: err as Error };
+    }
+}
+
+/**
+ * Transition an already-held lock from phase='started' to phase='spawned'. Caller
+ * must hold the lock (i.e., have acquired via acquireCodexLoginLock and not released).
+ *
+ * Uses `flag: 'w'` (overwrite) since the caller owns the lock — atomic creation is
+ * unnecessary. Throws if the underlying writeFileSync fails so the caller can
+ * roll back backup + release lock.
+ */
+export function updateCodexLoginLockToSpawned(
+    lockPath: string,
+    info: { profileName: string; started: string; hadOriginal: boolean },
+): void {
+    writeFileSync(
+        lockPath,
+        JSON.stringify({
+            profileName: info.profileName,
+            pid: process.pid,
+            started: info.started,
+            phase: 'spawned',
+            hadOriginal: info.hadOriginal,
+        }),
+        { flag: 'w', encoding: 'utf-8' },
+    );
+}
+
 function performCodexLogin(
     profileName: string,
     ctx: BangCommandContext,
@@ -1385,38 +1460,191 @@ function performCodexLogin(
         };
     }
 
+    // Concurrency invariant: every observable fs side effect on ~/.codex (mkdir
+    // instance, seed config, backup auth.json, spawn codex, finalize) must run
+    // inside the lock-protected window. The atomic O_EXCL acquire (acquireCodexLoginLock
+    // below) is the EVENT HORIZON — a concurrent happy process is blocked there and
+    // cannot observe any partial state.
+    //
+    // The lock has two phases (phase='started' → phase='spawned'). Crash recovery
+    // uses the phase to decide whether codex may have touched ~/.codex/auth.json:
+    //   - phase='started' → codex never ran; defaultAuthPath is the user's original
+    //   - phase='spawned' → restore from backup (or delete leftover) per hadOriginal
+    const defaultCodexHome = join(homedir(), '.codex');
+    const defaultAuthPath = join(defaultCodexHome, 'auth.json');
+    const lockPath = join(defaultCodexHome, '.happy-login.lock');
+    const backupAuthPath = join(defaultCodexHome, 'auth.json.happy-bak');
+
     const codexInstancePath = getCodexInstancePath(profileName);
     const dirExistedBefore = existsSync(codexInstancePath);
+
+    // Idempotent: ensure ~/.codex exists so we have somewhere to put the lock file.
+    // mkdir recursive produces no observable mid-state, so it's safe outside the lock.
     try {
-        mkdirSync(codexInstancePath, { recursive: true });
+        mkdirSync(defaultCodexHome, { recursive: true });
     } catch (err) {
         return {
-            message: `❌ 创建 Codex 实例目录失败: ${(err as Error).message}`,
+            message: `❌ 创建 ~/.codex 失败: ${(err as Error).message}`,
             action: 'none',
         };
     }
 
-    // Seed config from current CODEX_HOME so proxy/trust settings carry over
-    const currentCodexHome = process.env.CODEX_HOME || join(homedir(), '.codex');
-    for (const file of ['config.toml', '.env'] as const) {
-        const destFile = join(codexInstancePath, file);
-        if (!existsSync(destFile)) {
-            const srcFile = join(currentCodexHome, file);
-            if (existsSync(srcFile)) {
-                try { copyFileSync(srcFile, destFile); } catch { /* best-effort */ }
+    logger.info(`[!login:codex] BEGIN profile=${profileName} defaultCodexHome=${defaultCodexHome} instancePath=${codexInstancePath} dirExistedBefore=${dirExistedBefore}`);
+
+    // -------- ATOMIC LOCK ACQUISITION (event horizon) --------
+    // Up to this point we have NOT made any observable side effect on ~/.codex.
+    // After this point, every fs op is fully serialized by the lock — no other happy
+    // process can interleave. busy/error returns immediately with no cleanup needed.
+    const lockResult = acquireCodexLoginLock(lockPath, { profileName });
+    if (lockResult.kind === 'busy') {
+        logger.warn(`[!login:codex] acquireLock=busy lockPath=${lockPath} — another login in flight, refusing`);
+        return {
+            message: '❌ 另一个 Codex 登录正在进行中\n\n请等待它完成；若进程已退出可重启 happy 自动清理',
+            action: 'none',
+        };
+    }
+    if (lockResult.kind === 'error') {
+        logger.warn(`[!login:codex] acquireLock=error code=${(lockResult.error as NodeJS.ErrnoException).code ?? 'unknown'} message=${lockResult.error.message}`);
+        return {
+            message: `❌ 创建登录锁失败: ${lockResult.error.message}`,
+            action: 'none',
+        };
+    }
+    const lockStarted = lockResult.started;
+    logger.info(`[!login:codex] acquireLock=acquired phase=started started=${lockStarted}`);
+
+    // ============== UNDER LOCK ==============
+    // closure variables consumed by restoreDefaultAuth and the onExit finalize block.
+    // hadOriginal replaces the old `backedUp` flag — same semantics, clearer name.
+    let hadOriginal = false;
+    const releaseLock = (): void => {
+        try { rmSync(lockPath, { force: true }); } catch {}
+    };
+    const restoreDefaultAuth = (): void => {
+        try {
+            if (hadOriginal && existsSync(backupAuthPath)) {
+                copyFileSync(backupAuthPath, defaultAuthPath);
+            } else if (!hadOriginal) {
+                rmSync(defaultAuthPath, { force: true });
             }
+        } catch (err) {
+            logger.warn('[!login:codex] restore default auth failed', err);
         }
+        try { rmSync(backupAuthPath, { force: true }); } catch {}
+    };
+
+    // 1. Create the per-profile instance dir (now under lock, so concurrent !login
+    //    on the same machine is fully serialized regardless of profile name).
+    try {
+        mkdirSync(codexInstancePath, { recursive: true });
+    } catch (err) {
+        releaseLock();
+        return {
+            message: `❌ 创建实例目录失败: ${(err as Error).message}`,
+            action: 'none',
+        };
     }
 
-    // Build env for codex login — point CODEX_HOME to the new instance
+    // 2. Seed instance config.toml/.env from current CODEX_HOME — first profile's
+    //    instance promotes these into the shared dir via linkCodexSharedDirectories
+    //    below, so users who configured proxy/trust in ~/.codex carry it across all
+    //    happy-managed profiles.
+    const currentCodexHome = process.env.CODEX_HOME || defaultCodexHome;
+    const seedReport: Record<string, string> = {};
+    for (const file of ['config.toml', '.env'] as const) {
+        const destFile = join(codexInstancePath, file);
+        if (existsSync(destFile)) {
+            seedReport[file] = 'skipped (dest exists)';
+            continue;
+        }
+        const srcFile = join(currentCodexHome, file);
+        if (!existsSync(srcFile)) {
+            seedReport[file] = 'no source';
+            continue;
+        }
+        try {
+            copyFileSync(srcFile, destFile);
+            seedReport[file] = `copied from ${srcFile}`;
+        } catch (err) {
+            seedReport[file] = `copy failed: ${(err as Error).message}`;
+        }
+    }
+    logger.info(`[!login:codex] seed config (currentCodexHome=${currentCodexHome}): ${JSON.stringify(seedReport)}`);
+
+    // 3. Backup ~/.codex/auth.json if it exists — now safe under lock, no concurrent
+    //    process can race against the shared backup file because they're all blocked
+    //    at acquireCodexLoginLock.
+    if (existsSync(defaultAuthPath)) {
+        try {
+            const stats = statSync(defaultAuthPath);
+            copyFileSync(defaultAuthPath, backupAuthPath);
+            hadOriginal = true;
+            logger.info(`[!login:codex] backup defaultAuth: size=${stats.size} mtime=${stats.mtime.toISOString()} → ${backupAuthPath}`);
+        } catch (err) {
+            logger.warn(`[!login:codex] backup defaultAuth failed: ${(err as Error).message}`);
+            releaseLock();
+            if (!dirExistedBefore) cleanupInstance(codexInstancePath);
+            return {
+                message: `❌ 备份 ~/.codex/auth.json 失败: ${(err as Error).message}`,
+                action: 'none',
+            };
+        }
+    } else {
+        logger.info(`[!login:codex] no defaultAuth at ${defaultAuthPath}, hadOriginal=false`);
+    }
+
+    // 4. Transition lock to phase='spawned'. From this point on, recovery treats
+    //    defaultAuthPath as "potentially modified by codex" and will restore from
+    //    backup (or delete leftover) according to hadOriginal.
+    try {
+        updateCodexLoginLockToSpawned(lockPath, {
+            profileName,
+            started: lockStarted,
+            hadOriginal,
+        });
+        logger.info(`[!login:codex] lock transition: phase=started → phase=spawned hadOriginal=${hadOriginal}`);
+    } catch (err) {
+        logger.warn(`[!login:codex] updateLockToSpawned failed: ${(err as Error).message}`);
+        restoreDefaultAuth();
+        releaseLock();
+        if (!dirExistedBefore) cleanupInstance(codexInstancePath);
+        return {
+            message: `❌ 更新登录锁失败: ${(err as Error).message}`,
+            action: 'none',
+        };
+    }
+
+    // 5. Build env for codex login — DO NOT override CODEX_HOME (let codex use ~/.codex)
     const childEnv: Record<string, string> = {};
     for (const [k, v] of Object.entries(process.env)) {
         if (v !== undefined) childEnv[k] = v;
     }
-    childEnv.CODEX_HOME = codexInstancePath;
-    // Remove ambient provider variables that might confuse codex
+    delete childEnv.CODEX_HOME;
     delete childEnv.ANTHROPIC_AUTH_TOKEN;
     delete childEnv.CLAUDE_CODE_OAUTH_TOKEN;
+
+    // Diagnostic dump: log what codex actually sees so we can debug OAuth failures
+    // (proxy mishandling, stale env vars, missing locale, etc). Values for sensitive
+    // keys are length-only; auth vars and proxy auth are masked. Filtered to keys
+    // that plausibly affect codex's HTTP / locale / TLS behavior.
+    const ENV_KEYS_OF_INTEREST = /^(HTTPS?_PROXY|ALL_PROXY|NO_PROXY|REQUESTS_CA_BUNDLE|SSL_CERT_FILE|NODE_EXTRA_CA_CERTS|CODEX_|OPENAI_|XDG_|LANG|LC_|LOCALE|TZ|HOME|USERPROFILE|TMPDIR|TEMP|TMP|PATH|COMSPEC|SHELL|HTTPS_PROXY)/i;
+    const maskProxyAuth = (v: string): string => v.replace(/\/\/[^@/]*@/, '//<auth>@');
+    const envSnapshot: Record<string, string> = {};
+    for (const [k, v] of Object.entries(childEnv)) {
+        if (!ENV_KEYS_OF_INTEREST.test(k)) continue;
+        if (k === 'PATH') {
+            envSnapshot[k] = `<${v.split(/[;:]/).length} entries>`;
+        } else if (/PROXY/i.test(k)) {
+            envSnapshot[k] = maskProxyAuth(v);
+        } else if (/^(OPENAI_API_KEY|OPENAI_TOKEN)$/i.test(k)) {
+            envSnapshot[k] = `<set, len=${v.length}>`;
+        } else {
+            envSnapshot[k] = v;
+        }
+    }
+    logger.info(`[!login:codex] childEnv snapshot: ${JSON.stringify(envSnapshot)}`);
+    logger.info(`[!login:codex] CODEX_HOME explicitly: ${childEnv.CODEX_HOME ?? '<unset>'} (deleted from inherited env, codex will fall back to ~/.codex)`);
+    logger.info(`[!login:codex] spawn target: path=${codexInfo.path} needsShell=${codexInfo.needsShell} cwd=${homedir()}`);
 
     // Spawn codex login via PTY
     ensurePtySpawnHelper();
@@ -1437,6 +1665,8 @@ function performCodexLogin(
             },
         );
     } catch (err) {
+        restoreDefaultAuth();
+        releaseLock();
         if (!dirExistedBefore) cleanupInstance(codexInstancePath);
         return {
             message: `❌ 启动 Codex 登录失败: ${(err as Error).message}`,
@@ -1449,6 +1679,16 @@ function performCodexLogin(
     let exited = false;
     let loginUrlSent = false;
     let loginSucceeded = false;
+    // State for failure / cancel paths — set by error/cancel handlers, consumed by
+    // onExit so the mobile message is dispatched AFTER finalize completes (single
+    // source of truth, no double-message races).
+    let cancelled = false;
+    let errorMessage: string | null = null;
+    // Reentrancy guard for onExit — node-pty has been observed double-firing onExit
+    // on Windows ConPTY in rare error paths. Without this guard, finalize would
+    // re-migrate (potentially with the restored backup as source) and double-dispatch
+    // the mobile message.
+    let finalized = false;
     // Ring buffer of the last ~4KB of raw PTY output — survives discard/flush so
     // onExit can dump the final codex stderr/stdout when login fails.
     let recentOutput = '';
@@ -1511,11 +1751,9 @@ function performCodexLogin(
             case 'error':
                 outputBuffer = '';
                 if (flushTimer) clearTimeout(flushTimer);
+                errorMessage = result.message;
                 unregisterInteractiveSession();
                 ptyProcess.kill();
-                if (!dirExistedBefore) cleanupInstance(codexInstancePath);
-                ctx.client.sendCodexMessage({ type: 'message', message: `❌ Codex 登录失败\n\n${result.message}` });
-                ctx.client.sendSessionEvent({ type: 'ready' });
                 return;
 
             case 'discard':
@@ -1530,13 +1768,11 @@ function performCodexLogin(
         const trimmed = text.trim();
         if (trimmed === '!cancel' || trimmed === '!取消') {
             logger.debug('[!login:codex] User cancelled login');
+            cancelled = true;
             loginSucceeded = false;
             unregisterInteractiveSession();
             flushOutput();
             ptyProcess.kill();
-            if (!dirExistedBefore) cleanupInstance(codexInstancePath);
-            ctx.client.sendCodexMessage({ type: 'message', message: '❌ 登录已取消' });
-            ctx.client.sendSessionEvent({ type: 'ready' });
             return;
         }
         if (exited) return;
@@ -1545,44 +1781,103 @@ function performCodexLogin(
     });
 
     ptyProcess.onExit(({ exitCode }) => {
+        if (finalized) {
+            logger.debug(`[!login:codex] onExit re-entry blocked by finalized guard (exitCode=${exitCode})`);
+            return;
+        }
+        finalized = true;
         exited = true;
+        logger.info(`[!login:codex] onExit entry: exitCode=${exitCode} loginSucceeded=${loginSucceeded} cancelled=${cancelled} errorMessage=${errorMessage ? JSON.stringify(errorMessage).slice(0, 200) : 'null'}`);
         flushOutput();
         unregisterInteractiveSession();
 
-        const hasAuth = loginSucceeded
-            || existsSync(join(codexInstancePath, 'auth.json'));
+        // Ordering matters: migrate → restore → register → unlock → notify.
+        // The mobile client is told "success" only after the lock is released, so a
+        // follow-up !login command from the user can immediately begin.
 
-        if (hasAuth) {
+        // Step 1: migrate the freshly-written auth.json from ~/.codex into the instance.
+        // We rely on `loginSucceeded` (set by the PTY 'success' parser) instead of mere
+        // existence of defaultAuthPath, because the user's pre-existing auth.json could
+        // still be sitting there if codex never completed login.
+        let migrated = false;
+        let registerError: Error | null = null;
+        try {
+            if (loginSucceeded && existsSync(defaultAuthPath)) {
+                const stats = statSync(defaultAuthPath);
+                mkdirSync(codexInstancePath, { recursive: true });
+                copyFileSync(defaultAuthPath, join(codexInstancePath, 'auth.json'));
+                migrated = true;
+                logger.info(`[!login:codex] step1 migrate: size=${stats.size} mtime=${stats.mtime.toISOString()} → ${join(codexInstancePath, 'auth.json')}`);
+            } else {
+                logger.info(`[!login:codex] step1 migrate skipped: loginSucceeded=${loginSucceeded} defaultAuthExists=${existsSync(defaultAuthPath)}`);
+            }
+        } catch (err) {
+            registerError = err as Error;
+            logger.warn(`[!login:codex] step1 migrate error: ${(err as Error).message}`);
+        }
+
+        // Step 2: restore the user's original ~/.codex/auth.json (or remove leftover)
+        restoreDefaultAuth();
+        logger.info(`[!login:codex] step2 restoreDefaultAuth done (hadOriginal=${hadOriginal})`);
+
+        // Step 3: register profile + link shared dirs (still under lock)
+        let isFirstProfile = false;
+        if (migrated && !registerError) {
             try {
-                // Check before register to avoid redundant config.yaml read-after-write
-                const isFirstProfile = !readCodexDefaultProfile();
-                // Register in CCS so !auth can discover the profile
+                isFirstProfile = !readCodexDefaultProfile();
                 registerCodexProfile(profileName);
                 if (isFirstProfile) {
                     setCodexDefaultProfile(profileName);
                     logger.debug(`[!login:codex] Auto-set default codex profile to "${profileName}" (first profile)`);
                 }
-                // Link shared resources and session history — mirrors Claude login pattern
                 linkCodexSharedDirectories(codexInstancePath);
                 syncCodexSessionSharing(codexInstancePath);
-                const defaultNote = isFirstProfile ? '\n已自动设为默认账户' : '';
-                const msg = `✅ Codex 配置 "${profileName}" 登录成功${defaultNote}\n\n`
-                    + `切换账号: !auth-all --codex ${profileName}`;
-                ctx.client.sendCodexMessage({ type: 'message', message: msg });
+                logger.info(`[!login:codex] step3 register+linkShared done (isFirstProfile=${isFirstProfile})`);
             } catch (err) {
-                logger.debug('[!login:codex] Failed to register profile:', err);
-                ctx.client.sendCodexMessage({ type: 'message', message: `⚠️ 登录成功但注册失败: ${(err as Error).message}` });
+                registerError = err as Error;
+                logger.warn(`[!login:codex] step3 register error: ${(err as Error).message}`);
             }
         } else {
-            if (!dirExistedBefore) cleanupInstance(codexInstancePath);
+            logger.info(`[!login:codex] step3 register skipped (migrated=${migrated} registerError=${registerError ? 'set' : 'null'})`);
+        }
+
+        // Step 4: release lock — only AFTER all fs ops above complete
+        releaseLock();
+        logger.info('[!login:codex] step4 releaseLock done');
+
+        // Step 5: notify mobile client (after lock released, so a follow-up !login is safe).
+        // Cleanup of half-created instance dir is consolidated here for any non-success branch.
+        const finalSuccess = migrated && !registerError;
+        if (!finalSuccess && !dirExistedBefore) {
+            cleanupInstance(codexInstancePath);
+            logger.info(`[!login:codex] cleanupInstance ${codexInstancePath} (was newly created, login failed)`);
+        }
+
+        if (finalSuccess) {
+            logger.info(`[!login:codex] step5 dispatch=success profile=${profileName} isFirstProfile=${isFirstProfile}`);
+            const defaultNote = isFirstProfile ? '\n已自动设为默认账户' : '';
+            const msg = `✅ Codex 配置 "${profileName}" 登录成功${defaultNote}\n\n`
+                + `切换账号: !auth-all --codex ${profileName}`;
+            ctx.client.sendCodexMessage({ type: 'message', message: msg });
+        } else if (registerError) {
+            logger.warn(`[!login:codex] step5 dispatch=registerError: ${registerError.message}`);
+            ctx.client.sendCodexMessage({ type: 'message', message: `⚠️ 登录成功但注册失败: ${registerError.message}` });
+        } else if (cancelled) {
+            logger.info('[!login:codex] step5 dispatch=cancelled');
+            ctx.client.sendCodexMessage({ type: 'message', message: '❌ 登录已取消' });
+        } else if (errorMessage) {
+            logger.info(`[!login:codex] step5 dispatch=errorMessage: ${errorMessage}`);
+            ctx.client.sendCodexMessage({ type: 'message', message: `❌ Codex 登录失败\n\n${errorMessage}` });
+        } else {
             const finalStripped = stripTerminalOutput(recentOutput).slice(-1000);
-            logger.info(`[!login:codex] Login failed with exit code: ${exitCode ?? 'unknown'} finalOutput=${JSON.stringify(finalStripped)}`);
+            logger.warn(`[!login:codex] step5 dispatch=genericFailure exitCode=${exitCode ?? 'unknown'} finalOutput=${JSON.stringify(finalStripped)}`);
             const tail = finalStripped.trim();
             const detail = tail ? `\n\nCodex 输出:\n${codeBlock(tail)}` : '';
             ctx.client.sendCodexMessage({ type: 'message', message: `❌ Codex 登录失败或已取消${detail}\n\n重新尝试: !login --codex ${profileName}` });
         }
 
         ctx.client.sendSessionEvent({ type: 'ready' });
+        logger.info(`[!login:codex] END profile=${profileName}`);
     });
 
     const msg = `🔐 正在登录 Codex...\n\n`
@@ -1590,4 +1885,113 @@ function performCodexLogin(
         + '请等待 OAuth 链接，然后在浏览器中打开\n\n'
         + '取消: !cancel';
     return { message: msg, action: 'none' };
+}
+
+/**
+ * Returns true when `pid` belongs to a still-running process. Uses `process.kill(pid, 0)`,
+ * the standard cross-platform liveness probe (Node implements it on Windows too).
+ * Rejects 0/negative pids — `process.kill(0, 0)` targets the process group and
+ * `process.kill(-1, 0)` targets all signalable processes; neither belongs in a lock file.
+ */
+function isCodexLoginPidAlive(pid: number | undefined): boolean {
+    if (!pid || typeof pid !== 'number' || pid <= 0) return false;
+    if (pid === process.pid) return true;
+    try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+/**
+ * Lock files older than this are treated as stale even if the recorded pid happens
+ * to still be alive (defends against PID reuse — Linux pid_max is typically 32768
+ * so reuse cycles in hours under load). Device-auth code TTL is 15 minutes, so a
+ * 1-hour ceiling is comfortably above any legitimate login duration.
+ */
+const CODEX_LOGIN_LOCK_STALE_MS = 60 * 60 * 1000;
+
+/**
+ * Recover from an interrupted codex login (parent happy process killed mid-flow).
+ * Called once at CLI startup — idempotent, safe when no lock exists.
+ *
+ * Liveness gate (defends against two failure modes):
+ * - Live pid + fresh timestamp → real in-flight login, skip recovery (race protection)
+ * - Live pid + stale timestamp → PID reuse after crash, treat as stale and recover
+ * - Live pid + missing timestamp → conservative: skip (assume in-flight)
+ * - Dead pid (any timestamp) → recover
+ *
+ * Phase-driven recovery state machine (the structural fix):
+ * - phase='started': codex never spawned, defaultAuthPath is the user's untouched
+ *   original. Just clean up lock + any orphan backup. Do NOT touch defaultAuthPath.
+ * - phase='spawned' + hadOriginal=true + backup exists: restore from backup.
+ * - phase='spawned' + hadOriginal=true + no backup: cannot restore (rare crash window
+ *   between backup-create and update-lock); log warning, leave defaultAuthPath alone.
+ * - phase='spawned' + hadOriginal=false: codex wrote a new auth.json into a previously
+ *   empty ~/.codex; delete it (restore "no auth" state, otherwise the user's default
+ *   would be silently bound to a happy-managed account).
+ *
+ * Backwards compat: pre-phase locks used a `backedUp` field and implied that codex
+ * had spawned. We map them to phase='spawned' with hadOriginal=backedUp.
+ *
+ * `codexHome` is exposed for unit tests so they can point at a temp directory; in
+ * production the default ~/.codex location is used.
+ */
+export function recoverInterruptedCodexLogin(codexHome?: string): void {
+    const defaultCodexHome = codexHome ?? join(homedir(), '.codex');
+    const lockPath = join(defaultCodexHome, '.happy-login.lock');
+    if (!existsSync(lockPath)) return;
+
+    const defaultAuthPath = join(defaultCodexHome, 'auth.json');
+    const backupAuthPath = join(defaultCodexHome, 'auth.json.happy-bak');
+
+    let info: {
+        phase?: string;
+        hadOriginal?: boolean;
+        backedUp?: boolean; // legacy field for backwards compat with pre-phase locks
+        profileName?: string;
+        pid?: number;
+        started?: string;
+    } = {};
+    try { info = JSON.parse(readFileSync(lockPath, 'utf-8')); } catch {}
+
+    // Legacy lock format compat: pre-phase locks only had `backedUp` and were always
+    // post-spawn semantically (the old code only wrote the lock right before spawning).
+    const phase: 'started' | 'spawned' = info.phase === 'started' || info.phase === 'spawned'
+        ? info.phase
+        : (info.backedUp !== undefined ? 'spawned' : 'started');
+    const hadOriginal = info.hadOriginal ?? info.backedUp ?? false;
+
+    const startedAt = info.started ? Date.parse(info.started) : NaN;
+    const looksFresh = !Number.isFinite(startedAt) || (Date.now() - startedAt) < CODEX_LOGIN_LOCK_STALE_MS;
+    if (isCodexLoginPidAlive(info.pid) && looksFresh) {
+        logger.debug(`[!login:codex] Lock held by live pid=${info.pid} (phase=${phase}, started=${info.started ?? 'unknown'}), skipping recovery`);
+        return;
+    }
+    if (isCodexLoginPidAlive(info.pid) && !looksFresh) {
+        logger.warn(`[!login:codex] Lock pid=${info.pid} alive but timestamp stale (started=${info.started}), assuming PID reuse and recovering`);
+    }
+
+    try {
+        if (phase === 'started') {
+            // codex never spawned; defaultAuthPath is untouched. Just clean lock + orphan backup.
+            logger.info(`[!login:codex] Cleared codex login lock from pre-spawn crash (profile=${info.profileName ?? 'unknown'})`);
+        } else {
+            // phase === 'spawned' — codex MAY have written defaultAuthPath
+            const backupExists = existsSync(backupAuthPath);
+            if (hadOriginal && backupExists) {
+                copyFileSync(backupAuthPath, defaultAuthPath);
+                logger.info(`[!login:codex] Recovered ~/.codex/auth.json from interrupted login (profile=${info.profileName ?? 'unknown'})`);
+            } else if (hadOriginal && !backupExists) {
+                // Rare crash window: backup creation completed but lock update to spawned
+                // didn't, OR backup was lost. Don't touch defaultAuthPath — the user's
+                // original may still be there.
+                logger.warn(`[!login:codex] Lock indicates backup but file is missing — cannot restore (profile=${info.profileName ?? 'unknown'})`);
+            } else if (!hadOriginal && existsSync(defaultAuthPath)) {
+                rmSync(defaultAuthPath, { force: true });
+                logger.info('[!login:codex] Removed leftover auth.json from interrupted login (no original to restore)');
+            }
+        }
+        rmSync(backupAuthPath, { force: true });
+    } catch (err) {
+        logger.warn('[!login:codex] Recovery failed', err);
+    }
+
+    try { rmSync(lockPath, { force: true }); } catch {}
 }

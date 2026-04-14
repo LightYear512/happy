@@ -26,6 +26,7 @@ import { listDaemonSessions, stopDaemonSession } from './daemon/controlClient'
 import { handleAuthCommand } from './commands/auth'
 import { handleConnectCommand } from './commands/connect'
 import { handleSandboxCommand } from './commands/sandbox'
+import { recoverInterruptedCodexLogin } from './commands/bang/loginCommand'
 import { spawnHappyCLI } from './utils/spawnHappyCLI'
 import { claudeCliPath } from './claude/claudeLocal'
 import { execFileSync } from 'node:child_process'
@@ -39,6 +40,10 @@ import { extractNoSandboxFlag } from './utils/sandboxFlags'
   if (!args.includes('--version')) {
     logger.debug('Starting happy CLI with args: ', process.argv)
   }
+
+  // Roll forward any interrupted codex login (parent killed mid-flow last time).
+  // Idempotent and cheap — just an existsSync check when no lock file is present.
+  recoverInterruptedCodexLogin()
 
   // Check if first argument is a subcommand
   const subcommand = args[0]

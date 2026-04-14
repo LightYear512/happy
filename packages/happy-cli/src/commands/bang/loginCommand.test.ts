@@ -1,5 +1,8 @@
-import { describe, it, expect } from 'vitest';
-import { analyzePtyOutput, analyzeCodexPtyOutput, stripAnsiOnly, parseLoginArgs, type PtyAction } from './loginCommand';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { analyzePtyOutput, analyzeCodexPtyOutput, stripAnsiOnly, parseLoginArgs, recoverInterruptedCodexLogin, acquireCodexLoginLock, updateCodexLoginLockToSpawned, type PtyAction } from './loginCommand';
 
 // Real OAuth URL from actual Claude Code login flow
 const REAL_OAUTH_URL = 'https://claude.ai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference+user%3Asessions%3Aclaude_code+user%3Amcp_servers+user%3Afile_upload&code_challenge=9wvqXasXp7FespyUXZRRUy7pzFl6NfFQR0bO-vCLBr4&code_challenge_method=S256&state=2ppMXLEutGbkjDlq3aZdYUJqF3-sU7RUX1xODTviPkE';
@@ -336,5 +339,346 @@ describe('parseLoginArgs', () => {
                 kind: 'ok', profileName: 'first',
             });
         });
+    });
+});
+
+describe('recoverInterruptedCodexLogin', () => {
+    let tmpHome: string;
+
+    beforeEach(() => {
+        tmpHome = mkdtempSync(join(tmpdir(), 'happy-codex-recovery-'));
+    });
+
+    afterEach(() => {
+        try { rmSync(tmpHome, { recursive: true, force: true }); } catch { /* best-effort */ }
+    });
+
+    const lockPath = (): string => join(tmpHome, '.happy-login.lock');
+    const authPath = (): string => join(tmpHome, 'auth.json');
+    const backupPath = (): string => join(tmpHome, 'auth.json.happy-bak');
+
+    it('no lock file → no-op (idempotent on clean state)', () => {
+        writeFileSync(authPath(), '{"original":true}');
+        recoverInterruptedCodexLogin(tmpHome);
+        expect(readFileSync(authPath(), 'utf-8')).toBe('{"original":true}');
+        expect(existsSync(lockPath())).toBe(false);
+        expect(existsSync(backupPath())).toBe(false);
+    });
+
+    it('stale lock + backup exists → restores backup, removes both lock and backup', () => {
+        // Simulate: user had original auth.json, login created backup, then crashed
+        writeFileSync(authPath(), '{"freshly_written_by_codex_login":true}');
+        writeFileSync(backupPath(), '{"original_user_token":true}');
+        writeFileSync(lockPath(), JSON.stringify({
+            profileName: 'foo',
+            pid: 999999, // dead pid
+            backedUp: true,
+            started: '2026-01-01T00:00:00Z',
+        }));
+
+        recoverInterruptedCodexLogin(tmpHome);
+
+        expect(readFileSync(authPath(), 'utf-8')).toBe('{"original_user_token":true}');
+        expect(existsSync(backupPath())).toBe(false);
+        expect(existsSync(lockPath())).toBe(false);
+    });
+
+    it('stale lock + no backup + backedUp:false + auth.json present → removes leftover auth.json', () => {
+        // Simulate: user had NO original auth.json, login wrote a fresh one, then crashed
+        writeFileSync(authPath(), '{"freshly_written_by_codex_login":true}');
+        writeFileSync(lockPath(), JSON.stringify({
+            profileName: 'foo',
+            pid: 999999, // dead pid
+            backedUp: false,
+        }));
+
+        recoverInterruptedCodexLogin(tmpHome);
+
+        // Original state was "no auth.json" — recovery must restore that, NOT leave the
+        // freshly-written token in place (would silently bind ~/.codex to a happy account)
+        expect(existsSync(authPath())).toBe(false);
+        expect(existsSync(lockPath())).toBe(false);
+    });
+
+    it('lock held by LIVE pid → no-op (refuses to touch in-flight login)', () => {
+        // Critical race-prevention test: a parallel happy CLI startup (e.g. daemon
+        // --version) must NOT clobber a foreground login's state mid-flow.
+        writeFileSync(authPath(), '{"in_flight_token":true}');
+        writeFileSync(backupPath(), '{"would_be_restored_by_buggy_recovery":true}');
+        writeFileSync(lockPath(), JSON.stringify({
+            profileName: 'foo',
+            pid: process.pid, // LIVE
+            backedUp: true,
+        }));
+
+        recoverInterruptedCodexLogin(tmpHome);
+
+        // Nothing should have changed
+        expect(readFileSync(authPath(), 'utf-8')).toBe('{"in_flight_token":true}');
+        expect(readFileSync(backupPath(), 'utf-8')).toBe('{"would_be_restored_by_buggy_recovery":true}');
+        expect(existsSync(lockPath())).toBe(true);
+    });
+
+    it('malformed lock JSON → still removes lock, no crash', () => {
+        writeFileSync(lockPath(), 'not-json{{{');
+        recoverInterruptedCodexLogin(tmpHome);
+        expect(existsSync(lockPath())).toBe(false);
+    });
+
+    it('live pid + FRESH timestamp → skip (real in-flight login)', () => {
+        writeFileSync(authPath(), '{"in_flight_token":true}');
+        writeFileSync(backupPath(), '{"original_user_token":true}');
+        writeFileSync(lockPath(), JSON.stringify({
+            profileName: 'foo',
+            pid: process.pid,
+            backedUp: true,
+            started: new Date().toISOString(), // brand new
+        }));
+
+        recoverInterruptedCodexLogin(tmpHome);
+
+        expect(readFileSync(authPath(), 'utf-8')).toBe('{"in_flight_token":true}');
+        expect(existsSync(backupPath())).toBe(true);
+        expect(existsSync(lockPath())).toBe(true);
+    });
+
+    it('live pid + STALE timestamp → recover (PID reuse defense)', () => {
+        // Defends against: process A crashes during login, system reuses pid A's
+        // number for an unrelated process. Without timestamp gating, recovery would
+        // see the (unrelated) live pid and skip — leaving lock permanently held.
+        writeFileSync(authPath(), '{"freshly_written":true}');
+        writeFileSync(backupPath(), '{"original_user_token":true}');
+        const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+        writeFileSync(lockPath(), JSON.stringify({
+            profileName: 'foo',
+            pid: process.pid, // "alive" but the timestamp is way past device-auth TTL
+            backedUp: true,
+            started: twoHoursAgo,
+        }));
+
+        recoverInterruptedCodexLogin(tmpHome);
+
+        // Recovery proceeded despite live pid: backup restored, lock removed
+        expect(readFileSync(authPath(), 'utf-8')).toBe('{"original_user_token":true}');
+        expect(existsSync(backupPath())).toBe(false);
+        expect(existsSync(lockPath())).toBe(false);
+    });
+
+    // ====== Phase state machine tests (round-5 structural fix) ======
+
+    it('phase=started crash → defaultAuthPath UNTOUCHED (proves structural fix)', () => {
+        // Critical regression test for the lock-first ordering: if happy crashes
+        // BETWEEN acquireLock and updateToSpawned, the lock has phase='started' and
+        // codex never ran. The user's original auth.json is still pristine — recovery
+        // MUST NOT touch it. Earlier rounds (with the legacy backedUp-only schema)
+        // had no way to distinguish this from "crashed after spawn", and could either
+        // leave a happy-managed token in place or delete the user's original.
+        writeFileSync(authPath(), '{"user_original_token":true}');
+        writeFileSync(lockPath(), JSON.stringify({
+            profileName: 'foo',
+            pid: 999999, // dead
+            started: new Date().toISOString(),
+            phase: 'started',
+            hadOriginal: false,
+        }));
+
+        recoverInterruptedCodexLogin(tmpHome);
+
+        // The crucial invariant: defaultAuthPath is unchanged
+        expect(readFileSync(authPath(), 'utf-8')).toBe('{"user_original_token":true}');
+        expect(existsSync(lockPath())).toBe(false);
+    });
+
+    it('phase=spawned + hadOriginal=true + backup → restore from backup', () => {
+        writeFileSync(authPath(), '{"codex_wrote_new":true}');
+        writeFileSync(backupPath(), '{"user_original":true}');
+        writeFileSync(lockPath(), JSON.stringify({
+            profileName: 'foo',
+            pid: 999999,
+            started: new Date().toISOString(),
+            phase: 'spawned',
+            hadOriginal: true,
+        }));
+
+        recoverInterruptedCodexLogin(tmpHome);
+
+        expect(readFileSync(authPath(), 'utf-8')).toBe('{"user_original":true}');
+        expect(existsSync(backupPath())).toBe(false);
+        expect(existsSync(lockPath())).toBe(false);
+    });
+
+    it('phase=spawned + hadOriginal=false + auth.json → delete leftover', () => {
+        writeFileSync(authPath(), '{"codex_wrote_new_into_empty_home":true}');
+        writeFileSync(lockPath(), JSON.stringify({
+            profileName: 'foo',
+            pid: 999999,
+            started: new Date().toISOString(),
+            phase: 'spawned',
+            hadOriginal: false,
+        }));
+
+        recoverInterruptedCodexLogin(tmpHome);
+
+        expect(existsSync(authPath())).toBe(false);
+        expect(existsSync(lockPath())).toBe(false);
+    });
+
+    it('phase=spawned + hadOriginal=true + NO backup → log warn, defaultAuth untouched', () => {
+        // Rare crash window: backup file vanished (disk error, manual deletion, etc).
+        // We can't restore — must leave defaultAuthPath alone rather than risk deleting
+        // the user's data.
+        writeFileSync(authPath(), '{"may_be_codex_or_original":true}');
+        writeFileSync(lockPath(), JSON.stringify({
+            profileName: 'foo',
+            pid: 999999,
+            started: new Date().toISOString(),
+            phase: 'spawned',
+            hadOriginal: true,
+        }));
+
+        recoverInterruptedCodexLogin(tmpHome);
+
+        // defaultAuth left as-is; lock still removed
+        expect(existsSync(authPath())).toBe(true);
+        expect(existsSync(lockPath())).toBe(false);
+    });
+
+    it('phase=started + orphan backup → backup removed, lock removed, auth untouched', () => {
+        // Pre-spawn crash that somehow left a backup file behind. Sweep on recovery.
+        writeFileSync(authPath(), '{"untouched":true}');
+        writeFileSync(backupPath(), '{"orphan":true}');
+        writeFileSync(lockPath(), JSON.stringify({
+            profileName: 'foo',
+            pid: 999999,
+            started: new Date().toISOString(),
+            phase: 'started',
+            hadOriginal: false,
+        }));
+
+        recoverInterruptedCodexLogin(tmpHome);
+
+        expect(readFileSync(authPath(), 'utf-8')).toBe('{"untouched":true}');
+        expect(existsSync(backupPath())).toBe(false);
+        expect(existsSync(lockPath())).toBe(false);
+    });
+
+    it('legacy lock format (backedUp field, no phase) → recovers via compat path', () => {
+        // Backwards compat: pre-round-5 lock files used `backedUp: bool` and were
+        // written right before spawn (so semantically phase='spawned'). Recovery
+        // should still handle them correctly.
+        writeFileSync(authPath(), '{"codex_wrote_new":true}');
+        writeFileSync(backupPath(), '{"user_original":true}');
+        writeFileSync(lockPath(), JSON.stringify({
+            profileName: 'foo',
+            pid: 999999,
+            started: new Date().toISOString(),
+            backedUp: true, // legacy field, no phase
+        }));
+
+        recoverInterruptedCodexLogin(tmpHome);
+
+        expect(readFileSync(authPath(), 'utf-8')).toBe('{"user_original":true}');
+        expect(existsSync(backupPath())).toBe(false);
+        expect(existsSync(lockPath())).toBe(false);
+    });
+});
+
+describe('acquireCodexLoginLock', () => {
+    let tmpHome: string;
+    beforeEach(() => {
+        tmpHome = mkdtempSync(join(tmpdir(), 'happy-codex-acquire-'));
+    });
+    afterEach(() => {
+        try { rmSync(tmpHome, { recursive: true, force: true }); } catch { /* best-effort */ }
+    });
+
+    it('first acquisition succeeds, writes phase=started lock, returns started ISO', () => {
+        const lockFile = join(tmpHome, '.happy-login.lock');
+        const before = Date.now();
+        const result = acquireCodexLoginLock(lockFile, { profileName: 'foo' });
+        expect(result.kind).toBe('acquired');
+        if (result.kind !== 'acquired') return;
+        expect(Number.isFinite(Date.parse(result.started))).toBe(true);
+        expect(Date.parse(result.started)).toBeGreaterThanOrEqual(before);
+        expect(existsSync(lockFile)).toBe(true);
+
+        const json = JSON.parse(readFileSync(lockFile, 'utf-8'));
+        expect(json.profileName).toBe('foo');
+        expect(json.pid).toBe(process.pid);
+        expect(json.phase).toBe('started');
+        expect(json.hadOriginal).toBe(false);
+        expect(json.started).toBe(result.started);
+    });
+
+    it('second concurrent acquisition returns busy (TOCTOU defense via O_EXCL)', () => {
+        // Regression test for the file-locking textbook bug: a naive existsSync +
+        // writeFileSync pattern would let both calls proceed. The wx flag delegates
+        // to the kernel's atomic O_CREAT|O_EXCL, so the second call gets EEXIST → busy.
+        const lockFile = join(tmpHome, '.happy-login.lock');
+        const first = acquireCodexLoginLock(lockFile, { profileName: 'foo' });
+        expect(first.kind).toBe('acquired');
+
+        const second = acquireCodexLoginLock(lockFile, { profileName: 'bar' });
+        expect(second.kind).toBe('busy');
+
+        // First lock content must be untouched (second call did NOT clobber)
+        const json = JSON.parse(readFileSync(lockFile, 'utf-8'));
+        expect(json.profileName).toBe('foo');
+        expect(json.phase).toBe('started');
+    });
+
+    it('error kind on missing parent directory (ENOENT)', () => {
+        const result = acquireCodexLoginLock(
+            join(tmpHome, 'nonexistent-subdir', '.happy-login.lock'),
+            { profileName: 'foo' },
+        );
+        expect(result.kind).toBe('error');
+        if (result.kind !== 'error') return;
+        expect(result.error).toBeInstanceOf(Error);
+    });
+});
+
+describe('updateCodexLoginLockToSpawned', () => {
+    let tmpHome: string;
+    beforeEach(() => {
+        tmpHome = mkdtempSync(join(tmpdir(), 'happy-codex-update-'));
+    });
+    afterEach(() => {
+        try { rmSync(tmpHome, { recursive: true, force: true }); } catch { /* best-effort */ }
+    });
+
+    it('transitions phase=started → spawned, preserves started + profileName + pid', () => {
+        const lockFile = join(tmpHome, '.happy-login.lock');
+        const acquired = acquireCodexLoginLock(lockFile, { profileName: 'alpha' });
+        expect(acquired.kind).toBe('acquired');
+        if (acquired.kind !== 'acquired') return;
+        const originalStarted = acquired.started;
+
+        updateCodexLoginLockToSpawned(lockFile, {
+            profileName: 'alpha',
+            started: originalStarted,
+            hadOriginal: true,
+        });
+
+        const json = JSON.parse(readFileSync(lockFile, 'utf-8'));
+        expect(json.phase).toBe('spawned');
+        expect(json.hadOriginal).toBe(true);
+        expect(json.started).toBe(originalStarted);
+        expect(json.profileName).toBe('alpha');
+        expect(json.pid).toBe(process.pid);
+    });
+
+    it('records hadOriginal=false correctly', () => {
+        const lockFile = join(tmpHome, '.happy-login.lock');
+        const acquired = acquireCodexLoginLock(lockFile, { profileName: 'beta' });
+        if (acquired.kind !== 'acquired') return;
+        updateCodexLoginLockToSpawned(lockFile, {
+            profileName: 'beta',
+            started: acquired.started,
+            hadOriginal: false,
+        });
+        const json = JSON.parse(readFileSync(lockFile, 'utf-8'));
+        expect(json.phase).toBe('spawned');
+        expect(json.hadOriginal).toBe(false);
     });
 });
