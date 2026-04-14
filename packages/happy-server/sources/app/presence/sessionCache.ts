@@ -7,6 +7,13 @@ interface SessionCacheEntry {
     lastUpdateSent: number;
     pendingUpdate: number | null;
     userId: string;
+    /**
+     * Set by markSessionDead when a session-end event is processed. Blocks
+     * subsequent queueSessionUpdate calls (from lingering session-alive
+     * heartbeats of a child process that hasn't exited yet) from resurrecting
+     * the session via the batch flush path. Cleared on explicit revalidation.
+     */
+    dead?: boolean;
 }
 
 interface MachineCacheEntry {
@@ -16,7 +23,7 @@ interface MachineCacheEntry {
     userId: string;
 }
 
-class ActivityCache {
+export class ActivityCache {
     private sessionCache = new Map<string, SessionCacheEntry>();
     private machineCache = new Map<string, MachineCacheEntry>();
     private batchTimer: NodeJS.Timeout | null = null;
@@ -49,32 +56,43 @@ class ActivityCache {
     async isSessionValid(sessionId: string, userId: string): Promise<boolean> {
         const now = Date.now();
         const cached = this.sessionCache.get(sessionId);
-        
-        // Check cache first
+
+        // Cache hit within TTL — short-circuit. A dead entry returns false
+        // directly so a straggler session-alive from a child that hasn't exited
+        // yet cannot sneak through the DB refetch path and resurrect the
+        // session. The TTL (CACHE_TTL) bounds how long the dead flag sticks;
+        // afterwards the next call falls through to the DB and respects
+        // whatever `active` state the session is in at that point.
         if (cached && cached.validUntil > now && cached.userId === userId) {
             sessionCacheCounter.inc({ operation: 'session_validation', result: 'hit' });
-            return true;
+            return !cached.dead;
         }
-        
+
         sessionCacheCounter.inc({ operation: 'session_validation', result: 'miss' });
-        
+
         // Cache miss - check database
         try {
             const session = await db.session.findUnique({
                 where: { id: sessionId, accountId: userId }
             });
-            
+
             if (session) {
-                // Cache the result
+                // Cache the result, respecting the DB's `active` flag. A session
+                // that was explicitly ended (active=false) must be reflected as
+                // `dead: true` in the cache, otherwise stragglers from a child's
+                // lingering session-alive heartbeats would revalidate and
+                // resurrect it via the ephemeral broadcast path.
+                const dead = !session.active;
                 this.sessionCache.set(sessionId, {
                     validUntil: now + this.CACHE_TTL,
                     lastUpdateSent: session.lastActiveAt.getTime(),
                     pendingUpdate: null,
-                    userId
+                    userId,
+                    dead
                 });
-                return true;
+                return session.active;
             }
-            
+
             return false;
         } catch (error) {
             log({ module: 'session-cache', level: 'error' }, `Error validating session ${sessionId}: ${error}`);
@@ -131,6 +149,7 @@ class ActivityCache {
     isSessionAlive(sessionId: string): boolean {
         const cached = this.sessionCache.get(sessionId);
         if (!cached) return false;
+        if (cached.dead) return false;
         // Has a pending heartbeat waiting to flush → session is alive
         if (cached.pendingUpdate) return true;
         // Last flushed heartbeat was recent (within batch interval + threshold margin)
@@ -148,7 +167,18 @@ class ActivityCache {
         if (cached) {
             cached.pendingUpdate = null;
             cached.lastUpdateSent = 0;
+            cached.dead = true;
         }
+    }
+
+    /**
+     * Drop the cache entry entirely so the next isSessionValid call re-fetches
+     * from the DB and picks up any out-of-band state changes (e.g. an explicit
+     * tryRestoreSession that just flipped `active` back to true). Callers that
+     * know the session state changed under their feet should invoke this.
+     */
+    invalidateSession(sessionId: string): void {
+        this.sessionCache.delete(sessionId);
     }
 
     queueSessionUpdate(sessionId: string, timestamp: number): boolean {
@@ -156,14 +186,20 @@ class ActivityCache {
         if (!cached) {
             return false; // Should validate first
         }
-        
+        if (cached.dead) {
+            // Session was explicitly ended. Refuse stragglers from the child's
+            // lingering session-alive heartbeats so the batch flush can't
+            // resurrect it via lastActiveAt bump.
+            return false;
+        }
+
         // Only queue if time difference is significant
         const timeDiff = Math.abs(timestamp - cached.lastUpdateSent);
         if (timeDiff > this.UPDATE_THRESHOLD) {
             cached.pendingUpdate = timestamp;
             return true;
         }
-        
+
         databaseUpdatesSkippedCounter.inc({ type: 'session' });
         return false; // No update needed
     }
@@ -212,15 +248,23 @@ class ActivityCache {
         }
         
         // Batch update sessions
+        //
+        // IMPORTANT: only update `lastActiveAt` here. This is a heartbeat flush;
+        // `active` is lifecycle state owned by session-create / session-end and
+        // must NOT be touched from the heartbeat path. Previously this also
+        // wrote `active: true`, which resurrected sessions that had just been
+        // marked dead by a session-end event — because a child process's
+        // session-alive heartbeats can land between session-end and the child
+        // actually exiting, re-populating pendingUpdate.
         if (sessionUpdates.length > 0) {
             try {
                 await Promise.all(sessionUpdates.map(update =>
                     db.session.update({
                         where: { id: update.id },
-                        data: { lastActiveAt: new Date(update.timestamp), active: true }
+                        data: { lastActiveAt: new Date(update.timestamp) }
                     })
                 ));
-                
+
                 log({ module: 'session-cache' }, `Flushed ${sessionUpdates.length} session updates`);
             } catch (error) {
                 log({ module: 'session-cache', level: 'error' }, `Error updating sessions: ${error}`);
