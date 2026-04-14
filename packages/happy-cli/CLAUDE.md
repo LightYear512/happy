@@ -176,6 +176,12 @@ HAPPY_SERVER_URL=http://localhost:3005 ./bin/happy.mjs daemon start
 - Device-auth 需用户先在 ChatGPT Security settings 启用；未启用时 codex 回退到 localhost:1455 浏览器回调，headless 环境会挂
 - `codex login --help` 可快速确认当前版本是否支持 `--device-auth`
 
+# Bang Commands & Auth Profiles
+
+- Claude profiles live at `~/.ccs/instances/<name>/` (managed by external CCS, **not** under `$HAPPY_HOME_DIR`)
+- Codex profiles live at `<happyHomeDir>/auth/codex/instances/<name>/` (the old `codex-instances/` path is dead — `docs/codex-bangcommand-support.md` still references it, treat as stale)
+- Console sessions (`isConsoleSession=true`) are not launched via `ccs`, so `CLAUDE_CONFIG_DIR`/`CODEX_HOME` are never set → `getCurrentProfileForFlavor()` always returns `null` in console. Branches that depend on a "current profile" must guard `if (isConsole)` first, before any `if (!currentProfile)` fallback
+
 # Codex Backends
 
 Happy CLI supports two codex backends selected by `HAPPY_CODEX_BACKEND_MODE`:

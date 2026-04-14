@@ -22,7 +22,7 @@ vi.mock('@/ui/logger', () => ({
     logger: { debug: vi.fn() },
 }));
 
-import { handleAuthBangCommand } from './authCommand';
+import { handleAuthBangCommand, handleAuthAllBangCommand } from './authCommand';
 import type { BangCommandContext } from './types';
 
 const ccsDir = join(homedir(), '.ccs');
@@ -170,6 +170,50 @@ describe('handleAuthBangCommand', () => {
             expect(result.action).toBe('none');
             const msg = flatMsg(result.message);
             expect(msg).toMatch(/未初始化|not initialized/i);
+        });
+    });
+
+    describe('!auth-all (console list profiles)', () => {
+        // Regression: console has no CLAUDE_CONFIG_DIR, so the listing must show
+        // the flat console layout, not the "no current profile" fallback header.
+        function consoleCtx(): BangCommandContext {
+            return { ...createMockContext(), isConsoleSession: true };
+        }
+
+        it('lists profiles flatly without "no current" header (no CLAUDE_CONFIG_DIR)', async () => {
+            mockCcsProfiles({
+                work: { type: 'account' },
+                personal: { type: 'account' },
+            });
+
+            const result = await handleAuthAllBangCommand('', consoleCtx());
+            const msg = flatMsg(result.message);
+            expect(msg).toContain('📋 账号列表');
+            expect(msg).not.toContain('当前无 CCS 配置');
+            expect(msg).toContain('work');
+            expect(msg).toContain('personal');
+            expect(msg).toContain('!auth-all');
+        });
+
+        it('returns explicit empty message when no profiles exist in console', async () => {
+            mockExistsSync.mockImplementation((path: string) => path === ccsDir);
+            mockReadFileSync.mockReturnValue(JSON.stringify({}));
+
+            const result = await handleAuthAllBangCommand('', consoleCtx());
+            const msg = flatMsg(result.message);
+            expect(msg).toContain('未找到 CCS 配置');
+            // Must NOT show the misleading "no other switchable" wording.
+            expect(msg).not.toContain('暂无其他可切换账号');
+        });
+
+        it('shows single-profile fallback message in console', async () => {
+            mockCcsProfiles({ work: { type: 'account' } });
+
+            const result = await handleAuthAllBangCommand('', consoleCtx());
+            const msg = flatMsg(result.message);
+            expect(msg).toContain('📋 账号列表');
+            expect(msg).toContain('work');
+            expect(msg).toContain('暂无其他可切换账号');
         });
     });
 

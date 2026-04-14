@@ -204,32 +204,16 @@ async function listProfiles(isConsole: boolean, flavor: AuthFlavor = 'claude'): 
         ? codexToCcsProfiles(codexProfiles)
         : ccsProfiles;
 
-    const currentProfile = getCurrentProfileForFlavor(flavor);
     const codexNames = flavor === 'codex' ? new Set(codexProfiles.map(p => p.name)) : undefined;
     const codexDefault = flavor === 'codex' ? readCodexDefaultProfile() : null;
 
     const flavorLabel = flavor === 'codex' ? 'Codex' : 'Claude';
 
-    // No active CCS profile (session not started via CCS)
-    if (!currentProfile) {
-        const messages: string[] = [`📋 当前无 CCS 配置。(${flavorLabel})`];
-        if (profiles.length > 0) {
-            const usageMap = await fetchUsageSummaries(profiles.map(p => p.name), flavor);
-            messages.push(SEPARATOR);
-            for (const p of profiles) {
-                const status = getProfileStatus(p, flavor, codexNames);
-                messages.push(profileLine('○', p.name, status, usageMap.get(p.name), p.name === codexDefault));
-            }
-            messages.push(SEPARATOR);
-            if (hasAuthExpired(usageMap)) messages.push(REFRESH_HINT);
-        } else {
-            messages.push('未找到 CCS 配置。');
-        }
-        return { message: messages, action: 'none' };
-    }
-
-    // Console: no "current" concept — list all profiles equally
+    // Console: currentProfile is always null (CLAUDE_CONFIG_DIR never set in console process).
     if (isConsole) {
+        if (profiles.length === 0) {
+            return { message: `❌ 未找到 CCS 配置。(${flavorLabel})`, action: 'none' };
+        }
         const usageMap = await fetchUsageSummaries(profiles.map(p => p.name), flavor);
         const codexPrefix = flavor === 'codex' ? '--codex ' : '';
         const messages: string[] = [`📋 账号列表 (${flavorLabel})`];
@@ -250,6 +234,26 @@ async function listProfiles(isConsole: boolean, flavor: AuthFlavor = 'claude'): 
             if (hasAuthExpired(usageMap)) messages.push(REFRESH_HINT);
             return { message: messages, action: 'none' };
         }
+    }
+
+    const currentProfile = getCurrentProfileForFlavor(flavor);
+
+    // Normal session not launched via CCS — no current profile to anchor on.
+    if (!currentProfile) {
+        const messages: string[] = [`📋 当前无 CCS 配置。(${flavorLabel})`];
+        if (profiles.length > 0) {
+            const usageMap = await fetchUsageSummaries(profiles.map(p => p.name), flavor);
+            messages.push(SEPARATOR);
+            for (const p of profiles) {
+                const status = getProfileStatus(p, flavor, codexNames);
+                messages.push(profileLine('○', p.name, status, usageMap.get(p.name), p.name === codexDefault));
+            }
+            messages.push(SEPARATOR);
+            if (hasAuthExpired(usageMap)) messages.push(REFRESH_HINT);
+        } else {
+            messages.push('未找到 CCS 配置。');
+        }
+        return { message: messages, action: 'none' };
     }
 
     // Normal session: show current profile with ● indicator
