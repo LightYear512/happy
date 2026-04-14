@@ -22,7 +22,7 @@ const restoringLocks = new Map<string, number>();
  * Check if a session needs restore (inactive or zombie) and trigger daemon spawn if so.
  * Returns true if restore was triggered, false otherwise.
  */
-async function tryRestoreSession(
+export async function tryRestoreSession(
     userId: string,
     session: { id: string, active: boolean, lastActiveAt: Date, accountId: string, claudeSessionId: string | null, summary: string | null, plainMachineId: string | null },
     rpcListeners: Map<string, Socket>,
@@ -101,6 +101,23 @@ async function tryRestoreSession(
         restoringLocks.delete(session.id);
         return false;
     }
+
+    // Explicit revival: the daemon acknowledged spawning a new child for this
+    // sessionId, so flip `active` back to true and drop the cache entry that
+    // still carries `dead: true` from a prior session-end. Without this step
+    // the next session-alive heartbeat from the restored child is rejected by
+    // isSessionValid and the UI never sees the session come back online.
+    const nowMs = Date.now();
+    await db.session.update({
+        where: { id: session.id },
+        data: { active: true, lastActiveAt: new Date(nowMs) },
+    });
+    activityCache.invalidateSession(session.id);
+    eventRouter.emitEphemeral({
+        userId,
+        payload: buildSessionActivityEphemeral(session.id, true, nowMs, false),
+        recipientFilter: { type: 'user-scoped-only' },
+    });
 
     return true;
 }
