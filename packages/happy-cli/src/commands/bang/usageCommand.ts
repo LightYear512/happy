@@ -733,9 +733,9 @@ async function handleCodexUsage(profileArg: string, ctx: BangCommandContext): Pr
             messages.push(p.name);
         }
         messages.push(SEPARATOR);
-        messages.push('用法: !usage <账户名> --codex');
+        messages.push('用法: !usage --codex <账户名>');
 
-        const suggestions = codexProfiles.slice(0, 3).map(p => `!usage ${p.name} --codex`);
+        const suggestions = codexProfiles.map(p => `!usage --codex ${p.name}`);
         return { message: messages, action: 'none', suggestions };
     }
 
@@ -816,7 +816,7 @@ export async function handleUsageBangCommand(args: string, ctx: BangCommandConte
         messages.push(SEPARATOR);
         messages.push('用法: !usage <账户名>');
 
-        const suggestions = claudeProfiles.slice(0, 3).map(p => `!usage ${p.name}`);
+        const suggestions = claudeProfiles.map(p => `!usage ${p.name}`);
         return { message: messages, action: 'none', suggestions };
     }
 
@@ -972,55 +972,47 @@ export async function queryRateLimitContext(): Promise<RateLimitContext | null> 
     }
     windows.sort((a, b) => b.utilization - a.utilization);
 
-    // Find switchable profiles: shared mode, with credentials
+    // Find switchable profiles with credentials
     const currentFiveHour = data.five_hour?.utilization ?? 0;
     const { profiles } = readCcsProfiles();
 
-    const currentProfileInfo = profiles.find(p => p.name === profileLabel);
-    const currentIsShared = currentProfileInfo?.contextMode === 'shared' || !currentProfileInfo?.contextMode;
-
-    // Only look for switchable profiles if current profile is shared
     const switchable: string[] = [];
     let checkedCount = 0;
     let overLimitCount = 0;
 
-    if (currentIsShared) {
-        for (const p of profiles) {
-            if (p.name === profileLabel) continue;
-            // Must be shared (mirrors authCommand switchProfile constraints)
-            if (p.contextMode === 'isolated') continue;
+    for (const p of profiles) {
+        if (p.name === profileLabel) continue;
 
-            const otherToken = readOAuthToken(p.instancePath);
-            if (!otherToken) continue;
+        const otherToken = readOAuthToken(p.instancePath);
+        if (!otherToken) continue;
 
-            checkedCount++;
+        checkedCount++;
 
-            // Check cached usage for the other profile
-            const otherCached = cache.get(p.instancePath);
-            if (otherCached && (Date.now() - otherCached.fetchedAt) < CACHE_TTL_MS) {
-                const other5h = otherCached.data.five_hour?.utilization ?? 0;
-                if (other5h < currentFiveHour && other5h < THRESHOLD) {
-                    switchable.push(p.name);
-                } else if (other5h >= THRESHOLD) {
-                    overLimitCount++;
-                }
-                continue;
+        // Check cached usage for the other profile
+        const otherCached = cache.get(p.instancePath);
+        if (otherCached && (Date.now() - otherCached.fetchedAt) < CACHE_TTL_MS) {
+            const other5h = otherCached.data.five_hour?.utilization ?? 0;
+            if (other5h < currentFiveHour && other5h < THRESHOLD) {
+                switchable.push(p.name);
+            } else if (other5h >= THRESHOLD) {
+                overLimitCount++;
             }
+            continue;
+        }
 
-            // Try fetching usage for the other profile (best-effort)
-            try {
-                const otherData = await fetchUsage(otherToken, p.name);
-                setClaudeCache(p.instancePath, { data: otherData, fetchedAt: Date.now() });
-                const other5h = otherData.five_hour?.utilization ?? 0;
-                if (other5h < currentFiveHour && other5h < THRESHOLD) {
-                    switchable.push(p.name);
-                } else if (other5h >= THRESHOLD) {
-                    overLimitCount++;
-                }
-            } catch (e) {
-                logger.debug(`[rateLimitContext] Failed to fetch usage for ${p.name}: ${e}`);
-                // Don't add — can't verify this profile has available quota
+        // Try fetching usage for the other profile (best-effort)
+        try {
+            const otherData = await fetchUsage(otherToken, p.name);
+            setClaudeCache(p.instancePath, { data: otherData, fetchedAt: Date.now() });
+            const other5h = otherData.five_hour?.utilization ?? 0;
+            if (other5h < currentFiveHour && other5h < THRESHOLD) {
+                switchable.push(p.name);
+            } else if (other5h >= THRESHOLD) {
+                overLimitCount++;
             }
+        } catch (e) {
+            logger.debug(`[rateLimitContext] Failed to fetch usage for ${p.name}: ${e}`);
+            // Don't add — can't verify this profile has available quota
         }
     }
 

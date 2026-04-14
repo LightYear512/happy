@@ -43,7 +43,7 @@ export async function handleOpenBangCommand(args: string, ctx: BangCommandContex
         const messages = [`⚠️ "${prefix}" 匹配了 ${matches.length} 个会话`];
         const matchLines: string[] = [];
         const suggestions: string[] = [];
-        for (const s of matches.slice(0, 5)) {
+        for (const s of matches) {
             const shortId = s.sessionId.slice(0, 12);
             const dir = s.cwd ? s.cwd.split(/[/\\]/).pop() || s.projectDir : s.projectDir;
             matchLines.push(`${shortId} | ${dir}`);

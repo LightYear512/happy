@@ -332,7 +332,7 @@ function formatDirectoryListing(sessions: ClaudeSessionInfo[]): BangCommandResul
     messages.push('');
     messages.push('💡 !session <目录> 查看该目录下的会话');
 
-    const suggestions = displayed.slice(0, 5).map(d => `!session ${displayNames.get(d.cwd) || shortenPath(d.cwd)}`);
+    const suggestions = displayed.map(d => `!session ${displayNames.get(d.cwd) || shortenPath(d.cwd)}`);
     return { message: messages, action: 'none', suggestions };
 }
 
@@ -370,7 +370,7 @@ export function formatAllSessionsListing(sessions: ClaudeSessionInfo[]): BangCom
     messages.push('');
     messages.push('💡 !open <id前缀>');
 
-    const suggestions = displayed.slice(0, 5).map(s => `!open ${s.sessionId.slice(0, SHORT_ID_LEN)}`);
+    const suggestions = displayed.map(s => `!open ${s.sessionId.slice(0, SHORT_ID_LEN)}`);
     return { message: messages, action: 'none', suggestions };
 }
 
@@ -424,6 +424,6 @@ function formatSessionListing(sessions: ClaudeSessionInfo[], rawFilter: string):
     messages.push('');
     messages.push('💡 !open <id前缀>');
 
-    const suggestions = displayed.slice(0, 5).map(s => `!open ${s.sessionId.slice(0, SHORT_ID_LEN)}`);
+    const suggestions = displayed.map(s => `!open ${s.sessionId.slice(0, SHORT_ID_LEN)}`);
     return { message: messages, action: 'none', suggestions };
 }
