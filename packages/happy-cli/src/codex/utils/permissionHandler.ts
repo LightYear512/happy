@@ -20,6 +20,22 @@ export type { PermissionResult, PendingRequest };
  * Codex-specific permission handler.
  */
 export class CodexPermissionHandler extends BasePermissionHandler {
+    // Exact tool names that should always be auto-approved. Include the bare
+    // form (used by Codex elicitation messages like `tool "change_title"`)
+    // and the MCP-qualified form for defense in depth.
+    private static readonly ALWAYS_AUTO_APPROVE_NAMES: ReadonlySet<string> = new Set([
+        'change_title',
+        'mcp__happy__change_title',
+    ]);
+
+    // Tool-call IDs that should auto-approve when they exactly match one of
+    // these values or start with `<name>-` (e.g. `change_title-1765385846663`).
+    // Substring matching was a bypass vector — any tool whose ID happened to
+    // contain `change_title` as a substring would be silently approved.
+    private static readonly ALWAYS_AUTO_APPROVE_ID_PREFIXES: readonly string[] = [
+        'change_title',
+    ];
+
     constructor(session: ApiSessionClient) {
         super(session);
     }
@@ -28,8 +44,19 @@ export class CodexPermissionHandler extends BasePermissionHandler {
         return '[Codex]';
     }
 
-    // Tools that are always safe to auto-approve without user interaction.
-    private static readonly AUTO_APPROVED_TOOLS = new Set(['change_title']);
+    private shouldAutoApprove(toolName: string, toolCallId: string): boolean {
+        if (CodexPermissionHandler.ALWAYS_AUTO_APPROVE_NAMES.has(toolName)) {
+            return true;
+        }
+
+        for (const prefix of CodexPermissionHandler.ALWAYS_AUTO_APPROVE_ID_PREFIXES) {
+            if (toolCallId === prefix || toolCallId.startsWith(`${prefix}-`)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     /**
      * Handle a tool permission request
@@ -43,7 +70,7 @@ export class CodexPermissionHandler extends BasePermissionHandler {
         toolName: string,
         input: unknown
     ): Promise<PermissionResult> {
-        if (CodexPermissionHandler.AUTO_APPROVED_TOOLS.has(toolName)) {
+        if (this.shouldAutoApprove(toolName, toolCallId)) {
             const result: PermissionResult = { decision: 'approved' };
             this.session.updateAgentState((currentState) => ({
                 ...currentState,
