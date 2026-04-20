@@ -1,6 +1,5 @@
 import { createHash, createHmac } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import tweetnacl from 'tweetnacl';
 import { z } from 'zod';
 
@@ -65,14 +64,12 @@ function deriveContentKeyPair(secret: Uint8Array): { publicKey: Uint8Array; secr
     };
 }
 
-export function getLocalHappyAgentCredentialPath(happyHomeDir: string = configuration.happyHomeDir): string {
-    return join(happyHomeDir, 'agent.key');
+export function getLocalHappyAgentCredentialPath(): string {
+    return configuration.agentKeyFile;
 }
 
-export function readLocalHappyAgentCredentials(
-    happyHomeDir: string = configuration.happyHomeDir,
-): LocalHappyAgentCredentials | null {
-    const credentialPath = getLocalHappyAgentCredentialPath(happyHomeDir);
+export function readLocalHappyAgentCredentials(): LocalHappyAgentCredentials | null {
+    const credentialPath = configuration.agentKeyFile;
     if (!existsSync(credentialPath)) {
         return null;
     }
@@ -90,12 +87,12 @@ export function readLocalHappyAgentCredentials(
     }
 }
 
-export function hasLocalHappyAgentAuth(happyHomeDir: string = configuration.happyHomeDir): boolean {
-    return readLocalHappyAgentCredentials(happyHomeDir) !== null;
+export function hasLocalHappyAgentAuth(): boolean {
+    return readLocalHappyAgentCredentials() !== null;
 }
 
-export function detectResumeSupport(happyHomeDir: string = configuration.happyHomeDir): ResumeSupport {
-    const happyAgentAuthenticated = hasLocalHappyAgentAuth(happyHomeDir);
+export function detectResumeSupport(): ResumeSupport {
+    const happyAgentAuthenticated = hasLocalHappyAgentAuth();
     return {
         rpcAvailable: happyAgentAuthenticated,
         requiresSameMachine: true,

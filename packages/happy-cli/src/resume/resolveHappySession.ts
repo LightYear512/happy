@@ -1,8 +1,7 @@
 import axios, { AxiosError } from 'axios';
-import tweetnacl from 'tweetnacl';
 import { z } from 'zod';
 
-import { decodeBase64, decryptLegacy, decryptWithDataKey } from '@/api/encryption';
+import { decodeBase64, decryptBoxBundle, decryptLegacy, decryptWithDataKey } from '@/api/encryption';
 import type { Metadata } from '@/api/types';
 import { configuration } from '@/configuration';
 import {
@@ -50,19 +49,6 @@ export function resolveSessionRecordByPrefix<T extends { id: string }>(records: 
         throw new Error(`Ambiguous Happy session "${trimmed}" matches ${matches.length} sessions. Be more specific.`);
     }
     return matches[0];
-}
-
-function decryptBoxBundle(bundle: Uint8Array, recipientSecretKey: Uint8Array): Uint8Array | null {
-    if (bundle.length < 56) {
-        return null;
-    }
-
-    const ephemeralPublicKey = bundle.slice(0, 32);
-    const nonce = bundle.slice(32, 56);
-    const ciphertext = bundle.slice(56);
-    const decrypted = tweetnacl.box.open(ciphertext, nonce, ephemeralPublicKey, recipientSecretKey);
-
-    return decrypted ? new Uint8Array(decrypted) : null;
 }
 
 function readAgentCredentials() {
