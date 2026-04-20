@@ -7,7 +7,6 @@
 
 import { logger } from "@/ui/logger";
 import { ApiSessionClient } from "@/api/apiSession";
-import type { AgentState } from "@/api/types";
 import {
     BasePermissionHandler,
     PermissionResult,
@@ -21,14 +20,6 @@ export type { PermissionResult, PendingRequest };
  * Codex-specific permission handler.
  */
 export class CodexPermissionHandler extends BasePermissionHandler {
-    private static readonly ALWAYS_AUTO_APPROVE_NAMES = [
-        'change_title',
-    ];
-
-    private static readonly ALWAYS_AUTO_APPROVE_IDS = [
-        'change_title',
-    ];
-
     constructor(session: ApiSessionClient) {
         super(session);
     }
@@ -37,17 +28,8 @@ export class CodexPermissionHandler extends BasePermissionHandler {
         return '[Codex]';
     }
 
-    private shouldAutoApprove(toolName: string, toolCallId: string): boolean {
-        if (CodexPermissionHandler.ALWAYS_AUTO_APPROVE_NAMES.some((name) => toolName.toLowerCase().includes(name.toLowerCase()))) {
-            return true;
-        }
-
-        if (CodexPermissionHandler.ALWAYS_AUTO_APPROVE_IDS.some((id) => toolCallId.toLowerCase().includes(id.toLowerCase()))) {
-            return true;
-        }
-
-        return false;
-    }
+    // Tools that are always safe to auto-approve without user interaction.
+    private static readonly AUTO_APPROVED_TOOLS = new Set(['change_title']);
 
     /**
      * Handle a tool permission request
@@ -61,9 +43,8 @@ export class CodexPermissionHandler extends BasePermissionHandler {
         toolName: string,
         input: unknown
     ): Promise<PermissionResult> {
-        if (this.shouldAutoApprove(toolName, toolCallId)) {
-            logger.debug(`${this.getLogPrefix()} Auto-approving tool ${toolName} (${toolCallId})`);
-
+        if (CodexPermissionHandler.AUTO_APPROVED_TOOLS.has(toolName)) {
+            const result: PermissionResult = { decision: 'approved' };
             this.session.updateAgentState((currentState) => ({
                 ...currentState,
                 completedRequests: {
@@ -77,9 +58,9 @@ export class CodexPermissionHandler extends BasePermissionHandler {
                         decision: 'approved',
                     },
                 },
-            } satisfies AgentState));
-
-            return { decision: 'approved' };
+            }));
+            logger.debug(`${this.getLogPrefix()} Auto-approved safe tool: ${toolName} (${toolCallId})`);
+            return result;
         }
 
         return new Promise<PermissionResult>((resolve, reject) => {

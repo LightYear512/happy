@@ -22,6 +22,6 @@ export async function handleCodexCommand(args: string[]): Promise<void> {
     credentials,
     startedBy,
     noSandbox: sandboxArgs.noSandbox,
-    resumeThreadId: codexArgs.resumeThreadId ?? undefined,
+    restoreSessionId: codexArgs.resumeThreadId ?? undefined,
   })
 }

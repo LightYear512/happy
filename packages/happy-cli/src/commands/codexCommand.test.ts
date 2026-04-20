@@ -79,7 +79,7 @@ describe('handleCodexCommand', () => {
       credentials: { token: 'token' },
       startedBy: 'daemon',
       noSandbox: true,
-      resumeThreadId: 'thread-123',
+      restoreSessionId: 'thread-123',
     })
   })
 })

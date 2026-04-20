@@ -71,9 +71,9 @@ async function main() {
       title: 'Change Chat Title',
       inputSchema: {
         title: z.string().describe('The new title for the chat session'),
-      },
+      } as any,
     },
-    async (args) => {
+    async (args: any) => {
       try {
         const client = await ensureHttpClient();
         const response = await client.callTool({ name: 'change_title', arguments: args });

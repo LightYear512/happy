@@ -1,28 +1,17 @@
-import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { SandboxConfig } from '@/persistence';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { Readable } from 'node:stream';
 
 const {
     mockExecSync,
-    mockInitializeSandbox,
-    mockWrapForMcpTransport,
-    mockSandboxCleanup,
     mockSpawn,
 } = vi.hoisted(() => ({
-    mockExecSync: vi.fn(),
-    mockInitializeSandbox: vi.fn(),
-    mockWrapForMcpTransport: vi.fn(),
-    mockSandboxCleanup: vi.fn(),
+    mockExecSync: vi.fn().mockReturnValue('codex 0.115.0'),
     mockSpawn: vi.fn(),
 }));
 
-vi.mock('child_process', () => ({
+vi.mock('node:child_process', () => ({
     execSync: mockExecSync,
     spawn: mockSpawn,
-}));
-
-vi.mock('@/sandbox/manager', () => ({
-    initializeSandbox: mockInitializeSandbox,
-    wrapForMcpTransport: mockWrapForMcpTransport,
 }));
 
 vi.mock('@/ui/logger', () => ({
@@ -30,6 +19,7 @@ vi.mock('@/ui/logger', () => ({
         debug: vi.fn(),
         info: vi.fn(),
         warn: vi.fn(),
+        error: vi.fn(),
     },
 }));
 
@@ -37,845 +27,359 @@ vi.mock('../package.json', () => ({
     default: { version: '0.0.1-test' },
 }));
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 type MockRpcMessage = {
-    id?: number;
+    id?: number | string;
     method?: string;
-    params?: any;
-    result?: any;
+    params?: unknown;
+    result?: unknown;
+    error?: { code: number; message: string };
 };
 
-function pushJsonLine(stdout: NodeJS.ReadableStream & { push: (chunk: string) => void }, payload: unknown) {
+/** Push a JSON-RPC line to the mock process stdout. */
+function pushLine(
+    stdout: import('stream').Readable & { push(chunk: string): void },
+    payload: unknown,
+) {
     stdout.push(JSON.stringify(payload) + '\n');
 }
 
-// Mock child process with stdin/stdout/stderr
+/**
+ * Create a mock child process with controllable stdin/stdout/stderr.
+ *
+ * - Automatically responds to `initialize` so that `createCodexAppServerClient()`
+ *   can complete its handshake without any extra test setup.
+ * - `kill()` emits `'close'` so that `dispose()` resolves correctly.
+ * - Pass `onRequest` to handle additional server-initiated or user-triggered
+ *   requests per test.
+ */
 function createMockProcess(opts?: {
     pid?: number;
-    initializeDelayMs?: number;
-    onRequest?: (msg: MockRpcMessage, stdout: NodeJS.ReadableStream & { push: (chunk: string) => void }) => void;
+    onRequest?: (msg: MockRpcMessage, reply: (response: MockRpcMessage) => void) => void;
 }) {
-    const { Readable, Writable } = require('stream');
-    const initializeDelayMs = opts?.initializeDelayMs ?? 5;
-    const stdin = new Writable({ write: (_: any, __: any, cb: () => void) => cb() });
-    const stdout = new Readable({ read() {} });
+    const { Readable, Writable } = require('stream') as typeof import('stream');
+    const events = require('events') as typeof import('events');
+
+    const stdin = new Writable({ write(_chunk: unknown, _enc: unknown, cb: () => void) { cb(); } });
+    const stdout = new Readable({ read() {} }) as Readable & { push(chunk: string): void };
     const stderr = new Readable({ read() {} });
-    const proc = Object.assign(new (require('events').EventEmitter)(), {
+    const proc = Object.assign(new events.EventEmitter(), {
+        pid: opts?.pid ?? 12345,
         stdin,
         stdout,
         stderr,
-        pid: opts?.pid ?? 12345,
         kill: vi.fn(),
     });
-    // Send initialize response immediately when stdin is written to
-    const origWrite = stdin.write.bind(stdin);
-    stdin.write = (data: any, ...args: any[]) => {
-        try {
-            const msg = JSON.parse(typeof data === 'string' ? data : data.toString());
-            if (msg.method === 'initialize' && msg.id != null) {
-                // Send response on next tick
-                setTimeout(() => {
-                    pushJsonLine(stdout, { id: msg.id, result: { userAgent: 'test' } });
-                }, initializeDelayMs);
-            }
-            opts?.onRequest?.(msg, stdout);
-        } catch {}
-        return origWrite(data, ...args);
-    };
-    return proc;
-}
 
-async function waitFor(predicate: () => boolean, timeoutMs: number = 1000): Promise<void> {
-    const deadline = Date.now() + timeoutMs;
-    while (!predicate()) {
-        if (Date.now() >= deadline) {
-            throw new Error(`Timed out after ${timeoutMs}ms`);
+    // When kill() is called, emit 'close' so that dispose() resolves.
+    (proc.kill as ReturnType<typeof vi.fn>).mockImplementation(() => {
+        setImmediate(() => proc.emit('close', 0, null));
+    });
+
+    const originalWrite = stdin.write.bind(stdin);
+    stdin.write = (chunk: unknown, ...rest: unknown[]) => {
+        const text = typeof chunk === 'string' ? chunk : (chunk as Buffer).toString();
+        for (const line of text.split('\n')) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            try {
+                const msg: MockRpcMessage = JSON.parse(trimmed);
+                if (msg.id !== undefined && msg.method) {
+                    if (msg.method === 'initialize') {
+                        // Always auto-respond to initialize so the handshake completes.
+                        setImmediate(() =>
+                            pushLine(stdout, { id: msg.id, result: { capabilities: {} } }),
+                        );
+                    } else if (opts?.onRequest) {
+                        opts.onRequest(msg, (resp) =>
+                            pushLine(stdout, { id: msg.id, ...resp }),
+                        );
+                    }
+                }
+            } catch { /* skip */ }
         }
-        await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+        return (originalWrite as (...args: unknown[]) => boolean)(chunk, ...rest);
+    };
+
+    return { proc, stdout, stderr, stdin };
 }
 
-const sandboxConfig: SandboxConfig = {
-    enabled: true,
-    workspaceRoot: '~/projects',
-    sessionIsolation: 'workspace',
-    customWritePaths: [],
-    denyReadPaths: ['~/.ssh'],
-    extraWritePaths: ['/tmp'],
-    denyWritePaths: ['.env'],
-    networkMode: 'allowed',
-    allowedDomains: [],
-    deniedDomains: [],
-    allowLocalBinding: true,
-};
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
-describe('CodexAppServerClient sandbox integration', () => {
-    const originalRustLog = process.env.RUST_LOG;
-
+describe('createCodexAppServerClient', () => {
     beforeEach(() => {
         vi.clearAllMocks();
-        process.env.RUST_LOG = originalRustLog;
-        mockExecSync.mockReturnValue('codex-cli 0.107.0');
-        mockInitializeSandbox.mockResolvedValue(mockSandboxCleanup);
-        mockWrapForMcpTransport.mockResolvedValue({ command: 'sh', args: ['-c', 'wrapped codex app-server'] });
-        mockSpawn.mockImplementation(() => createMockProcess());
     });
 
-    afterAll(() => {
-        process.env.RUST_LOG = originalRustLog;
+    afterEach(() => {
+        vi.restoreAllMocks();
     });
 
-    it('wraps transport when sandbox is enabled', async () => {
-        // Dynamic import to ensure mocks are applied
-        const { CodexAppServerClient } = await import('./codexAppServerClient');
-        const client = new CodexAppServerClient(sandboxConfig);
+    it('spawns the codex app-server process', async () => {
+        const { proc } = createMockProcess();
+        mockSpawn.mockReturnValue(proc);
 
-        await client.connect();
+        const { createCodexAppServerClient } = await import('./codexAppServerClient');
+        const client = await createCodexAppServerClient();
 
-        expect(mockInitializeSandbox).toHaveBeenCalledWith(sandboxConfig, process.cwd());
-        expect(mockWrapForMcpTransport).toHaveBeenCalledWith('codex', ['app-server', '--listen', 'stdio://']);
-        expect(mockSpawn).toHaveBeenCalledWith(
-            'sh',
-            ['-c', 'wrapped codex app-server'],
-            expect.objectContaining({
-                env: expect.objectContaining({
-                    CODEX_SANDBOX: 'seatbelt',
-                    RUST_LOG: expect.stringContaining('codex_core::rollout::list=off'),
-                }),
-            }),
-        );
-        expect(client.sandboxEnabled).toBe(true);
+        expect(mockSpawn).toHaveBeenCalledOnce();
+        // On Windows, codex is wrapped via cmd.exe; check the combined command string.
+        const [cmd, args] = mockSpawn.mock.calls[0] as [string, string[]];
+        const combined = [cmd, ...args].join(' ');
+        // On Windows cmd.exe wraps args; check that codex and stdio:// are present.
+        expect(combined).toContain('codex');
+        expect(combined).toContain('stdio://');
 
-        await client.disconnect();
+        await client.dispose();
     });
 
-    it('falls back to non-sandbox transport when sandbox initialization fails', async () => {
-        mockInitializeSandbox.mockRejectedValue(new Error('sandbox init failed'));
-        const { CodexAppServerClient } = await import('./codexAppServerClient');
-        const client = new CodexAppServerClient(sandboxConfig);
+    it('passes configOverrides as -c args', async () => {
+        const { proc } = createMockProcess();
+        mockSpawn.mockReturnValue(proc);
 
-        await client.connect();
+        const { createCodexAppServerClient } = await import('./codexAppServerClient');
+        const client = await createCodexAppServerClient({
+            configOverrides: ['model.provider=openai', 'sandbox=false'],
+        });
 
-        expect(mockWrapForMcpTransport).not.toHaveBeenCalled();
-        expect(mockSpawn).toHaveBeenCalledWith(
-            'codex',
-            ['app-server', '--listen', 'stdio://'],
-            expect.objectContaining({
-                env: expect.objectContaining({
-                    RUST_LOG: expect.stringContaining('codex_core::rollout::list=off'),
-                }),
-            }),
-        );
-        expect(client.sandboxEnabled).toBe(false);
+        expect(mockSpawn).toHaveBeenCalledOnce();
+        // On Windows the args are cmd.exe-escaped into a single string; check combined.
+        const [, args] = mockSpawn.mock.calls[0] as [string, string[]];
+        const combined = args.join(' ');
+        expect(combined).toContain('model.provider=openai');
+        expect(combined).toContain('sandbox=false');
 
-        await client.disconnect();
+        await client.dispose();
     });
 
-    it('resets sandbox on disconnect', async () => {
-        const { CodexAppServerClient } = await import('./codexAppServerClient');
-        const client = new CodexAppServerClient(sandboxConfig);
-
-        await client.connect();
-        await client.disconnect();
-
-        expect(mockSandboxCleanup).toHaveBeenCalledTimes(1);
-        expect(client.sandboxEnabled).toBe(false);
-    });
-
-    it('appends rollout log filter to existing RUST_LOG', async () => {
-        process.env.RUST_LOG = 'info,codex_core=warn';
-        const { CodexAppServerClient } = await import('./codexAppServerClient');
-        const client = new CodexAppServerClient(sandboxConfig);
-
-        await client.connect();
-
-        expect(mockSpawn).toHaveBeenCalledWith(
-            expect.anything(),
-            expect.anything(),
-            expect.objectContaining({
-                env: expect.objectContaining({
-                    RUST_LOG: 'info,codex_core=warn,codex_core::rollout::list=off',
-                }),
-            }),
-        );
-
-        await client.disconnect();
-    });
-
-    it('ignores stale process exit during reconnect initialize', async () => {
-        const proc1 = createMockProcess({ pid: 1001, initializeDelayMs: 5 });
-        const proc2 = createMockProcess({ pid: 1002, initializeDelayMs: 50 });
-        mockSpawn
-            .mockImplementationOnce(() => proc1)
-            .mockImplementationOnce(() => proc2);
-
-        const { CodexAppServerClient } = await import('./codexAppServerClient');
-        const client = new CodexAppServerClient();
-
-        await client.connect();
-        await client.disconnect();
-
-        const reconnect = client.connect();
-        setTimeout(() => {
-            proc1.emit('exit', 0, null);
-        }, 10);
-
-        await expect(reconnect).resolves.toBeUndefined();
-        await client.disconnect();
-    });
-
-    it('reconnects and resumes the same thread after forced restart timeout', async () => {
-        const firstProcessRequests: MockRpcMessage[] = [];
-        const secondProcessRequests: MockRpcMessage[] = [];
-        type CapturedEvent = { type: string; [key: string]: unknown };
-
-        const proc1 = createMockProcess({
-            pid: 2001,
-            onRequest: (msg, stdout) => {
-                firstProcessRequests.push(msg);
-
-                if (msg.method === 'thread/start' && msg.id != null) {
-                    setTimeout(() => {
-                        pushJsonLine(stdout, {
-                            id: msg.id,
-                            result: {
-                                thread: { id: 'thread-1', path: '/tmp/thread-1' },
-                                model: 'gpt-test',
-                                modelProvider: 'openai',
-                                cwd: '/tmp/project',
-                                approvalPolicy: 'on-request',
-                                sandbox: { type: 'readOnly' },
-                                reasoningEffort: null,
-                            },
-                        });
-                    }, 0);
-                }
-
-                if (msg.method === 'turn/start' && msg.id != null) {
-                    setTimeout(() => {
-                        pushJsonLine(stdout, { id: msg.id, result: {} });
-                        pushJsonLine(stdout, {
-                            method: 'codex/event',
-                            params: { msg: { type: 'task_started', turn_id: 'turn-1' } },
-                        });
-                    }, 0);
-                }
-
-                if (msg.method === 'turn/interrupt' && msg.id != null) {
-                    setTimeout(() => {
-                        pushJsonLine(stdout, { id: msg.id, result: { abortReason: 'interrupted' } });
-                    }, 0);
+    it('sends a JSON-RPC request and resolves with the response', async () => {
+        const { proc } = createMockProcess({
+            onRequest: (msg, reply) => {
+                if (msg.method === 'test/method') {
+                    reply({ result: { value: 42 } });
                 }
             },
         });
+        mockSpawn.mockReturnValue(proc);
 
-        const proc2 = createMockProcess({
-            pid: 2002,
-            onRequest: (msg, stdout) => {
-                secondProcessRequests.push(msg);
+        const { createCodexAppServerClient } = await import('./codexAppServerClient');
+        const client = await createCodexAppServerClient();
 
-                if (msg.method === 'thread/resume' && msg.id != null) {
-                    setTimeout(() => {
-                        pushJsonLine(stdout, {
-                            id: msg.id,
-                            result: {
-                                thread: { id: 'thread-1', path: '/tmp/thread-1' },
-                                model: 'gpt-test',
-                                modelProvider: 'openai',
-                                cwd: '/tmp/project',
-                                approvalPolicy: 'on-request',
-                                sandbox: { type: 'readOnly' },
-                                reasoningEffort: null,
-                            },
-                        });
-                    }, 0);
-                }
+        const result = await client.request('test/method', { foo: 'bar' });
+        expect(result).toEqual({ value: 42 });
 
-                if (msg.method === 'turn/start' && msg.id != null) {
-                    setTimeout(() => {
-                        pushJsonLine(stdout, { id: msg.id, result: {} });
-                        pushJsonLine(stdout, {
-                            method: 'codex/event',
-                            params: { msg: { type: 'task_started', turn_id: 'turn-2' } },
-                        });
-                        pushJsonLine(stdout, {
-                            method: 'codex/event',
-                            params: { msg: { type: 'task_complete', turn_id: 'turn-2' } },
-                        });
-                    }, 0);
-                }
-            },
-        });
-
-        mockSpawn
-            .mockImplementationOnce(() => proc1)
-            .mockImplementationOnce(() => proc2);
-
-        const { CodexAppServerClient } = await import('./codexAppServerClient');
-        const client = new CodexAppServerClient();
-        const events: CapturedEvent[] = [];
-        client.setEventHandler((msg) => {
-            events.push(msg as CapturedEvent);
-        });
-
-        await client.connect();
-        await client.startThread({
-            model: 'gpt-test',
-            cwd: '/tmp/project',
-            approvalPolicy: 'on-request',
-            sandbox: 'read-only',
-        });
-
-        const pendingTurn = client.sendTurnAndWait('hang forever', { turnTimeoutMs: 5000 });
-        await waitFor(() => firstProcessRequests.some((msg) => msg.method === 'turn/start'));
-
-        const abortResult = await client.abortTurnWithFallback({
-            gracePeriodMs: 1,
-            forceRestartOnTimeout: true,
-        });
-
-        await expect(pendingTurn).resolves.toEqual({ aborted: true });
-        expect(abortResult).toEqual({
-            hadActiveTurn: true,
-            aborted: true,
-            forcedRestart: true,
-            resumedThread: true,
-        });
-        expect(events).toContainEqual(expect.objectContaining({
-            type: 'turn_aborted',
-            reason: 'interrupted',
-            turn_id: 'turn-1',
-            forced_restart: true,
-        }));
-
-        const resumeRequest = secondProcessRequests.find((msg) => msg.method === 'thread/resume');
-        expect(resumeRequest?.params).toEqual(expect.objectContaining({
-            threadId: 'thread-1',
-            model: 'gpt-test',
-            cwd: '/tmp/project',
-            approvalPolicy: 'on-request',
-            sandbox: 'read-only',
-            persistExtendedHistory: true,
-        }));
-        expect(client.threadId).toBe('thread-1');
-
-        await expect(client.sendTurnAndWait('follow up after reconnect')).resolves.toEqual({ aborted: false });
-
-        await client.disconnect();
+        await client.dispose();
     });
 
-    it('maps raw item notifications into legacy events and deduplicates turn completion', async () => {
-        const requests: MockRpcMessage[] = [];
-        const proc = createMockProcess({
-            pid: 3001,
-            onRequest: (msg, stdout) => {
-                requests.push(msg);
-
-                if (msg.method === 'thread/start' && msg.id != null) {
-                    setTimeout(() => {
-                        pushJsonLine(stdout, {
-                            id: msg.id,
-                            result: {
-                                thread: { id: 'thread-raw-1', path: '/tmp/thread-raw-1' },
-                                model: 'gpt-test',
-                                modelProvider: 'openai',
-                                cwd: '/tmp/project',
-                                approvalPolicy: 'never',
-                                sandbox: { type: 'dangerFullAccess' },
-                                reasoningEffort: null,
-                            },
-                        });
-                    }, 0);
-                }
-
-                if (msg.method === 'turn/start' && msg.id != null) {
-                    setTimeout(() => {
-                        pushJsonLine(stdout, {
-                            id: msg.id,
-                            result: {
-                                turn: { id: 'turn-raw-1', items: [], status: 'inProgress', error: null },
-                            },
-                        });
-                        pushJsonLine(stdout, {
-                            method: 'thread/status/changed',
-                            params: { threadId: 'thread-raw-1', status: { type: 'active', activeFlags: [] } },
-                        });
-                        pushJsonLine(stdout, {
-                            method: 'turn/started',
-                            params: {
-                                threadId: 'thread-raw-1',
-                                turn: { id: 'turn-raw-1', items: [], status: 'inProgress', error: null },
-                            },
-                        });
-                        pushJsonLine(stdout, {
-                            method: 'item/started',
-                            params: {
-                                threadId: 'thread-raw-1',
-                                turnId: 'turn-raw-1',
-                                item: {
-                                    type: 'commandExecution',
-                                    id: 'call-1',
-                                    command: '/bin/zsh -lc pwd',
-                                    cwd: '/tmp/project',
-                                    status: 'inProgress',
-                                },
-                            },
-                        });
-                        pushJsonLine(stdout, {
-                            method: 'item/completed',
-                            params: {
-                                threadId: 'thread-raw-1',
-                                turnId: 'turn-raw-1',
-                                item: {
-                                    type: 'commandExecution',
-                                    id: 'call-1',
-                                    command: '/bin/zsh -lc pwd',
-                                    cwd: '/tmp/project',
-                                    aggregatedOutput: '/tmp/project\n',
-                                    exitCode: 0,
-                                    durationMs: 1,
-                                    status: 'completed',
-                                },
-                            },
-                        });
-                        pushJsonLine(stdout, {
-                            method: 'item/completed',
-                            params: {
-                                threadId: 'thread-raw-1',
-                                turnId: 'turn-raw-1',
-                                item: {
-                                    type: 'agentMessage',
-                                    id: 'msg-1',
-                                    text: 'done',
-                                    phase: 'final_answer',
-                                },
-                            },
-                        });
-                        pushJsonLine(stdout, {
-                            method: 'thread/status/changed',
-                            params: { threadId: 'thread-raw-1', status: { type: 'idle' } },
-                        });
-                        pushJsonLine(stdout, {
-                            method: 'turn/completed',
-                            params: {
-                                threadId: 'thread-raw-1',
-                                turn: { id: 'turn-raw-1', items: [], status: 'completed', error: null },
-                            },
-                        });
-                    }, 0);
+    it('rejects request on JSON-RPC error response', async () => {
+        const { proc } = createMockProcess({
+            onRequest: (msg, reply) => {
+                if (msg.method === 'test/fail') {
+                    reply({ error: { code: -32600, message: 'Invalid request' } });
                 }
             },
         });
+        mockSpawn.mockReturnValue(proc);
 
-        mockSpawn.mockImplementation(() => proc);
+        const { createCodexAppServerClient } = await import('./codexAppServerClient');
+        const client = await createCodexAppServerClient();
 
-        const { CodexAppServerClient } = await import('./codexAppServerClient');
-        const client = new CodexAppServerClient();
-        const events: Array<Record<string, unknown>> = [];
-        client.setEventHandler((msg) => {
-            events.push(msg as Record<string, unknown>);
-        });
+        await expect(client.request('test/fail', {})).rejects.toThrow('Invalid request');
 
-        await client.connect();
-        await client.startThread({
-            model: 'gpt-test',
-            cwd: '/tmp/project',
-            approvalPolicy: 'never',
-            sandbox: 'danger-full-access',
-        });
-
-        await expect(client.sendTurnAndWait('run pwd')).resolves.toEqual({ aborted: false });
-
-        expect(events).toEqual(expect.arrayContaining([
-            expect.objectContaining({ type: 'task_started', turn_id: 'turn-raw-1' }),
-            expect.objectContaining({ type: 'exec_command_begin', callId: 'call-1' }),
-            expect.objectContaining({ type: 'exec_command_end', callId: 'call-1', output: '/tmp/project\n' }),
-            expect.objectContaining({ type: 'agent_message', message: 'done' }),
-        ]));
-        expect(events.filter((event) => event.type === 'task_complete')).toHaveLength(1);
-
-        await client.disconnect();
+        await client.dispose();
     });
 
-    it('maps raw file change items into legacy patch events', async () => {
-        const proc = createMockProcess({
-            pid: 3003,
-            onRequest: (msg, stdout) => {
-                if (msg.method === 'thread/start' && msg.id != null) {
-                    setTimeout(() => {
-                        pushJsonLine(stdout, {
-                            id: msg.id,
-                            result: {
-                                thread: { id: 'thread-raw-3', path: '/tmp/thread-raw-3' },
-                                model: 'gpt-test',
-                                modelProvider: 'openai',
-                                cwd: '/tmp/project',
-                                approvalPolicy: 'never',
-                                sandbox: { type: 'dangerFullAccess' },
-                                reasoningEffort: null,
-                            },
-                        });
-                    }, 0);
-                }
+    it('calls registered notification handlers on incoming notifications', async () => {
+        const { proc, stdout } = createMockProcess();
+        mockSpawn.mockReturnValue(proc);
 
-                if (msg.method === 'turn/start' && msg.id != null) {
-                    setTimeout(() => {
-                        pushJsonLine(stdout, {
-                            id: msg.id,
-                            result: {
-                                turn: { id: 'turn-raw-3', items: [], status: 'inProgress', error: null },
-                            },
-                        });
-                        pushJsonLine(stdout, {
-                            method: 'turn/started',
-                            params: {
-                                threadId: 'thread-raw-3',
-                                turn: { id: 'turn-raw-3', items: [], status: 'inProgress', error: null },
-                            },
-                        });
-                        pushJsonLine(stdout, {
-                            method: 'item/started',
-                            params: {
-                                threadId: 'thread-raw-3',
-                                turnId: 'turn-raw-3',
-                                item: {
-                                    type: 'fileChange',
-                                    id: 'patch-1',
-                                    status: 'inProgress',
-                                    changes: [{
-                                        path: 'README.md',
-                                        kind: { type: 'update', move_path: null },
-                                        diff: '@@ -1 +1 @@',
-                                    }],
-                                },
-                            },
-                        });
-                        pushJsonLine(stdout, {
-                            method: 'item/completed',
-                            params: {
-                                threadId: 'thread-raw-3',
-                                turnId: 'turn-raw-3',
-                                item: {
-                                    type: 'fileChange',
-                                    id: 'patch-1',
-                                    status: 'completed',
-                                    changes: [{
-                                        path: 'README.md',
-                                        kind: { type: 'update', move_path: null },
-                                        diff: '@@ -1 +1 @@',
-                                    }],
-                                },
-                            },
-                        });
-                        pushJsonLine(stdout, {
-                            method: 'item/completed',
-                            params: {
-                                threadId: 'thread-raw-3',
-                                turnId: 'turn-raw-3',
-                                item: {
-                                    type: 'agentMessage',
-                                    id: 'msg-3',
-                                    text: 'patched',
-                                    phase: 'final_answer',
-                                },
-                            },
-                        });
-                    }, 0);
-                }
-            },
-        });
+        const { createCodexAppServerClient } = await import('./codexAppServerClient');
+        const client = await createCodexAppServerClient();
 
-        mockSpawn.mockImplementation(() => proc);
+        const handler = vi.fn();
+        client.registerNotificationHandler('agent/event', handler);
 
-        const { CodexAppServerClient } = await import('./codexAppServerClient');
-        const client = new CodexAppServerClient();
-        const events: Array<Record<string, unknown>> = [];
-        client.setEventHandler((msg) => {
-            events.push(msg as Record<string, unknown>);
-        });
+        await new Promise(r => setTimeout(r, 10));
+        pushLine(stdout, { method: 'agent/event', params: { type: 'message', text: 'hello' } });
 
-        await client.connect();
-        await client.startThread({
-            model: 'gpt-test',
-            cwd: '/tmp/project',
-            approvalPolicy: 'never',
-            sandbox: 'danger-full-access',
-        });
+        await new Promise(r => setTimeout(r, 20));
+        expect(handler).toHaveBeenCalledWith({ type: 'message', text: 'hello' });
 
-        await expect(client.sendTurnAndWait('patch the file')).resolves.toEqual({ aborted: false });
-
-        expect(events).toEqual(expect.arrayContaining([
-            expect.objectContaining({
-                type: 'patch_apply_begin',
-                callId: 'patch-1',
-                changes: {
-                    'README.md': {
-                        diff: '@@ -1 +1 @@',
-                        kind: { type: 'update', move_path: null },
-                    },
-                },
-            }),
-            expect.objectContaining({
-                type: 'patch_apply_end',
-                callId: 'patch-1',
-                status: 'completed',
-            }),
-        ]));
-
-        await client.disconnect();
+        await client.dispose();
     });
 
-    it('hydrates v2 file change approvals from raw item metadata', async () => {
-        const approvals: Array<Record<string, unknown>> = [];
-        const proc = createMockProcess({
-            pid: 3004,
-            onRequest: (msg, stdout) => {
-                if (msg.method === 'thread/start' && msg.id != null) {
-                    setTimeout(() => {
-                        pushJsonLine(stdout, {
-                            id: msg.id,
-                            result: {
-                                thread: { id: 'thread-raw-4', path: '/tmp/thread-raw-4' },
-                                model: 'gpt-test',
-                                modelProvider: 'openai',
-                                cwd: '/tmp/project',
-                                approvalPolicy: 'on-request',
-                                sandbox: { type: 'workspaceWrite', writableRoots: [], networkAccess: true, excludeTmpdirEnvVar: false, excludeSlashTmp: false },
-                                reasoningEffort: null,
-                            },
-                        });
-                        pushJsonLine(stdout, {
-                            method: 'item/started',
-                            params: {
-                                threadId: 'thread-raw-4',
-                                turnId: 'turn-raw-4',
-                                item: {
-                                    type: 'fileChange',
-                                    id: 'patch-approval-1',
-                                    status: 'inProgress',
-                                    changes: [{
-                                        path: 'README.md',
-                                        kind: { type: 'update', move_path: null },
-                                        diff: '@@ -1 +1 @@',
-                                    }],
-                                },
-                            },
-                        });
-                        pushJsonLine(stdout, {
-                            id: 99,
-                            method: 'item/fileChange/requestApproval',
-                            params: {
-                                threadId: 'thread-raw-4',
-                                turnId: 'turn-raw-4',
-                                itemId: 'patch-approval-1',
-                                reason: null,
-                                grantRoot: null,
-                            },
-                        });
-                    }, 0);
-                }
-            },
-        });
+    it('unregisters notification handler when returned cleanup is called', async () => {
+        const { proc, stdout } = createMockProcess();
+        mockSpawn.mockReturnValue(proc);
 
-        mockSpawn.mockImplementation(() => proc);
+        const { createCodexAppServerClient } = await import('./codexAppServerClient');
+        const client = await createCodexAppServerClient();
 
-        const { CodexAppServerClient } = await import('./codexAppServerClient');
-        const client = new CodexAppServerClient();
-        client.setApprovalHandler(async (params) => {
-            approvals.push(params as Record<string, unknown>);
-            return 'approved';
-        });
+        const handler = vi.fn();
+        const unregister = client.registerNotificationHandler('agent/event', handler);
+        unregister();
 
-        await client.connect();
-        await client.startThread({
-            model: 'gpt-test',
-            cwd: '/tmp/project',
-            approvalPolicy: 'on-request',
-            sandbox: 'workspace-write',
-        });
+        await new Promise(r => setTimeout(r, 10));
+        pushLine(stdout, { method: 'agent/event', params: { text: 'ignored' } });
 
-        await waitFor(() => approvals.length === 1);
+        await new Promise(r => setTimeout(r, 20));
+        expect(handler).not.toHaveBeenCalled();
 
-        expect(approvals[0]).toEqual(expect.objectContaining({
-            type: 'patch',
-            callId: 'patch-approval-1',
-            fileChanges: {
-                'README.md': {
-                    diff: '@@ -1 +1 @@',
-                    kind: { type: 'update', move_path: null },
-                },
-            },
-            reason: null,
-        }));
-
-        await client.disconnect();
+        await client.dispose();
     });
 
-    it('falls back to final answer completion when raw turn/completed is missing', async () => {
-        const proc = createMockProcess({
-            pid: 3002,
-            onRequest: (msg, stdout) => {
-                if (msg.method === 'thread/start' && msg.id != null) {
-                    setTimeout(() => {
-                        pushJsonLine(stdout, {
-                            id: msg.id,
-                            result: {
-                                thread: { id: 'thread-raw-2', path: '/tmp/thread-raw-2' },
-                                model: 'gpt-test',
-                                modelProvider: 'openai',
-                                cwd: '/tmp/project',
-                                approvalPolicy: 'never',
-                                sandbox: { type: 'dangerFullAccess' },
-                                reasoningEffort: null,
-                            },
-                        });
-                    }, 0);
-                }
+    it('responds to server-initiated requests via registerRequestHandler', async () => {
+        const { proc, stdout, stdin } = createMockProcess();
+        mockSpawn.mockReturnValue(proc);
 
-                if (msg.method === 'turn/start' && msg.id != null) {
-                    setTimeout(() => {
-                        pushJsonLine(stdout, {
-                            id: msg.id,
-                            result: {
-                                turn: { id: 'turn-raw-2', items: [], status: 'inProgress', error: null },
-                            },
-                        });
-                        pushJsonLine(stdout, {
-                            method: 'turn/started',
-                            params: {
-                                threadId: 'thread-raw-2',
-                                turn: { id: 'turn-raw-2', items: [], status: 'inProgress', error: null },
-                            },
-                        });
-                        pushJsonLine(stdout, {
-                            method: 'item/completed',
-                            params: {
-                                threadId: 'thread-raw-2',
-                                turnId: 'turn-raw-2',
-                                item: {
-                                    type: 'agentMessage',
-                                    id: 'msg-2',
-                                    text: 'still works',
-                                    phase: 'final_answer',
-                                },
-                            },
-                        });
-                    }, 0);
-                }
-            },
+        // Collect all writes (including initialize/initialized) to inspect responses.
+        const writes: MockRpcMessage[] = [];
+        const origWrite = stdin.write.bind(stdin);
+        stdin.write = (chunk: unknown, ...rest: unknown[]) => {
+            const text = typeof chunk === 'string' ? chunk : (chunk as Buffer).toString();
+            for (const line of text.split('\n')) {
+                const t = line.trim();
+                if (t) try { writes.push(JSON.parse(t)); } catch { /* skip */ }
+            }
+            return (origWrite as (...args: unknown[]) => boolean)(chunk, ...rest);
+        };
+
+        const { createCodexAppServerClient } = await import('./codexAppServerClient');
+        const client = await createCodexAppServerClient();
+
+        client.registerRequestHandler('permissions/review', async (_params) => {
+            return { decision: 'approved' };
         });
 
-        mockSpawn.mockImplementation(() => proc);
+        await new Promise(r => setTimeout(r, 10));
+        pushLine(stdout, { id: 99, method: 'permissions/review', params: { tool: 'write_file' } });
 
-        const { CodexAppServerClient } = await import('./codexAppServerClient');
-        const client = new CodexAppServerClient();
-        const events: Array<Record<string, unknown>> = [];
-        client.setEventHandler((msg) => {
-            events.push(msg as Record<string, unknown>);
-        });
+        await new Promise(r => setTimeout(r, 30));
 
-        await client.connect();
-        await client.startThread({
-            model: 'gpt-test',
-            cwd: '/tmp/project',
-            approvalPolicy: 'never',
-            sandbox: 'danger-full-access',
-        });
+        const response = writes.find(m => m.id === 99);
+        expect(response).toBeDefined();
+        expect(response?.result).toEqual({ decision: 'approved' });
 
-        await expect(client.sendTurnAndWait('say hi')).resolves.toEqual({ aborted: false });
-        expect(events).toEqual(expect.arrayContaining([
-            expect.objectContaining({ type: 'task_started', turn_id: 'turn-raw-2' }),
-            expect.objectContaining({ type: 'agent_message', message: 'still works' }),
-            expect.objectContaining({ type: 'task_complete', turn_id: 'turn-raw-2' }),
-        ]));
-
-        await client.disconnect();
+        await client.dispose();
     });
 
-    it('responds to MCP elicitation requests with an action payload', async () => {
-        const approvals: Array<Record<string, unknown>> = [];
-        const requests: MockRpcMessage[] = [];
-        const proc = createMockProcess({
-            pid: 3007,
-            onRequest: (msg, stdout) => {
-                requests.push(msg);
-                if (msg.method === 'thread/start' && msg.id != null) {
-                    setTimeout(() => {
-                        pushJsonLine(stdout, {
-                            id: msg.id,
-                            result: {
-                                thread: { id: 'thread-raw-7', path: '/tmp/thread-raw-7' },
-                                model: 'gpt-test',
-                                modelProvider: 'openai',
-                                cwd: '/tmp/project',
-                                approvalPolicy: 'on-request',
-                                sandbox: { type: 'workspaceWrite', writableRoots: [], networkAccess: true, excludeTmpdirEnvVar: false, excludeSlashTmp: false },
-                                reasoningEffort: null,
-                            },
-                        });
-                        pushJsonLine(stdout, {
-                            id: 77,
-                            method: 'mcpServer/elicitation/request',
-                            params: {
-                                threadId: 'thread-raw-7',
-                                turnId: 'turn-raw-7',
-                                serverName: 'happy',
-                                mode: 'form',
-                                _meta: {
-                                    codex_approval_kind: 'mcp_tool_call',
-                                    tool_title: 'Change Chat Title',
-                                    tool_description: 'Change the title of the current chat session',
-                                    tool_params: { title: 'Casual Greeting' },
-                                },
-                                message: 'Allow the happy MCP server to run tool "change_title"?',
-                                requestedSchema: {
-                                    type: 'object',
-                                    properties: {},
-                                },
-                            },
-                        });
-                    }, 0);
-                }
+    it('sends error response when no handler registered for server request', async () => {
+        const { proc, stdout, stdin } = createMockProcess();
+        mockSpawn.mockReturnValue(proc);
+
+        const writes: MockRpcMessage[] = [];
+        const origWrite = stdin.write.bind(stdin);
+        stdin.write = (chunk: unknown, ...rest: unknown[]) => {
+            const text = typeof chunk === 'string' ? chunk : (chunk as Buffer).toString();
+            for (const line of text.split('\n')) {
+                const t = line.trim();
+                if (t) try { writes.push(JSON.parse(t)); } catch { /* skip */ }
+            }
+            return (origWrite as (...args: unknown[]) => boolean)(chunk, ...rest);
+        };
+
+        const { createCodexAppServerClient } = await import('./codexAppServerClient');
+        const client = await createCodexAppServerClient();
+
+        await new Promise(r => setTimeout(r, 10));
+        pushLine(stdout, { id: 7, method: 'unknown/method', params: {} });
+
+        await new Promise(r => setTimeout(r, 30));
+
+        const response = writes.find(m => m.id === 7);
+        expect(response?.error).toBeDefined();
+        expect(response?.error?.code).toBe(-32601);
+
+        await client.dispose();
+    });
+
+    it('sends a JSON-RPC notification (no id, no response expected)', async () => {
+        const { proc, stdin } = createMockProcess();
+        mockSpawn.mockReturnValue(proc);
+
+        const writes: MockRpcMessage[] = [];
+        const origWrite = stdin.write.bind(stdin);
+        stdin.write = (chunk: unknown, ...rest: unknown[]) => {
+            const text = typeof chunk === 'string' ? chunk : (chunk as Buffer).toString();
+            for (const line of text.split('\n')) {
+                const t = line.trim();
+                if (t) try { writes.push(JSON.parse(t)); } catch { /* skip */ }
+            }
+            return (origWrite as (...args: unknown[]) => boolean)(chunk, ...rest);
+        };
+
+        const { createCodexAppServerClient } = await import('./codexAppServerClient');
+        const client = await createCodexAppServerClient();
+
+        await client.notify('agent/cancel', { reason: 'user_abort' });
+
+        await new Promise(r => setTimeout(r, 20));
+
+        const notification = writes.find(m => m.method === 'agent/cancel' && m.id === undefined);
+        expect(notification).toBeDefined();
+        expect(notification?.params).toEqual({ reason: 'user_abort' });
+
+        await client.dispose();
+    });
+
+    it('rejects pending requests when process exits unexpectedly', async () => {
+        const { proc } = createMockProcess({
+            onRequest: (_msg, _reply) => {
+                // Do not respond — simulates a slow/hung request.
             },
         });
+        mockSpawn.mockReturnValue(proc);
 
-        mockSpawn.mockImplementation(() => proc);
+        const { createCodexAppServerClient } = await import('./codexAppServerClient');
+        const client = await createCodexAppServerClient();
 
-        const { CodexAppServerClient } = await import('./codexAppServerClient');
-        const client = new CodexAppServerClient();
-        client.setApprovalHandler(async (params) => {
-            approvals.push(params as Record<string, unknown>);
-            return 'approved';
-        });
+        const requestPromise = client.request('slow/method', {});
 
-        await client.connect();
-        await client.startThread({
-            model: 'gpt-test',
-            cwd: '/tmp/project',
-            approvalPolicy: 'on-request',
-            sandbox: 'workspace-write',
-        });
+        await new Promise(r => setTimeout(r, 10));
+        // Simulate process crash — implementation listens for 'close'.
+        proc.emit('close', 1, null);
 
-        await waitFor(() => approvals.length === 1);
-        await waitFor(() => requests.some((msg) => msg.id === 77 && msg.result?.action === 'accept'));
+        await expect(requestPromise).rejects.toThrow();
+    });
 
-        expect(approvals[0]).toEqual(expect.objectContaining({
-            type: 'mcp',
-            callId: 'happy:77',
-            toolName: 'change_title',
-            input: { title: 'Casual Greeting' },
-            serverName: 'happy',
-        }));
-        expect(requests).toEqual(expect.arrayContaining([
-            expect.objectContaining({
-                id: 77,
-                result: {
-                    action: 'accept',
-                    content: {},
-                    _meta: null,
-                },
-            }),
-        ]));
+    it('dispose resolves cleanly and marks client as disposed', async () => {
+        const { proc } = createMockProcess();
+        mockSpawn.mockReturnValue(proc);
 
-        await client.disconnect();
+        const { createCodexAppServerClient } = await import('./codexAppServerClient');
+        const client = await createCodexAppServerClient();
+
+        await expect(client.dispose()).resolves.toBeUndefined();
+
+        // After dispose, requests should reject.
+        await expect(client.request('any/method', {})).rejects.toThrow();
+    });
+
+    it('handles multi-line stdout correctly (partial lines)', async () => {
+        const { proc, stdout } = createMockProcess();
+        mockSpawn.mockReturnValue(proc);
+
+        const { createCodexAppServerClient } = await import('./codexAppServerClient');
+        const client = await createCodexAppServerClient();
+
+        const handler = vi.fn();
+        client.registerNotificationHandler('ping', handler);
+
+        await new Promise(r => setTimeout(r, 10));
+        // Send in two chunks (simulates partial TCP-style delivery).
+        const full = JSON.stringify({ method: 'ping', params: { seq: 1 } }) + '\n';
+        stdout.push(full.slice(0, 10));
+        await new Promise(r => setTimeout(r, 5));
+        stdout.push(full.slice(10));
+
+        await new Promise(r => setTimeout(r, 30));
+        expect(handler).toHaveBeenCalledWith({ seq: 1 });
+
+        await client.dispose();
     });
 });

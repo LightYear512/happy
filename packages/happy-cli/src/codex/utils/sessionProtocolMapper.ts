@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { createId } from '@paralleldrive/cuid2';
 import type { ReasoningOutput } from './reasoningProcessor';
 import type { DiffToolCall, DiffToolResult } from './diffProcessor';
-import { createEnvelope, type CreateEnvelopeOptions, type SessionEnvelope } from '@slopus/happy-wire';
+import { createEnvelope, type CreateEnvelopeOptions, type SessionEnvelope } from '@/sessionProtocol/types';
 
 export type CodexTurnState = {
     currentTurnId: string | null;
@@ -288,10 +288,7 @@ export function mapCodexMcpMessageToSessionEnvelopes(message: Record<string, unk
         };
     }
 
-    // exec_approval_request is intentionally NOT mapped here — the permission
-    // handler already renders the approval UI via agent state.  Mapping it to
-    // tool-call-start too would create a duplicate tool call card.
-    if (type === 'exec_command_begin') {
+    if (type === 'exec_command_begin' || type === 'exec_approval_request') {
         const call = pickCallId(message);
         const { call_id: _callIdSnake, callId: _callIdCamel, type: _type, ...args } = message;
 
