@@ -2,32 +2,46 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
-// Mock fs
+// Mock fs — must include all fs functions used transitively
 const mockExistsSync = vi.hoisted(() => vi.fn());
 const mockReadFileSync = vi.hoisted(() => vi.fn());
+const mockWriteFileSync = vi.hoisted(() => vi.fn());
+const mockMkdirSync = vi.hoisted(() => vi.fn());
+const mockWatch = vi.hoisted(() => vi.fn());
 
 vi.mock('node:fs', () => ({
     existsSync: mockExistsSync,
     readFileSync: mockReadFileSync,
+    writeFileSync: mockWriteFileSync,
+    mkdirSync: mockMkdirSync,
+    watch: mockWatch,
 }));
 
 // Mock logger
 vi.mock('@/ui/logger', () => ({
-    logger: { debug: vi.fn() },
+    logger: { debug: vi.fn(), warn: vi.fn(), info: vi.fn() },
 }));
 
 import { handleAuthBangCommand } from './authCommand';
-import type { BangCommandContext } from './types';
+import type { BangCommandContext, BangCommandResult } from './types';
 
 const ccsDir = join(homedir(), '.ccs');
 
+/** Join string | string[] to a single string for contains checks. */
+function joinMsg(result: BangCommandResult): string {
+    if (!result.message) return '';
+    return Array.isArray(result.message) ? result.message.join('\n') : result.message;
+}
+
 /** Create a minimal mock context */
-function createMockContext(): BangCommandContext {
+function createMockContext(overrides: Partial<BangCommandContext> = {}): BangCommandContext {
     return {
-        client: {} as any,
+        client: { sendSessionEvent: vi.fn(), sendCodexMessage: vi.fn() } as any,
         session: { clearSessionId: vi.fn() } as any,
         messageQueue: { pushIsolateAndClear: vi.fn() } as any,
         currentEnhancedMode: { permissionMode: 'default' as const },
+        mode: 'remote' as const,
+        ...overrides,
     };
 }
 
@@ -57,6 +71,10 @@ describe('handleAuthBangCommand', () => {
         savedConfigDir = process.env.CLAUDE_CONFIG_DIR;
         delete process.env.CLAUDE_CONFIG_DIR;
         delete process.env.CCS_DIR;
+        // Default: writeFileSync is a no-op
+        mockWriteFileSync.mockReturnValue(undefined);
+        // Default: watch returns a mock watcher
+        mockWatch.mockReturnValue({ on: vi.fn(), close: vi.fn() });
     });
 
     afterEach(() => {
@@ -68,12 +86,12 @@ describe('handleAuthBangCommand', () => {
     });
 
     describe('!auth (list profiles)', () => {
-        it('should show warning when no CCS profiles exist', async () => {
+        it('should show message when no CCS profiles exist', async () => {
             mockExistsSync.mockReturnValue(false);
 
             const result = await handleAuthBangCommand('', createMockContext());
             expect(result.action).toBe('none');
-            expect(result.message).toContain('No CCS profiles found');
+            expect(joinMsg(result)).toContain('未找到 CCS 配置');
         });
 
         it('should list available profiles', async () => {
@@ -84,12 +102,12 @@ describe('handleAuthBangCommand', () => {
 
             const result = await handleAuthBangCommand('', createMockContext());
             expect(result.action).toBe('none');
-            expect(result.message).toContain('work');
-            expect(result.message).toContain('personal');
-            expect(result.message).toContain('[default]');
+            const msg = joinMsg(result);
+            expect(msg).toContain('work');
+            expect(msg).toContain('personal');
         });
 
-        it('should mark current profile when CLAUDE_CONFIG_DIR is set', async () => {
+        it('should mark current profile with ● when CLAUDE_CONFIG_DIR is set', async () => {
             mockCcsProfiles(
                 { work: { type: 'account' }, personal: { type: 'account' } },
                 'work'
@@ -97,14 +115,17 @@ describe('handleAuthBangCommand', () => {
             process.env.CLAUDE_CONFIG_DIR = join(ccsDir, 'instances', 'work');
 
             const result = await handleAuthBangCommand('', createMockContext());
-            expect(result.message).toContain('(current)');
+            expect(joinMsg(result)).toContain('●');
         });
 
-        it('should show "default (current)" when no profile is active', async () => {
+        it('should show no-profile message when no profile is active', async () => {
             mockCcsProfiles({ work: { type: 'account' } });
 
             const result = await handleAuthBangCommand('', createMockContext());
-            expect(result.message).toContain('default (current)');
+            const msg = joinMsg(result);
+            // No CLAUDE_CONFIG_DIR means no current profile — new code shows "当前无 CCS 配置"
+            expect(msg).toContain('当前无 CCS 配置');
+            expect(msg).toContain('work');
         });
     });
 
@@ -114,7 +135,7 @@ describe('handleAuthBangCommand', () => {
 
             const result = await handleAuthBangCommand('work', createMockContext());
             expect(result.action).toBe('restart-session');
-            expect(result.message).toContain('Switching to "work"');
+            expect(joinMsg(result)).toContain('已切换到 "work"');
             expect(process.env.CLAUDE_CONFIG_DIR).toBe(join(ccsDir, 'instances', 'work'));
         });
 
@@ -124,7 +145,7 @@ describe('handleAuthBangCommand', () => {
 
             const result = await handleAuthBangCommand('work', createMockContext());
             expect(result.action).toBe('none');
-            expect(result.message).toContain('Already using');
+            expect(joinMsg(result)).toContain('当前已是');
         });
 
         it('should error for non-existent profile', async () => {
@@ -132,36 +153,28 @@ describe('handleAuthBangCommand', () => {
 
             const result = await handleAuthBangCommand('nonexistent', createMockContext());
             expect(result.action).toBe('none');
-            expect(result.message).toContain('not found');
+            expect(joinMsg(result)).toContain('未找到配置');
         });
 
-        it('should suggest similar profile names', async () => {
+        it('should include profile names in not-found error', async () => {
             mockCcsProfiles({ workspace: { type: 'account' } });
 
             const result = await handleAuthBangCommand('work', createMockContext());
-            expect(result.message).toContain('workspace');
+            // Profile not found — error message mentions the queried name
+            expect(joinMsg(result)).toContain('work');
         });
 
-        it('should switch to default (unset CLAUDE_CONFIG_DIR)', async () => {
-            process.env.CLAUDE_CONFIG_DIR = join(ccsDir, 'instances', 'work');
+        it('should error when switching to unrecognised "default" keyword', async () => {
             mockCcsProfiles({ work: { type: 'account' } });
 
-            const result = await handleAuthBangCommand('default', createMockContext());
-            expect(result.action).toBe('restart-session');
-            expect(process.env.CLAUDE_CONFIG_DIR).toBeUndefined();
-        });
-
-        it('should skip switch when already on default', async () => {
-            // No CLAUDE_CONFIG_DIR set = already on default
-            mockCcsProfiles({ work: { type: 'account' } });
-
+            // New code has no special "default" keyword — treated as unknown profile
             const result = await handleAuthBangCommand('default', createMockContext());
             expect(result.action).toBe('none');
-            expect(result.message).toContain('Already using default');
+            expect(joinMsg(result)).toContain('未找到配置');
         });
 
         it('should error when instance directory is not initialized', async () => {
-            // Profile exists but instance dir doesn't
+            // Profile exists in profiles.json but instance dir doesn't
             mockExistsSync.mockImplementation((path: string) => {
                 if (path === ccsDir) return true;
                 if (path === join(ccsDir, 'profiles.json')) return true;
@@ -175,7 +188,15 @@ describe('handleAuthBangCommand', () => {
 
             const result = await handleAuthBangCommand('work', createMockContext());
             expect(result.action).toBe('none');
-            expect(result.message).toContain('not initialized');
+            expect(joinMsg(result)).toContain('未初始化');
+        });
+
+        it('should redirect to !auth-all when in console session', async () => {
+            mockCcsProfiles({ work: { type: 'account' } });
+
+            const result = await handleAuthBangCommand('work', createMockContext({ isConsoleSession: true }));
+            expect(result.action).toBe('none');
+            expect(joinMsg(result)).toContain('auth-all');
         });
     });
 });

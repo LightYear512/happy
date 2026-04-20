@@ -7,6 +7,7 @@ import { createInterface } from 'node:readline';
 import { stopDaemon, checkIfDaemonRunningAndCleanupStaleState } from '@/daemon/controlClient';
 import { logger } from '@/ui/logger';
 import os from 'node:os';
+import { requestAgentAuth } from '@/resume/agentAuth';
 
 export async function handleAuthCommand(args: string[]): Promise<void> {
   const subcommand = args[0];
@@ -94,6 +95,18 @@ async function handleAuthLogin(args: string[]): Promise<void> {
       console.log(chalk.gray(`  Machine ID: ${settings.machineId}`));
       console.log(chalk.gray(`  Host: ${os.hostname()}`));
       console.log(chalk.gray(`  Use 'happy auth login --force' to re-authenticate`));
+      // Still run agent auth if agent.key is missing — covers users who authenticated
+      // before the session-resume feature was introduced.
+      if (!existsSync(configuration.agentKeyFile)) {
+        try {
+          await requestAgentAuth(configuration.serverUrl);
+          console.log(chalk.green('✓ Agent credentials saved'));
+        } catch (error) {
+          logger.debug('[auth] Agent auth failed:', error);
+          console.log(chalk.yellow('⚠️  Agent auth skipped:'), error instanceof Error ? error.message : 'Unknown error');
+          console.log(chalk.gray('  Session resume may not be available. Run `happy auth login --force` to retry.'));
+        }
+      }
       return;
     } else if (existingCreds && !settings?.machineId) {
       console.log(chalk.yellow('⚠️  Credentials exist but machine ID is missing'));
@@ -111,6 +124,22 @@ async function handleAuthLogin(args: string[]): Promise<void> {
   } catch (error) {
     console.error(chalk.red('Authentication failed:'), error instanceof Error ? error.message : 'Unknown error');
     process.exit(1);
+  }
+
+  // Agent auth: obtain account-scoped credentials for session resume.
+  // Skip if agent.key already exists (and we're not forcing re-auth).
+  if (!forceAuth && existsSync(configuration.agentKeyFile)) {
+    logger.debug('[auth] agent.key already exists, skipping agent auth');
+    return;
+  }
+  try {
+    await requestAgentAuth(configuration.serverUrl);
+    console.log(chalk.green('✓ Agent credentials saved'));
+  } catch (error) {
+    // Non-fatal: session resume won't work, but core auth succeeded.
+    logger.debug('[auth] Agent auth failed:', error);
+    console.log(chalk.yellow('⚠️  Agent auth skipped:'), error instanceof Error ? error.message : 'Unknown error');
+    console.log(chalk.gray('  Session resume may not be available. Run `happy auth login --force` to retry.'));
   }
 }
 
