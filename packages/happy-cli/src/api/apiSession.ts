@@ -47,7 +47,7 @@ export type ACPMessageData =
 
 export type ACPProvider = 'gemini' | 'codex' | 'claude' | 'opencode';
 
-type V3SessionMessage = {
+export type V3SessionMessage = {
     id: string;
     seq: number;
     content: { t: 'encrypted'; c: string };
@@ -618,6 +618,32 @@ export class ApiSessionClient extends EventEmitter {
                 resolve();
             }, 10000);
         });
+    }
+
+    /**
+     * Wait for the socket to establish a connection, with a 5-second timeout fallback.
+     */
+    waitForConnect(): Promise<void> {
+        if (this.socket.connected) return Promise.resolve();
+        return new Promise((resolve) => {
+            const timer = setTimeout(resolve, 5000);
+            this.socket.once('connect', () => {
+                clearTimeout(timer);
+                resolve();
+            });
+        });
+    }
+
+    /**
+     * Inject a pending message directly into the incoming message queue.
+     * Used after session restore to replay user messages that arrived while offline.
+     */
+    injectPendingMessage(message: unknown): void {
+        if (this.pendingMessageCallback) {
+            this.pendingMessageCallback(message as UserMessage);
+        } else {
+            this.pendingMessages.push(message as UserMessage);
+        }
     }
 
     async close() {

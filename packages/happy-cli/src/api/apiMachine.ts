@@ -20,6 +20,8 @@ interface ServerToDaemonEvents {
     'rpc-registered': (data: { method: string }) => void;
     'rpc-unregistered': (data: { method: string }) => void;
     'rpc-error': (data: { type: string, error: string }) => void;
+    /** Server-initiated session restore: emitted when the App sends a message to a closed session */
+    'session-restore-request': (data: { sessionId: string }) => void;
     auth: (data: { success: boolean, user: string }) => void;
     error: (data: { message: string }) => void;
 }
@@ -29,6 +31,7 @@ interface DaemonToServerEvents {
         machineId: string;
         time: number;
     }) => void;
+    'session-end': (data: { sid: string; time: number }) => void;
 
     'machine-update-metadata': (data: {
         machineId: string;
@@ -129,8 +132,14 @@ export class ApiMachineClient {
                     logger.debug(`[API MACHINE] Requesting directory creation approval for: ${result.directory}`);
                     return { type: 'requestToApproveDirectoryCreation', directory: result.directory };
 
+                case 'superseded':
+                    logger.debug(`[API MACHINE] Session superseded by a newer resume`);
+                    return { type: 'success', sessionId: 'superseded' };
+
                 case 'error':
                     throw new Error(result.errorMessage);
+                default:
+                    throw new Error(`Unexpected spawn result type: ${(result as any).type}`);
             }
         });
 
@@ -192,6 +201,8 @@ export class ApiMachineClient {
                             return result;
                         case 'error':
                             throw new Error(result.errorMessage);
+                        default:
+                            throw new Error(`Unexpected resume result type: ${(result as any).type}`);
                     }
                 });
             }
@@ -312,6 +323,21 @@ export class ApiMachineClient {
             callback(await this.rpcHandlerManager.handleRequest(data));
         });
 
+        // Server-initiated session restore: App sent a message to a closed session
+        this.socket.on('session-restore-request', async (data: { sessionId: string }) => {
+            logger.debug(`[API MACHINE] Received session-restore-request for ${data.sessionId}`);
+            if (!this.resumeSessionHandler) {
+                logger.debug(`[API MACHINE] No resumeSessionHandler registered, ignoring restore request`);
+                return;
+            }
+            try {
+                const result = await this.resumeSessionHandler(data.sessionId);
+                logger.debug(`[API MACHINE] Session restore result: type=${result.type}`);
+            } catch (error) {
+                logger.debug(`[API MACHINE] Session restore failed for ${data.sessionId}:`, error);
+            }
+        });
+
         // Handle update events from server
         this.socket.on('update', (data: Update) => {
             // Machine clients should only care about machine updates
@@ -389,6 +415,12 @@ export class ApiMachineClient {
             this.keepAliveInterval = null;
             logger.debug('[API MACHINE] Keep-alive stopped');
         }
+    }
+
+    /** Notify server that a session has ended. Fire-and-forget. */
+    sendSessionEnd(sessionId: string): void {
+        if (!this.socket?.connected) return;
+        this.socket.emit('session-end', { sid: sessionId, time: Date.now() });
     }
 
     shutdown() {

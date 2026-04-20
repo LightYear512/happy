@@ -8,6 +8,50 @@ import { log } from "@/utils/log";
 import { randomKeyNaked } from "@/utils/randomKeyNaked";
 import { Socket } from "socket.io";
 
+/**
+ * Attempt to wake a daemon to restore a session when no active Claude process
+ * is connected for it. Looks up the AccessKey to find which machine last owned
+ * the session, then emits `session-restore-request` directly on that machine's
+ * socket so the daemon can call `runClaude({ restoreSessionId })`.
+ *
+ * No-op (silent) if: the session is already active, no AccessKey exists, or
+ * the owning machine is currently offline.
+ */
+async function tryRestoreSession(userId: string, sessionId: string): Promise<void> {
+    const connections = eventRouter.getConnections(userId);
+
+    // If a session-scoped connection already exists, Claude is running — nothing to do
+    if (connections) {
+        for (const conn of connections) {
+            if (conn.connectionType === 'session-scoped' && conn.sessionId === sessionId) {
+                return;
+            }
+        }
+    }
+
+    // Look up which machine last registered for this session (most recent wins)
+    const accessKey = await db.accessKey.findFirst({
+        where: { sessionId, accountId: userId },
+        orderBy: { updatedAt: 'desc' }
+    });
+    if (!accessKey) {
+        return;
+    }
+
+    // Find that machine's live socket and request a restore
+    if (!connections) {
+        return;
+    }
+    for (const conn of connections) {
+        if (conn.connectionType === 'machine-scoped' && conn.machineId === accessKey.machineId) {
+            log({ module: 'session-restore' }, `Requesting session restore: sessionId=${sessionId}, machineId=${accessKey.machineId}`);
+            conn.socket.emit('session-restore-request', { sessionId });
+            return;
+        }
+    }
+    // Machine is offline — cannot restore now
+}
+
 export function sessionUpdateHandler(userId: string, socket: Socket, connection: ClientConnection) {
     socket.on('update-metadata', async (data: any, callback: (response: any) => void) => {
         try {
@@ -237,6 +281,11 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                     payload: updatePayload,
                     recipientFilter: { type: 'all-interested-in-session', sessionId: sid },
                     skipSenderConnection: connection
+                });
+
+                // Wake the daemon if no Claude process is actively handling this session
+                tryRestoreSession(userId, sid).catch((err) => {
+                    log({ module: 'session-restore', level: 'error' }, `tryRestoreSession failed: ${err}`);
                 });
             } catch (error) {
                 log({ module: 'websocket', level: 'error' }, `Error in message handler: ${error}`);

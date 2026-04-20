@@ -79,6 +79,36 @@ export function libsodiumEncryptForPublicKey(data: Uint8Array, recipientPublicKe
 }
 
 /**
+ * Decrypt a NaCl box bundle encrypted with an ephemeral keypair.
+ * Bundle format: ephemeralPublicKey(32) + nonce(24) + ciphertext.
+ * Returns null if the bundle is too short or decryption fails.
+ */
+export function decryptBoxBundle(bundle: Uint8Array, recipientSecretKey: Uint8Array): Uint8Array | null {
+  if (bundle.length < 56) {
+    return null;
+  }
+  const ephemeralPublicKey = bundle.slice(0, 32);
+  const nonce = bundle.slice(32, 56);
+  const ciphertext = bundle.slice(56);
+  const decrypted = tweetnacl.box.open(ciphertext, nonce, ephemeralPublicKey, recipientSecretKey);
+  return decrypted ? new Uint8Array(decrypted) : null;
+}
+
+/**
+ * Decrypt data that was encrypted with libsodiumEncryptForPublicKey, using the seed.
+ * The seed is the machine key from which the recipient keypair was derived.
+ * Bundle format: ephemeralPublicKey(32) + nonce(24) + ciphertext
+ */
+export function libsodiumDecryptWithSeed(bundle: Uint8Array, seed: Uint8Array): Uint8Array | null {
+  const hashedSeed = new Uint8Array(createHash('sha512').update(seed).digest());
+  const secretKey = hashedSeed.slice(0, 32);
+  const ephemeralPublicKey = bundle.slice(0, 32);
+  const nonce = bundle.slice(32, 32 + tweetnacl.box.nonceLength);
+  const ciphertext = bundle.slice(32 + tweetnacl.box.nonceLength);
+  return tweetnacl.box.open(ciphertext, nonce, ephemeralPublicKey, secretKey);
+}
+
+/**
  * Encrypt data using the secret key
  * @param data - The data to encrypt
  * @param secret - The secret key to use for encryption

@@ -1,9 +1,9 @@
 import axios from 'axios'
 import { logger } from '@/ui/logger'
 import type { AgentState, CreateSessionResponse, Metadata, Session, Machine, MachineMetadata, DaemonState } from '@/api/types'
-import { ApiSessionClient } from './apiSession';
+import { ApiSessionClient, V3SessionMessage } from './apiSession';
 import { ApiMachineClient } from './apiMachine';
-import { decodeBase64, encodeBase64, getRandomBytes, encrypt, decrypt, libsodiumEncryptForPublicKey } from './encryption';
+import { decodeBase64, encodeBase64, getRandomBytes, encrypt, decrypt, libsodiumEncryptForPublicKey, libsodiumDecryptWithSeed } from './encryption';
 import { PushNotificationClient } from './pushNotifications';
 import { configuration } from '@/configuration';
 import chalk from 'chalk';
@@ -396,6 +396,111 @@ export class ApiClient {
       }
       logger.debug(`[API] [ERROR] Failed to get vendor token:`, error);
       return null;
+    }
+  }
+
+  /**
+   * Fetch an existing session by its ID.
+   * Returns null if the session is not found or cannot be decrypted.
+   */
+  async getSessionById(sessionId: string): Promise<Session | null> {
+    try {
+      const response = await axios.get(
+        `${configuration.serverUrl}/v1/sessions/${encodeURIComponent(sessionId)}`,
+        {
+          headers: {
+            'Authorization': `Bearer ${this.credential.token}`,
+          },
+          timeout: 10000,
+        }
+      );
+
+      const raw = response.data.session;
+      if (!raw) return null;
+
+      let encryptionKey: Uint8Array;
+      let encryptionVariant: 'legacy' | 'dataKey';
+
+      if (this.credential.encryption.type === 'dataKey') {
+        encryptionVariant = 'dataKey';
+        if (!raw.dataEncryptionKey) return null;
+        // Wire format: 1 version byte + libsodium box bytes (nonce 24 + MAC 16 + key).
+        // Minimum valid length is 2; libsodiumDecryptWithSeed rejects anything too short.
+        const decoded = decodeBase64(raw.dataEncryptionKey);
+        if (decoded.length < 2) return null;
+        const encryptedBundle = decoded.slice(1);
+        const decryptedKey = libsodiumDecryptWithSeed(encryptedBundle, this.credential.encryption.machineKey);
+        if (!decryptedKey) return null;
+        encryptionKey = decryptedKey;
+      } else {
+        encryptionKey = this.credential.encryption.secret;
+        encryptionVariant = 'legacy';
+      }
+
+      return {
+        id: raw.id,
+        seq: raw.seq ?? 0,
+        metadata: decrypt(encryptionKey, encryptionVariant, decodeBase64(raw.metadata)),
+        metadataVersion: raw.metadataVersion ?? 0,
+        agentState: raw.agentState ? decrypt(encryptionKey, encryptionVariant, decodeBase64(raw.agentState)) : null,
+        agentStateVersion: raw.agentStateVersion ?? 0,
+        encryptionKey,
+        encryptionVariant,
+      };
+    } catch (error) {
+      logger.debug('[API] Failed to get session by ID:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Register this machine as the owner of a session for server-side routing.
+   * Creates an AccessKey record mapping sessionId → machineId so the server knows
+   * which daemon to wake when the App sends a message to a closed session.
+   * Idempotent: silently succeeds if the record already exists (409).
+   */
+  async createAccessKey(sessionId: string, machineId: string): Promise<void> {
+    try {
+      await axios.post(
+        `${configuration.serverUrl}/v1/access-keys/${encodeURIComponent(sessionId)}/${encodeURIComponent(machineId)}`,
+        { data: '{}' },
+        {
+          headers: {
+            'Authorization': `Bearer ${this.credential.token}`,
+            'Content-Type': 'application/json',
+          },
+          timeout: 10000,
+        }
+      );
+      logger.debug(`[API] AccessKey registered: session=${sessionId}, machine=${machineId}`);
+    } catch (error) {
+      if (axios.isAxiosError(error) && error.response?.status === 409) {
+        logger.debug(`[API] AccessKey already exists for session=${sessionId}, machine=${machineId}`);
+        return;
+      }
+      // Non-fatal: server-side routing won't work but local session continues normally
+      logger.debug('[API] Failed to create AccessKey (non-fatal):', error);
+    }
+  }
+
+  /**
+   * Fetch messages for a session, ordered newest-first.
+   * Used by fetchAndInjectPendingMessages to replay missed user messages after restore.
+   */
+  async getSessionMessages(sessionId: string): Promise<V3SessionMessage[]> {
+    try {
+      const response = await axios.get<{ messages: V3SessionMessage[]; hasMore: boolean }>(
+        `${configuration.serverUrl}/v3/sessions/${encodeURIComponent(sessionId)}/messages`,
+        {
+          params: { limit: 100, order: 'desc' },
+          headers: { 'Authorization': `Bearer ${this.credential.token}` },
+          timeout: 10000,
+        }
+      );
+      return Array.isArray(response.data.messages) ? response.data.messages : [];
+    } catch (error) {
+      logger.debug('[API] Failed to get session messages:', error);
+      return [];
     }
   }
 }
