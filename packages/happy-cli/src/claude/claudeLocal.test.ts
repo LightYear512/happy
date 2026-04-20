@@ -248,7 +248,7 @@ describe('claudeLocal --continue handling', () => {
         expect(spawnArgs).toContain('-r');
     });
 
-    it('should initialize sandbox, wrap command, and cleanup on exit', async () => {
+    it.skipIf(process.platform === 'win32')('should initialize sandbox, wrap command, and cleanup on exit', async () => {
         await claudeLocal({
             abort: new AbortController().signal,
             sessionId: null,

@@ -13,7 +13,8 @@ import { hashObject } from '@/utils/deterministicJson';
 import { startCaffeinate, stopCaffeinate } from '@/utils/caffeinate';
 import { extractSDKMetadataAsync } from '@/claude/sdk/metadataExtractor';
 import { parseSpecialCommand } from '@/parsers/specialCommands';
-import { isBangCommand, executeBangCommand } from '@/commands/bang/dispatcher';
+import { isBangCommand, executeBangCommand, hasActiveInteractiveSession, handleInteractiveInput, buildConsoleWelcome } from '@/commands/bang/dispatcher';
+import { tryGlobalProfileSwitch } from '@/commands/bang/authCommand';
 import { getEnvironmentInfo } from '@/ui/doctor';
 import { configuration } from '@/configuration';
 import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
@@ -24,13 +25,14 @@ import { generateHookSettingsFile, cleanupHookSettingsFile } from '@/claude/util
 import { registerKillSessionHandler } from './registerKillSessionHandler';
 import { projectPath } from '../projectPath';
 import { resolve } from 'node:path';
-import { existsSync } from 'node:fs';
+import { existsSync, watch as fsWatch } from 'node:fs';
 import { startOfflineReconnection, connectionState } from '@/utils/serverConnectionErrors';
 import { readCcsProfiles, getInstancePath, getCurrentCcsProfile } from '@/commands/bang/ccsProfiles';
 import { claudeLocal } from '@/claude/claudeLocal';
 import { createSessionScanner } from '@/claude/utils/sessionScanner';
 import { Session } from './session';
 import { applySandboxPermissionPolicy, resolveInitialClaudePermissionMode } from './utils/permissionMode';
+import { fetchAndInjectPendingMessages } from '@/utils/fetchPendingMessages';
 
 /** JavaScript runtime to use for spawning Claude Code */
 export type JsRuntime = 'node' | 'bun'
@@ -48,11 +50,15 @@ export interface StartOptions {
     jsRuntime?: JsRuntime
     /** CCS profile name to use at startup */
     profile?: string
+    /** Happy session ID to restore (rejoin existing session instead of creating new) */
+    restoreSessionId?: string
 }
 
 export async function runClaude(credentials: Credentials, options: StartOptions = {}): Promise<void> {
     logger.debug(`[CLAUDE] ===== CLAUDE MODE STARTING =====`);
     logger.debug(`[CLAUDE] This is the Claude agent, NOT Gemini`);
+
+    const isConsoleSession = process.env.HAPPY_CONSOLE_SESSION === '1';
 
     // Resolve CCS profile: --profile flag > CCS default > system default
     const resolvedProfile = resolveCcsProfile(options.profile);
@@ -60,8 +66,10 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         process.env.CLAUDE_CONFIG_DIR = resolvedProfile.configDir;
         logger.debug(`[CLAUDE] Using CCS profile "${resolvedProfile.name}" → ${resolvedProfile.configDir}`);
     }
-    // Print current account info
-    console.log(`🔑 Account: ${resolvedProfile.name}${resolvedProfile.source !== 'default' ? ` (${resolvedProfile.source})` : ''}`);
+    // Print current account info (skip for console sessions — lightweight, no Claude)
+    if (!isConsoleSession) {
+        console.log(`🔑 Account: ${resolvedProfile.name}${resolvedProfile.source !== 'default' ? ` (${resolvedProfile.source})` : ''}`);
+    }
 
     const workingDirectory = process.cwd();
     const sessionTag = randomUUID();
@@ -111,7 +119,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     });
 
     let metadata: Metadata = {
-        path: workingDirectory,
+        path: isConsoleSession ? os.homedir() : workingDirectory,
         host: os.hostname(),
         version: packageJson.version,
         os: os.platform(),
@@ -130,7 +138,21 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         sandbox: sandboxConfig?.enabled ? sandboxConfig : null,
         dangerouslySkipPermissions,
     };
-    const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
+    // Restore path: rejoin existing session by ID, fallback to creating new session
+    let response;
+    let didRestoreSession = false;
+    if (options.restoreSessionId) {
+        response = await api.getSessionById(options.restoreSessionId);
+        if (response) {
+            didRestoreSession = true;
+            logger.debug(`[CLAUDE] Restored session ${options.restoreSessionId}`);
+        } else {
+            logger.debug(`[CLAUDE] Failed to restore session ${options.restoreSessionId}, creating new session`);
+            response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
+        }
+    } else {
+        response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
+    }
 
     // Handle server unreachable case - run Claude locally with hot reconnection
     // Note: connectionState.notifyOffline() was already called by api.ts with error details
@@ -179,6 +201,10 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
     logger.debug(`Session created: ${response.id}`);
 
+    // Register this machine as session owner for server-side routing.
+    // Allows the server to wake this daemon when the App sends a message to a closed session.
+    await api.createAccessKey(response.id, machineId);
+
     // Always report to daemon if it exists
     try {
         logger.debug(`[START] Reporting session ${response.id} to daemon`);
@@ -193,7 +219,8 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     }
 
     // Extract SDK metadata in background and update session when ready
-    extractSDKMetadataAsync(async (sdkMetadata) => {
+    // Console sessions skip this — they don't use Claude SDK
+    if (!isConsoleSession) extractSDKMetadataAsync(async (sdkMetadata) => {
         logger.debug('[start] SDK metadata extracted, updating session:', sdkMetadata);
         try {
             // Update session metadata with tools and slash commands
@@ -210,6 +237,29 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
     // Create realtime session
     const session = api.sessionSyncClient(response);
+
+    // After restore, fetch pending user messages that arrived while CLI was offline.
+    if (didRestoreSession && response) {
+        try {
+            await fetchAndInjectPendingMessages(
+                api, session, options.restoreSessionId!,
+                response.encryptionKey, response.encryptionVariant,
+                '[Claude]',
+            );
+        } catch (error) {
+            logger.debug('[Claude] Failed to fetch pending messages after restore:', error);
+        }
+    }
+
+    // Console session: send title + welcome banner, then let the bang handler take over
+    if (isConsoleSession) {
+        session.sendClaudeSessionMessage({ type: 'summary', summary: `🖥️ 控制台 - ${os.hostname()}`, leafUuid: randomUUID() });
+        const welcome = buildConsoleWelcome();
+        const welcomeMsgs = Array.isArray(welcome.message) ? welcome.message : [welcome.message];
+        for (const msg of welcomeMsgs) {
+            session.sendSessionEvent({ type: 'message', message: msg });
+        }
+    }
 
     // Start Happy MCP server
     const happyServer = await startHappyServer(session);
@@ -349,6 +399,13 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             logger.debug(`[loop] User message received with no disallowed tools override, using current: ${currentDisallowedTools ? currentDisallowedTools.join(', ') : 'none'}`);
         }
 
+        // Route to active interactive session (e.g., !login PTY flow) before any other dispatch
+        if (hasActiveInteractiveSession()) {
+            logger.debug('[loop] Routing message to active interactive session');
+            handleInteractiveInput(message.content.text);
+            return;
+        }
+
         // Check for bang commands (! prefix) - handle without LLM
         if (isBangCommand(message.content.text)) {
             const enhancedMode: EnhancedMode = {
@@ -365,8 +422,11 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 session: currentSession,
                 messageQueue,
                 currentEnhancedMode: enhancedMode,
+                mode: 'remote',
+                isConsoleSession,
             }).then(result => {
-                session.sendSessionEvent({ type: 'message', message: result.message });
+                const msg = Array.isArray(result.message) ? result.message.join('\n\n') : result.message;
+                if (msg) session.sendSessionEvent({ type: 'message', message: msg });
 
                 if (result.action === 'restart-session') {
                     if (currentSession) {
@@ -413,6 +473,12 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             };
             messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, enhancedMode);
             logger.debugLargeJson('[start] /compact command pushed to queue:', message);
+            return;
+        }
+
+        // Console sessions only handle bang commands — discard regular messages
+        if (isConsoleSession) {
+            session.sendSessionEvent({ type: 'message', message: '⚠️ 控制台模式仅支持 ! 指令，请使用 !help 查看可用命令' });
             return;
         }
 
@@ -488,6 +554,43 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     });
 
     registerKillSessionHandler(session.rpcHandlerManager, cleanup);
+
+    // Watch for global profile broadcast (written by !auth-all in console session)
+    // When another session writes activeProfileFile, apply the switch in this session too.
+    if (!isConsoleSession) {
+        let profileSwitchDebounce: NodeJS.Timeout | null = null;
+        try {
+            const profileWatcher = fsWatch(configuration.happyHomeDir, (_event, filename) => {
+                if (filename !== 'active-ccs-profile') return;
+                if (profileSwitchDebounce) clearTimeout(profileSwitchDebounce);
+                profileSwitchDebounce = setTimeout(() => {
+                    const switched = tryGlobalProfileSwitch('claude');
+                    if (switched) {
+                        logger.debug('[START] Global profile switch applied, restarting session');
+                        if (currentSession) currentSession.clearSessionId();
+                        const enhancedMode: EnhancedMode = {
+                            permissionMode: currentPermissionMode || 'default',
+                            model: currentModel,
+                            fallbackModel: currentFallbackModel,
+                            customSystemPrompt: currentCustomSystemPrompt,
+                            appendSystemPrompt: currentAppendSystemPrompt,
+                            allowedTools: currentAllowedTools,
+                            disallowedTools: currentDisallowedTools,
+                        };
+                        messageQueue.pushIsolateAndClear('/clear', enhancedMode);
+                    }
+                }, 200);
+            });
+            profileWatcher.on('error', (err) => logger.debug('[START] Profile watcher error:', err));
+        } catch (err) {
+            logger.debug('[START] Failed to set up profile watcher:', err);
+        }
+    }
+
+    // Console sessions: no Claude loop — just wait for OS signal (SIGTERM/SIGINT handled above)
+    if (isConsoleSession) {
+        await new Promise<never>(() => { /* resolved only by process signal handlers */ });
+    }
 
     // Create claude loop
     const exitCode = await loop({
