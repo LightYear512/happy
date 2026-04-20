@@ -123,12 +123,14 @@ export interface SpawnSessionOptions {
     agent?: 'claude' | 'codex' | 'gemini' | 'openclaw';
     environmentVariables?: Record<string, string>;
     token?: string;
+    consoleSession?: boolean;
 }
 
 export type SpawnSessionResult =
     | { type: 'success'; sessionId: string }
     | { type: 'requestToApproveDirectoryCreation'; directory: string }
-    | { type: 'error'; errorMessage: string };
+    | { type: 'error'; errorMessage: string }
+    | { type: 'superseded' };
 
 /**
  * Register all RPC handlers with the session
@@ -157,6 +159,7 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
             const options: ExecOptions = {
                 cwd: data.cwd === '/' ? undefined : data.cwd,
                 timeout: data.timeout || 30000, // Default 30 seconds timeout
+                windowsHide: true,
             };
 
             logger.debug('Shell command executing...', { cwd: options.cwd, timeout: options.timeout });

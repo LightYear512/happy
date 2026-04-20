@@ -588,6 +588,8 @@ ${chalk.bold('To clean up runaway processes:')} Use ${chalk.cyan('happy doctor c
         unknownArgs.push('--dangerously-skip-permissions')
       } else if (arg === '--started-by') {
         options.startedBy = args[++i] as 'daemon' | 'terminal'
+      } else if (arg === '--happy-restore-session') {
+        options.restoreSessionId = args[++i]
       } else if (arg === '--profile') {
         const profile = args[++i]
         if (!profile) {

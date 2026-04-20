@@ -7,15 +7,24 @@ export interface PathValidationResult {
 }
 
 /**
+ * Normalize a resolved path for cross-platform consistency:
+ * strip Windows drive letter and convert backslashes to forward slashes.
+ */
+function normalizePlatformPath(p: string): string {
+    return p.replace(/^[A-Za-z]:/, '').replace(/\\/g, '/');
+}
+
+/**
  * Validates that a path is within the allowed working directory
  * @param targetPath - The path to validate (can be relative or absolute)
  * @param workingDirectory - The session's working directory (must be absolute)
  * @returns Validation result
  */
 export function validatePath(targetPath: string, workingDirectory: string): PathValidationResult {
-    // Resolve both paths to absolute paths to handle path traversal attempts
-    const resolvedTarget = resolve(workingDirectory, targetPath);
-    const resolvedWorkingDir = resolve(workingDirectory);
+    // Resolve both paths to absolute paths to handle path traversal attempts,
+    // then normalize for cross-platform consistency.
+    const resolvedTarget = normalizePlatformPath(resolve(workingDirectory, targetPath));
+    const resolvedWorkingDir = normalizePlatformPath(resolve(workingDirectory));
 
     // Check if the resolved target path starts with the working directory
     // This prevents access to files outside the working directory

@@ -25,11 +25,13 @@ const binSource = join(projectRoot, 'bin', 'happy-dev.mjs');
 const action = process.argv[2] || 'link';
 
 function getGlobalBinDir() {
-    // Try npm global bin first using execFileSync (safer than execSync)
+    const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+
+    // Try npm prefix -g to find global install location
     try {
-        const npmBin = execFileSync('npm', ['bin', '-g'], { encoding: 'utf8' }).trim();
-        if (fs.existsSync(npmBin)) {
-            return npmBin;
+        const npmPrefix = execFileSync(npmCmd, ['prefix', '-g'], { encoding: 'utf8', shell: true }).trim();
+        if (npmPrefix && fs.existsSync(npmPrefix)) {
+            return process.platform === 'win32' ? npmPrefix : join(npmPrefix, 'bin');
         }
     } catch (e) {
         // Fall through to alternatives
@@ -37,12 +39,10 @@ function getGlobalBinDir() {
 
     // Common locations by platform
     if (process.platform === 'darwin') {
-        // macOS with Homebrew Node (Apple Silicon)
         const homebrewBin = '/opt/homebrew/bin';
         if (fs.existsSync(homebrewBin)) {
             return homebrewBin;
         }
-        // Intel Mac Homebrew
         const homebrewUsrBin = '/usr/local/bin';
         if (fs.existsSync(homebrewUsrBin)) {
             return homebrewUsrBin;
