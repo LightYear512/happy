@@ -13,6 +13,7 @@ import { startCaffeinate, stopCaffeinate } from '@/utils/caffeinate';
 import packageJson from '../../package.json';
 import { getEnvironmentInfo } from '@/ui/doctor';
 import { spawnHappyCLI } from '@/utils/spawnHappyCLI';
+import { killProcessTree } from '@/utils/processKill';
 import { writeDaemonState, DaemonLocallyPersistedState, readDaemonState, acquireDaemonLock, releaseDaemonLock } from '@/persistence';
 
 import { cleanupDaemonState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './controlClient';
@@ -147,7 +148,12 @@ export async function startDaemon(): Promise<void> {
     const pidToTrackedSession = new Map<number, TrackedSession>();
 
     // Session spawning awaiter system
-    const pidToAwaiter = new Map<number, (session: TrackedSession) => void>();
+    interface SessionAwaiter {
+      resolve: (session: TrackedSession) => void;
+      cancel: () => void;
+      timeout: ReturnType<typeof setTimeout>;
+    }
+    const pidToAwaiter = new Map<number, SessionAwaiter>();
 
     // Helper functions
     const getCurrentChildren = () => Array.from(pidToTrackedSession.values());
@@ -178,7 +184,8 @@ export async function startDaemon(): Promise<void> {
         const awaiter = pidToAwaiter.get(pid);
         if (awaiter) {
           pidToAwaiter.delete(pid);
-          awaiter(existingSession);
+          clearTimeout(awaiter.timeout);
+          awaiter.resolve(existingSession);
           logger.debug(`[DAEMON RUN] Resolved session awaiter for PID ${pid}`);
         }
       } else if (!existingSession) {
@@ -270,6 +277,7 @@ export async function startDaemon(): Promise<void> {
         let extraEnv = {
           ...authEnv,
           ...(options.environmentVariables ?? {}),
+          ...(options.consoleSession ? { HAPPY_CONSOLE_SESSION: '1' } : {}),
         };
         logger.debug(`[DAEMON RUN] Environment variable keys (before expansion) (${Object.keys(extraEnv).length}): ${Object.keys(extraEnv).join(', ')}`);
 
@@ -316,7 +324,7 @@ export async function startDaemon(): Promise<void> {
 
         // Get tmux session name from environment variables (now set by profile system)
         // Empty string means "use current/most recent session" (tmux default behavior)
-        let tmuxSessionName: string | undefined = extraEnv.TMUX_SESSION_NAME;
+        let tmuxSessionName: string | undefined = (extraEnv as Record<string, string>).TMUX_SESSION_NAME;
 
         // If tmux is not available or session name is explicitly undefined, fall back to regular spawning
         // Note: Empty string is valid (means use current/most recent tmux session)
@@ -401,13 +409,20 @@ export async function startDaemon(): Promise<void> {
               }, 15_000); // Same timeout as regular sessions
 
               // Register awaiter for tmux session (exact same as regular flow)
-              pidToAwaiter.set(tmuxResult.pid!, (completedSession) => {
-                clearTimeout(timeout);
-                logger.debug(`[DAEMON RUN] Session ${completedSession.happySessionId} fully spawned with webhook (tmux)`);
-                resolve({
-                  type: 'success',
-                  sessionId: completedSession.happySessionId!
-                });
+              pidToAwaiter.set(tmuxResult.pid!, {
+                timeout,
+                resolve: (completedSession) => {
+                  clearTimeout(timeout);
+                  logger.debug(`[DAEMON RUN] Session ${completedSession.happySessionId} fully spawned with webhook (tmux)`);
+                  resolve({
+                    type: 'success',
+                    sessionId: completedSession.happySessionId!
+                  });
+                },
+                cancel: () => {
+                  clearTimeout(timeout);
+                  resolve({ type: 'superseded' });
+                }
               });
             });
           } else {
@@ -459,6 +474,7 @@ export async function startDaemon(): Promise<void> {
             },
             directoryCreated,
             message: directoryCreated ? `The path '${directory}' did not exist. We created a new folder and spawned a new session there.` : undefined,
+            consoleSession: options.consoleSession,
           });
         }
 
@@ -483,12 +499,16 @@ export async function startDaemon(): Promise<void> {
       env,
       directoryCreated = false,
       message,
+      resumeTarget,
+      consoleSession,
     }: {
       args: string[];
       cwd: string;
       env: NodeJS.ProcessEnv;
       directoryCreated?: boolean;
       message?: string;
+      resumeTarget?: string;
+      consoleSession?: boolean;
     }): Promise<SpawnSessionResult> => {
       const happyProcess = spawnHappyCLI(args, {
         cwd,
@@ -513,6 +533,8 @@ export async function startDaemon(): Promise<void> {
         childProcess: happyProcess,
         directoryCreated,
         message,
+        resumeTarget,
+        isConsoleSession: consoleSession,
       };
 
       pidToTrackedSession.set(happyProcess.pid, trackedSession);
@@ -543,13 +565,20 @@ export async function startDaemon(): Promise<void> {
           });
         }, 15_000);
 
-        pidToAwaiter.set(happyProcess.pid!, (completedSession) => {
-          clearTimeout(timeout);
-          logger.debug(`[DAEMON RUN] Session ${completedSession.happySessionId} fully spawned with webhook`);
-          resolve({
-            type: 'success',
-            sessionId: completedSession.happySessionId!
-          });
+        pidToAwaiter.set(happyProcess.pid!, {
+          timeout,
+          resolve: (completedSession) => {
+            clearTimeout(timeout);
+            logger.debug(`[DAEMON RUN] Session ${completedSession.happySessionId} fully spawned with webhook`);
+            resolve({
+              type: 'success',
+              sessionId: completedSession.happySessionId!
+            });
+          },
+          cancel: () => {
+            clearTimeout(timeout);
+            resolve({ type: 'superseded' });
+          }
         });
       });
     };
@@ -557,6 +586,7 @@ export async function startDaemon(): Promise<void> {
     const resumeSession = async (happySessionId: string): Promise<SpawnSessionResult> => {
       try {
         const previousSession = await resolveHappySession(happySessionId);
+        const claudeSessionId = previousSession.metadata.claudeSessionId;
         const launch = buildResumeLaunch(previousSession, {
           startedBy: 'daemon',
           claudeStartingMode: 'remote',
@@ -564,10 +594,46 @@ export async function startDaemon(): Promise<void> {
 
         await fs.access(launch.cwd);
 
+        // Kill stale processes resuming the same Claude session (dedup, upstream #721)
+        if (claudeSessionId) {
+          const staleEntries: Array<[number, TrackedSession]> = [];
+          for (const [pid, session] of pidToTrackedSession) {
+            if (session.resumeTarget === claudeSessionId ||
+                session.happySessionMetadataFromLocalWebhook?.claudeSessionId === claudeSessionId) {
+              staleEntries.push([pid, session]);
+            }
+          }
+
+          for (const [pid, session] of staleEntries) {
+            logger.debug(`[DAEMON RUN] Killing stale session PID ${pid} before resume ${claudeSessionId}`);
+            try {
+              await killProcessTree(pid);
+            } catch {
+              // Process may have already exited
+            }
+            const pendingAwaiter = pidToAwaiter.get(pid);
+            if (pendingAwaiter) {
+              pendingAwaiter.cancel();
+              pidToAwaiter.delete(pid);
+              logger.debug(`[DAEMON RUN] Cancelled pending awaiter for superseded PID ${pid}`);
+            }
+            if (session.happySessionId) {
+              apiMachine.sendSessionEnd(session.happySessionId);
+              logger.debug(`[DAEMON RUN] Sent session-end for stale session ${session.happySessionId}`);
+            }
+            pidToTrackedSession.delete(pid);
+          }
+
+          if (staleEntries.length > 0) {
+            logger.debug(`[DAEMON RUN] Cleaned up ${staleEntries.length} stale session(s) before resuming ${claudeSessionId}`);
+          }
+        }
+
         return spawnTrackedHappyProcess({
-          args: launch.args,
+          args: [...launch.args, '--happy-restore-session', happySessionId],
           cwd: launch.cwd,
           env: { ...process.env },
+          resumeTarget: claudeSessionId,
         });
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
@@ -588,22 +654,10 @@ export async function startDaemon(): Promise<void> {
         if (session.happySessionId === sessionId ||
           (sessionId.startsWith('PID-') && pid === parseInt(sessionId.replace('PID-', '')))) {
 
-          if (session.startedBy === 'daemon' && session.childProcess) {
-            try {
-              session.childProcess.kill('SIGTERM');
-              logger.debug(`[DAEMON RUN] Sent SIGTERM to daemon-spawned session ${sessionId}`);
-            } catch (error) {
-              logger.debug(`[DAEMON RUN] Failed to kill session ${sessionId}:`, error);
-            }
-          } else {
-            // For externally started sessions, try to kill by PID
-            try {
-              process.kill(pid, 'SIGTERM');
-              logger.debug(`[DAEMON RUN] Sent SIGTERM to external session PID ${pid}`);
-            } catch (error) {
-              logger.debug(`[DAEMON RUN] Failed to kill external session PID ${pid}:`, error);
-            }
-          }
+          killProcessTree(pid).catch(error => {
+            logger.debug(`[DAEMON RUN] killProcessTree failed for session ${sessionId} PID ${pid}:`, error);
+          });
+          logger.debug(`[DAEMON RUN] Sent kill signal to session ${sessionId} PID ${pid}`);
 
           pidToTrackedSession.delete(pid);
           logger.debug(`[DAEMON RUN] Removed session ${sessionId} from tracking`);
@@ -674,6 +728,45 @@ export async function startDaemon(): Promise<void> {
     // Connect to server
     apiMachine.connect();
 
+    // Spawn console session (lightweight bang-command-only session for mobile control)
+    let consoleSessionPid: number | null = null;
+    let consoleSessionSpawning = false;
+    const consoleDir = join(configuration.happyHomeDir, 'console');
+    try {
+      await fs.mkdir(consoleDir, { recursive: true });
+    } catch { /* already exists */ }
+
+    const spawnConsoleSession = async () => {
+      if (consoleSessionSpawning) return;
+      consoleSessionSpawning = true;
+      logger.debug('[DAEMON RUN] Spawning console session');
+      try {
+        const result = await spawnSession({
+          directory: consoleDir,
+          consoleSession: true,
+          approvedNewDirectoryCreation: true,
+        });
+        if (result.type === 'success') {
+          for (const [pid, tracked] of pidToTrackedSession.entries()) {
+            if (tracked.happySessionId === result.sessionId) {
+              consoleSessionPid = pid;
+              break;
+            }
+          }
+          logger.debug(`[DAEMON RUN] Console session spawned: ${result.sessionId} (PID: ${consoleSessionPid})`);
+        } else {
+          logger.debug(`[DAEMON RUN] Failed to spawn console session: ${result.type === 'error' ? result.errorMessage : result.type}`);
+        }
+      } catch (error) {
+        logger.debug('[DAEMON RUN] Failed to spawn console session:', error);
+      } finally {
+        consoleSessionSpawning = false;
+      }
+    };
+
+    // Fire-and-forget — don't block other RPC handling
+    spawnConsoleSession();
+
     // Every 60 seconds:
     // 1. Prune stale sessions
     // 2. Check if daemon needs update
@@ -700,6 +793,16 @@ export async function startDaemon(): Promise<void> {
           // Process is dead, remove from tracking
           logger.debug(`[DAEMON RUN] Removing stale session with PID ${pid} (process no longer exists)`);
           pidToTrackedSession.delete(pid);
+        }
+      }
+
+      // Re-spawn console session if it died
+      if (consoleSessionPid !== null) {
+        const consoleAlive = pidToTrackedSession.has(consoleSessionPid);
+        if (!consoleAlive && !consoleSessionSpawning) {
+          logger.debug(`[DAEMON RUN] Console session (PID ${consoleSessionPid}) is dead, re-spawning`);
+          consoleSessionPid = null;
+          spawnConsoleSession();
         }
       }
 
@@ -807,9 +910,7 @@ export async function startDaemon(): Promise<void> {
             // Brief wait so the event reaches the server before we disconnect
             await new Promise(resolve => setTimeout(resolve, 200));
           }
-          try {
-            process.kill(consoleSessionPid, 'SIGTERM');
-          } catch {}
+          await killProcessTree(consoleSessionPid);
         }
       }
 
