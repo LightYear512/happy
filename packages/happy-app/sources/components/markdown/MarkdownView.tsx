@@ -303,11 +303,14 @@ function RenderTableBlock(props: {
 
     return (
         <View style={[style.tableContainer, props.first && style.first, props.last && style.last]}>
+            {/* flexGrow:0 stops iOS from stretching the horizontal ScrollView
+                vertically to fill the parent — the cause of the table's frame
+                extending down past the last row into empty space. */}
             <ScrollView
                 horizontal
                 showsHorizontalScrollIndicator={Platform.OS !== 'web'}
                 nestedScrollEnabled={true}
-                style={style.tableScrollView}
+                style={[style.tableScrollView, { flexGrow: 0 }]}
             >
                 <View style={style.tableContent}>
                     {/* Render each column as a vertical container */}
