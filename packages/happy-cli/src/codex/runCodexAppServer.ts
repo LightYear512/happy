@@ -918,21 +918,20 @@ export async function runCodexWithAppServer(opts: {
 
             if (!message) break;
 
-            // Mode change: need a new thread
+            // Mode change: keep the same Codex thread.
+            //
+            // The `mode hash` is only a MessageQueue2 batching boundary (it prevents
+            // mixing prompts with different permissionMode/model into the same turn).
+            // It must NOT drive thread lifecycle — Codex `turn/start` already accepts
+            // per-turn `approvalPolicy`/`sandboxPolicy`/`model` (see below), so a mode
+            // switch takes effect on the next turn without losing conversation history.
+            //
+            // Previously we tore down the thread here, which created a brand-new Codex
+            // conversation (and a new rollout .jsonl) every time the user toggled the
+            // permission mode in the app. That silently lost all prior context.
             if (threadId && currentModeHash && message.hash !== currentModeHash) {
-                logger.debug('[CodexAppServer] Mode changed - starting new thread');
-                messageBuffer.addMessage('Starting new Codex session (mode changed)...', 'status');
-                threadId = null;
-                threadIdStored = false;
-                currentModeHash = null;
-                needsSystemPromptInjection = true;
-                pending = message;
-                permissionHandler.reset();
-                reasoningProcessor.abort();
-                diffProcessor.reset();
-                thinking = false;
-                session.keepAlive(thinking, 'remote');
-                continue;
+                logger.debug(`[CodexAppServer] Mode hash changed (${currentModeHash} -> ${message.hash}); reusing thread ${threadId}`);
+                messageBuffer.addMessage(`Permission mode: ${message.mode.permissionMode} (continuing session)`, 'status');
             }
 
             messageBuffer.addMessage(message.message, 'user');

@@ -3,6 +3,46 @@ import type { CodexSessionConfig } from './types';
 type CodexApprovalPolicy = NonNullable<CodexSessionConfig['approval-policy']>;
 type CodexSandboxMode = NonNullable<CodexSessionConfig['sandbox']>;
 
+/**
+ * Single source of truth for the Codex protocol value sets accepted by
+ * `turn/start` (approvalPolicy) and `sandboxPolicy`. Tests import these
+ * arrays so protocol-domain assertions stay coupled to the type definitions
+ * instead of duplicated as string literals that drift over time.
+ *
+ * The `_AssertExhaustive*` constants below use the standard TypeScript
+ * type-level equality trick: if the exported array's value-union ever
+ * diverges from `CodexApprovalPolicy` / `CodexSandboxMode` (either side
+ * gains or loses a member), the assignment fails to type-check.
+ */
+export const CODEX_APPROVAL_POLICY_VALUES = [
+    'untrusted',
+    'on-failure',
+    'on-request',
+    'never',
+] as const;
+
+export const CODEX_SANDBOX_MODE_VALUES = [
+    'read-only',
+    'workspace-write',
+    'danger-full-access',
+] as const;
+
+type Equals<X, Y> =
+    (<T>() => T extends X ? 1 : 2) extends (<T>() => T extends Y ? 1 : 2) ? true : false;
+
+const _AssertExhaustiveApproval: Equals<
+    CodexApprovalPolicy,
+    (typeof CODEX_APPROVAL_POLICY_VALUES)[number]
+> = true;
+
+const _AssertExhaustiveSandbox: Equals<
+    CodexSandboxMode,
+    (typeof CODEX_SANDBOX_MODE_VALUES)[number]
+> = true;
+
+void _AssertExhaustiveApproval;
+void _AssertExhaustiveSandbox;
+
 export function resolveCodexExecutionPolicy(
     permissionMode: import('@/api/types').PermissionMode,
     sandboxManagedByHappy: boolean,
