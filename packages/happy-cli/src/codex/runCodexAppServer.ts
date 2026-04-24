@@ -491,12 +491,13 @@ export async function runCodexWithAppServer(opts: {
             switch (update.type) {
                 case 'envelope': {
                     const envelope = update.envelope;
+                    logger.debug(`[CodexAppServer] DISPATCH envelope t=${envelope.ev.t} id=${envelope.id} turn=${envelope.turn ?? 'none'} time=${envelope.time}`);
                     session.sendSessionProtocolMessage(envelope);
-                    // Older happy-app builds render tool calls from the codex
-                    // content path (content.type === 'codex'), not from session
-                    // envelopes. Dual-send tool-call envelopes in the legacy
-                    // shape for backwards compatibility.
+                    // Older happy-app builds render codex content, not session
+                    // envelopes. Dual-send in the legacy shape per-segment so
+                    // text and tool-calls stay in the order codex emitted them.
                     if (envelope.ev.t === 'tool-call-start') {
+                        logger.debug(`[CodexAppServer] DISPATCH codex-legacy tool-call callId=${envelope.ev.call} name=${envelope.ev.name}`);
                         session.sendCodexMessage({
                             type: 'tool-call',
                             callId: envelope.ev.call,
@@ -505,18 +506,33 @@ export async function runCodexWithAppServer(opts: {
                             input: envelope.ev.args,
                         });
                     } else if (envelope.ev.t === 'tool-call-end') {
+                        logger.debug(`[CodexAppServer] DISPATCH codex-legacy tool-call-result callId=${envelope.ev.call}`);
                         session.sendCodexMessage({
                             type: 'tool-call-result',
                             callId: envelope.ev.call,
                             id: envelope.id,
                             output: null,
                         });
+                    } else if (envelope.ev.t === 'text') {
+                        const text = envelope.ev.text;
+                        logger.debug(`[CodexAppServer] DISPATCH codex-legacy message id=${envelope.id} len=${text.length}`);
+                        messageBuffer.addMessage(text, 'assistant');
+                        session.sendCodexMessage({
+                            type: 'message',
+                            message: text,
+                            id: envelope.id,
+                        });
+                        // Segment finalized — drop any accumulated deltas so
+                        // turn-aborted fallback doesn't replay delivered text.
+                        pendingAgentText = '';
                     }
                     break;
                 }
 
                 case 'agent-message':
-                    // Accumulate streaming deltas — will be sent as one message on task-complete
+                    // Buffer deltas only for the turn-aborted fallback below.
+                    // The authoritative delivery happens on item/completed via
+                    // the envelope t:'text' branch above.
                     pendingAgentText += update.message;
                     break;
 
@@ -559,16 +575,9 @@ export async function runCodexWithAppServer(opts: {
                         thinking = false;
                         session.keepAlive(thinking, 'remote');
                     }
-                    // Flush accumulated agent text as a single message
-                    const agentText = pendingAgentText.trim();
-                    if (agentText) {
-                        messageBuffer.addMessage(agentText, 'assistant');
-                        session.sendCodexMessage({
-                            type: 'message',
-                            message: agentText,
-                            id: randomUUID(),
-                        });
-                    }
+                    // Per-segment delivery already happened via envelope t:'text' —
+                    // no turn-end flush here, it would just reorder text to after
+                    // tool calls and duplicate already-delivered content.
                     pendingAgentText = '';
                     messageBuffer.addMessage('Task completed', 'status');
                     diffProcessor.reset();

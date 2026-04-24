@@ -331,13 +331,19 @@ export function createAppServerStreamBridge(): {
             if (!item) return [];
             const itemId = readItemId(item);
             const itemType = readItemType(item);
+            logger.debug(`[appServerStreamBridge] item/completed diag itemType=${itemType} itemId=${itemId} keys=${item ? Object.keys(item).join(',') : 'null'}`);
             if (!itemId) return [];
 
             // Agent message completed — emit text envelope
             if (itemType === 'agentmessage' || itemType === 'plan') {
                 const text = readText(item, ['text', 'message']);
-                if (!text) return [];
+                logger.debug(`[appServerStreamBridge] item/completed agentMessage text=${text ? `len=${text.length}` : 'MISSING'} rawText=${typeof item.text} rawMessage=${typeof item.message}`);
+                if (!text) {
+                    logger.debug(`[appServerStreamBridge] item/completed agentMessage DROPPED (no text) — consumer will only get delta-accumulated message via task-complete path`);
+                    return [];
+                }
                 const envelope = createEnvelope('agent', { t: 'text', text }, opts());
+                logger.debug(`[appServerStreamBridge] item/completed agentMessage EMIT text envelope id=${envelope.id} turn=${currentTurnId} len=${text.length}`);
                 return [{ type: 'envelope', envelope }];
             }
 
@@ -399,6 +405,15 @@ export function createAppServerStreamBridge(): {
             return updates;
         }
 
+        // Diagnostic: inspect the unhandled rawResponseItem/completed payload — it may carry the real text
+        if (method === 'rawResponseItem/completed') {
+            const item = readItem(params);
+            const rawType = item ? readString(item.type) : null;
+            const hasText = item && typeof item.text === 'string' ? (item.text as string).length : -1;
+            const hasMessage = item && typeof item.message === 'string' ? (item.message as string).length : -1;
+            const contentLen = item && Array.isArray(item.content) ? (item.content as unknown[]).length : -1;
+            logger.debug(`[appServerStreamBridge] rawResponseItem/completed diag rawType=${rawType} textLen=${hasText} messageLen=${hasMessage} contentLen=${contentLen} keys=${item ? Object.keys(item).join(',') : 'null'}`);
+        }
         logger.debug(`[appServerStreamBridge] unhandled notification: ${method}`);
         return [];
     }
