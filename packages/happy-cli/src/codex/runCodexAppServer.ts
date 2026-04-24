@@ -55,6 +55,7 @@ import {
     handleInteractiveInput,
     buildSessionWelcome,
 } from '@/commands/bang/dispatcher';
+import { parseSpecialCommand } from '@/parsers/specialCommands';
 
 // ---------------------------------------------------------------------------
 // Types (mirrors runCodex.ts)
@@ -294,6 +295,33 @@ export async function runCodexWithAppServer(opts: {
 
         if (hasActiveInteractiveSession()) {
             handleInteractiveInput(text);
+            return;
+        }
+
+        // Intercept /compact and /clear before they reach codex. The codex
+        // app-server protocol exposes no manual-compact RPC and no per-session
+        // context-clear RPC. Without these intercepts the slash commands would
+        // be sent to codex as literal user prompts and the LLM would just reply
+        // with prose, leaving the user thinking something happened when nothing
+        // actually did (silent failure). We surface a clear status message and
+        // close the turn so the UI doesn't hang.
+        const specialCommand = parseSpecialCommand(text);
+        if (specialCommand.type === 'compact') {
+            logger.debug('[CodexAppServer] /compact intercepted — codex auto-compacts internally, no manual API');
+            session.sendSessionEvent({
+                type: 'message',
+                message: 'ℹ️ Codex 自动管理上下文压缩（接近 token 上限时由 codex 内部触发），暂无手动触发接口。可继续对话。',
+            });
+            session.sendSessionEvent({ type: 'ready' });
+            return;
+        }
+        if (specialCommand.type === 'clear') {
+            logger.debug('[CodexAppServer] /clear intercepted — codex app-server has no per-session clear RPC');
+            session.sendSessionEvent({
+                type: 'message',
+                message: 'ℹ️ Codex 暂不支持 /clear 清空当前会话上下文。需要全新上下文请使用 !restart 重启会话。',
+            });
+            session.sendSessionEvent({ type: 'ready' });
             return;
         }
 
