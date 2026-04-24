@@ -1,13 +1,19 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import {
   findGlobalClaudeCliPath,
   findClaudeInPath,
   detectSourceFromPath,
   findNpmGlobalCliPath,
   findBunGlobalCliPath,
+  findClaudeInBunHome,
   findHomebrewCliPath,
+  findClaudeInHomebrewPrefix,
   findNativeInstallerCliPath,
+  resolveClaudeEntryInPkg,
+  walkUpToPkgEntry,
   getVersion,
   compareVersions
 } from '../scripts/claude_version_utils.cjs';
@@ -71,6 +77,11 @@ describe('Claude Version Utils - Cross-Platform Detection', () => {
     });
 
     describe('Homebrew installations', () => {
+      const _originalPlatform = process.platform;
+      afterEach(() => {
+        Object.defineProperty(process, 'platform', { value: _originalPlatform, configurable: true });
+      });
+
       it('should detect Homebrew on Apple Silicon macOS', () => {
         const result = detectSourceFromPath('/opt/homebrew/bin/claude');
         expect(result).toBe('Homebrew');
@@ -371,5 +382,345 @@ describe('HAPPY_CLAUDE_PATH env var', () => {
     process.env.HAPPY_CLAUDE_PATH = '/nonexistent/path/claude';
     const result = findGlobalClaudeCliPath();
     expect(result?.source).not.toBe('HAPPY_CLAUDE_PATH');
+  });
+});
+
+describe('resolveClaudeEntryInPkg - package layout detection', () => {
+  let tmpRoot: string;
+  let pkgDir: string;
+  let binName: string;
+  const originalPlatform = process.platform;
+
+  beforeEach(() => {
+    // Earlier tests in this file mutate process.platform and occasionally leak
+    // the mutation when an assertion throws before the restore line. Reset
+    // defensively so binName reflects the real host platform.
+    Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
+    binName = process.platform === 'win32' ? 'claude.exe' : 'claude';
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-entry-test-'));
+    pkgDir = path.join(tmpRoot, 'claude-code');
+    fs.mkdirSync(pkgDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  it('returns null for null / empty pkgDir', () => {
+    expect(resolveClaudeEntryInPkg(null)).toBeNull();
+    expect(resolveClaudeEntryInPkg('')).toBeNull();
+  });
+
+  it('returns null for non-existent directory', () => {
+    expect(resolveClaudeEntryInPkg(path.join(tmpRoot, 'nope'))).toBeNull();
+  });
+
+  it('returns null for empty package directory', () => {
+    expect(resolveClaudeEntryInPkg(pkgDir)).toBeNull();
+  });
+
+  it('legacy: returns cli.js when it is the only entry', () => {
+    const cliJs = path.join(pkgDir, 'cli.js');
+    fs.writeFileSync(cliJs, '// legacy');
+    expect(resolveClaudeEntryInPkg(pkgDir)).toBe(cliJs);
+  });
+
+  it('new wrapper: returns cli-wrapper.cjs when it is the only entry', () => {
+    const wrapper = path.join(pkgDir, 'cli-wrapper.cjs');
+    fs.writeFileSync(wrapper, '// wrapper');
+    expect(resolveClaudeEntryInPkg(pkgDir)).toBe(wrapper);
+  });
+
+  it('binary: returns bin/claude[.exe] when it is the only entry', () => {
+    fs.mkdirSync(path.join(pkgDir, 'bin'));
+    const binPath = path.join(pkgDir, 'bin', binName);
+    fs.writeFileSync(binPath, 'binary');
+    expect(resolveClaudeEntryInPkg(pkgDir)).toBe(binPath);
+  });
+
+  it('priority: cli.js beats cli-wrapper.cjs when both present', () => {
+    fs.writeFileSync(path.join(pkgDir, 'cli.js'), '// legacy');
+    fs.writeFileSync(path.join(pkgDir, 'cli-wrapper.cjs'), '// wrapper');
+    expect(resolveClaudeEntryInPkg(pkgDir)).toBe(path.join(pkgDir, 'cli.js'));
+  });
+
+  it('priority: cli-wrapper.cjs beats bin/claude when both present', () => {
+    fs.writeFileSync(path.join(pkgDir, 'cli-wrapper.cjs'), '// wrapper');
+    fs.mkdirSync(path.join(pkgDir, 'bin'));
+    fs.writeFileSync(path.join(pkgDir, 'bin', binName), 'binary');
+    expect(resolveClaudeEntryInPkg(pkgDir)).toBe(path.join(pkgDir, 'cli-wrapper.cjs'));
+  });
+
+  it('priority: cli.js wins even when all three coexist (protects against stale artifacts)', () => {
+    fs.writeFileSync(path.join(pkgDir, 'cli.js'), '// legacy');
+    fs.writeFileSync(path.join(pkgDir, 'cli-wrapper.cjs'), '// wrapper');
+    fs.mkdirSync(path.join(pkgDir, 'bin'));
+    fs.writeFileSync(path.join(pkgDir, 'bin', binName), 'binary');
+    expect(resolveClaudeEntryInPkg(pkgDir)).toBe(path.join(pkgDir, 'cli.js'));
+  });
+});
+
+describe('getVersion - claude-code package.json extraction', () => {
+  let tmpRoot: string;
+  let pkgDir: string;
+  let binName: string;
+  const originalPlatform = process.platform;
+
+  beforeEach(() => {
+    Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
+    binName = process.platform === 'win32' ? 'claude.exe' : 'claude';
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-getver-test-'));
+    pkgDir = path.join(tmpRoot, 'claude-code');
+    fs.mkdirSync(pkgDir, { recursive: true });
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  function writePkg(version: string, name: string = '@anthropic-ai/claude-code') {
+    fs.writeFileSync(path.join(pkgDir, 'package.json'), JSON.stringify({ name, version }));
+  }
+
+  it('reads version from sibling package.json for cli.js', () => {
+    writePkg('2.1.50');
+    const cliJs = path.join(pkgDir, 'cli.js');
+    fs.writeFileSync(cliJs, '// legacy');
+    expect(getVersion(cliJs)).toBe('2.1.50');
+  });
+
+  it('reads version from sibling package.json for cli-wrapper.cjs', () => {
+    writePkg('2.1.114');
+    const wrapper = path.join(pkgDir, 'cli-wrapper.cjs');
+    fs.writeFileSync(wrapper, '// wrapper');
+    expect(getVersion(wrapper)).toBe('2.1.114');
+  });
+
+  it('reads version from parent package.json for bin/claude[.exe]', () => {
+    writePkg('2.1.114');
+    fs.mkdirSync(path.join(pkgDir, 'bin'));
+    const binPath = path.join(pkgDir, 'bin', binName);
+    fs.writeFileSync(binPath, 'binary');
+    expect(getVersion(binPath)).toBe('2.1.114');
+  });
+
+  it('rejects package.json with wrong package name (prevents NVM/grandparent leak)', () => {
+    writePkg('24.10.0', 'node');
+    const cliJs = path.join(pkgDir, 'cli.js');
+    fs.writeFileSync(cliJs, '// not claude-code');
+    expect(getVersion(cliJs)).toBeNull();
+  });
+
+  it('returns null when no package.json on path (native installer standalone binary)', () => {
+    const standaloneBin = path.join(tmpRoot, '2.1.41');
+    fs.writeFileSync(standaloneBin, 'binary');
+    expect(getVersion(standaloneBin)).toBeNull();
+  });
+
+  it('handles malformed package.json gracefully', () => {
+    fs.writeFileSync(path.join(pkgDir, 'package.json'), '{ not valid json');
+    const cliJs = path.join(pkgDir, 'cli.js');
+    fs.writeFileSync(cliJs, '// legacy');
+    expect(getVersion(cliJs)).toBeNull();
+  });
+});
+
+describe('getVersion - native installer path-name fallback', () => {
+  it('extracts semver from ~/.local/share/claude/versions/<x.y.z>/claude', () => {
+    expect(getVersion('/home/user/.local/share/claude/versions/2.1.114/claude')).toBe('2.1.114');
+  });
+
+  it('extracts semver from Windows %LOCALAPPDATA%/Claude/versions/<x.y.z>/claude.exe', () => {
+    expect(getVersion('C:\\Users\\test\\AppData\\Local\\Claude\\versions\\2.1.114\\claude.exe')).toBe('2.1.114');
+  });
+
+  it('extracts semver with pre-release suffix', () => {
+    expect(getVersion('/home/user/.local/share/claude/versions/2.1.114-beta.1/claude')).toBe('2.1.114-beta.1');
+  });
+
+  it('returns null when versions/ segment is followed by non-semver name', () => {
+    expect(getVersion('/home/user/.local/share/claude/versions/foo/claude')).toBeNull();
+  });
+
+  it('returns null when path has no versions/ segment', () => {
+    expect(getVersion('/usr/local/bin/claude')).toBeNull();
+  });
+
+  it('picks the last (deepest) versions/ segment when multiple exist', () => {
+    // Defensive: if a path coincidentally has nested 'versions' dirs, take the most
+    // specific one. Right-to-left scan in the implementation.
+    expect(getVersion('/opt/versions/legacy/claude/versions/2.1.114/claude')).toBe('2.1.114');
+  });
+});
+
+describe('findClaudeInBunHome - integration with mkdtemp', () => {
+  let tmpHome: string;
+  const originalPlatform = process.platform;
+
+  beforeEach(() => {
+    Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
+    tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'bun-home-test-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  function makeBunBin() {
+    // bunBin path that findClaudeInBunHome reads: <home>/.bun/bin/claude
+    const bunBinDir = path.join(tmpHome, '.bun', 'bin');
+    fs.mkdirSync(bunBinDir, { recursive: true });
+    const bunBin = path.join(bunBinDir, 'claude');
+    fs.writeFileSync(bunBin, 'fake bun shim');
+    return bunBin;
+  }
+
+  it('returns null when .bun/bin/claude does not exist', () => {
+    expect(findClaudeInBunHome(tmpHome)).toBeNull();
+  });
+
+  it('walks up from .bun/bin to find cli-wrapper.cjs at .bun root', () => {
+    // Simulate pkg root co-located at .bun/ — walk-up from .bun/bin discovers it.
+    makeBunBin();
+    const wrapper = path.join(tmpHome, '.bun', 'cli-wrapper.cjs');
+    fs.writeFileSync(wrapper, '// wrapper');
+    expect(findClaudeInBunHome(tmpHome)).toBe(wrapper);
+  });
+
+  it('prefers cli.js over cli-wrapper.cjs found via walk-up', () => {
+    makeBunBin();
+    const cliJs = path.join(tmpHome, '.bun', 'cli.js');
+    fs.writeFileSync(cliJs, '// legacy');
+    fs.writeFileSync(path.join(tmpHome, '.bun', 'cli-wrapper.cjs'), '// wrapper');
+    expect(findClaudeInBunHome(tmpHome)).toBe(cliJs);
+  });
+
+  it('returns null when pkg lives deeper than PKG_WALKUP_DEPTH allows', () => {
+    // Pkg buried at .bun/install/global/node_modules/@anthropic-ai/claude-code/
+    // is more than 3 levels above .bun/bin — walk-up should fail closed.
+    makeBunBin();
+    const deepPkg = path.join(tmpHome, '.bun', 'install', 'global', 'node_modules', '@anthropic-ai', 'claude-code');
+    fs.mkdirSync(deepPkg, { recursive: true });
+    fs.writeFileSync(path.join(deepPkg, 'cli.js'), '// legacy');
+    expect(findClaudeInBunHome(tmpHome)).toBeNull();
+  });
+});
+
+describe('findClaudeInHomebrewPrefix - integration with mkdtemp', () => {
+  let tmpPrefix: string;
+  const originalPlatform = process.platform;
+
+  beforeEach(() => {
+    Object.defineProperty(process, 'platform', { value: originalPlatform, configurable: true });
+    tmpPrefix = fs.mkdtempSync(path.join(os.tmpdir(), 'brew-prefix-test-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpPrefix, { recursive: true, force: true });
+  });
+
+  it('returns null for an empty prefix', () => {
+    expect(findClaudeInHomebrewPrefix(tmpPrefix)).toBeNull();
+  });
+
+  it('Layout A fallback: finds cli.js under lib/node_modules/@anthropic-ai/claude-code/', () => {
+    // No <prefix>/bin/claude symlink — exercises the readdirSync fallback branch.
+    const pkgDir = path.join(tmpPrefix, 'lib', 'node_modules', '@anthropic-ai', 'claude-code');
+    fs.mkdirSync(pkgDir, { recursive: true });
+    const cliJs = path.join(pkgDir, 'cli.js');
+    fs.writeFileSync(cliJs, '// legacy');
+    expect(findClaudeInHomebrewPrefix(tmpPrefix)).toBe(cliJs);
+  });
+
+  it('Layout A fallback: handles hashed .claude-code-<hash> directories', () => {
+    const pkgDir = path.join(tmpPrefix, 'lib', 'node_modules', '@anthropic-ai', '.claude-code-2DTsDk1V');
+    fs.mkdirSync(pkgDir, { recursive: true });
+    const wrapper = path.join(pkgDir, 'cli-wrapper.cjs');
+    fs.writeFileSync(wrapper, '// wrapper');
+    expect(findClaudeInHomebrewPrefix(tmpPrefix)).toBe(wrapper);
+  });
+
+  it('Layout B: returns standalone binary when bin/claude is the only entry', () => {
+    // Cellar cask: <prefix>/bin/claude is a regular file (no node_modules layout).
+    // Walk-up sees pkgRoot = <prefix>; resolver finds <prefix>/bin/claude as the
+    // lowest-priority entry and returns it.
+    const binDir = path.join(tmpPrefix, 'bin');
+    fs.mkdirSync(binDir, { recursive: true });
+    const binPath = path.join(binDir, 'claude');
+    fs.writeFileSync(binPath, 'binary');
+    expect(findClaudeInHomebrewPrefix(tmpPrefix)).toBe(binPath);
+  });
+
+  it('Layout A wins over Layout B when both present (cli.js takes priority over standalone bin)', () => {
+    // <prefix>/bin/claude exists AND <prefix>/cli.js exists at the resolved pkgRoot.
+    // Resolver should prefer cli.js per documented priority.
+    const binDir = path.join(tmpPrefix, 'bin');
+    fs.mkdirSync(binDir, { recursive: true });
+    fs.writeFileSync(path.join(binDir, 'claude'), 'binary');
+    const cliJs = path.join(tmpPrefix, 'cli.js');
+    fs.writeFileSync(cliJs, '// legacy');
+    expect(findClaudeInHomebrewPrefix(tmpPrefix)).toBe(cliJs);
+  });
+});
+
+describe('walkUpToPkgEntry - shared walk-up helper', () => {
+  let tmpRoot: string;
+
+  beforeEach(() => {
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'walkup-test-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  it('returns null when no pkg found within depth', () => {
+    expect(walkUpToPkgEntry(tmpRoot)).toBeNull();
+  });
+
+  it('finds entry at startDir itself (depth 0 hit)', () => {
+    const cliJs = path.join(tmpRoot, 'cli.js');
+    fs.writeFileSync(cliJs, '// legacy');
+    expect(walkUpToPkgEntry(tmpRoot)).toBe(cliJs);
+  });
+
+  it('finds entry one level up (depth 1 hit)', () => {
+    const child = path.join(tmpRoot, 'bin');
+    fs.mkdirSync(child);
+    const wrapper = path.join(tmpRoot, 'cli-wrapper.cjs');
+    fs.writeFileSync(wrapper, '// wrapper');
+    expect(walkUpToPkgEntry(child)).toBe(wrapper);
+  });
+
+  it('finds entry two levels up (depth 2 hit, last covered iteration)', () => {
+    const grandchild = path.join(tmpRoot, 'a', 'b');
+    fs.mkdirSync(grandchild, { recursive: true });
+    const cliJs = path.join(tmpRoot, 'cli.js');
+    fs.writeFileSync(cliJs, '// legacy');
+    expect(walkUpToPkgEntry(grandchild)).toBe(cliJs);
+  });
+
+  it('returns null when pkg lies beyond default depth (PKG_WALKUP_DEPTH = 3)', () => {
+    // Default depth = 3 means we probe iter 0/1/2 → startDir + 2 parents.
+    // Burying the pkg at depth 3 (3 parents away) must NOT be found.
+    const deep = path.join(tmpRoot, 'a', 'b', 'c');
+    fs.mkdirSync(deep, { recursive: true });
+    fs.writeFileSync(path.join(tmpRoot, 'cli.js'), '// legacy');
+    expect(walkUpToPkgEntry(deep)).toBeNull();
+  });
+
+  it('respects custom depth override', () => {
+    const deep = path.join(tmpRoot, 'a', 'b', 'c');
+    fs.mkdirSync(deep, { recursive: true });
+    fs.writeFileSync(path.join(tmpRoot, 'cli.js'), '// legacy');
+    expect(walkUpToPkgEntry(deep, 4)).toBe(path.join(tmpRoot, 'cli.js'));
+  });
+
+  it('terminates at filesystem root without infinite loop', () => {
+    // Use a deep depth + a path near root so the dirname fixed-point is hit
+    // before depth runs out. If termination is broken, this would loop forever
+    // and timeout instead of returning null cleanly.
+    const root = path.parse(tmpRoot).root;
+    expect(walkUpToPkgEntry(root, 100)).toBeNull();
   });
 });

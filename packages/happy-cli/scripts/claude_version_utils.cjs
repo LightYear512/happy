@@ -27,9 +27,71 @@ function resolvePathSafe(filePath) {
     try {
         return fs.realpathSync(filePath);
     } catch (e) {
-        // Symlink resolution failed, return original path
         return filePath;
     }
+}
+
+/**
+ * Resolve the executable entry inside a claude-code package directory.
+ * Supports both the legacy single-file layout (cli.js) and the 2.1.100+ wrapper
+ * layout (cli-wrapper.cjs + bin/claude[.exe] native binary).
+ *
+ * Priority: cli.js > cli-wrapper.cjs > bin/claude[.exe].
+ *
+ * Interceptor note: only legacy cli.js actually keeps the launcher's fetch
+ * interceptor useful — cli.js *is* the Claude CLI code, so its fetch() calls
+ * run in-process and are visible to the launcher's global.fetch override.
+ * cli-wrapper.cjs and bin/claude[.exe] both spawn the native binary as a
+ * child process; the real API calls happen there and cannot be intercepted
+ * from the parent. cli-wrapper.cjs is still preferred over the bare binary
+ * because it works under `npm install --ignore-scripts`, where postinstall
+ * hasn't copied the native binary into bin/.
+ *
+ * @param {string} pkgDir - Path to @anthropic-ai/claude-code package root
+ * @returns {string|null} Path to entry (cli.js / cli-wrapper.cjs / binary) or null
+ */
+function resolveClaudeEntryInPkg(pkgDir) {
+    if (!pkgDir) return null;
+    const binName = process.platform === 'win32' ? 'claude.exe' : 'claude';
+    const candidates = [
+        path.join(pkgDir, 'cli.js'),
+        path.join(pkgDir, 'cli-wrapper.cjs'),
+        path.join(pkgDir, 'bin', binName),
+    ];
+    for (const c of candidates) {
+        if (fs.existsSync(c)) return c;
+    }
+    return null;
+}
+
+// Walk up from a resolved shim path to find the enclosing claude-code package.
+// bin/claude[.exe] lives 2 dirs below pkg root; cli.js/cli-wrapper.cjs lives 1.
+// Add a margin for future layout drift.
+const PKG_WALKUP_DEPTH = 3;
+
+/**
+ * Walk parent directories from `startDir` up to PKG_WALKUP_DEPTH levels and
+ * return the first directory that resolves to a claude-code entry. Single
+ * source of truth for the walk-up pattern used by findClaudeInPath,
+ * findClaudeInBunHome, and any future caller that has a shim path and wants
+ * its enclosing package's preferred entry.
+ *
+ * Stops on filesystem root (path.dirname fixed-point) regardless of depth.
+ *
+ * @param {string} startDir - Directory to start walk-up from (typically dirname of resolved shim)
+ * @param {number} [depth=PKG_WALKUP_DEPTH] - Maximum levels to walk
+ * @returns {string|null} Path to entry or null if no enclosing pkg found
+ */
+function walkUpToPkgEntry(startDir, depth = PKG_WALKUP_DEPTH) {
+    let dir = startDir;
+    for (let i = 0; i < depth && dir; i++) {
+        const entry = resolveClaudeEntryInPkg(dir);
+        if (entry) return entry;
+        const parent = path.dirname(dir);
+        if (parent === dir) break;
+        dir = parent;
+    }
+    return null;
 }
 
 /**
@@ -38,14 +100,10 @@ function resolvePathSafe(filePath) {
  */
 function findNpmGlobalCliPath() {
     try {
-        const globalRoot = execSync('npm root -g', { encoding: 'utf8' }).trim();
-        const globalCliPath = path.join(globalRoot, '@anthropic-ai', 'claude-code', 'cli.js');
-        if (fs.existsSync(globalCliPath)) {
-            return globalCliPath;
-        }
-    } catch (e) {
-        // npm root -g failed
-    }
+        const globalRoot = execSync('npm root -g', { encoding: 'utf8', stdio: ['pipe','pipe','pipe'] }).trim();
+        const pkgDir = path.join(globalRoot, '@anthropic-ai', 'claude-code');
+        return resolveClaudeEntryInPkg(pkgDir);
+    } catch (e) {}
     return null;
 }
 
@@ -56,9 +114,7 @@ function findNpmGlobalCliPath() {
  */
 function findClaudeInPath() {
     try {
-        // Cross-platform: 'where' on Windows, 'which' on Unix
         const command = process.platform === 'win32' ? 'where claude' : 'which claude';
-        // stdio suppression for cleaner execution (from tiann/PR#83)
         const result = execSync(command, {
             encoding: 'utf8',
             stdio: ['pipe', 'pipe', 'pipe']
@@ -76,36 +132,44 @@ function findClaudeInPath() {
         if (resolvedPath) {
             // On Windows, npm creates shell script shims (no extension) for global packages.
             // These cannot be spawned directly by Node.js. When we find such a shim,
-            // resolve to the actual cli.js in the adjacent node_modules directory.
+            // resolve to the actual entry inside the adjacent node_modules directory.
             const isExecutable = resolvedPath.endsWith('.js') || resolvedPath.endsWith('.cjs') || resolvedPath.endsWith('.exe');
             if (!isExecutable) {
+                // NVM on Windows uses a junction at C:\Program Files\nodejs → nvm\vX.Y.Z,
+                // so the junction path and the realpath dir can host different node_modules
+                // trees. Probe both, dedup when realpath is a no-op.
                 const shimDir = path.dirname(claudePath);
-                const cliJsPath = path.join(shimDir, 'node_modules', '@anthropic-ai', 'claude-code', 'cli.js');
-                if (fs.existsSync(cliJsPath)) {
-                    return { path: cliJsPath, source: 'npm' };
+                const realDir = path.dirname(resolvedPath);
+                const searchDirs = shimDir === realDir ? [shimDir] : [shimDir, realDir];
+                for (const baseDir of searchDirs) {
+                    const pkgDir = path.join(baseDir, 'node_modules', '@anthropic-ai', 'claude-code');
+                    const entry = resolveClaudeEntryInPkg(pkgDir);
+                    if (entry) {
+                        return { path: entry, source: 'npm' };
+                    }
                 }
-                // Shim found but no cli.js next to it — skip and let other finders handle it
                 return null;
             }
 
-            // Detect source from BOTH original PATH entry and resolved path
-            // Original path tells us HOW user accessed it (context)
-            // Resolved path tells us WHERE it actually lives (content)
-            const originalSource = detectSourceFromPath(claudePath);
-            const resolvedSource = detectSourceFromPath(resolvedPath);
+            // Walk up to claude-code pkg root and re-run priority resolver, so PATH
+            // detection picks the same entry as the other finders even when the
+            // shim points directly at wrapper/binary while a higher-priority cli.js
+            // exists in the same package (upgrade/downgrade window, yalc link, etc.).
+            const preferredPath = walkUpToPkgEntry(path.dirname(resolvedPath)) || resolvedPath;
 
-            // Prioritize original PATH entry for context (e.g., bun vs npm access)
-            // Fall back to resolved path for accurate location detection
+            // Detect source from BOTH original PATH entry and final preferred path.
+            // Original path tells us HOW user accessed it (context); preferred path
+            // tells us WHERE the chosen entry actually lives (content).
+            const originalSource = detectSourceFromPath(claudePath);
+            const resolvedSource = detectSourceFromPath(preferredPath);
             const source = originalSource !== 'PATH' ? originalSource : resolvedSource;
 
             return {
-                path: resolvedPath,
+                path: preferredPath,
                 source: source
             };
         }
-    } catch (e) {
-        // Command failed (claude not in PATH)
-    }
+    } catch (e) {}
     return null;
 }
 
@@ -116,11 +180,9 @@ function findClaudeInPath() {
  * @returns {string} Installation method/source
  */
 function detectSourceFromPath(resolvedPath) {
-    const normalized = resolvedPath.toLowerCase();
-    const path = require('path');
-
-    // Use path.normalize() for proper cross-platform path handling
-    const normalizedPath = path.normalize(resolvedPath).toLowerCase();
+    // Normalize separators to forward slashes so that pattern matching with
+    // includes('opt/homebrew') etc. works identically on Windows and Unix.
+    const normalizedPath = path.normalize(resolvedPath).replace(/\\/g, '/').toLowerCase();
 
     // Bun: ~/.bun/bin/claude -> ../node_modules/@anthropic-ai/claude-code/cli.js
     // Works on Windows too: C:\Users\[user]\.bun\bin\claude
@@ -197,6 +259,29 @@ function detectSourceFromPath(resolvedPath) {
  * FIX: Check bun's bin directory, not non-existent modules directory
  * @returns {string|null} Path to cli.js or null if not found
  */
+/**
+ * Locate the Claude entry under a given Bun home directory.
+ * Extracted from findBunGlobalCliPath so tests can inject a fake homedir
+ * built with mkdtemp instead of mocking os.homedir() globally.
+ *
+ * @param {string} homedir - Directory that holds .bun/bin/claude
+ * @returns {string|null} Path to entry or null
+ */
+function findClaudeInBunHome(homedir) {
+    const bunBin = path.join(homedir, '.bun', 'bin', 'claude');
+    const resolved = resolvePathSafe(bunBin);
+    if (!resolved) return null;
+
+    // Legacy layout: bun symlinked directly to cli.js
+    if (resolved.endsWith('cli.js')) {
+        return resolved;
+    }
+
+    // New layout (2.1.100+): bun's shim points at the package's bin/claude[.exe] or
+    // cli-wrapper.cjs. Walk up to the package root and use the shared resolver.
+    return walkUpToPkgEntry(path.dirname(resolved));
+}
+
 function findBunGlobalCliPath() {
     // First check if bun command exists (cross-platform)
     try {
@@ -206,12 +291,44 @@ function findBunGlobalCliPath() {
         return null; // bun not installed
     }
 
-    // Check bun's binary directory (works on both Unix and Windows)
-    const bunBin = path.join(os.homedir(), '.bun', 'bin', 'claude');
-    const resolved = resolvePathSafe(bunBin);
+    return findClaudeInBunHome(os.homedir());
+}
 
-    if (resolved && resolved.endsWith('cli.js') && fs.existsSync(resolved)) {
-        return resolved;
+/**
+ * Locate the Claude entry inside one Homebrew prefix.
+ * Extracted from findHomebrewCliPath so tests can construct fake prefixes
+ * with mkdtemp without mocking platform-wide symlink resolution.
+ *
+ * Probes both Layout A (npm-via-brew, symlink → node_modules tree) and
+ * Layout B (Cellar cask, symlink → standalone binary).
+ *
+ * @param {string} prefix - Homebrew prefix dir (e.g. /opt/homebrew)
+ * @returns {string|null} Path to entry or null
+ */
+function findClaudeInHomebrewPrefix(prefix) {
+    // --- Layout A or B: follow the <prefix>/bin/claude symlink ---
+    const binPath = path.join(prefix, 'bin', 'claude');
+    const resolved = resolvePathSafe(binPath);
+    if (resolved && fs.existsSync(resolved)) {
+        const inBinDir = path.basename(path.dirname(resolved)) === 'bin';
+        const pkgRoot = inBinDir ? path.dirname(path.dirname(resolved)) : path.dirname(resolved);
+        const entry = resolveClaudeEntryInPkg(pkgRoot);
+        if (entry) return entry;          // Layout A
+        return resolved;                   // Layout B (standalone binary)
+    }
+
+    // --- Layout A fallback: no top-level symlink but pkg still installed ---
+    // Homebrew cask sometimes stores claude-code under hashed dirs like
+    // `.claude-code-<hash>/` alongside the canonical `claude-code/`.
+    const nodeModulesPath = path.join(prefix, 'lib', 'node_modules', '@anthropic-ai');
+    if (fs.existsSync(nodeModulesPath)) {
+        const entries = fs.readdirSync(nodeModulesPath);
+        for (const entry of entries) {
+            if (entry === 'claude-code' || entry.startsWith('.claude-code-')) {
+                const found = resolveClaudeEntryInPkg(path.join(nodeModulesPath, entry));
+                if (found) return found;
+            }
+        }
     }
 
     return null;
@@ -234,28 +351,17 @@ function findHomebrewCliPath() {
         path.join(os.homedir(), '.homebrew')
     ].filter(fs.existsSync);
 
+    // Homebrew hosts claude-code through two distinct layouts; probe both per prefix:
+    //   A) npm-via-brew (`brew install claude-code`): symlink in <prefix>/bin points
+    //      into a standard <prefix>/lib/node_modules/@anthropic-ai/claude-code/... tree.
+    //      Walk the symlink target back to its pkg root and delegate to the shared
+    //      resolver so we pick the highest-priority entry (cli.js > wrapper > binary).
+    //   B) Cellar cask (self-contained binary): symlink points at a standalone binary
+    //      under <prefix>/Cellar/<pkg>/<ver>/bin/claude with no npm layout. Return it
+    //      verbatim for spawn.
     for (const prefix of possiblePrefixes) {
-        // Check for binary symlink first (most reliable)
-        const binPath = path.join(prefix, 'bin', 'claude');
-        const resolved = resolvePathSafe(binPath);
-        if (resolved && fs.existsSync(resolved)) {
-            return resolved;
-        }
-
-        // Fallback: check for hashed directories in node_modules
-        const nodeModulesPath = path.join(prefix, 'lib', 'node_modules', '@anthropic-ai');
-        if (fs.existsSync(nodeModulesPath)) {
-            // Look for both claude-code and .claude-code-[hash]
-            const entries = fs.readdirSync(nodeModulesPath);
-            for (const entry of entries) {
-                if (entry === 'claude-code' || entry.startsWith('.claude-code-')) {
-                    const cliPath = path.join(nodeModulesPath, entry, 'cli.js');
-                    if (fs.existsSync(cliPath)) {
-                        return cliPath;
-                    }
-                }
-            }
-        }
+        const found = findClaudeInHomebrewPrefix(prefix);
+        if (found) return found;
     }
 
     return null;
@@ -386,9 +492,7 @@ function findLatestVersionBinary(versionsDir, binaryName = null) {
                 return cliPath;
             }
         }
-    } catch (e) {
-        // Directory read failed
-    }
+    } catch (e) {}
     return null;
 }
 
@@ -431,13 +535,36 @@ function findGlobalClaudeCliPath() {
  * @returns {string|null} Version string or null
  */
 function getVersion(cliPath) {
-    try {
-        const pkgPath = path.join(path.dirname(cliPath), 'package.json');
-        if (fs.existsSync(pkgPath)) {
-            const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-            return pkg.version;
+    // For cli.js / cli-wrapper.cjs the sibling package.json exists.
+    // For bin/claude[.exe] the package.json lives one level up.
+    const candidates = [path.dirname(cliPath), path.dirname(path.dirname(cliPath))];
+    for (const dir of candidates) {
+        try {
+            const pkgPath = path.join(dir, 'package.json');
+            if (fs.existsSync(pkgPath)) {
+                const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+                // Strict name match prevents grabbing an unrelated package.json
+                // (e.g. NVM's own) when cliPath is a dangling/misrouted shim.
+                if (pkg && pkg.version && pkg.name === '@anthropic-ai/claude-code') {
+                    return pkg.version;
+                }
+            }
+        } catch (e) {}
+    }
+
+    // Native installer fallback: version encoded in path under a `versions/<semver>/`
+    // segment. Layouts in the wild:
+    //   ~/.local/share/claude/versions/<semver>/claude
+    //   %LOCALAPPDATA%/Claude/versions/<semver>/claude.exe
+    //   ~/.local/share/claude/versions/<semver>            (file directly named after version)
+    // Strict semver regex avoids false positives from unrelated `versions/` dirs.
+    const segments = path.normalize(cliPath).replace(/\\/g, '/').split('/');
+    const semver = /^\d+\.\d+\.\d+(?:-[\w.+-]+)?$/;
+    for (let i = segments.length - 1; i >= 0; i--) {
+        if (segments[i] === 'versions' && i + 1 < segments.length && semver.test(segments[i + 1])) {
+            return segments[i + 1];
         }
-    } catch (e) {}
+    }
     return null;
 }
 
@@ -523,8 +650,12 @@ module.exports = {
     detectSourceFromPath,
     findNpmGlobalCliPath,
     findBunGlobalCliPath,
+    findClaudeInBunHome,
     findHomebrewCliPath,
+    findClaudeInHomebrewPrefix,
     findNativeInstallerCliPath,
+    resolveClaudeEntryInPkg,
+    walkUpToPkgEntry,
     getVersion,
     compareVersions,
     getClaudeCliPath,
