@@ -22,6 +22,7 @@ import { createAppServerStreamBridge, type AppServerStreamUpdate } from './appSe
 import { CodexPermissionHandler } from './utils/permissionHandler';
 import { ReasoningProcessor } from './utils/reasoningProcessor';
 import { DiffProcessor } from './utils/diffProcessor';
+import { extractCodexErrorDetail, formatCodexErrorForUi } from './utils/codexErrorDetail';
 import { randomUUID } from 'node:crypto';
 import { logger } from '@/ui/logger';
 import { Credentials, readSettings } from '@/persistence';
@@ -741,7 +742,7 @@ export async function runCodexWithAppServer(opts: {
             logger.warn('[CodexAppServer] Codex error notification:', params);
             session.sendSessionEvent({
                 type: 'message',
-                message: `Codex error: ${record?.message || record?.error || 'unknown'}`,
+                message: formatCodexErrorForUi(extractCodexErrorDetail(params)),
             });
         });
 
