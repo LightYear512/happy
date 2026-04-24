@@ -51,7 +51,8 @@
     "dist",
     "bin",
     "scripts",
-    "tools",
+    "tools/archives",
+    "tools/licenses",
     "package.json"
   ],
   "scripts": {
