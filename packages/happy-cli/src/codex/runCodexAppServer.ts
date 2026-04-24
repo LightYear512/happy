@@ -319,7 +319,7 @@ export async function runCodexWithAppServer(opts: {
             logger.debug('[CodexAppServer] /clear intercepted — codex app-server has no per-session clear RPC');
             session.sendSessionEvent({
                 type: 'message',
-                message: 'ℹ️ Codex 暂不支持 /clear 清空当前会话上下文。需要全新上下文请使用 !restart 重启会话。',
+                message: 'ℹ️ Codex 暂不支持 /clear 清空当前会话上下文。需要全新上下文请启动新会话。',
             });
             session.sendSessionEvent({ type: 'ready' });
             return;
