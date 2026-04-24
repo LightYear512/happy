@@ -257,6 +257,38 @@ export function createAppServerStreamBridge(): {
             return updates;
         }
 
+        // -- thread/tokenUsage/updated -----------------------------------
+        // Observability-only: log token usage + context-window occupancy so
+        // `grep token_usage` in the CLI log reveals how close the session is to
+        // the model's compact threshold. No envelope is emitted — mobile UI
+        // reads usage from a separate codex message channel.
+        if (method === 'thread/tokenUsage/updated') {
+            const tokenUsage = asRecord(record.tokenUsage) ?? asRecord(record.token_usage);
+            const total = asRecord(tokenUsage?.total);
+            const last = asRecord(tokenUsage?.last);
+            const readNum = (v: unknown): number | null => typeof v === 'number' && Number.isFinite(v) ? v : null;
+            const ctxWindow = readNum(tokenUsage?.modelContextWindow)
+                ?? readNum(tokenUsage?.model_context_window)
+                ?? readNum(record.modelContextWindow)
+                ?? readNum(record.model_context_window);
+            const pick = (rec: RecordLike | null, ...keys: string[]): number | null => {
+                if (!rec) return null;
+                for (const k of keys) { const n = readNum(rec[k]); if (n !== null) return n; }
+                return null;
+            };
+            const input = pick(total, 'inputTokens', 'input_tokens');
+            const cached = pick(total, 'cachedInputTokens', 'cached_input_tokens');
+            const output = pick(total, 'outputTokens', 'output_tokens');
+            const reasoning = pick(total, 'reasoningOutputTokens', 'reasoning_output_tokens');
+            const totalTokens = pick(total, 'totalTokens', 'total_tokens');
+            const lastTotal = pick(last, 'totalTokens', 'total_tokens');
+            const pct = lastTotal !== null && ctxWindow && ctxWindow > 0
+                ? ((lastTotal / ctxWindow) * 100).toFixed(1)
+                : null;
+            logger.debug(`[appServerStreamBridge] token_usage input=${input} cached=${cached} output=${output} reasoning=${reasoning} total=${totalTokens} last_turn_total=${lastTotal} ctx_window=${ctxWindow} last_turn_pct=${pct ?? 'n/a'}%`);
+            return [];
+        }
+
         // -- turn/interrupted --------------------------------------------
         if (method === 'turn/interrupted') {
             if (!currentTurnId) return [];
