@@ -204,8 +204,10 @@ describe('Claude Version Utils - Cross-Platform Detection', () => {
     });
 
     it('should handle Unix-style absolute paths', () => {
+      // Only platform-agnostic paths here — `/usr/local/bin/claude` resolves to
+      // Homebrew on darwin and native installer on linux, so it lives in the
+      // platform-mocked tests above, not this generic case.
       const unixPaths = [
-        '/usr/local/bin/claude',
         '/opt/homebrew/bin/claude',
         '/home/user/.local/bin/claude'
       ];
