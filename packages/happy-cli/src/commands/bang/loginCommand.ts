@@ -13,6 +13,7 @@ import {
 } from './interactiveSession';
 import { SEPARATOR, codeBlock, parseCodexFlag, rejectCodexFlagInSession, type BangCommandContext, type BangCommandResult } from './types';
 import { getCodexInstancePath, getHappyHome, registerCodexProfile, readCodexDefaultProfile, setCodexDefaultProfile, readCodexProfiles, type AuthFlavor } from './ccsProfiles';
+import { buildCodexChildEnv } from '@/codex/codexEnvBuilder';
 
 const PROFILE_NAME_REGEX = /^[a-zA-Z][a-zA-Z0-9_-]*$/;
 
@@ -1613,100 +1614,16 @@ function performCodexLogin(
         };
     }
 
-    // 5. Build env for codex login — DO NOT override CODEX_HOME (let codex use ~/.codex)
-    const childEnv: Record<string, string> = {};
-    for (const [k, v] of Object.entries(process.env)) {
-        if (v !== undefined) childEnv[k] = v;
-    }
-    delete childEnv.CODEX_HOME;
-    delete childEnv.ANTHROPIC_AUTH_TOKEN;
-    delete childEnv.CLAUDE_CODE_OAUTH_TOKEN;
-
-    // Inject proxy from ~/.codex/.env as a fallback. Rationale: codex CLI's Rust
-    // reqwest client reads proxy env vars once at Client::builder() time, from the
-    // real process env only — it does NOT consult any .env file loaded at runtime.
-    // So a daemon started without proxy env (e.g. autostart, explorer-launched)
-    // would spawn codex with no proxy, causing intermittent direct-connect failures
-    // against auth.openai.com. We materialize the .env proxy into childEnv BEFORE
-    // spawning to guarantee codex sees it.
-    //
-    // INVARIANT: never overwrite a value already in childEnv (either case). The
-    // .env file is a fallback source, not a force-override.
-    const dotenvSource = join(defaultCodexHome, '.env');
-    const dotenvInjectReport: Record<string, string> = {};
-    if (existsSync(dotenvSource)) {
-        try {
-            const dotenvText = readFileSync(dotenvSource, 'utf-8');
-            for (const rawLine of dotenvText.split(/\r?\n/)) {
-                const line = rawLine.trim();
-                if (!line || line.startsWith('#')) continue;
-                const eq = line.indexOf('=');
-                if (eq < 0) continue;
-                const key = line.slice(0, eq).trim();
-                let val = line.slice(eq + 1).trim();
-                if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
-                    val = val.slice(1, -1);
-                }
-                const keyLower = key.toLowerCase();
-                const matchedPair = CODEX_PROXY_KEY_PAIRS.find(([, lower]) => lower === keyLower);
-                if (!matchedPair) continue;
-                const [upperKey, lowerKey] = matchedPair;
-                if (childEnv[lowerKey] === undefined && childEnv[upperKey] === undefined) {
-                    childEnv[lowerKey] = val;
-                    childEnv[upperKey] = val;
-                    dotenvInjectReport[`${lowerKey}/${upperKey}`] = `injected from ${dotenvSource}`;
-                } else {
-                    dotenvInjectReport[lowerKey] = 'skipped (already in childEnv)';
-                }
-            }
-        } catch (err) {
-            logger.warn(`[!login:codex] failed to parse ${dotenvSource}: ${(err as Error).message}`);
-        }
-    }
-    if (Object.keys(dotenvInjectReport).length > 0) {
-        logger.info(`[!login:codex] dotenv proxy inject: ${JSON.stringify(dotenvInjectReport)}`);
-    }
-
-    // Mirror upper↔lower proxy env vars so codex sees both cases regardless of which
-    // the user (or dotenv inject above) set. Reqwest historically only honors the
-    // lowercase form while Windows/cmd only exposes uppercase. INVARIANT: never
-    // overwrite an already-present case; only fill in the missing one.
-    const proxyMirrorReport: Record<string, string> = {};
-    for (const [upper, lower] of CODEX_PROXY_KEY_PAIRS) {
-        const upperVal = childEnv[upper];
-        const lowerVal = childEnv[lower];
-        if (upperVal && !lowerVal) {
-            childEnv[lower] = upperVal;
-            proxyMirrorReport[lower] = `mirrored ← ${upper}`;
-        } else if (lowerVal && !upperVal) {
-            childEnv[upper] = lowerVal;
-            proxyMirrorReport[upper] = `mirrored ← ${lower}`;
-        } else if (upperVal && lowerVal) {
-            proxyMirrorReport[`${upper}/${lower}`] = upperVal === lowerVal
-                ? 'both set, identical (no-op)'
-                : 'both set, DIFFERENT (left as-is, user explicit)';
-        }
-    }
-    if (Object.keys(proxyMirrorReport).length > 0) {
-        logger.info(`[!login:codex] proxy env mirror: ${JSON.stringify(proxyMirrorReport)}`);
-    }
-
-    // Diagnostic dump: what codex actually sees. Sensitive values are masked/elided.
-    const maskProxyAuth = (v: string): string => v.replace(/\/\/[^@/]*@/, '//<auth>@');
-    const envSnapshot: Record<string, string> = {};
-    for (const [k, v] of Object.entries(childEnv)) {
-        if (!CODEX_DIAGNOSTIC_ENV_KEYS.test(k)) continue;
-        if (k === 'PATH') {
-            envSnapshot[k] = `<${v.split(/[;:]/).length} entries>`;
-        } else if (/PROXY/i.test(k)) {
-            envSnapshot[k] = maskProxyAuth(v);
-        } else if (/^(OPENAI_API_KEY|OPENAI_TOKEN)$/i.test(k)) {
-            envSnapshot[k] = `<set, len=${v.length}>`;
-        } else {
-            envSnapshot[k] = v;
-        }
-    }
-    logger.info(`[!login:codex] childEnv snapshot: ${JSON.stringify(envSnapshot)}`);
+    // 5. Build env for codex login — DO NOT override CODEX_HOME (let codex use ~/.codex).
+    // Delegates dotenv proxy inject + upper↔lower mirror + diagnostic snapshot to the
+    // shared builder so the spec stays in lockstep with runCodexAppServer. The helper
+    // emits its own snapshot log line under the same tag.
+    const { env: childEnv } = buildCodexChildEnv({
+        baseEnv: process.env,
+        dotenvPath: join(defaultCodexHome, '.env'),
+        keysToDelete: ['CODEX_HOME', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN'],
+        logTag: '!login:codex',
+    });
     logger.info(`[!login:codex] CODEX_HOME explicitly: ${childEnv.CODEX_HOME ?? '<unset>'} (deleted from inherited env, codex will fall back to ~/.codex)`);
     logger.info(`[!login:codex] spawn target: path=${codexInfo.path} needsShell=${codexInfo.needsShell} cwd=${homedir()}`);
 
@@ -1968,21 +1885,6 @@ function isCodexLoginPidAlive(pid: number | undefined): boolean {
  * 1-hour ceiling is comfortably above any legitimate login duration.
  */
 const CODEX_LOGIN_LOCK_STALE_MS = 60 * 60 * 1000;
-
-/**
- * Proxy env var pairs (uppercase/lowercase). Reqwest historically only honors the
- * lowercase form, while Windows/cmd typically only exposes the uppercase. We mirror
- * both directions (never overwriting) and parse both cases from ~/.codex/.env.
- */
-const CODEX_PROXY_KEY_PAIRS: ReadonlyArray<readonly [upper: string, lower: string]> = [
-    ['HTTPS_PROXY', 'https_proxy'],
-    ['HTTP_PROXY', 'http_proxy'],
-    ['NO_PROXY', 'no_proxy'],
-    ['ALL_PROXY', 'all_proxy'],
-];
-
-/** Env keys whose values get included in the spawn-time childEnv diagnostic snapshot. */
-const CODEX_DIAGNOSTIC_ENV_KEYS = /^(HTTPS?_PROXY|ALL_PROXY|NO_PROXY|REQUESTS_CA_BUNDLE|SSL_CERT_FILE|NODE_EXTRA_CA_CERTS|CODEX_|OPENAI_|XDG_|LANG|LC_|LOCALE|TZ|HOME|USERPROFILE|TMPDIR|TEMP|TMP|PATH|COMSPEC|SHELL)/i;
 
 /**
  * Recover from an interrupted codex login (parent happy process killed mid-flow).
