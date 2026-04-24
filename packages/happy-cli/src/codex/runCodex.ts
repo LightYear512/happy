@@ -95,6 +95,21 @@ export function emitReadyIfIdle({ pending, queueSize, shouldExit, sendReady, not
 }
 
 /**
+ * Extracts a human-readable error from a codex task_complete/turn_aborted event.
+ * Returns null if the event represents a successful/clean completion.
+ */
+function describeCodexFailure(msg: any): string | null {
+    const hasFailure = msg?.status === 'failed' || (msg?.error !== undefined && msg?.error !== null);
+    if (!hasFailure) return null;
+    const err = msg.error;
+    if (typeof err === 'string' && err.length > 0) return err;
+    if (err && typeof err === 'object' && typeof err.message === 'string' && err.message.length > 0) {
+        return err.message;
+    }
+    return 'Unknown error';
+}
+
+/**
  * Main entry point for the codex command with ink UI
  */
 export async function runCodex(opts: {
@@ -606,22 +621,34 @@ export async function runCodex(opts: {
         } else if (msg.type === 'task_started') {
             messageBuffer.addMessage('Starting task...', 'status');
         } else if (msg.type === 'task_complete') {
-            messageBuffer.addMessage('Task completed', 'status');
-            // Auto-update session title on first task completion
-            if (first && msg.last_agent_message) {
-                const title = String(msg.last_agent_message).substring(0, 80).replace(/\n/g, ' ').trim();
-                if (title) {
-                    logger.debug(`[Codex] Auto-setting session title: ${title}`);
-                    session.sendClaudeSessionMessage({
-                        type: 'summary',
-                        summary: title,
-                        leafUuid: randomUUID(),
-                    });
+            const failure = describeCodexFailure(msg);
+            if (failure) {
+                messageBuffer.addMessage(`Task failed: ${failure}`, 'status');
+                session.sendSessionEvent({ type: 'message', message: `Codex error: ${failure}` });
+            } else {
+                messageBuffer.addMessage('Task completed', 'status');
+                // Auto-update session title on first task completion
+                if (first && msg.last_agent_message) {
+                    const title = String(msg.last_agent_message).substring(0, 80).replace(/\n/g, ' ').trim();
+                    if (title) {
+                        logger.debug(`[Codex] Auto-setting session title: ${title}`);
+                        session.sendClaudeSessionMessage({
+                            type: 'summary',
+                            summary: title,
+                            leafUuid: randomUUID(),
+                        });
+                    }
                 }
             }
             sendReady();
         } else if (msg.type === 'turn_aborted') {
-            messageBuffer.addMessage('Turn aborted', 'status');
+            const failure = describeCodexFailure(msg);
+            if (failure) {
+                messageBuffer.addMessage(`Turn aborted: ${failure}`, 'status');
+                session.sendSessionEvent({ type: 'message', message: `Codex error: ${failure}` });
+            } else {
+                messageBuffer.addMessage('Turn aborted', 'status');
+            }
             sendReady();
         }
 
