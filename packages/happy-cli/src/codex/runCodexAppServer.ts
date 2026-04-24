@@ -18,6 +18,7 @@ import { projectPath } from '@/projectPath';
 import { fetchAndInjectPendingMessages } from '@/utils/fetchPendingMessages';
 import { registerShutdownHandlers } from '@/utils/shutdownHandlers';
 import { createCodexAppServerClient, type CodexAppServerClient } from './codexAppServerClient';
+import { buildCodexChildEnv } from './codexEnvBuilder';
 import { createAppServerStreamBridge, type AppServerStreamUpdate } from './appServerStreamBridge';
 import { CodexPermissionHandler } from './utils/permissionHandler';
 import { ReasoningProcessor } from './utils/reasoningProcessor';
@@ -807,10 +808,17 @@ export async function runCodexWithAppServer(opts: {
     });
 
     try {
-        // Create app-server client
+        // Create app-server client. Build the child env via the shared helper so
+        // codex sees the same proxy/dotenv treatment as `!login codex` — including
+        // ~/.codex/.env inject and upper↔lower case mirroring (Reqwest only honors
+        // the lowercase form). Without this, a daemon launched without proxy env
+        // would spawn codex with no proxy and fail wss://chatgpt.com CONNECT. The
+        // helper emits its own snapshot log line under the same tag.
         logger.debug('[CodexAppServer] Creating app-server client');
+        const initialEnvBuild = buildCodexChildEnv({ logTag: 'CodexAppServer' });
         client = await createCodexAppServerClient({
             configOverrides: mcpServerConfigOverrides,
+            processEnv: initialEnvBuild.env,
         });
         logger.debug('[CodexAppServer] App-server client created');
 
@@ -862,8 +870,12 @@ export async function runCodexWithAppServer(opts: {
                         await client.dispose();
                         client = null;
                     }
+                    // Account swap: rebuild env so the new spawn picks up the just-
+                    // updated process.env.CODEX_HOME (set by tryGlobalProfileSwitch).
+                    const swapEnvBuild = buildCodexChildEnv({ logTag: 'CodexAppServer:swap' });
                     client = await createCodexAppServerClient({
                         configOverrides: mcpServerConfigOverrides,
+                        processEnv: swapEnvBuild.env,
                     });
                     registerClientHandlers(client);
                     threadId = null;
