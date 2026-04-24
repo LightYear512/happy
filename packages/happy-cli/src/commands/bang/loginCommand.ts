@@ -1057,8 +1057,18 @@ export async function handleLoginBangCommand(
         }
 
         logger.debug('[!login] Feeding input to Claude PTY');
+        // Claude Code's OAuth code input is a password/paste-aware field — writing
+        // `text + '\r'` in one chunk causes the trailing `\r` to be swallowed as
+        // part of the pasted payload, so submit never fires. Write the body, let
+        // Claude's paste buffer flush, then send `\r` as an independent keystroke.
         try {
-            ptyProcess.write(text + '\r');
+            const body = text.replace(/[\r\n]+$/, '');
+            ptyProcess.write(body);
+            setTimeout(() => {
+                try { ptyProcess.write('\r'); } catch (err) {
+                    logger.debug('[!login] Failed to send submit CR:', err);
+                }
+            }, 120);
         } catch (err) {
             logger.debug('[!login] Failed to write to PTY:', err);
         }
