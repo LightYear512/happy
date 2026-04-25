@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildHeuristicSeed } from './compactSeedBuilder';
+import { buildHeuristicSeed, SEED_SENTINEL } from './compactSeedBuilder';
 
 function jsonl(records: object[]): string {
     return records.map((r) => JSON.stringify(r)).join('\n') + '\n';
@@ -570,5 +570,90 @@ describe('buildHeuristicSeed', () => {
         expect(result.stats.userTurns).toBe(0);
         expect(result.stats.fileEdits).toBeGreaterThan(0);
         expect(result.seedText).toContain('涉及的文件路径');
+    });
+
+    // ---- seed sentinel detection (compaction-loop fix) ------------------
+    // Background: prior to 2026-04-25, every /compact prepended the previous
+    // seed to the next user prompt as plain text, so codex persisted the
+    // whole seed as a `role:user` response_item. The next /compact then read
+    // that rollout and put the seed back into the `user` bucket — leading to
+    // unbounded seed growth (7K → 14K → 20K …) and eventual real-content
+    // truncation by the global head/tail collapse.
+    //
+    // Fix: every seed is now emitted with a leading SEED_SENTINEL line, and
+    // the read path detects it to route the prior seed into the `compacted`
+    // bucket (which is naturally bounded and discards older user history).
+
+    it('emits SEED_SENTINEL as the first line of every produced seed', async () => {
+        const path = await writeRollout('emit-sentinel', [
+            userMessage('hello'),
+            assistantFinal('hi'),
+        ]);
+        const result = await buildHeuristicSeed({ rolloutPath: path });
+        expect(result.seedText.startsWith(SEED_SENTINEL)).toBe(true);
+    });
+
+    it('routes user message starting with SEED_SENTINEL to compacted bucket', async () => {
+        const priorSeed = `${SEED_SENTINEL}\n## 上下文摘要（happy /compact 本地重建）\n\n旧对话摘要 A\n旧对话摘要 B\n`;
+        const path = await writeRollout('detect-sentinel', [
+            userMessage(priorSeed),
+            userMessage('actual user question after compact'),
+            assistantFinal('answer to that question'),
+        ]);
+        const result = await buildHeuristicSeed({ rolloutPath: path });
+        expect(result.stats.hadCompactedRecord).toBe(true);
+        expect(result.stats.bucketUsage.compacted).toBeGreaterThan(0);
+        expect(result.seedText).toContain('actual user question');
+        expect(result.seedText).toContain('旧对话摘要');
+    });
+
+    it('discards earlier (pre-sentinel) user/assistant content like processCompacted does', async () => {
+        // This sequence cannot occur in real rollouts (sentinel is always the
+        // first user message in a fresh thread), but exercises the discard
+        // contract — same as the existing "reuses compacted record" test.
+        const priorSeed = `${SEED_SENTINEL}\nseeded content`;
+        const path = await writeRollout('discard-pre-sentinel', [
+            userMessage('pre-seed user turn'),
+            assistantFinal('pre-seed final answer'),
+            userMessage(priorSeed),
+            userMessage('post-sentinel turn'),
+        ]);
+        const result = await buildHeuristicSeed({ rolloutPath: path });
+        expect(result.stats.userTurns).toBe(1); // only post-sentinel
+        expect(result.stats.finalAnswers).toBe(0);
+        expect(result.seedText).toContain('post-sentinel turn');
+        expect(result.seedText).not.toContain('pre-seed user turn');
+        expect(result.seedText).not.toContain('pre-seed final answer');
+    });
+
+    it('does not bloat across simulated double-compaction', async () => {
+        // First compact: build seed S1 from a small conversation.
+        const path1 = await writeRollout('bloat-round1', [
+            userMessage('原始问题 1'),
+            assistantFinal('原始回答 1'),
+            userMessage('原始问题 2'),
+            assistantFinal('原始回答 2'),
+        ]);
+        const r1 = await buildHeuristicSeed({ rolloutPath: path1 });
+        const s1 = r1.seedText;
+
+        // Second compact: simulate a new thread that began with S1 prepended
+        // to the user's next question, plus one more turn.
+        const path2 = await writeRollout('bloat-round2', [
+            userMessage(s1),
+            userMessage('新问题'),
+            assistantFinal('新回答'),
+        ]);
+        const r2 = await buildHeuristicSeed({ rolloutPath: path2 });
+
+        // Detection took effect: prior seed sits in compacted bucket, not user.
+        expect(r2.stats.hadCompactedRecord).toBe(true);
+        expect(r2.stats.bucketUsage.compacted).toBeGreaterThan(0);
+        expect(r2.stats.userTurns).toBe(1); // only "新问题"
+
+        // Without the fix, |S2| would be roughly |S1| + new content. With the
+        // fix the compacted bucket is bounded by `compacted: 0.20` of total
+        // budget, so S2 must not significantly exceed S1.
+        expect(r2.seedText.length).toBeLessThanOrEqual(s1.length + 2000);
     });
 });

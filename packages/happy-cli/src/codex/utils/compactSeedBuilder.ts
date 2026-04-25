@@ -41,6 +41,24 @@ const TOKEN_CHAR_RATIO = 4; // rough ascii heuristic; codex sessions skew JSON/c
 const DEFAULT_TOKEN_BUDGET = 12000; // ~4.7% of a 256k context window
 const MAX_FILE_PATHS = 50;
 
+/**
+ * Sentinel marker emitted as the first line of every seed produced by this
+ * module (and by codexExecCompact.ts wrapping the LLM summary).
+ *
+ * On the next /compact, when the seed-builder reads the new thread's rollout
+ * and finds a user-message that starts with this sentinel, it routes the
+ * whole message into the `compacted` bucket and clears `userTexts` /
+ * `finalAnswers` — same as `processCompacted`. Without this, every previous
+ * seed accumulates as ordinary user content (~7K → 14K → 20K…) until the
+ * 48K-char global cap kicks in and head/tail-truncates real user history
+ * (investigated 2026-04-25 against rollout-019dc4b9-...jsonl).
+ *
+ * HTML comment chosen to be: (a) invisible to markdown renderers so it
+ * doesn't pollute the visible summary, (b) extremely unlikely to appear at
+ * the start of a real user message.
+ */
+export const SEED_SENTINEL = '<!--HAPPY-COMPACT-SEED-v1-->';
+
 // The most recent N user messages are kept verbatim regardless of budget —
 // they are ground truth for "what the user actually asked" and silent
 // truncation here is the highest-impact failure mode of /compact.
@@ -202,6 +220,26 @@ function processResponseItem(payload: Record<string, unknown>, buckets: Buckets)
         const role = payload.role;
         const text = extractMessageText(payload.content);
         if (role === 'user' && !isNoiseUserMessage(text)) {
+            // Detect happy-injected seed from a prior /compact. When found,
+            // synthesise a `lastCompacted` record so it competes for the
+            // dedicated 20% compacted bucket instead of the 35% user bucket,
+            // and clear earlier user/assistant entries — mirroring the
+            // discard-older behaviour of `processCompacted`. This is what
+            // breaks the per-compaction seed-bloat loop documented at
+            // SEED_SENTINEL.
+            if (text.startsWith(SEED_SENTINEL)) {
+                buckets.lastCompacted = {
+                    message: 'happy-injected seed',
+                    replacement_history: [{
+                        type: 'message',
+                        role: 'user',
+                        content: [{ type: 'input_text', text }],
+                    }],
+                };
+                buckets.userTexts = [];
+                buckets.finalAnswers = [];
+                return;
+            }
             buckets.userTexts.push(redactSensitive(text));
         } else if (role === 'assistant' && payload.phase === 'final_answer' && text) {
             buckets.finalAnswers.push(redactSensitive(text));
@@ -697,6 +735,7 @@ function composeSeed(
     const wants = estimateBucketWants(buckets);
     const budgets = allocateBucketBudgets(wants, charBudget);
 
+    lines.push(SEED_SENTINEL);
     lines.push('## 上下文摘要（happy /compact 本地重建）');
 
     // 1. codex's own compacted history (if any). User messages only.
