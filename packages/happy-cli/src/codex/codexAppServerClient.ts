@@ -106,7 +106,18 @@ function escapeCmdArgument(arg: string): string {
     return s;
 }
 
-function buildWindowsSpawnArgs(
+/**
+ * Wrap a command + args list for safe spawn on Windows. On non-Windows
+ * platforms returns the input unchanged. On Windows, wraps with
+ * `cmd.exe /d /s /c "..."` and escapes arguments per the cross-spawn
+ * algorithm so that `.cmd`/`.bat` shims (e.g. the npm-installed `codex`)
+ * receive arguments verbatim, preserving embedded quotes such as
+ * `-c web_search="disabled"`.
+ *
+ * Caller must pass the returned `windowsVerbatimArguments` flag to
+ * `child_process.spawn` options.
+ */
+export function buildWindowsSpawnArgs(
     command: string,
     args: string[],
 ): { spawnCommand: string; spawnArgs: string[]; windowsVerbatimArguments: boolean } {
