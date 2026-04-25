@@ -58,6 +58,7 @@ import {
 import { parseSpecialCommand } from '@/parsers/specialCommands';
 import { findRolloutByConversationId, getDefaultCodexSessionsRoot } from './utils/rolloutDiscovery';
 import { buildHeuristicSeed } from './utils/compactSeedBuilder';
+import { compactViaCodexExec, renderCompactionResultMessage, wrapL2SeedAsHeuristicSeed } from './utils/codexExecCompact';
 import { shouldAutoRescue, createRescueGate } from './utils/codexAutoRescue';
 import { createTurnLifecycle } from './utils/turnLifecycle';
 
@@ -512,7 +513,54 @@ export async function runCodexWithAppServer(opts: {
                 });
                 seedText = built.seedText;
                 seedStats = built.stats;
-                logger.debug(`[CodexAppServer] ${autoTriggered ? '[auto] ' : ''}/compact seed built: rollout=${rolloutPath} stats=${JSON.stringify(seedStats)} chars=${seedText.length}`);
+                logger.debug(`[CodexAppServer] ${autoTriggered ? '[auto] ' : ''}/compact heuristic seed: rollout=${rolloutPath} stats=${JSON.stringify(seedStats)} chars=${seedText.length}`);
+
+                // Step 2: try LLM-driven compaction in a fresh `codex exec`
+                // process, using the heuristic seed as input. The fresh
+                // process has its own clean context, so it works even when
+                // the live thread has overflowed (which is exactly when the
+                // user hits /compact). On any failure — timeout, network,
+                // auth, missing binary — we transparently keep the heuristic
+                // seed as fallback. See codexExecCompact.ts for empirical
+                // tuning and full pipeline rationale.
+                const l2 = await compactViaCodexExec({
+                    heuristicSeed: built.seedText,
+                    codexHome: process.env.CODEX_HOME,
+                });
+
+                // Always: update seedText based on L2 result. This is what
+                // gets injected into the next thread's first user message,
+                // and applies regardless of auto-trigger.
+                if (l2.summary) {
+                    seedText = wrapL2SeedAsHeuristicSeed(l2.summary, '请基于以上摘要继续。');
+                    logger.debug(
+                        `[CodexAppServer] ${autoTriggered ? '[auto] ' : ''}/compact L2 succeeded: ${l2.elapsedMs}ms summary=${l2.summary.length} seed=${seedText.length}`,
+                    );
+                } else if (l2.skipped === 'short_circuit') {
+                    logger.debug(
+                        `[CodexAppServer] ${autoTriggered ? '[auto] ' : ''}/compact L2 skipped (heuristic short enough): ${l2.error}`,
+                    );
+                } else {
+                    logger.debug(
+                        `[CodexAppServer] ${autoTriggered ? '[auto] ' : ''}/compact L2 fallback to heuristic: ${l2.elapsedMs}ms error=${l2.error}`,
+                    );
+                }
+
+                // User-initiated /compact only: emit a visible summary
+                // message between the protocol "Compaction started" /
+                // "Compaction completed" events. This aligns with Claude
+                // Code's /compact UX (`claudeRemote.ts:241-247`) where the
+                // SDK streams the assistant's compaction summary as a
+                // normal chat message in that window.
+                //
+                // Auto-compact (`autoTriggered`) stays silent on purpose:
+                // it fires when context fills up mid-conversation, and a
+                // wall-of-text summary message dropped into the user's
+                // flow would be more disruptive than informative.
+                if (!autoTriggered) {
+                    const visibleSummary = renderCompactionResultMessage(l2, seedText.length);
+                    session.sendSessionEvent({ type: 'message', message: visibleSummary });
+                }
             }
 
             // Reset thread state. The turn loop's `if (!threadId)` branch will
