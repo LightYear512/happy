@@ -43,7 +43,7 @@ Execute these steps **sequentially**. Stop immediately on any failure and report
    - `major`: increment major (e.g., `0.14.0` → `1.0.0`)
    - Explicit version: use as-is
 5. Note the current branch name. This release does NOT require `main` branch — we may release from feature/compat branches.
-6. Detect the GitHub repo owner/name from `git remote get-url origin` (parse SSH or HTTPS URL) or fall back to the `repository` field in `package.json`.
+6. Detect the GitHub repo owner/name **from `git remote get-url origin` only** (parse SSH or HTTPS URL). Do NOT fall back to `package.json#repository` — in this fork, that field still points to upstream `slopus/happy-cli`, which would route the release to the wrong repo and cause a 404.
 7. Confirm with the user: "Ready to release **v{version}** from branch **{branch}**. Proceed?"
 
 ### Step 2: Version Bump
@@ -108,10 +108,11 @@ node .release-it.notes.js {version}
 
 If the script fails (e.g., `claude` CLI not available), fall back to generating release notes yourself by reading `git log` since the last tag and writing a concise changelog.
 
-Create the GitHub release with the tarball attached:
+Create the GitHub release with the tarball attached. **You MUST pass `--repo {owner}/{repo}` explicitly** — otherwise `gh` reads `package.json#repository` (which points to upstream `slopus/happy-cli`) and the API returns HTTP 404, surfaced misleadingly as `"workflow" scope may be required`. Token scopes are fine; the error is a routing bug.
 
 ```bash
 gh release create "v{version}" ./happy-coder-{version}.tgz \
+  --repo {owner}/{repo} \
   --title "v{version}" \
   --notes "{release_notes}" \
   --target {branch}
