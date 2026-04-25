@@ -58,6 +58,7 @@ import {
 import { parseSpecialCommand } from '@/parsers/specialCommands';
 import { findRolloutByConversationId, getDefaultCodexSessionsRoot } from './utils/rolloutDiscovery';
 import { buildHeuristicSeed } from './utils/compactSeedBuilder';
+import { shouldAutoRescue, createRescueGate } from './utils/codexAutoRescue';
 import { createTurnLifecycle } from './utils/turnLifecycle';
 
 // ---------------------------------------------------------------------------
@@ -411,6 +412,13 @@ export async function runCodexWithAppServer(opts: {
     const compactState: { pendingSeedText: string | null } = { pendingSeedText: null };
     let compactInFlight = false;
 
+    // Auto-rescue gate: when codex's auto pre-sampling compaction fails
+    // (`willRetry: false`, message contains "Error running remote compact task")
+    // we trigger /compact for the user automatically. The cooldown prevents a
+    // failure storm (same turn retrying 5x in 2s) from spawning multiple
+    // rescues.
+    const autoRescueGate = createRescueGate(30_000);
+
     // Pending turn tracking — turn/start RPC returns immediately (non-blocking).
     // We await `turnLifecycle.current` which is settled by the turn/completed,
     // turn/interrupted, error notification handlers, or the turn-loop catch
@@ -430,9 +438,9 @@ export async function runCodexWithAppServer(opts: {
         mode: 'compact' | 'clear',
         autoTriggered: boolean = false,
     ): Promise<void> {
-        // User-facing label: "本地压缩" when triggered programmatically,
-        // "/compact" when typed by the user. Hides internal triggering mechanism
-        // from the user-visible status messages.
+        // User-facing label for /compact: "本地压缩" when triggered by us
+        // (auto-rescue or unknown), "/compact" when typed by the user. Avoid
+        // surfacing "auto-rescue" — it's an internal abstraction.
         const compactLabel = autoTriggered ? '本地压缩' : '/compact';
         const opLabel = mode === 'compact' ? compactLabel : '/clear';
 
@@ -857,8 +865,8 @@ export async function runCodexWithAppServer(opts: {
             const updates = bridge.onNotification('turn/completed', params);
             processBridgeUpdates(updates);
             // Stale notification guard: a delayed turn/completed for a turn we
-            // already moved past (e.g. after /compact swap to a fresh
-            // threadId) must not settle the NEW turn's promise. The bridge
+            // already moved past (e.g. after /compact swap or auto-rescue
+            // re-thread) must not settle the NEW turn's promise. The bridge
             // still gets the update for protocol bookkeeping; only the
             // lifecycle and activeTurnId are guarded.
             const notifTurnId = readTurnId(params);
@@ -945,6 +953,36 @@ export async function runCodexWithAppServer(opts: {
                 // error reporting.
             } else {
                 turnLifecycle.finish();
+            }
+
+            // Auto-rescue: codex's server-side compact endpoint is unstable
+            // (~25% failure rate on flaky proxies). When it fails the current
+            // turn dies with `willRetry: false`. We detect that exact signature
+            // and kick off our local heuristic /compact path so the user sees
+            // the standard `Compaction started` / `Compaction completed` ack
+            // pair (same UX as a manual /compact) instead of "Codex error:
+            // stream disconnected".
+            if (shouldAutoRescue(params) && autoRescueGate.tryClaim(Date.now())) {
+                logger.warn('[CodexAppServer] Auto-rescue triggered for compact failure:', params);
+                // No "auto-rescue" preamble — runManualCompact emits the
+                // standard `Compaction started` / `Compaction completed`
+                // protocol events. From the user's POV this is identical to
+                // a manual /compact: same ack pair, same context-bar reset.
+                void runManualCompact('compact', true).catch((err) => {
+                    // Roll back the cooldown claim so the next genuine compact
+                    // failure within 30s is still rescuable. Without this, a
+                    // failed rescue silently disables auto-rescue for the
+                    // cooldown window and the user gets a raw codex error
+                    // after we've already eaten their one shot.
+                    autoRescueGate.release();
+                    logger.warn('[CodexAppServer] Auto-rescue /compact failed:', err);
+                    session.sendSessionEvent({
+                        type: 'message',
+                        message: '⚠️ 本地压缩失败',
+                    });
+                    session.sendSessionEvent({ type: 'ready' });
+                });
+                return;
             }
 
             logger.warn('[CodexAppServer] Codex error notification:', params);
