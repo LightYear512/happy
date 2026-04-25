@@ -56,6 +56,9 @@ import {
     buildSessionWelcome,
 } from '@/commands/bang/dispatcher';
 import { parseSpecialCommand } from '@/parsers/specialCommands';
+import { findRolloutByConversationId, getDefaultCodexSessionsRoot } from './utils/rolloutDiscovery';
+import { buildHeuristicSeed } from './utils/compactSeedBuilder';
+import { createTurnLifecycle } from './utils/turnLifecycle';
 
 // ---------------------------------------------------------------------------
 // Types (mirrors runCodex.ts)
@@ -298,30 +301,54 @@ export async function runCodexWithAppServer(opts: {
             return;
         }
 
-        // Intercept /compact and /clear before they reach codex. The codex
-        // app-server protocol exposes no manual-compact RPC and no per-session
-        // context-clear RPC. Without these intercepts the slash commands would
-        // be sent to codex as literal user prompts and the LLM would just reply
-        // with prose, leaving the user thinking something happened when nothing
-        // actually did (silent failure). We surface a clear status message and
-        // close the turn so the UI doesn't hang.
-        const specialCommand = parseSpecialCommand(text);
-        if (specialCommand.type === 'compact') {
-            logger.debug('[CodexAppServer] /compact intercepted — codex auto-compacts internally, no manual API');
+        // /compact / /clear swap-race guard: while runManualCompact is between
+        // `findRolloutByConversationId` / `buildHeuristicSeed` (both await) and
+        // the threadId swap, the turn loop is parked on
+        // `messageQueue.waitForMessagesAndGetAsString()`. If a new user message
+        // lands here it would push into the queue, the turn loop would unblock
+        // and dispatch with the OLD threadId (we haven't swapped yet), and the
+        // pending heuristic seed would never be consumed.
+        //
+        // Reject + advise. The user re-sends after they see
+        // `Compaction completed`. Cheaper than building a barrier between the
+        // two coroutines and avoids state-machine surface area.
+        if (compactInFlight) {
             session.sendSessionEvent({
                 type: 'message',
-                message: 'ℹ️ Codex 自动管理上下文压缩（接近 token 上限时由 codex 内部触发），暂无手动触发接口。可继续对话。',
+                message: '⏳ 本地压缩进行中，请等待 "Compaction completed" 后再发送。',
             });
             session.sendSessionEvent({ type: 'ready' });
             return;
         }
-        if (specialCommand.type === 'clear') {
-            logger.debug('[CodexAppServer] /clear intercepted — codex app-server has no per-session clear RPC');
-            session.sendSessionEvent({
-                type: 'message',
-                message: 'ℹ️ Codex 暂不支持 /clear 清空当前会话上下文。需要全新上下文请启动新会话。',
+
+        // Intercept /compact and /clear before they reach codex.
+        //
+        // Background: codex app-server's auto pre-sampling compaction posts the
+        // entire conversation history (~800KB) to /backend-api/codex/responses/compact.
+        // On unstable proxies this fails roughly 25% of the time, which kills
+        // the current turn (`willRetry: false`). There is no manual-compact
+        // RPC, and asking codex to "summarize" the conversation in-place would
+        // re-trigger the same broken endpoint.
+        //
+        // /compact implementation: read the current thread's rollout file from
+        // disk, build a heuristic seed locally (no network), allocate a fresh
+        // codex thread, and stash the seed so the user's NEXT prompt is
+        // prepended with it. This sidesteps the broken endpoint entirely.
+        //
+        // /clear: no truncation RPC exists — the closest analog is a fresh
+        // thread with no seed. We expose this as the same orchestrator path
+        // but skip the seed.
+        const specialCommand = parseSpecialCommand(text);
+        if (specialCommand.type === 'compact' || specialCommand.type === 'clear') {
+            const verb = specialCommand.type;
+            void runManualCompact(verb).catch((err) => {
+                logger.warn(`[CodexAppServer] /${verb} orchestrator failed:`, err);
+                session.sendSessionEvent({
+                    type: 'message',
+                    message: `⚠️ /${verb} 失败`,
+                });
+                session.sendSessionEvent({ type: 'ready' });
             });
-            session.sendSessionEvent({ type: 'ready' });
             return;
         }
 
@@ -373,30 +400,135 @@ export async function runCodexWithAppServer(opts: {
     let activeTurnId: string | null = null;
     let threadIdStored = false;
 
+    // /compact state. When the user runs /compact we read the current rollout
+    // file, build a heuristic seed locally, allocate a fresh codex thread, and
+    // stash the seed in `compactState.pendingSeedText` so the next turn
+    // prepends it to the user's prompt. The holder object keeps the type as
+    // `string | null` at the read site (a bare `let` would get narrowed to
+    // `null` by TS control-flow analysis since the writer lives in a different
+    // closure). `compactInFlight` guards against concurrent /compact
+    // invocations while the swap is in progress.
+    const compactState: { pendingSeedText: string | null } = { pendingSeedText: null };
+    let compactInFlight = false;
+
     // Pending turn tracking — turn/start RPC returns immediately (non-blocking).
-    // We await `pendingTurnPromise` which is resolved by the turn/completed /
-    // turn/interrupted notification handlers.
-    let pendingTurnPromise: Promise<void> | null = null;
-    let resolvePendingTurn: (() => void) | null = null;
-    let rejectPendingTurn: ((error: Error) => void) | null = null;
+    // We await `turnLifecycle.current` which is settled by the turn/completed,
+    // turn/interrupted, error notification handlers, or the turn-loop catch
+    // block on RPC failure.
+    //
+    // Protocol invariant: `turnLifecycle.finish` is the SINGLE EXIT for the
+    // pending state. Every transition (success, interrupt, error notification,
+    // RPC failure) must go through it. See `utils/turnLifecycle.ts` for the
+    // state-machine contract; covered by `turnLifecycle.test.ts`.
+    const turnLifecycle = createTurnLifecycle();
 
-    function beginPendingTurn(): void {
-        pendingTurnPromise = new Promise<void>((resolve, reject) => {
-            resolvePendingTurn = resolve;
-            rejectPendingTurn = reject;
-        });
-    }
+    // /compact + /clear orchestrator. Reads the rollout for the current thread,
+    // builds a local heuristic seed (compact mode only), then resets thread
+    // state so the next turn allocates a fresh codex conversation. The seed is
+    // stashed in `compactState.pendingSeedText` and prepended at the next `turn/start`.
+    async function runManualCompact(
+        mode: 'compact' | 'clear',
+        autoTriggered: boolean = false,
+    ): Promise<void> {
+        // User-facing label: "本地压缩" when triggered programmatically,
+        // "/compact" when typed by the user. Hides internal triggering mechanism
+        // from the user-visible status messages.
+        const compactLabel = autoTriggered ? '本地压缩' : '/compact';
+        const opLabel = mode === 'compact' ? compactLabel : '/clear';
 
-    function finishPendingTurn(error?: Error): void {
-        if (error && rejectPendingTurn) {
-            rejectPendingTurn(error);
-        } else if (resolvePendingTurn) {
-            resolvePendingTurn();
+        if (compactInFlight) {
+            session.sendSessionEvent({
+                type: 'message',
+                message: `⚠️ ${opLabel} 进行中`,
+            });
+            session.sendSessionEvent({ type: 'ready' });
+            return;
         }
-        resolvePendingTurn = null;
-        rejectPendingTurn = null;
-        pendingTurnPromise = null;
+        if (!client) {
+            session.sendSessionEvent({
+                type: 'message',
+                message: `ℹ️ ${opLabel} 暂不可用`,
+            });
+            session.sendSessionEvent({ type: 'ready' });
+            return;
+        }
+        const previousThreadId = threadId;
+        if (!previousThreadId) {
+            session.sendSessionEvent({
+                type: 'message',
+                message: `ℹ️ ${opLabel}：当前无对话`,
+            });
+            session.sendSessionEvent({ type: 'ready' });
+            return;
+        }
+
+        compactInFlight = true;
+        try {
+            // If a turn is in flight, wait for it to settle before swapping
+            // threads — interrupting mid-stream loses partial output, while
+            // waiting yields a clean handoff.
+            //
+            // No timeout here: the turn-lifecycle state machine guarantees
+            // every terminal signal (turn/completed, turn/interrupted, error
+            // notification, RPC failure) routes through `turnLifecycle.finish`,
+            // so the promise can never hang. `.catch` swallows reject because
+            // we only need the "settled" signal — the actual error has already
+            // been surfaced via the session event stream.
+            const pending = turnLifecycle.current;
+            if (pending) {
+                await pending.catch(() => {});
+            }
+
+            let seedText: string | null = null;
+            let seedStats: Awaited<ReturnType<typeof buildHeuristicSeed>>['stats'] | null = null;
+
+            if (mode === 'compact') {
+                // Emit the protocol-level "Compaction started" string. happy-app
+                // renders this verbatim and it's the standard ack contract used
+                // by Claude (`claudeRemote.ts:118`).
+                session.sendSessionEvent({ type: 'message', message: 'Compaction started' });
+
+                const sessionsRoot = getDefaultCodexSessionsRoot();
+                const rolloutPath = await findRolloutByConversationId(sessionsRoot, previousThreadId);
+                if (!rolloutPath) {
+                    session.sendSessionEvent({
+                        type: 'message',
+                        message: `⚠️ ${compactLabel} 失败：会话历史不存在`,
+                    });
+                    session.sendSessionEvent({ type: 'ready' });
+                    return;
+                }
+                const built = await buildHeuristicSeed({
+                    rolloutPath,
+                    trailerNote: '请基于以上摘要继续。',
+                });
+                seedText = built.seedText;
+                seedStats = built.stats;
+                logger.debug(`[CodexAppServer] ${autoTriggered ? '[auto] ' : ''}/compact seed built: rollout=${rolloutPath} stats=${JSON.stringify(seedStats)} chars=${seedText.length}`);
+            }
+
+            // Reset thread state. The turn loop's `if (!threadId)` branch will
+            // call `thread/start` next iteration, allocating a fresh codex
+            // conversation. Clearing `threadIdStored` lets the notification
+            // handler refresh happy session metadata with the new threadId.
+            threadId = null;
+            threadIdStored = false;
+            opts.codexSessionId = undefined;
+            compactState.pendingSeedText = seedText;
+            logger.debug(`[CodexAppServer] ${autoTriggered ? '[auto] ' : ''}/${mode} completed`);
+
+            // Protocol-level completion event. happy-app reducer matches these
+            // exact strings (`Compaction completed` / `Context was reset`) to
+            // reset contextSize → the in-app context-usage bar drops to zero,
+            // matching the Claude /compact UX.
+            const completionMessage = mode === 'compact' ? 'Compaction completed' : 'Context was reset';
+            session.sendSessionEvent({ type: 'message', message: completionMessage });
+            session.sendSessionEvent({ type: 'ready' });
+        } finally {
+            compactInFlight = false;
+        }
     }
+
     let shouldExit = false;
 
     session.keepAlive(thinking, 'remote');
@@ -724,13 +856,30 @@ export async function runCodexWithAppServer(opts: {
         c.registerNotificationHandler('turn/completed', (params) => {
             const updates = bridge.onNotification('turn/completed', params);
             processBridgeUpdates(updates);
-            finishPendingTurn();
+            // Stale notification guard: a delayed turn/completed for a turn we
+            // already moved past (e.g. after /compact swap to a fresh
+            // threadId) must not settle the NEW turn's promise. The bridge
+            // still gets the update for protocol bookkeeping; only the
+            // lifecycle and activeTurnId are guarded.
+            const notifTurnId = readTurnId(params);
+            if (notifTurnId && activeTurnId && notifTurnId !== activeTurnId) {
+                logger.debug(`[CodexAppServer] Ignoring stale turn/completed turnId=${notifTurnId} (active=${activeTurnId})`);
+                return;
+            }
+            activeTurnId = null;
+            turnLifecycle.finish();
         });
 
         c.registerNotificationHandler('turn/interrupted', (params) => {
             const updates = bridge.onNotification('turn/interrupted', params);
             processBridgeUpdates(updates);
-            finishPendingTurn();
+            const notifTurnId = readTurnId(params);
+            if (notifTurnId && activeTurnId && notifTurnId !== activeTurnId) {
+                logger.debug(`[CodexAppServer] Ignoring stale turn/interrupted turnId=${notifTurnId} (active=${activeTurnId})`);
+                return;
+            }
+            activeTurnId = null;
+            turnLifecycle.finish();
         });
 
         c.registerNotificationHandler('item/agentMessage/delta', (params) => {
@@ -768,6 +917,36 @@ export async function runCodexWithAppServer(opts: {
         c.registerNotificationHandler('error', (params) => {
             const record = params as Record<string, unknown> | null;
             if (record && record.willRetry === true) return; // transient, codex will retry
+
+            // Turn state-machine exit: a non-retryable error notification means
+            // the current turn is dead. Settle the pending promise (resolve,
+            // not reject — the error already flows through the session event
+            // stream below; the promise channel only signals "settled"). This
+            // closes the fourth state-machine exit so callers awaiting
+            // `turnLifecycle.current` never hang.
+            //
+            // Stale notification guard (parity with turn/completed and
+            // turn/interrupted handlers): if a delayed error for a turn we've
+            // already moved past arrives after a new turn has begun, ignore
+            // it — settling the new turn's promise on stale data would
+            // unblock the turn loop prematurely.
+            //
+            // We do NOT clear `activeTurnId` here — codex may still emit a
+            // `turn/interrupted` notification afterwards, and the existing
+            // handler at the turn/interrupted registration is the right place
+            // to clean that up. Clearing it eagerly would break the user's
+            // Ctrl-C interrupt path, which checks `activeTurnId` before
+            // sending the `turn/interrupt` RPC.
+            const errorTurnId = readTurnId(params);
+            if (errorTurnId && activeTurnId && errorTurnId !== activeTurnId) {
+                logger.debug(`[CodexAppServer] Ignoring stale error turnId=${errorTurnId} (active=${activeTurnId})`);
+                // Still surface the error message to the user below — the
+                // stale guard only blocks lifecycle settling, not user-visible
+                // error reporting.
+            } else {
+                turnLifecycle.finish();
+            }
+
             logger.warn('[CodexAppServer] Codex error notification:', params);
             session.sendSessionEvent({
                 type: 'message',
@@ -1012,11 +1191,21 @@ export async function runCodexWithAppServer(opts: {
                 // completes asynchronously via turn/completed notification. Set up
                 // the pending-turn promise BEFORE sending the RPC so we don't miss
                 // notifications that arrive before the await.
-                beginPendingTurn();
+                turnLifecycle.begin();
                 const injectSystemPrompt = needsSystemPromptInjection;
-                const turnInputText = injectSystemPrompt
-                    ? `${systemPrompt}\n\n${message.message}`
-                    : message.message;
+                // /compact stashes a heuristic seed in compactState after
+                // allocating a fresh thread. Prepend it to the user's prompt
+                // exactly once, then clear so subsequent turns are unaffected.
+                let turnInputText = message.message;
+                if (injectSystemPrompt) {
+                    turnInputText = `${systemPrompt}\n\n${turnInputText}`;
+                }
+                const seed = compactState.pendingSeedText;
+                if (seed !== null && seed.length > 0) {
+                    turnInputText = `${seed}\n\n${turnInputText}`;
+                    compactState.pendingSeedText = null;
+                    logger.debug(`[CodexAppServer] Injecting compact seed (${seed.length} chars) into next turn`);
+                }
                 const turnResponse = await client.request('turn/start', {
                     threadId,
                     input: [{ type: 'text', text: turnInputText }],
@@ -1030,16 +1219,22 @@ export async function runCodexWithAppServer(opts: {
                 logger.debug('[CodexAppServer] turn/start RPC returned:', JSON.stringify(turnResponse).substring(0, 200));
 
                 // Wait for the real turn completion (turn/completed notification).
-                if (pendingTurnPromise) {
-                    await pendingTurnPromise;
+                // The turn-lifecycle state machine guarantees this settles via
+                // one of: turn/completed, turn/interrupted, error notification,
+                // or this catch block on RPC failure. Error notifications
+                // resolve (not reject), so this await only throws when the
+                // surrounding RPC itself failed — the catch below handles it.
+                const pending = turnLifecycle.current;
+                if (pending) {
+                    await pending;
                 }
                 logger.debug('[CodexAppServer] Turn fully completed');
             } catch (error) {
                 logger.warn('[CodexAppServer] Error in app-server session:', error);
-                // Clean up any pending turn promise to avoid leaks
-                if (pendingTurnPromise) {
-                    finishPendingTurn(error instanceof Error ? error : new Error(String(error)));
-                }
+                // Settle the pending promise on RPC failure (the only path that
+                // legitimately rejects). Idempotent if it was already settled
+                // by an error notification handler that beat us here.
+                turnLifecycle.finish(error instanceof Error ? error : new Error(String(error)));
                 const errorMessage = error instanceof Error ? error.message : String(error);
 
                 if (errorMessage.includes('disposed') || errorMessage.includes('exited')) {
