@@ -58,7 +58,7 @@ import {
 import { parseSpecialCommand } from '@/parsers/specialCommands';
 import { findRolloutByConversationId, getDefaultCodexSessionsRoot } from './utils/rolloutDiscovery';
 import { buildHeuristicSeed } from './utils/compactSeedBuilder';
-import { compactViaCodexExec, renderCompactionResultMessage, wrapL2SeedAsHeuristicSeed } from './utils/codexExecCompact';
+import { compactViaCodexExec, wrapL2SeedAsHeuristicSeed } from './utils/codexExecCompact';
 import { shouldAutoRescue, createRescueGate } from './utils/codexAutoRescue';
 import { createTurnLifecycle } from './utils/turnLifecycle';
 
@@ -546,21 +546,15 @@ export async function runCodexWithAppServer(opts: {
                     );
                 }
 
-                // User-initiated /compact only: emit a visible summary
-                // message between the protocol "Compaction started" /
-                // "Compaction completed" events. This aligns with Claude
-                // Code's /compact UX (`claudeRemote.ts:241-247`) where the
-                // SDK streams the assistant's compaction summary as a
-                // normal chat message in that window.
-                //
-                // Auto-compact (`autoTriggered`) stays silent on purpose:
-                // it fires when context fills up mid-conversation, and a
-                // wall-of-text summary message dropped into the user's
-                // flow would be more disruptive than informative.
-                if (!autoTriggered) {
-                    const visibleSummary = renderCompactionResultMessage(l2, seedText.length);
-                    session.sendSessionEvent({ type: 'message', message: visibleSummary });
-                }
+                // No visible summary surfaced to the chat. Tried several
+                // envelopes (sendSessionEvent / sendCodexMessage /
+                // sendClaudeSessionMessage with type:'summary') — each had
+                // either wrong styling or a metadata side effect that
+                // contaminated the session title. Until happy-app exposes
+                // a codex-specific visible-summary block, we keep the
+                // legacy behavior: the protocol-level "Compaction started"
+                // / "Compaction completed" banners are enough signalling.
+                // The seed itself is still injected on the next turn.
             }
 
             // Reset thread state. The turn loop's `if (!threadId)` branch will
