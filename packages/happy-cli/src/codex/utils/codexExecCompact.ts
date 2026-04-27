@@ -170,6 +170,9 @@ export async function compactViaCodexExec(
             env,
             stdio: ['pipe', 'pipe', 'pipe'],
             windowsVerbatimArguments: winSpawn.windowsVerbatimArguments,
+            // Without this, `cmd.exe /d /s /c codex ...` flashes a black
+            // console window on every /compact (cf. AcpBackend.ts:396).
+            windowsHide: true,
         });
     } catch (err) {
         const elapsedMs = Date.now() - startMs;
