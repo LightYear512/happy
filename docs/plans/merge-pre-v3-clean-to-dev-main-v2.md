@@ -259,18 +259,18 @@ Prisma schema 还增加了 `driverAdapters` preview feature（为 PGLite 支持�
 
 | 提交 | PR 价值 | 状态 | 理由 |
 |------|---------|------|------|
-| `26a2f3ed` MCP proxy bypass | ✅ **推荐提 PR** | ✅ 已打磨 | upstream 无此修复，企业代理环境普遍受影响 |
+| `26a2f3ed` MCP proxy bypass | ✅ **推荐提 PR** | ✅ 已推送 | upstream 无此修复，企业代理环境普遍受影响 |
 | `02f31206` outbox flush fix | ✅ **推荐提 PR** | ⏳ 待打磨 | upstream `5a08be71` 有 data loss 风险，我们的修复更安全 |
 | `54494c38` McpServer per-request | ❌ 不需要 | — | upstream `0fd4112f` 已有等价修复 |
 
-### `26a2f3ed` MCP proxy bypass — ✅ PR 已就绪
+### `26a2f3ed` MCP proxy bypass — ✅ PR 已推送
 
 分支：`pr/mcp-proxy-bypass-upstream`（基于 `upstream/main`，commit `1b00de58`）
 - ✅ 剥离 happy-specific 路径引用（改为相对路径 `./utils/proxyBypass`）
 - ✅ 补充 10 个单元测试（含 IPv6 `::1` 覆盖）
 - ✅ `{ ...process.env }` 按需展开（仅在有 MCP servers 时）
 - ✅ commit message 强调企业代理环境影响面
-- ⏳ 待推送到 origin 并通过 `gh pr create` 提交
+- ✅ 已推送到 origin（2026-04-28 确认）
 
 详细打磨方案见 `docs/plans/pr-mcp-proxy-bypass.md`
 

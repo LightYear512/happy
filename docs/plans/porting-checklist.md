@@ -221,16 +221,19 @@ const msg = Array.isArray(result.message) ? result.message.join('\n') : result.m
 
 ---
 
-### Step 4：`!sessions` / `!resume` 命令（依赖 Step 3）
+### Step 4：~~`!sessions` / `!resume` 命令~~ ❌ 故意跳过
 
-依赖 `agent.key` 存在后实现：
-
-```
-!sessions      → GET /v1/sessions（用 agent.key 解密 metadata）→ 列出所有 session
-!resume <id>   → 解密 metadata → RPC resume-happy-session
-```
-
-参考：`packages/happy-cli/src/resume/resolveHappySession.ts`（upstream 已有）。
+> 状态：**不实现**（2026-04-28 确认）
+>
+> 改用顶层 CLI 命令 `happy resume <id>` 实现等价能力。bang 命令形式不再需要。
+>
+> 当前已具备的等价路径：
+> - `packages/happy-cli/src/index.ts:105` 注册 `happy resume <id>` 子命令
+> - `packages/happy-cli/src/resume/handleResumeCommand.ts` 实现 `parseResumeCommandArgs` + `buildResumeLaunch`
+> - `packages/happy-cli/src/resume/resolveHappySession.ts` 实现 `GET /v1/sessions` + 用 `agent.key` 解密 metadata + prefix 匹配
+> - `packages/happy-cli/src/api/apiMachine.ts:180` 注册 `resume-happy-session` RPC
+>
+> 用户可直接 `happy resume <session-id-prefix>` 触发恢复。无需在 bang dispatcher 中暴露 `!sessions` / `!resume`。
 
 ---
 
@@ -266,10 +269,10 @@ git show origin/compat/pre-v3-clean -- packages/happy-cli/src/daemon/run.ts | gr
 ## 执行顺序总结
 
 ```
-Step 1：Resume 去重（~2h）
+Step 1：Resume 去重（~2h）              ✅ 已完成
   └─ 1a types.ts + 1b run.ts + 1c controlServer.ts + 1d apiMachine.ts
 
-Step 2：BangCommand 体系（~3h）
+Step 2：BangCommand 体系（~3h）          ✅ 已完成
   └─ 2a configuration.ts
   └─ 2b types.ts
   └─ 2c restartCommand.ts（新建）
@@ -278,7 +281,7 @@ Step 2：BangCommand 体系（~3h）
 
 ---- 方案β 专项（独立 sprint）----
 
-Step 3：agent auth in CLI（~4h）
-Step 4：!sessions / !resume（~2h，依赖 Step 3）
-Step 5：killProcessTree（~1h，随时可做）
+Step 3：agent auth in CLI（~4h）         ✅ 已完成
+Step 4：!sessions / !resume              ❌ 故意跳过（用顶层 happy resume <id> 替代）
+Step 5：killProcessTree（~1h）           ✅ 已完成（utils/processKill.ts）
 ```
