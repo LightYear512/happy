@@ -80,8 +80,10 @@ function parseArgs() {
         return i !== -1 && args[i + 1] ? args[i + 1] : dflt;
     };
     return {
-        message: get('--message', `three-tier-smoke ${new Date().toISOString()}`),
-        timeoutMs: parseInt(get('--timeout', '60000'), 10),
+        // Keep the prompt minimal so LLM finishes fast.
+        message: get('--message', 'reply with the single word: ok'),
+        // Default 90s — comfortably covers LLM round trip + outbox ack.
+        timeoutMs: parseInt(get('--timeout', '90000'), 10),
         keepBrowser: args.includes('--keep-browser'),
     };
 }
@@ -117,6 +119,15 @@ function findLatestDaemonLog(happyHomeDir) {
     return path.join(logsDir, files[files.length - 1]);
 }
 
+function findCliSessionLog(happyHomeDir, pid) {
+    const logsDir = path.join(happyHomeDir, 'logs');
+    if (!fs.existsSync(logsDir)) return null;
+    const files = fs.readdirSync(logsDir)
+        .filter(f => f.endsWith(`-pid-${pid}.log`) && !f.endsWith('-daemon.log'));
+    if (files.length === 0) return null;
+    return path.join(logsDir, files[files.length - 1]);
+}
+
 function readLogTail(logPath, fromOffset) {
     const sizeNow = fs.statSync(logPath).size;
     if (sizeNow <= fromOffset) return '';
@@ -128,6 +139,10 @@ function readLogTail(logPath, fromOffset) {
     } finally {
         fs.closeSync(fd);
     }
+}
+
+function readWholeLog(logPath) {
+    return fs.readFileSync(logPath, 'utf-8');
 }
 
 // ============================================================================
@@ -230,17 +245,58 @@ function readLogTail(logPath, fromOffset) {
         const spawnDeadline = startedAt + args.timeoutMs;
         let spawnSeen = false;
         let daemonDelta = '';
+        let cliPid = null;
         while (Date.now() < spawnDeadline) {
             if (daemonLog) {
                 daemonDelta = readLogTail(daemonLog, daemonLogOffsetBefore);
                 if (/spawn-happy-session/.test(daemonDelta) && /Spawning session/.test(daemonDelta)) {
                     spawnSeen = true;
+                    const pidMatch = daemonDelta.match(/Spawned process with PID (\d+)/);
+                    if (pidMatch) cliPid = parseInt(pidMatch[1], 10);
                     break;
                 }
             }
             await new Promise(r => setTimeout(r, 500));
         }
-        pushEvt('daemon_spawn', { spawnSeen, deltaBytes: daemonDelta.length });
+        pushEvt('daemon_spawn', { spawnSeen, deltaBytes: daemonDelta.length, cliPid });
+
+        // CLI-side assertions: turn completion + outbox flush.
+        // These look inside the spawned CLI process's own log (not the daemon log)
+        // and prove the LLM call returned + ack pipeline back to server worked.
+        // No API key needed if the host already has Claude Code OAuth (Keychain or
+        // ~/.claude/credentials.json); CI without that will surface here as the
+        // expected failure.
+        let turnEndSeen = false;
+        let flushOutboxSeen = false;
+        let lastSeq = null;
+        let cliLogPath = null;
+        if (cliPid && spawnSeen) {
+            pushEvt('wait_for_cli_completion', { cliPid });
+            const cliDeadline = startedAt + args.timeoutMs;
+            // Allow the CLI session log to appear (it's created shortly after spawn).
+            while (Date.now() < cliDeadline) {
+                cliLogPath = findCliSessionLog(snap.happyHomeDir, cliPid);
+                if (cliLogPath) break;
+                await new Promise(r => setTimeout(r, 300));
+            }
+            if (cliLogPath) {
+                while (Date.now() < cliDeadline) {
+                    const content = readWholeLog(cliLogPath);
+                    // turn-end JSON event: { "t": "turn-end", "status": "completed" }
+                    if (/"t":\s*"turn-end"[\s\S]{0,300}"status":\s*"completed"/.test(content)) {
+                        turnEndSeen = true;
+                    }
+                    const flushMatch = content.match(/flushOutbox: success,?\s*\d+\s+messages?\s+acknowledged,?\s*lastSeq=(\d+)/);
+                    if (flushMatch) {
+                        flushOutboxSeen = true;
+                        lastSeq = parseInt(flushMatch[1], 10);
+                    }
+                    if (turnEndSeen && flushOutboxSeen) break;
+                    await new Promise(r => setTimeout(r, 500));
+                }
+            }
+            pushEvt('cli_completion', { turnEndSeen, flushOutboxSeen, lastSeq, cliLogPath });
+        }
 
         // Assertions.
         // We assert the POST was *issued* rather than the 200 response
@@ -256,6 +312,8 @@ function readLogTail(logPath, fromOffset) {
             session_route_matched: hasSessionId,
             message_post_issued: hasMessagePost,
             daemon_spawn_seen: spawnSeen,
+            cli_turn_completed: turnEndSeen,
+            cli_outbox_flushed: flushOutboxSeen,
         };
         const allPass = Object.values(assertions).every(Boolean);
 
@@ -273,6 +331,9 @@ function readLogTail(logPath, fromOffset) {
                         .map(pth => [pth, serverPosts.filter(p => new URL(p.url).pathname === pth).length])
                 ),
                 daemonDeltaBytes: daemonDelta.length,
+                cliPid,
+                cliLogPath,
+                lastSeq,
             },
             timeline: events,
             envSnapshot: {
