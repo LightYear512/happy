@@ -382,7 +382,13 @@ export async function startEnvironmentServices(name: string): Promise<void> {
     writePidFile(envDir, "web", webPid);
 
     try {
-        await waitFor(() => isPortInUse(config.expoPort), 30_000, "web");
+        // Two signals (port-bound OR Metro printed a ready marker), 90s budget.
+        // Metro often emits readiness in stdout before the port accepts connections.
+        await waitFor(async () => {
+            if (isPortInUse(config.expoPort)) return true;
+            const log = await fs.promises.readFile(webLogFile, "utf-8").catch(() => "");
+            return /Waiting on http:|Logs for your project|Web is waiting on|Metro waiting|Bundled \d+ms/i.test(log);
+        }, 90_000, "web", 1_000);
     } catch {
         throw new Error(`Web failed to start. Check logs: ${webLogFile}`);
     }
@@ -611,19 +617,93 @@ function commandRemove(name: string) {
     console.log(`Removed environment: ${name}`);
 }
 
-function commandCurrent() {
+function buildCurrentSnapshot(name: string): Record<string, unknown> {
+    const envDir = path.join(ENVIRONMENTS_DIR, name);
+    const config = readEnvironmentConfig(name);
+    const happyHomeDir = path.join(envDir, "cli", "home");
+    const accessKeyPath = path.join(happyHomeDir, "access.key");
+    const daemonStatePath = path.join(happyHomeDir, "daemon.state.json");
+    const serverUrl = `http://localhost:${config.serverPort}`;
+    const webUrl = `http://localhost:${config.expoPort}`;
+
+    let token: string | null = null;
+    let secret: string | null = null;
+    if (fs.existsSync(accessKeyPath)) {
+        try {
+            const ak = JSON.parse(fs.readFileSync(accessKeyPath, "utf-8"));
+            token = ak.token ?? null;
+            secret = ak.secret ?? null;
+        } catch {}
+    }
+
+    let daemonPid: number | null = null;
+    if (fs.existsSync(daemonStatePath)) {
+        try {
+            const ds = JSON.parse(fs.readFileSync(daemonStatePath, "utf-8"));
+            if (typeof ds.pid === "number") daemonPid = ds.pid;
+        } catch {}
+    }
+
+    const serverAlive = isPortInUse(config.serverPort);
+    const webAlive = isPortInUse(config.expoPort);
+    const daemonAlive = daemonPid !== null && isProcessAlive(daemonPid);
+
+    return {
+        name,
+        envDir,
+        envShPath: path.join(envDir, "env.sh"),
+        serverPort: config.serverPort,
+        expoPort: config.expoPort,
+        serverUrl,
+        webUrl,
+        authenticatedWebUrl: config.authenticatedWebUrl ?? null,
+        happyHomeDir,
+        happyProjectDir: config.projectPath,
+        token,
+        secret,
+        daemon: { pid: daemonPid, alive: daemonAlive },
+        health: {
+            server: serverAlive ? "ok" : "down",
+            web: webAlive ? "ok" : "down",
+            daemon: daemonAlive ? "ok" : "down",
+            authenticated: !!config.authenticatedWebUrl && !!token,
+        },
+        logs: {
+            server: path.join(envDir, "server", "stdout.log"),
+            web: path.join(envDir, "web", "stdout.log"),
+            daemonDir: path.join(happyHomeDir, "logs"),
+        },
+    };
+}
+
+function commandCurrent(args: string[] = []) {
+    const wantJson = args.includes("--json");
     const currentConfig = readCurrentConfig();
     if (!currentConfig?.current) {
+        if (wantJson) {
+            console.log(JSON.stringify({ ok: false, error: "no_current_environment" }));
+            process.exit(1);
+        }
         console.error("No current environment. Run `yarn env:new` or `yarn env:use <name>`.");
         process.exit(1);
     }
     const envShPath = path.join(ENVIRONMENTS_DIR, currentConfig.current, "env.sh");
     if (!fs.existsSync(envShPath)) {
+        if (wantJson) {
+            console.log(JSON.stringify({ ok: false, error: "environment_missing", name: currentConfig.current }));
+            process.exit(1);
+        }
         console.error(`Current environment "${currentConfig.current}" is missing. Run \`yarn env:new\`.`);
         process.exit(1);
     }
-    console.log(envShPath);
 
+    if (wantJson) {
+        const snapshot = buildCurrentSnapshot(currentConfig.current);
+        console.log(JSON.stringify({ ok: true, ...snapshot }, null, 2));
+        return;
+    }
+
+    console.log(envShPath);
     const config = readEnvironmentConfig(currentConfig.current);
     const webAppUrl = config.authenticatedWebUrl ?? `http://localhost:${config.expoPort}`;
     console.log(`\nServer:  http://localhost:${config.serverPort}`);
@@ -1004,7 +1084,7 @@ async function main(): Promise<void> {
             commandRemove(args[0]);
             break;
         case "current":
-            commandCurrent();
+            commandCurrent(args);
             break;
         case "run":
             if (!args[0]) {
