@@ -186,6 +186,18 @@ happy-app 全仓 0 个 testID，必须用文本/属性定位。**以下 selector
 
 ## 7. 标准联调流程（端到端）
 
+### 7.1 一键 smoke（推荐）
+
+```bash
+yarn env:up:authenticated
+yarn scenario:three-tier-smoke
+yarn env:down
+```
+
+`yarn scenario:three-tier-smoke` 会全自动跑完一遍：navigate → click 「开始新会话」→ 填消息 → cmd+enter 提交 → 等 `/session/<id>` 路由 → 等 daemon log 出现 `Spawning session`。输出结构化 PASS/FAIL JSON（exit code 0/1），适合 CI 或日常回归。
+
+### 7.2 手动逐步联调
+
 ```
 1. yarn env:up:authenticated
 2. SNAP=$(yarn env:current --json)            # 拿凭据
@@ -193,17 +205,25 @@ happy-app 全仓 0 个 testID，必须用文本/属性定位。**以下 selector
 4. 用 puppeteer/Playwright 打开 SNAP.authenticatedWebUrl
 5. wait for text "已连接"                      # daemon 联通
 6. 主界面 click "开始新会话"                   # URL → /new
-7. 在 textarea 输入消息，提交
+7. 在 textarea 输入消息，cmd+enter 提交        # URL → /session/<cuid>
 8. 监听三处信号：
-   - daemon log（spawn 记录）
-   - server API（session list 出现新条目）
-   - web DOM（assistant 消息渲染）
+   - daemon log（grep `spawn-happy-session` 和 `Spawning session`）
+   - server API（GET /v1/sessions 出现新条目）
+   - web DOM（assistant 消息渲染，依赖本地 Claude 认证）
 9. 验证完成 → yarn env:down
 ```
 
 ---
 
-## 8. 已知限制 / 未来改进
+## 8. Prerequisites（首次运行）
+
+| 依赖 | 用途 | 安装方式 |
+|------|------|---------|
+| `puppeteer` | 浏览器自动化（fixture + 探针）| `npm install --no-save puppeteer`（在仓库根，**不会污染 yarn.lock**），首次会下载 ~150 MB chromium 到本地 cache |
+| Claude Code 本地认证 | CLI session 调 Claude SDK 时使用 | 已装 `claude` CLI 并完成登录的开发机即可。CI / Docker 环境需注入 `ANTHROPIC_API_KEY` 或 mount `~/.claude/credentials.json`。**注**：fixture 不断言 assistant 真实回复，仅断言 daemon spawn + 消息接受，所以 fixture **不依赖** Claude 认证 |
+| `yarn env:up:authenticated` 必须先跑过 | fixture 不会自己起停环境，便于反复重试 | `yarn env:up:authenticated`（首次 ~90s） |
+
+## 9. 已知限制 / 未来改进
 
 | 项 | 当前状态 | 备注 |
 |----|---------|------|
@@ -215,18 +235,19 @@ happy-app 全仓 0 个 testID，必须用文本/属性定位。**以下 selector
 
 ---
 
-## 9. 修复记录
+## 10. 修复记录
 
-- **environments.ts web 启动 30s → 90s**（2026-04-28）：原 30s 在冷启动 Metro 时必失败（vitest integration suite 实测）。改为 **端口或日志双信号 + 90s 预算**。已实测：`yarn env:up:authenticated` 总耗时 91.75s 通过。
+- **environments.ts web 启动 30s → 90s**（2026-04-28）：原 30s 在冷启动 Metro 时必失败（vitest integration suite 实测）。改为 **端口或日志双信号 + 90s 预算**。已实测：`yarn env:up:authenticated` 总耗时 79~92s 通过。
 - **environments.ts 加 `current --json`**（2026-04-28）：补凭据 + health 一步到位机读出口。
+- **environments/scenarios/three-tier-smoke.cjs**（2026-04-28）：可重放端到端 smoke fixture，断言 session 路由 + 消息 POST + daemon spawn。
 
-## 10. 参考产出物
+## 11. 参考产出物
 
 | 文件 | 用途 |
 |------|------|
-| `/tmp/happy-web-probe/probe.js` | 主界面 DOM 探针 |
-| `/tmp/happy-web-probe/click-new-session.js` | 点击 + 路由 + 网络探针 |
-| `/tmp/happy-web-probe/out/snapshot.json` | 主界面 selector 候选清单 |
-| `/tmp/happy-web-probe/out2/summary.json` | 点击后 URL/composer/网络抓包证据 |
+| `environments/scenarios/three-tier-smoke.cjs` | **可重放 fixture** — 端到端 smoke，结构化 JSON 输出 |
+| `/tmp/happy-web-probe/probe.js` | （研发期） 主界面 DOM 探针 |
+| `/tmp/happy-web-probe/click-new-session.js` | （研发期） 点击 + 路由探针 |
+| `/tmp/happy-web-probe/send-message.js` | （研发期） 完整发消息探针，输出 daemon log delta |
 | `docs/plans/merge-pre-v3-clean-to-dev-main-v2.md` | 上游 / 移植策略 |
 | `docs/plans/porting-checklist.md` | 移植步骤清单 |
