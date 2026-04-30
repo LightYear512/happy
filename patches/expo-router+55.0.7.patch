@@ -1,0 +1,111 @@
+diff --git a/node_modules/expo-router/ios/Toolbar/RouterToolbarHostView.swift b/node_modules/expo-router/ios/Toolbar/RouterToolbarHostView.swift
+index 3b2a9ad..be4b855 100644
+--- a/node_modules/expo-router/ios/Toolbar/RouterToolbarHostView.swift
++++ b/node_modules/expo-router/ios/Toolbar/RouterToolbarHostView.swift
+@@ -80,14 +80,16 @@ class RouterToolbarHostView: RouterViewWithLogger, LinkPreviewMenuUpdatable {
+             )
+             // Otherwise, the menu items will be reversed in the toolbar
+             item.preferredMenuElementOrder = .fixed
+-            if #available(iOS 26.0, *) {
+-              if let hidesSharedBackground = menu.hidesSharedBackground {
+-                item.hidesSharedBackground = hidesSharedBackground
+-              }
+-              if let sharesBackground = menu.sharesBackground {
+-                item.sharesBackground = sharesBackground
+-              }
+-            }
++            // Patched: iOS 26+ APIs (hidesSharedBackground/sharesBackground)
++            // not present in Xcode 16.4 iOS 18.5 SDK.
++            // if #available(iOS 26.0, *) {
++            //   if let hidesSharedBackground = menu.hidesSharedBackground {
++            //     item.hidesSharedBackground = hidesSharedBackground
++            //   }
++            //   if let sharesBackground = menu.sharesBackground {
++            //     item.sharesBackground = sharesBackground
++            //   }
++            // }
+             if let titleStyle = menu.titleStyle {
+               RouterFontUtils.setTitleStyle(fromConfig: titleStyle, for: item)
+             }
+diff --git a/node_modules/expo-router/ios/Toolbar/RouterToolbarItemView.swift b/node_modules/expo-router/ios/Toolbar/RouterToolbarItemView.swift
+index 47936de..f20f9c2 100644
+--- a/node_modules/expo-router/ios/Toolbar/RouterToolbarItemView.swift
++++ b/node_modules/expo-router/ios/Toolbar/RouterToolbarItemView.swift
+@@ -113,7 +113,8 @@ class RouterToolbarItemView: RouterViewWithLogger {
+         return
+       }
+ 
+-      item = controller.navigationItem.searchBarPlacementBarButtonItem
++      // Patched: searchBarPlacementBarButtonItem is iOS 26+. Fallback to a fresh item.
++      item = UIBarButtonItem()
+     } else {
+       // Normal button - apply content properties during initial creation
+       applyContentProperties(to: item)
+@@ -160,43 +161,18 @@ class RouterToolbarItemView: RouterViewWithLogger {
+   }
+ 
+   private func applyCommonProperties(to item: UIBarButtonItem) {
+-    if #available(iOS 26.0, *) {
+-      item.hidesSharedBackground = hidesSharedBackground
+-      item.sharesBackground = sharesBackground
+-    }
++    // Patched: hidesSharedBackground/sharesBackground/badge are iOS 26+ APIs.
++    // if #available(iOS 26.0, *) {
++    //   item.hidesSharedBackground = hidesSharedBackground
++    //   item.sharesBackground = sharesBackground
++    // }
+     item.style = barButtonItemStyle ?? .plain
+     item.width = width.map { CGFloat($0) } ?? 0
+     item.isSelected = selected
+     item.accessibilityLabel = routerAccessibilityLabel
+     item.accessibilityHint = routerAccessibilityHint
+     item.isEnabled = !disabled
+-    if #available(iOS 26.0, *) {
+-      if let badgeConfig = badgeConfiguration {
+-        var badge = UIBarButtonItem.Badge.indicator()
+-        if let value = badgeConfig.value {
+-          badge = .string(value)
+-        }
+-        if let backgroundColor = badgeConfig.backgroundColor {
+-          badge.backgroundColor = backgroundColor
+-        }
+-        if let foregroundColor = badgeConfig.color {
+-          badge.foregroundColor = foregroundColor
+-        }
+-        if badgeConfig.fontFamily != nil || badgeConfig.fontSize != nil
+-          || badgeConfig.fontWeight != nil {
+-          let font = RouterFontUtils.convertTitleStyleToFont(
+-            TitleStyle(
+-              fontFamily: badgeConfig.fontFamily,
+-              fontSize: badgeConfig.fontSize,
+-              fontWeight: badgeConfig.fontWeight
+-            ))
+-          badge.font = font
+-        }
+-        item.badge = badge
+-      } else {
+-        item.badge = nil
+-      }
+-    }
++    // Patched: UIBarButtonItem.Badge is iOS 26+ API.
+   }
+ 
+   required init(appContext: AppContext? = nil) {
+diff --git a/node_modules/expo-router/ios/Toolbar/RouterToolbarModule.swift b/node_modules/expo-router/ios/Toolbar/RouterToolbarModule.swift
+index 1bee03c..f92c6cc 100644
+--- a/node_modules/expo-router/ios/Toolbar/RouterToolbarModule.swift
++++ b/node_modules/expo-router/ios/Toolbar/RouterToolbarModule.swift
+@@ -94,11 +94,8 @@ enum BarItemStyle: String, Enumerable {
+     case .plain:
+       return .plain
+     case .prominent:
+-      if #available(iOS 26.0, *) {
+-        return .prominent
+-      } else {
+-        return .done
+-      }
++      // Patched: UIBarButtonItem.Style.prominent is iOS 26+. Fall back to .done.
++      return .done
+     }
+   }
+ }

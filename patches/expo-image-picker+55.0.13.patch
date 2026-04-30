@@ -1,0 +1,29 @@
+diff --git a/node_modules/expo-image-picker/ios/MediaHandler.swift b/node_modules/expo-image-picker/ios/MediaHandler.swift
+index a0e3a44..7d735ef 100644
+--- a/node_modules/expo-image-picker/ios/MediaHandler.swift
++++ b/node_modules/expo-image-picker/ios/MediaHandler.swift
+@@ -296,20 +296,14 @@ internal struct MediaHandler {
+   }
+ 
+   private func getMimeType(from asset: PHAsset?, fileExtension: String) -> String? {
+-    let utType: UTType? = if #available(iOS 26.0, *) {
+-      asset?.contentType ?? UTType(filenameExtension: fileExtension)
+-    } else {
+-      UTType(filenameExtension: fileExtension)
+-    }
++    // Patched: PHAsset.contentType is iOS 26+. Use fileExtension fallback only.
++    let utType: UTType? = UTType(filenameExtension: fileExtension)
+     return utType?.preferredMIMEType
+   }
+ 
+   private func getMimeType(from resource: PHAssetResource, fileExtension: String) -> String? {
+-    let utType: UTType? = if #available(iOS 26.0, *) {
+-      resource.contentType
+-    } else {
+-      UTType(resource.uniformTypeIdentifier) ?? UTType(filenameExtension: fileExtension)
+-    }
++    // Patched: PHAssetResource.contentType is iOS 26+. Use uniformTypeIdentifier.
++    let utType: UTType? = UTType(resource.uniformTypeIdentifier) ?? UTType(filenameExtension: fileExtension)
+     return utType?.preferredMIMEType
+   }
+ 
