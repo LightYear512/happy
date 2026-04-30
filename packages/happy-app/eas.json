@@ -56,6 +56,16 @@
         "APP_ENV": "production",
         "SHARP_IGNORE_GLOBAL_LIBVIPS": "1"
       }
+    },
+    "simulator-test": {
+      "ios": {
+        "simulator": true
+      },
+      "node": "22.19.0",
+      "env": {
+        "APP_ENV": "development",
+        "SHARP_IGNORE_GLOBAL_LIBVIPS": "1"
+      }
     }
   },
   "submit": {
