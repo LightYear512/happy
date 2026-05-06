@@ -377,8 +377,8 @@ describe.skipIf(!claudeAvailable)('Claude Integration (SDK/query)', { timeout: 1
         expect(denied.toolUseNames).toContain('ToolSearch');
         expect(denied.toolUseNames).not.toContain('Bash');
         expect(existsSync(deniedFile)).toBe(false);
-        expect(denied.assistantText.toLowerCase()).toMatch(/cannot|can't|unable|not available|restricted|limitation/);
-        expect(denied.result?.result?.toLowerCase()).toMatch(/cannot|can't|unable|not available|restricted|limitation/);
+        expect(denied.assistantText.toLowerCase()).toMatch(/cannot|can't|unable|not available|restricted|limitation|无法|不能|无权|不可用|没有(?:权限|访问|可用)/);
+        expect(denied.result?.result?.toLowerCase()).toMatch(/cannot|can't|unable|not available|restricted|limitation|无法|不能|无权|不可用|没有(?:权限|访问|可用)/);
     });
 
     it('should stop a pending AskUserQuestion turn when the caller aborts it', async () => {
