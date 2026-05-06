@@ -129,9 +129,11 @@ npm pack
 
 Produces `{name}-{version}.tgz` (where `{name}` is read from `package.json` — do NOT hardcode the name). Verify the file exists at `packages/happy-cli/{name}-{version}.tgz`. Capture its absolute path and report its size.
 
-### Step 6: Git Commit & Tag
+### Step 6: Git Commit & Tag (skipped if --dry-run)
 
-From the **monorepo root**:
+**Skipped if --dry-run.** In dry-run mode, only print the commit message and tag name that *would* be created (`chore(release): happy-cli v{version}` and `v{version}`), then proceed to Step 9. Do NOT touch git state.
+
+In a real run, from the **monorepo root**:
 
 ```bash
 git add packages/happy-cli/package.json
@@ -194,12 +196,23 @@ Install command:
 
 ## Dry Run Behavior
 
-When `--dry-run` is specified:
-- Steps 1-6 execute normally (pre-flight, version bump, build, test, pack, commit, tag).
+`--dry-run` MUST produce zero git side effects: no commit, no tag, no push, no GitHub release. After a dry-run, `git status` should look exactly as it did before the run started (modulo the untracked `.tgz` artifact, see below).
+
+- Steps 1-5 execute normally (pre-flight, version bump in `package.json`, build, test, pack).
+- Step 6 is SKIPPED — only print the planned commit message + tag name.
 - Steps 7-8 are SKIPPED (no push, no GitHub release).
-- Step 9: Instead of cleanup, tell the user:
-  - "Dry run complete. To undo: `git reset --soft HEAD~1 && git checkout -- packages/happy-cli/package.json && git tag -d v{version}`"
-  - Show the `.tgz` path so they can inspect it.
+- Step 9 (dry-run cleanup, run automatically):
+  1. **Revert the `package.json` version bump** so the working tree is clean:
+     ```bash
+     git checkout -- packages/happy-cli/package.json
+     ```
+  2. Print the planned commit message + tag name (for the user to review).
+  3. Report the absolute tarball path at `packages/happy-cli/{name}-{version}.tgz` (kept for inspection — `npm pack` is the only artifact left). Tell the user how to delete it:
+     ```bash
+     rm packages/happy-cli/{name}-{version}.tgz
+     ```
+
+After dry-run completion, verify by running `git status --porcelain` — output should match the pre-run state. If it does not, that is a bug in this skill, not user error.
 
 ## Error Recovery
 
