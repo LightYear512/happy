@@ -9,6 +9,7 @@
       "developmentClient": true,
       "distribution": "internal",
       "channel": "development",
+      "node": "22.19.0",
       "env": {
         "APP_ENV": "development",
         "SHARP_IGNORE_GLOBAL_LIBVIPS": "1"
@@ -19,6 +20,7 @@
       "developmentClient": true,
       "distribution": "store",
       "channel": "development",
+      "node": "22.19.0",
       "env": {
         "APP_ENV": "development",
         "SHARP_IGNORE_GLOBAL_LIBVIPS": "1"
@@ -28,6 +30,7 @@
       "autoIncrement": true,
       "distribution": "internal",
       "channel": "preview",
+      "node": "22.19.0",
       "android": {
         "buildType": "apk",
         "gradleCommand": ":app:assembleRelease -PreactNativeArchitectures=arm64-v8a"
@@ -41,6 +44,7 @@
       "autoIncrement": true,
       "distribution": "store",
       "channel": "preview",
+      "node": "22.19.0",
       "android": {
         "buildType": "apk"
       },
@@ -52,6 +56,7 @@
     "production": {
       "autoIncrement": true,
       "channel": "production",
+      "node": "22.19.0",
       "env": {
         "APP_ENV": "production",
         "SHARP_IGNORE_GLOBAL_LIBVIPS": "1"
