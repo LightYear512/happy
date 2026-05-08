@@ -1,8 +1,8 @@
-# Stage 1: install dependencies with workspace context
-FROM node:20 AS deps
+# Stage 1: install dependencies — narrowed to server + happy-wire only
+FROM node:20-slim AS deps
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y python3 ffmpeg make g++ build-essential && rm -rf /var/lib/apt/lists/*
+# No apt build deps needed — sharp ships prebuilt binaries, no other native deps in server.
+# (If a node-gyp dep is added later, restore the apt install line from git history.)
 
 WORKDIR /repo
 
@@ -10,48 +10,42 @@ COPY package.json yarn.lock ./
 COPY scripts ./scripts
 COPY patches ./patches
 
-RUN mkdir -p packages/happy-app packages/happy-server packages/happy-cli packages/happy-wire
+RUN mkdir -p packages/happy-server packages/happy-wire
 
-COPY packages/happy-app/package.json packages/happy-app/
 COPY packages/happy-server/package.json packages/happy-server/
-COPY packages/happy-cli/package.json packages/happy-cli/
 COPY packages/happy-wire/package.json packages/happy-wire/
 
-# Workspace postinstall requirements
-COPY packages/happy-app/patches packages/happy-app/patches
-COPY packages/happy-server/prisma packages/happy-server/prisma
-COPY packages/happy-cli/scripts packages/happy-cli/scripts
-COPY packages/happy-cli/tools packages/happy-cli/tools
+# Narrow workspaces to server + happy-wire only.
+# Skips happy-app (~8.6GB), happy-cli, happy-agent, happy-app-logs — none of which the server runtime needs.
+# server depends on @slopus/happy-wire from v3 onward, so wire stays.
+RUN node -e "const p=require('./package.json'); p.workspaces={packages:['packages/happy-server','packages/happy-wire'], nohoist:p.workspaces.nohoist}; require('fs').writeFileSync('package.json',JSON.stringify(p,null,2))"
 
+# Workspace postinstall requirements (server only; happy-wire has none beyond its own deps)
+COPY packages/happy-server/prisma packages/happy-server/prisma
+
+# SKIP_HAPPY_WIRE_BUILD=1 defers wire build to Stage 2 where its source is present
 RUN SKIP_HAPPY_WIRE_BUILD=1 yarn install --frozen-lockfile --ignore-engines
 
-# Stage 2: build the server
+# Stage 2: build — happy-wire must build (pkgroll → dist/), server doesn't (tsc --noEmit is type-check only)
 FROM deps AS builder
 
 COPY packages/happy-wire ./packages/happy-wire
 COPY packages/happy-server ./packages/happy-server
 
 RUN yarn workspace @slopus/happy-wire build
-RUN yarn workspace happy-server build
+# happy-server `build` is `tsc --noEmit` (type check); runtime uses tsx to interpret .ts directly, so skip here.
 
-# Stage 3: runtime
-FROM node:20 AS runner
+# Stage 3: runtime — pure Node, no apt
+FROM node:20-slim AS runner
 
 WORKDIR /repo
 
-# Runtime dependencies
-RUN apt-get update && apt-get install -y python3 ffmpeg && rm -rf /var/lib/apt/lists/*
-
-# Set environment to production
 ENV NODE_ENV=production
 
-# Copy necessary files from the builder stage
 COPY --from=builder /repo/node_modules /repo/node_modules
 COPY --from=builder /repo/packages/happy-wire /repo/packages/happy-wire
 COPY --from=builder /repo/packages/happy-server /repo/packages/happy-server
 
-# Expose the port the app will run on
 EXPOSE 3000
 
-# Command to run the application
 CMD ["yarn", "--cwd", "packages/happy-server", "start"]
