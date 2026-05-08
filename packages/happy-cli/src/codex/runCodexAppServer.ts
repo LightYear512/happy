@@ -830,6 +830,11 @@ export async function runCodexWithAppServer(opts: {
         const target = getCurrentCodexProfile() || 'unknown';
         logger.debug(`[CodexAppServer] Account swap signaled: ${target}`);
         pendingAccountSwap = target;
+        // Wake the message-queue waiter so an idle session doesn't sit on the
+        // swap until the next user message arrives. The loop handles a null
+        // batch + non-null pendingAccountSwap as "consume the swap and keep
+        // looping" (see below) rather than "exit the runtime".
+        messageQueue.interrupt();
         if (client && threadId && activeTurnId) {
             void handleAbort();
         }
@@ -938,6 +943,15 @@ export async function runCodexWithAppServer(opts: {
             if (!message) {
                 const batch = await messageQueue.waitForMessagesAndGetAsString();
                 if (!batch) {
+                    // A null batch can mean three things: queue closed (shutdown),
+                    // signal-driven interrupt (e.g. account-swap watcher woke us
+                    // up while idle), or a regular interrupt with nothing pending.
+                    // Only the swap case wants to keep looping — the swap is
+                    // consumed at the top of the next iteration.
+                    if (pendingAccountSwap && !shouldExit && !messageQueue.isClosed()) {
+                        logger.debug('[CodexAppServer] Wait interrupted by account swap signal — re-entering loop');
+                        continue;
+                    }
                     logger.debug(`[CodexAppServer] batch=${!!batch}, shouldExit=${shouldExit}`);
                     break;
                 }
