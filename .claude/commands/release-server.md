@@ -8,11 +8,14 @@ argument-hint: "[--branch <name>] [--dry-run] [--allow-dirty] [--skip-tests] [--
 You are publishing the `happy-server` Docker image from this **fork**.
 Images are pushed to **GitHub Container Registry (GHCR)** under the fork owner. The image tag is the build date `YYYYMMDD` — re-running on the same day **overwrites** the tag (Docker registry semantics: pushing the same tag replaces the previous manifest; previous image layers are eventually GC'd by GHCR).
 
-The deployable reference is:
+Two image references are involved:
 
 ```
-ghcr.io/lightyear512/happy-server:{YYYYMMDD}
+LOCAL:   happy-server:{YYYYMMDD}                              # what the local Docker daemon stores
+REMOTE:  ghcr.io/lightyear512/happy-server:{YYYYMMDD}         # what gets pushed to GHCR
 ```
+
+The build emits the local short name; the push step adds the GHCR tag and pushes that. After push, **both tags coexist locally** pointing at the same image ID — so `docker run happy-server:{YYYYMMDD}` and `docker run ghcr.io/lightyear512/happy-server:{YYYYMMDD}` do the same thing.
 
 There is **no `latest` tag** — every deploy must reference an explicit dated tag, so a rollback is just "pin yesterday's date". This is intentional: opaque `latest` rolls drift silently and bite oncall.
 
@@ -38,7 +41,7 @@ For local testing without round-tripping GHCR:
 /release-server --dry-run --allow-dirty --skip-tests
 ```
 
-This builds and loads the image into your local Docker daemon. Inspect it with `docker run --rm -p 3000:3000 ghcr.io/lightyear512/happy-server:{YYYYMMDD}` (you'll need the env vars and DB the server expects). Iterate as much as you want — nothing leaves your machine. When you're ready to publish, drop the flags and re-run.
+This builds and loads the image into your local Docker daemon. Inspect it with `docker run --rm -p 3000:3000 happy-server:{YYYYMMDD}` (you'll need the env vars and DB the server expects). Iterate as much as you want — nothing leaves your machine. When you're ready to publish, drop the flags and re-run.
 
 There is no version-bump argument here — the server is not versioned via `package.json`. The tag is purely date-based.
 
@@ -80,16 +83,17 @@ Execute sequentially. Stop immediately on any failure and report.
 9. Compute the image tag:
    - If `--date YYYYMMDD` was passed, validate it (8 digits) and use it.
    - Otherwise, `date +%Y%m%d` (local time).
-10. Compute the full image reference:
+10. Compute both image references:
     ```
-    IMAGE=ghcr.io/{owner-lc}/happy-server:{YYYYMMDD}
+    IMAGE=happy-server:{YYYYMMDD}                              # local short name (build / smoke / save use this)
+    REMOTE_IMAGE=ghcr.io/{owner-lc}/happy-server:{YYYYMMDD}    # GHCR push target (only used in Step 6)
     ```
 11. Capture the build commit (for OCI labels):
     ```bash
     GIT_SHA=$(git rev-parse HEAD)
     GIT_SHA_SHORT=$(git rev-parse --short HEAD)
     ```
-12. Probe whether this tag already exists on GHCR (informational, NOT blocking — same-day overwrite is the documented behavior of this skill):
+12. Probe whether this tag already exists on GHCR (informational, NOT blocking — same-day overwrite is the documented behavior of this skill, AND irrelevant in `--dry-run` since we won't push):
     ```bash
     gh api "/users/{owner}/packages/container/happy-server/versions" --jq \
       '.[] | select(.metadata.container.tags[]? == "{YYYYMMDD}") | .id' 2>/dev/null
@@ -100,11 +104,12 @@ Execute sequentially. Stop immediately on any failure and report.
     Ready to build {& push|locally only}:
       Branch:      {branch}
       Commit:      {GIT_SHA_SHORT}{ + dirty if --allow-dirty}
-      Image:       {IMAGE}
+      Local image: {IMAGE}                  # happy-server:{YYYYMMDD}
+      {Push as:     {REMOTE_IMAGE}          # only shown if push is happening (no --dry-run)}
       Platform:    linux/amd64
-      Overwrite:   {yes|no}            (whether the dated tag already exists on GHCR)
-      Dry run:     {true|false}        (skip push)
-      Allow dirty: {true|false}        (skip clean-tree / sync checks)
+      Overwrite:   {yes|no}                 (GHCR tag exists; only matters when pushing)
+      Dry run:     {true|false}             (skip push)
+      Allow dirty: {true|false}             (skip clean-tree / sync checks)
     Proceed?
     ```
 
@@ -174,15 +179,16 @@ If either check fails, the image is broken — do not push. Report and stop.
 
 ### Step 6: Push (skipped if --dry-run)
 
-**Skipped if --dry-run.** In dry-run mode, print the planned `docker push` command and the IMAGE reference, then proceed to Step 7.
+**Skipped if --dry-run.** In dry-run mode, print the planned `docker tag` + `docker push` commands and the REMOTE_IMAGE reference, then proceed to Step 7.
 
-In a real run:
+In a real run, add the GHCR tag to the locally-built image, then push:
 
 ```bash
-docker push {IMAGE}
+docker tag {IMAGE} {REMOTE_IMAGE}
+docker push {REMOTE_IMAGE}
 ```
 
-Capture the digest from the push output (line `digest: sha256:...`) — we report it in the summary.
+Capture the digest from the push output (line `digest: sha256:...`) — we report it in the summary. After this step both tags coexist locally and point at the same image ID; that is intentional, so a follow-up `docker run happy-server:{YYYYMMDD}` works without a re-pull.
 
 ### Step 7: Verify Pushed Image (skipped if --dry-run)
 
@@ -201,18 +207,19 @@ Confirm the dated tag is present and the `created_at` matches this run (within a
 ```
 Server image published successfully!
 
-Branch:   {branch}
-Commit:   {GIT_SHA_SHORT}
-Image:    {IMAGE}
-Digest:   sha256:{first-12-of-digest}…
-Platform: linux/amd64
-Size:     {Size MB} MB
-Pushed:   {ISO timestamp}
-Pull:
-  docker pull {IMAGE}
+Branch:       {branch}
+Commit:       {GIT_SHA_SHORT}
+Local tag:    {IMAGE}                     # happy-server:{YYYYMMDD}
+Remote tag:   {REMOTE_IMAGE}              # ghcr.io/{owner-lc}/happy-server:{YYYYMMDD}
+Digest:       sha256:{first-12-of-digest}…
+Platform:     linux/amd64
+Size:         {Size MB} MB
+Pushed:       {ISO timestamp}
+Pull (deploy):
+  docker pull {REMOTE_IMAGE}
 
 Deploy reference (k8s manifest snippet):
-  image: {IMAGE}
+  image: {REMOTE_IMAGE}
   imagePullPolicy: IfNotPresent
 ```
 
@@ -245,7 +252,7 @@ In short: `--allow-dirty` opens a door; `--dry-run` makes the door safe to open.
 - **Pre-flight failure**: nothing has been touched; fix the prerequisite and retry.
 - **Test failure**: nothing has been touched; fix the regression. Do not use `--skip-tests` to paper over real failures.
 - **Build failure**: no GHCR side effects; local buildx cache may have grown. `docker buildx prune -f` to reclaim.
-- **Push failure mid-upload**: GHCR is layer-based — a failed push leaves partial layers but no new tag. Just retry `docker push {IMAGE}`.
+- **Push failure mid-upload**: GHCR is layer-based — a failed push leaves partial layers but no new tag. Just retry `docker push {REMOTE_IMAGE}`.
 - **Overwrote the wrong tag**: the previous image is **not** lost immediately — it becomes an untagged version under the same package. Rollback by re-tagging it: find the prior digest via `gh api /users/{owner}/packages/container/happy-server/versions`, then `docker pull ghcr.io/{owner-lc}/happy-server@sha256:{digest}` + `docker tag` + `docker push` with the correct date. GHCR retains untagged versions per its retention policy (default: kept until you delete or the policy expires them).
 - Never use `docker push --force` (it doesn't exist in modern Docker; tag overwrite is the default behavior). Never `docker rmi` the remote image directly through the CLI; use `gh api -X DELETE` only if you genuinely want to remove a tagged version, and confirm with the user first.
 
