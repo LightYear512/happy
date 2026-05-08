@@ -154,21 +154,50 @@ Push both the commit and the tag.
 
 ### Step 8: GitHub Release (skip if --dry-run)
 
-Generate release notes by running:
+#### 8a. Generate the changelog
+
+Save changelog to a file (so we can append the install section before publishing):
 
 ```bash
-node packages/happy-cli/.release-it.notes.js {version}
+node packages/happy-cli/.release-it.notes.js {version} > /tmp/release-notes-{version}.md
 ```
 
-If the script fails (e.g. `claude` CLI is unavailable), fall back: read `git log --no-merges` since the previous tag matching `v*` on this branch (or, if there is no previous tag reachable from this branch, since the branch's divergence point with `origin/main` or `upstream/main` — pick a reasonable starting point) and write a concise changelog yourself, grouped by `feat:` / `fix:` / `chore:`.
+If the script fails (e.g. `claude` CLI is unavailable), fall back: read `git log --no-merges` since the previous tag matching `v*` on this branch (or, if there is no previous tag reachable from this branch, since the branch's divergence point with `origin/main` or `upstream/main` — pick a reasonable starting point) and write a concise changelog yourself into the same file, grouped by `feat:` / `fix:` / `chore:`.
 
-Build the `gh release create` command. **You MUST pass `--repo {owner}/{repo}` explicitly** — `gh` would otherwise read `package.json#repository` (which points to upstream) and return HTTP 404 (misleadingly surfaced as a "workflow scope may be required" error).
+#### 8b. Append install section (REQUIRED — fork installs don't go through npm)
+
+The auto-generated changelog is upstream-style and has no install instructions. Fork users land on the GitHub release page and need a copy-paste-able command. Append:
+
+```bash
+cat >> /tmp/release-notes-{version}.md <<EOF
+
+---
+
+## Install
+
+This is a fork release published as a GitHub-hosted tarball (not on the public npm registry). Install directly from the release URL:
+
+\`\`\`bash
+npm install -g https://github.com/{owner}/{repo}/releases/download/v{version}/{name}-{version}.tgz
+\`\`\`
+
+After install, verify with \`{name} --version\` (should print \`{version}\`).
+
+> Note: this fork's package name is \`{name}\`, the same as upstream. If you previously installed the upstream \`{name}\` package from npm, this command **replaces** it. To restore upstream: \`npm install -g {name}\`.
+EOF
+```
+
+#### 8c. Build the `gh release create` command
+
+**You MUST pass `--repo {owner}/{repo}` explicitly** — `gh` would otherwise read `package.json#repository` (which points to upstream) and return HTTP 404 (misleadingly surfaced as a "workflow scope may be required" error).
+
+Use `--notes-file` (not `--notes "<inline>"`) so the markdown formatting is preserved exactly:
 
 ```bash
 gh release create "v{version}" "./packages/happy-cli/{name}-{version}.tgz" \
   --repo {owner}/{repo} \
   --title "v{version}" \
-  --notes "{release_notes}" \
+  --notes-file /tmp/release-notes-{version}.md \
   --target {branch} \
   {prerelease_flag}
 ```
@@ -176,6 +205,8 @@ gh release create "v{version}" "./packages/happy-cli/{name}-{version}.tgz" \
 Where `{prerelease_flag}` is:
 - `--prerelease` if `--prerelease` was passed (resolved value from Step 1.8 is `true`).
 - empty (omit the flag entirely) by default.
+
+After successful release, delete the temp notes file: `rm /tmp/release-notes-{version}.md`.
 
 ### Step 9: Cleanup & Summary
 
