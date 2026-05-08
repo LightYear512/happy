@@ -1,6 +1,6 @@
 ---
 description: "Build Android APK via EAS and publish a GitHub Release (fork, no Play Store)"
-argument-hint: "<tag-suffix> [--profile preview|production] [--branch <name>] [--dry-run]"
+argument-hint: "<tag-suffix> [--profile preview|production] [--branch <name>] [--allow-dirty] [--dry-run]"
 ---
 
 # Release Skill — happy-app Android APK (LightYear512/happy fork)
@@ -26,7 +26,8 @@ Parse arguments:
 - **Flags**:
   - `--profile <name>`: EAS build profile. Defaults to `preview` (APK, internal distribution). `production` is allowed but typically unusable on this fork (see Why below).
   - `--branch <name>`: Build from this branch instead of current. The branch must be pushed to origin first — EAS builds whatever EAS sees in the upload, but the GitHub release `--target` must point at a remote ref.
-  - `--dry-run`: Trigger EAS build, monitor to completion, download APK, but skip the `gh release create` step. Useful for verifying a build without making it public.
+  - `--dry-run`: Trigger EAS build, monitor to completion, download APK, but skip the `gh release create` step. The APK lands at `/tmp/happy-app-{appVersion}-{tag-suffix}.apk` for you to `adb install` and test. Useful for verifying a build without making it public. **EAS build itself still happens** (cloud-side, ~15–30 min) — there is no way to dry-run that part short of skipping it entirely.
+  - `--allow-dirty`: Skip the "branch synced with origin" / "dirty working tree" pre-flight bail-outs. EAS uploads the current working tree regardless, so dirty state ships into the build whether this flag is set or not. The flag only controls whether the skill aborts before triggering EAS. Use with `--dry-run` for a fast local-test build off a dirty branch — the resulting APK is yours alone, never publish it via `gh release create` since it won't trace to a remote SHA.
 
 ### Tag computation
 
@@ -64,12 +65,15 @@ Execute sequentially. Stop immediately on any failure and report.
    - If `--branch <name>` was passed, use that.
    - Otherwise, current branch from `git rev-parse --abbrev-ref HEAD`.
    - If the resolved branch differs from the checkout, ask the user whether to `git checkout {branch}` first or abort.
-4. Verify local `{branch}` is in sync with `origin/{branch}`:
+4. Verify local `{branch}` is in sync with `origin/{branch}` AND working tree state:
    ```bash
    git rev-list --count origin/{branch}..{branch}   # 0 = no unpushed local commits
    git rev-list --count {branch}..origin/{branch}   # 0 = no unpulled remote commits
+   git status --porcelain                            # empty = clean tree
    ```
-   If either is non-zero, ask the user to pull/push first. EAS uploads the local working tree (a 200+MB tarball), so untracked or uncommitted state would also ship — confirm any dirty state before continuing.
+   - All three clean: continue.
+   - Any non-clean **and** `--allow-dirty` was passed: list the deltas + dirty paths, print one warning ("⚠️ Building from non-reproducible state — APK won't trace to any remote commit. OK in `--dry-run`; do not `gh release create` from this build."), continue.
+   - Any non-clean **and** `--allow-dirty` was NOT passed: ask the user to pull/push/commit first, OR re-run with `--allow-dirty` if they intend to test locally. EAS uploads the local working tree (a 200+MB tarball), so dirty state ships into the cloud build regardless — the gate exists so a casual `gh release create` doesn't accidentally publish an unreviewable APK.
 5. Read app version from `packages/happy-app/app.config.js`:
    - Capture `expo.version` (e.g. `1.7.0`).
 6. Compute target tag: `v{appVersion}-{tag-suffix}`. Confirm with the user.
@@ -264,9 +268,18 @@ Direct APK:
 
 - Steps 1-5 execute normally (pre-flight, trigger, monitor, download, write notes).
 - Step 6 is SKIPPED — print the planned tag, APK path, notes path.
-- Step 7: delete the APK and notes file from `/tmp` (or keep, at user's option).
+- Step 7: keep the APK and notes file in `/tmp` so you can `adb install` and test (delete only on user request).
 
-After dry-run, the only persistent artifacts are: (a) the EAS build record on `expo.dev`, (b) the incremented versionCode on the EAS server. Both are inherent to running `eas build` and cannot be undone.
+After dry-run, the only persistent artifacts are: (a) the EAS build record on `expo.dev`, (b) the incremented versionCode on the EAS server, (c) the local APK in `/tmp`. The first two are inherent to running `eas build` and cannot be undone.
+
+## Allow-Dirty Behavior
+
+`--allow-dirty` only loosens the pre-flight reproducibility checks. It does NOT affect what EAS builds — EAS always uploads the current working tree, regardless of git state. The flag's job is to keep the skill from bailing out before that upload.
+
+- With `--allow-dirty` alone (no `--dry-run`): a warning is printed, but the GitHub release is still created at the end. **Strongly discouraged** — the released APK won't trace to a remote SHA, breaking rollback semantics.
+- With `--allow-dirty --dry-run` (the standard test loop): no GitHub release, just an APK at `/tmp/happy-app-{appVersion}-{tag-suffix}.apk` for `adb install`. This is the intended pairing.
+
+`--allow-dirty` opens a door; `--dry-run` makes the door safe to open.
 
 ## Error Recovery
 
