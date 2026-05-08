@@ -1097,8 +1097,12 @@ export async function runCodexWithAppServer(opts: {
     let pendingAccountSwap: string | null = null;
 
     // Watch for !auth-all --codex. On a valid switch, tryGlobalProfileSwitch has
-    // already updated process.env.CODEX_HOME — we just flag the loop and abort
-    // any in-flight turn.
+    // already updated process.env.CODEX_HOME — we just flag the loop. The current
+    // turn (if any) finishes naturally; the swap is consumed at the next top-of-loop
+    // check, mirroring the claude-side "wait for turn boundary" behavior. Forcibly
+    // aborting an in-flight turn here would drop the model's partial work and
+    // surprise the user — the broadcast is a "switch when convenient" intent, not
+    // an emergency stop.
     const codexProfileWatcher: FSWatcher | null = watchCodexProfileFile(() => {
         const target = getCurrentCodexProfile() || 'unknown';
         logger.debug(`[CodexAppServer] Account swap signaled: ${target}`);
@@ -1108,9 +1112,6 @@ export async function runCodexWithAppServer(opts: {
         // batch + non-null pendingAccountSwap as "consume the swap and keep
         // looping" (see below) rather than "exit the runtime".
         messageQueue.interrupt();
-        if (client && threadId && activeTurnId) {
-            void handleAbort();
-        }
     });
 
     try {
