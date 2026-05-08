@@ -349,6 +349,20 @@ export async function runCodexWithAppServer(opts: {
                     session.sendCodexMessage({ type: 'message', message: `<options>\n${options}\n</options>` });
                     await new Promise(resolve => setTimeout(resolve, 50));
                 }
+                // Route a bang-requested session restart through the same
+                // pendingAccountSwap path used by !auth-all --codex (broadcast
+                // file watcher). Without this, !auth --codex only updates
+                // process.env.CODEX_HOME in the parent — the running codex
+                // app-server child still has the old auth in its frozen env,
+                // so the success message ("✅ 已切换到 X") is a lie. The swap
+                // path disposes the child and respawns it with the new env;
+                // the savedThreadId hand-off keeps the conversation intact.
+                if (result.action === 'restart-session') {
+                    const target = getCurrentCodexProfile() || 'unknown';
+                    logger.debug(`[CodexAppServer] Single-session swap requested → ${target}`);
+                    pendingAccountSwap = target;
+                    messageQueue.interrupt();
+                }
                 session.sendSessionEvent({ type: 'ready' });
             }).catch(error => {
                 logger.warn('[CodexAppServer] Bang command failed:', error);
