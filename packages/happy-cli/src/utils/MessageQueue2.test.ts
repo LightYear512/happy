@@ -439,6 +439,32 @@ describe('MessageQueue2', () => {
         expect(result).toBeNull();
     });
 
+    it('should NOT leave a zombie flag after interrupting a live waiter', async () => {
+        // Regression: interrupt() on a live waiter used to set interrupted=true
+        // AND wake the waiter. The waiter path returned null without clearing
+        // the flag, so the *next* wait silently consumed the leftover and broke
+        // the codex account-swap loop — it saw two nulls instead of one and
+        // exited the runtime mid-session.
+        const queue = new MessageQueue2<string>(mode => mode);
+
+        const firstWait = queue.waitForMessagesAndGetAsString();
+        setTimeout(() => queue.interrupt(), 5);
+        expect(await firstWait).toBeNull();
+
+        // Second wait must block on a fresh push, not return null instantly.
+        let secondResolved = false;
+        const secondWait = queue.waitForMessagesAndGetAsString().then(r => {
+            secondResolved = true;
+            return r;
+        });
+        await new Promise(r => setTimeout(r, 20));
+        expect(secondResolved).toBe(false);
+
+        queue.push('post-interrupt', 'local');
+        const result = await secondWait;
+        expect(result?.message).toBe('post-interrupt');
+    });
+
     it('should return null on next call when interrupted with no waiter', async () => {
         const queue = new MessageQueue2<string>(mode => mode);
 

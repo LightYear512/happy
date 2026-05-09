@@ -179,20 +179,29 @@ export class MessageQueue2<T> {
 
     /**
      * Interrupt any waiting consumer so it returns null immediately.
-     * If no consumer is waiting, the flag persists until the next
-     * waitForMessagesAndGetAsString call, which will return null and clear it.
-     * Messages already in the queue are preserved for the next non-interrupted read.
+     * If a consumer is currently awaiting, wake it up directly — the wake path
+     * lets `waitForMessagesAndGetAsString` return null without going back through
+     * the top-of-function `interrupted` check, so we must NOT also set the flag
+     * (otherwise it lingers as a zombie that the *next* wait silently consumes —
+     * a one-shot signal turns into two, breaking callers like the codex
+     * account-swap loop that re-enter wait after handling the first null).
+     * If no consumer is waiting, the flag persists until the next call, which
+     * returns null and clears it. Messages already in the queue are preserved
+     * for the next non-interrupted read either way.
      */
     interrupt(): void {
         logger.debug(`[MessageQueue2] interrupt() called`);
-        this.interrupted = true;
 
-        // Wake up any waiting consumer immediately
         if (this.waiter) {
+            // Live consumer: wake it directly, no flag needed.
             const waiter = this.waiter;
             this.waiter = null;
             waiter(false);
+            return;
         }
+
+        // Idle: defer the null return to the next wait.
+        this.interrupted = true;
     }
 
     /**
