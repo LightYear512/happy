@@ -389,7 +389,7 @@ export async function runCodexWithAppServer(opts: {
                 if (result.action === 'restart-session') {
                     const target = getCurrentCodexProfile() || 'unknown';
                     logger.debug(`[CodexAppServer] Single-session swap requested → ${target}`);
-                    pendingAccountSwap = target;
+                    pendingAccountSwap = { target, source: 'single-session' };
                     messageQueue.interrupt();
                 }
                 session.sendSessionEvent({ type: 'ready' });
@@ -1090,11 +1090,16 @@ export async function runCodexWithAppServer(opts: {
         });
     };
 
-    // Set by the codex profile watcher when !auth-all --codex broadcasts a switch.
+    // Set by both swap entry points: the codex profile watcher (broadcast from
+    // !auth-all --codex) and the bang dispatcher (single-session !auth).
     // Consumed at top-of-loop: tears down the current app-server subprocess and
     // rebuilds with the new CODEX_HOME. The next iteration's thread/resume picks
-    // up savedThreadId so the conversation continues transparently.
-    let pendingAccountSwap: string | null = null;
+    // up savedThreadId so the conversation continues transparently. `source`
+    // drives the user-visible status message so the wording matches the path
+    // that triggered it (mirrors claude-side `(via !auth-all)` for broadcast vs
+    // a bare `(via !auth)` for the single-session swap).
+    type AccountSwapSource = 'broadcast' | 'single-session';
+    let pendingAccountSwap: { target: string; source: AccountSwapSource } | null = null;
 
     // Watch for !auth-all --codex. On a valid switch, tryGlobalProfileSwitch has
     // already updated process.env.CODEX_HOME — we just flag the loop. The current
@@ -1105,8 +1110,8 @@ export async function runCodexWithAppServer(opts: {
     // an emergency stop.
     const codexProfileWatcher: FSWatcher | null = watchCodexProfileFile(() => {
         const target = getCurrentCodexProfile() || 'unknown';
-        logger.debug(`[CodexAppServer] Account swap signaled: ${target}`);
-        pendingAccountSwap = target;
+        logger.debug(`[CodexAppServer] Account swap signaled (broadcast): ${target}`);
+        pendingAccountSwap = { target, source: 'broadcast' };
         // Wake the message-queue waiter so an idle session doesn't sit on the
         // swap until the next user message arrives. The loop handles a null
         // batch + non-null pendingAccountSwap as "consume the swap and keep
@@ -1169,7 +1174,7 @@ export async function runCodexWithAppServer(opts: {
             // next iteration's thread/resume pick up the conversation via the
             // shared symlinked sessions/ directory.
             if (pendingAccountSwap) {
-                const target = pendingAccountSwap;
+                const { target, source } = pendingAccountSwap;
                 pendingAccountSwap = null;
                 const savedThreadId = threadId;
                 try {
@@ -1197,10 +1202,14 @@ export async function runCodexWithAppServer(opts: {
                     diffProcessor.reset();
                     thinking = false;
                     session.keepAlive(thinking, 'remote');
-                    const msg = `🔄 Switched to "${target}" (via !auth-all --codex)`;
+                    // Mirror the claude-side wording: `(via !auth-all)` is the
+                    // broadcast path; the single-session path triggered locally
+                    // by `!auth <profile>` reads as a bare `(via !auth)`.
+                    const sourceTag = source === 'broadcast' ? '!auth-all --codex' : '!auth';
+                    const msg = `🔄 Switched to "${target}" (via ${sourceTag})`;
                     messageBuffer.addMessage(msg, 'status');
                     session.sendSessionEvent({ type: 'message', message: msg });
-                    logger.debug(`[CodexAppServer] Account swap complete → ${target}`);
+                    logger.debug(`[CodexAppServer] Account swap complete → ${target} (source=${source})`);
                 } catch (err) {
                     logger.warn('[CodexAppServer] Account swap failed:', err);
                     const errMsg = `⚠ 切换账号失败: ${(err as Error).message || 'unknown error'}`;
