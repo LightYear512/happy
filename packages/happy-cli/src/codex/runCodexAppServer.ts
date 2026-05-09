@@ -1210,6 +1210,13 @@ export async function runCodexWithAppServer(opts: {
                     messageBuffer.addMessage(msg, 'status');
                     session.sendSessionEvent({ type: 'message', message: msg });
                     logger.debug(`[CodexAppServer] Account swap complete → ${target} (source=${source})`);
+                    // The watcher's messageQueue.interrupt() was meant to wake an idle
+                    // waiter so the swap is consumed promptly. If the broadcast arrived
+                    // mid-turn there was no live waiter, so the flag is still pending.
+                    // We've now consumed the swap — drop the deferred flag so the next
+                    // wait blocks for real input instead of returning null and breaking
+                    // the loop into Final cleanup (which closes the socket → offline).
+                    messageQueue.clearInterrupt();
                 } catch (err) {
                     logger.warn('[CodexAppServer] Account swap failed:', err);
                     const errMsg = `⚠ 切换账号失败: ${(err as Error).message || 'unknown error'}`;

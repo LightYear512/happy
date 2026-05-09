@@ -205,6 +205,20 @@ export class MessageQueue2<T> {
     }
 
     /**
+     * Discard a deferred interrupt flag without touching the queue.
+     * Used when the caller has already handled the side-effect that
+     * `interrupt()` was meant to wake them for (e.g. codex consumed the
+     * pending account swap), so the next wait should NOT consume the
+     * one-shot flag and bail out.
+     */
+    clearInterrupt(): void {
+        if (this.interrupted) {
+            logger.debug(`[MessageQueue2] clearInterrupt() — discarding deferred interrupt flag`);
+            this.interrupted = false;
+        }
+    }
+
+    /**
      * Reset the queue - clears all messages and resets to empty state
      */
     reset(): void {

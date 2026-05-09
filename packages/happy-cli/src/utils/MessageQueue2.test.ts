@@ -482,6 +482,37 @@ describe('MessageQueue2', () => {
         expect(result2?.message).toBe('after');
     });
 
+    it('should drop deferred interrupt flag via clearInterrupt without consuming queue', async () => {
+        // Regression: codex broadcast `!auth-all` mid-turn calls interrupt() with
+        // no live waiter (loop is awaiting the turn promise). After consuming the
+        // pending swap, the next wait must NOT bail out on the leftover flag —
+        // otherwise the loop breaks into Final cleanup and the session goes
+        // offline. clearInterrupt() drops that one-shot flag.
+        const queue = new MessageQueue2<string>(mode => mode);
+
+        // Simulate watcher firing while no one is waiting.
+        queue.interrupt();
+
+        // Caller has consumed the side-effect (swap) and now drops the flag.
+        queue.clearInterrupt();
+
+        // The next wait must block (not return null), so feed it a message
+        // asynchronously and verify it is delivered normally.
+        const waitPromise = queue.waitForMessagesAndGetAsString();
+        setTimeout(() => queue.push('after-swap', 'local'), 10);
+        const result = await waitPromise;
+        expect(result).not.toBeNull();
+        expect(result?.message).toBe('after-swap');
+    });
+
+    it('clearInterrupt should be a no-op when no flag is set', () => {
+        const queue = new MessageQueue2<string>(mode => mode);
+        // Should not throw, should not affect subsequent behavior.
+        queue.clearInterrupt();
+        queue.clearInterrupt();
+        expect(queue.size()).toBe(0);
+    });
+
     it('should preserve queued messages after interrupt', async () => {
         const queue = new MessageQueue2<string>(mode => mode);
 
