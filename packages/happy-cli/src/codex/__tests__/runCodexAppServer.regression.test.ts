@@ -259,4 +259,197 @@ describe('runCodexAppServer — AST regression contracts', () => {
             expect(calls.some(isAddMessageStatus)).toBe(true);
         });
     });
+
+    // ─── Race-recovery buffer for /compact ────────────────────────────────
+    //
+    // Contract: every prompt accepted by onUserMessage must be mirrored into
+    // an in-memory ring (`recentUserBuffer.record`) BEFORE pushing into the
+    // message queue, and that ring must be snapshotted into buildHeuristicSeed
+    // as `extraUserTexts` so the seed can recover prompts that haven't yet
+    // flushed to rollout. The ring must also be cleared inside the compact
+    // critical section (between compactInFlight=true and compactInFlight=false)
+    // and AFTER the seed has been committed to compactState.pendingSeedText.
+    //
+    // The buffer FIFO behaviour itself is covered in `recentUserBuffer.test.ts`
+    // — these contracts only enforce wiring at the call site, not algorithm.
+    describe('race-recovery buffer wiring contracts', () => {
+        // Find every `<obj>.<method>(...)` call expression in a subtree.
+        const findMethodCalls = (root: ts.Node, obj: string, method: string) =>
+            findAllNodes(root, (n): n is ts.CallExpression =>
+                ts.isCallExpression(n)
+                && ts.isPropertyAccessExpression(n.expression)
+                && ts.isIdentifier(n.expression.expression)
+                && n.expression.expression.text === obj
+                && n.expression.name.text === method,
+            );
+
+        // Find an assignment `target = <literal>` whose RHS is a specific
+        // SyntaxKind (e.g. TrueKeyword / FalseKeyword).
+        const findLiteralAssignment = (root: ts.Node, target: string, valueKind: ts.SyntaxKind) =>
+            findFirstNode(root, (n): n is ts.BinaryExpression =>
+                ts.isBinaryExpression(n)
+                && n.operatorToken.kind === ts.SyntaxKind.EqualsToken
+                && ts.isIdentifier(n.left)
+                && n.left.text === target
+                && n.right.kind === valueKind,
+            );
+
+        // Find an assignment `<obj>.<prop> = anything` in a subtree.
+        const findPropertyAssignment = (root: ts.Node, obj: string, prop: string) =>
+            findFirstNode(root, (n): n is ts.BinaryExpression =>
+                ts.isBinaryExpression(n)
+                && n.operatorToken.kind === ts.SyntaxKind.EqualsToken
+                && ts.isPropertyAccessExpression(n.left)
+                && ts.isIdentifier(n.left.expression)
+                && n.left.expression.text === obj
+                && n.left.name.text === prop,
+            );
+
+        const findRunManualCompact = (): ts.FunctionDeclaration | null =>
+            findFirstNode(SF, (n): n is ts.FunctionDeclaration =>
+                ts.isFunctionDeclaration(n) && !!n.name && n.name.text === 'runManualCompact',
+            );
+
+        const findVarDeclPos = (name: string): number => {
+            const decl = findFirstNode(SF, (n): n is ts.VariableDeclaration =>
+                ts.isVariableDeclaration(n) && ts.isIdentifier(n.name) && n.name.text === name,
+            );
+            return decl ? decl.getStart(SF) : -1;
+        };
+
+        it('declares `recentUserBuffer` before EVERY `session.onUserMessage(...)` registration', () => {
+            const declPos = findVarDeclPos('recentUserBuffer');
+            // We require the declaration to live before ALL registrations, so a
+            // future second `session.onUserMessage` won't accidentally race.
+            const regPositions = findMethodCalls(SF, 'session', 'onUserMessage').map((c) => c.getStart(SF));
+            expect(declPos, '`recentUserBuffer` must be declared').toBeGreaterThan(-1);
+            expect(regPositions.length, 'at least one onUserMessage registration must exist').toBeGreaterThan(0);
+            for (const regPos of regPositions) {
+                expect(
+                    declPos,
+                    `declaration at offset ${declPos} must precede onUserMessage at offset ${regPos}`,
+                ).toBeLessThan(regPos);
+            }
+        });
+
+        it('records every user prompt via `recentUserBuffer.record(...)` BEFORE pushing into the message queue', () => {
+            const pushCalls = findMethodCalls(SF, 'messageQueue', 'push');
+            expect(pushCalls.length, '`messageQueue.push(...)` must exist somewhere').toBeGreaterThan(0);
+
+            // We only enforce the contract on push calls inside an
+            // `onUserMessage` callback — `executeBangCommand` etc. may legitimately
+            // push synthesised content without going through the user buffer.
+            // Heuristic: the enclosing scope's parent must be `session.onUserMessage(...)`.
+            for (const pushCall of pushCalls) {
+                let scope: ts.Node | undefined = pushCall.parent;
+                while (
+                    scope &&
+                    !ts.isFunctionDeclaration(scope) &&
+                    !ts.isArrowFunction(scope) &&
+                    !ts.isFunctionExpression(scope)
+                ) {
+                    scope = scope.parent;
+                }
+                if (!scope) continue;
+
+                const parentCall = scope.parent;
+                if (!parentCall || !ts.isCallExpression(parentCall)) continue;
+                const callee = parentCall.expression;
+                if (!ts.isPropertyAccessExpression(callee)) continue;
+                if (!ts.isIdentifier(callee.expression)) continue;
+                if (callee.expression.text !== 'session') continue;
+                if (callee.name.text !== 'onUserMessage') continue;
+
+                const recordCalls = findMethodCalls(scope, 'recentUserBuffer', 'record');
+                expect(
+                    recordCalls.length,
+                    'expected at least one `recentUserBuffer.record(...)` in the onUserMessage callback',
+                ).toBeGreaterThan(0);
+
+                const minRecordPos = Math.min(...recordCalls.map((c) => c.getStart(SF)));
+                expect(
+                    minRecordPos,
+                    'record must commit before push (push throwing synchronously could skip it otherwise)',
+                ).toBeLessThan(pushCall.getStart(SF));
+            }
+        });
+
+        it('passes `recentUserBuffer.snapshot()` as `extraUserTexts` to buildHeuristicSeed inside runManualCompact', () => {
+            // Scan limited to runManualCompact — codexExecCompact's L2 pipeline
+            // runs in a fresh codex process with no buffer to consume.
+            const compactFn = findRunManualCompact();
+            expect(compactFn, 'runManualCompact must exist (anchor)').not.toBeNull();
+            if (!compactFn) return;
+
+            const seedCalls = findAllNodes(compactFn, (n): n is ts.CallExpression =>
+                ts.isCallExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === 'buildHeuristicSeed',
+            );
+            expect(seedCalls.length, 'buildHeuristicSeed must be called inside runManualCompact').toBeGreaterThan(0);
+
+            for (const call of seedCalls) {
+                const arg = call.arguments[0];
+                expect(arg, 'buildHeuristicSeed must receive an options object').toBeDefined();
+                expect(ts.isObjectLiteralExpression(arg!)).toBe(true);
+                const extra = (arg as ts.ObjectLiteralExpression).properties.find(
+                    (p): p is ts.PropertyAssignment =>
+                        ts.isPropertyAssignment(p) && ts.isIdentifier(p.name) && p.name.text === 'extraUserTexts',
+                );
+                expect(extra, 'must pass `extraUserTexts`').toBeDefined();
+                if (!extra) continue;
+
+                // Value must be `recentUserBuffer.snapshot()` — the helper
+                // contractually returns a copy, so the seed builder sees a
+                // frozen view regardless of subsequent buffer mutations.
+                const value = extra.initializer;
+                expect(
+                    ts.isCallExpression(value),
+                    '`extraUserTexts` must be a call expression (recentUserBuffer.snapshot())',
+                ).toBe(true);
+                if (!ts.isCallExpression(value)) continue;
+                expect(value.expression.getText(SF)).toBe('recentUserBuffer.snapshot');
+                expect(value.arguments.length).toBe(0);
+            }
+        });
+
+        it('clears the buffer inside the compact critical section after committing the seed', () => {
+            // Four anchor points must obey A < B < C < D:
+            //   A: compactInFlight = true       (entry to critical section)
+            //   B: compactState.pendingSeedText = seedText  (seed committed)
+            //   C: recentUserBuffer.clear()     (the reset itself)
+            //   D: compactInFlight = false      (exit of critical section)
+            const compactFn = findRunManualCompact();
+            expect(compactFn, 'runManualCompact must exist (anchor)').not.toBeNull();
+            if (!compactFn) return;
+
+            const a = findLiteralAssignment(compactFn, 'compactInFlight', ts.SyntaxKind.TrueKeyword);
+            const d = findLiteralAssignment(compactFn, 'compactInFlight', ts.SyntaxKind.FalseKeyword);
+            const b = findPropertyAssignment(compactFn, 'compactState', 'pendingSeedText');
+            const clearCalls = findMethodCalls(compactFn, 'recentUserBuffer', 'clear');
+
+            expect(a, 'A: `compactInFlight = true` must exist').not.toBeNull();
+            expect(d, 'D: `compactInFlight = false` must exist').not.toBeNull();
+            expect(b, 'B: `compactState.pendingSeedText = seedText` must exist').not.toBeNull();
+            expect(
+                clearCalls.length,
+                'C: `recentUserBuffer.clear()` must be called in runManualCompact',
+            ).toBeGreaterThan(0);
+            if (!a || !b || !d) return;
+
+            const posA = a.getStart(SF);
+            const posB = b.getStart(SF);
+            const posD = d.getStart(SF);
+            // At least one clear must obey A < B < C < D (allow multiple call
+            // sites in case future success+failure branches both reset).
+            const validClears = clearCalls.filter((c) => {
+                const posC = c.getStart(SF);
+                return posA < posB && posB < posC && posC < posD;
+            });
+            expect(
+                validClears.length,
+                'expected `recentUserBuffer.clear()` to be placed AFTER ' +
+                '`compactState.pendingSeedText = seedText` and BEFORE ' +
+                '`compactInFlight = false` (i.e. on the try-block success path)',
+            ).toBeGreaterThan(0);
+        });
+    });
 });

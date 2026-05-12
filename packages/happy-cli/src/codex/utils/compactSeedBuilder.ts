@@ -293,6 +293,19 @@ export interface BuildSeedOptions {
     tokenBudget?: number;
     /** Optional: included verbatim as the closing line of the seed. */
     trailerNote?: string;
+    /**
+     * In-memory user messages to splice in on top of whatever the rollout
+     * scan produces. Use case: a /compact (manual or auto-rescue) fired
+     * before codex flushed the latest user input to rollout.jsonl — without
+     * this, the freshest "what did the user just ask" turn silently vanishes
+     * from the seed. Appended in order *after* rollout-scanned messages, so
+     * they become the newest entries and are protected by USER_RECENT_FORCE_KEEP.
+     *
+     * Same filters as scanned messages: env_context / permissions noise is
+     * dropped; sensitive patterns are redacted. SEED_SENTINEL is honoured —
+     * a prior-compact seed passed here will swap into the compacted bucket.
+     */
+    extraUserTexts?: string[];
 }
 
 export interface BuildSeedResult {
@@ -348,6 +361,21 @@ export async function buildHeuristicSeed(opts: BuildSeedOptions): Promise<BuildS
         }
     } catch (err) {
         logger.debug(`[compactSeedBuilder] read failed at line ${lineNum}: ${(err as Error).message}`);
+    }
+
+    // Splice in in-memory user messages that may not have hit rollout yet.
+    // Reuses processResponseItem's message branch so SEED_SENTINEL detection,
+    // noise filtering and sensitive redaction stay in lock-step with rollout-
+    // sourced messages.
+    if (opts.extraUserTexts) {
+        for (const text of opts.extraUserTexts) {
+            if (typeof text !== 'string' || !text) continue;
+            processResponseItem({
+                type: 'message',
+                role: 'user',
+                content: [{ type: 'input_text', text }],
+            }, buckets);
+        }
     }
 
     const composed = composeSeed(buckets, tokenBudget, opts.trailerNote);

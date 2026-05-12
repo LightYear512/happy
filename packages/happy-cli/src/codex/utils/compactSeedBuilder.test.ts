@@ -656,4 +656,129 @@ describe('buildHeuristicSeed', () => {
         // budget, so S2 must not significantly exceed S1.
         expect(r2.seedText.length).toBeLessThanOrEqual(s1.length + 2000);
     });
+
+    // ─── extraUserTexts: rollout-vs-flush race recovery ────────────────────
+    //
+    // Race scenario: user sends a new prompt → happy-cli pushes it into the
+    // turn loop and dispatches `turn/start` → codex hasn't yet flushed the
+    // message to rollout.jsonl → an auto-rescue compact fires → buildHeuristic
+    // Seed scans the rollout and sees *nothing* (or stale state). The result:
+    // the brand-new user prompt vanishes from the seed and the next thread
+    // starts with no awareness of what the user just asked.
+    //
+    // Fix: caller passes the still-in-memory user message(s) via
+    // `extraUserTexts`. They get spliced into the user bucket as the newest
+    // entries, protected by USER_RECENT_FORCE_KEEP.
+
+    it('extraUserTexts: recovers the new prompt when rollout is empty (race window)', async () => {
+        // Pathological race: rollout file exists but is empty — codex hasn't
+        // flushed anything yet for this thread.
+        const path = await writeRollout('race-empty-rollout', []);
+        const result = await buildHeuristicSeed({
+            rolloutPath: path,
+            extraUserTexts: ['用户刚提交的新任务：请帮我重构这个模块'],
+        });
+
+        expect(result.stats.userTurns).toBe(1);
+        expect(result.seedText).toContain('用户刚提交的新任务');
+        expect(result.seedText).toContain('请帮我重构这个模块');
+    });
+
+    it('extraUserTexts: appends as newest entries after rollout-scanned messages', async () => {
+        const path = await writeRollout('race-with-history', [
+            userMessage('历史消息 1'),
+            assistantFinal('历史回答 1'),
+            userMessage('历史消息 2'),
+        ]);
+        const result = await buildHeuristicSeed({
+            rolloutPath: path,
+            extraUserTexts: ['刚发出但未刷盘的新消息'],
+        });
+
+        expect(result.stats.userTurns).toBe(3);
+        expect(result.seedText).toContain('历史消息 1');
+        expect(result.seedText).toContain('历史消息 2');
+        expect(result.seedText).toContain('刚发出但未刷盘的新消息');
+
+        // Newest-first force-keep means the extra message must sit AFTER
+        // history in chronological order (packBucket reverses back).
+        const idxOld = result.seedText.indexOf('历史消息 2');
+        const idxNew = result.seedText.indexOf('刚发出但未刷盘的新消息');
+        expect(idxOld).toBeGreaterThan(-1);
+        expect(idxNew).toBeGreaterThan(idxOld);
+    });
+
+    it('extraUserTexts: force-keeps the new prompt even under tight budget', async () => {
+        // Flood rollout with old messages that would normally swallow the budget.
+        const filler = (i: number) => 'z'.repeat(2000) + ` #${i}`;
+        const records: object[] = [];
+        for (let i = 0; i < 30; i++) records.push(userMessage(`旧消息 ${filler(i)}`));
+        const path = await writeRollout('race-budget-pressure', records);
+
+        const result = await buildHeuristicSeed({
+            rolloutPath: path,
+            tokenBudget: 1000,
+            extraUserTexts: ['这是关键的新任务输入'],
+        });
+
+        // USER_RECENT_FORCE_KEEP=3 means the 3 newest user texts survive
+        // regardless of budget — the spliced extra is at position newest.
+        expect(result.seedText).toContain('这是关键的新任务输入');
+    });
+
+    it('extraUserTexts: applies sensitive redaction', async () => {
+        const path = await writeRollout('race-redact', []);
+        const result = await buildHeuristicSeed({
+            rolloutPath: path,
+            extraUserTexts: ['请用这个 key: sk-proj-LeakedSecretAbCdEfGhIjKlMnOpQrStUvWx'],
+        });
+        expect(result.seedText).not.toContain('LeakedSecret');
+        expect(result.seedText).toContain('[REDACTED-API-KEY]');
+    });
+
+    it('extraUserTexts: filters environment_context noise the same as rollout-sourced messages', async () => {
+        const path = await writeRollout('race-noise', []);
+        const result = await buildHeuristicSeed({
+            rolloutPath: path,
+            extraUserTexts: [
+                '<environment_context>\n  <cwd>/x</cwd>\n</environment_context>',
+                '真正的用户输入',
+            ],
+        });
+        expect(result.stats.userTurns).toBe(1);
+        expect(result.seedText).toContain('真正的用户输入');
+        expect(result.seedText).not.toContain('environment_context');
+    });
+
+    it('extraUserTexts: SEED_SENTINEL in extras routes to compacted bucket (no user-bucket bloat)', async () => {
+        // Simulates: a prior /compact produced a seed, the user's next prompt
+        // (which contains the prepended seed at its start) is the in-memory
+        // turn input that hasn't flushed yet.
+        const priorSeed = `${SEED_SENTINEL}\n## 上下文摘要\n- 之前讨论过 X`;
+        const path = await writeRollout('race-sentinel', [
+            userMessage('应被清空的早期消息'),
+        ]);
+        const result = await buildHeuristicSeed({
+            rolloutPath: path,
+            extraUserTexts: [priorSeed, '基于摘要继续：新问题 Y'],
+        });
+
+        // Sentinel triggers compacted-bucket swap and clears userTexts; then
+        // the post-sentinel extra ("新问题 Y") is appended.
+        expect(result.stats.hadCompactedRecord).toBe(true);
+        expect(result.stats.userTurns).toBe(1);
+        expect(result.seedText).not.toContain('应被清空的早期消息');
+        expect(result.seedText).toContain('之前讨论过 X');
+        expect(result.seedText).toContain('新问题 Y');
+    });
+
+    it('extraUserTexts: empty array and undefined behave identically (no-op safety)', async () => {
+        const path = await writeRollout('race-noop', [userMessage('只有这一条')]);
+        const a = await buildHeuristicSeed({ rolloutPath: path });
+        const b = await buildHeuristicSeed({ rolloutPath: path, extraUserTexts: [] });
+        const c = await buildHeuristicSeed({ rolloutPath: path, extraUserTexts: ['', '  '.trim()] });
+        // All three should produce structurally identical seeds.
+        expect(b.seedText).toBe(a.seedText);
+        expect(c.seedText).toBe(a.seedText);
+    });
 });

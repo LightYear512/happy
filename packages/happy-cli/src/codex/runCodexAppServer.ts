@@ -61,6 +61,7 @@ import { buildHeuristicSeed } from './utils/compactSeedBuilder';
 import { compactViaCodexExec, wrapL2SeedAsHeuristicSeed } from './utils/codexExecCompact';
 import { shouldAutoRescue, createRescueGate } from './utils/codexAutoRescue';
 import { createTurnLifecycle } from './utils/turnLifecycle';
+import { createRecentUserBuffer } from './utils/recentUserBuffer';
 
 // ---------------------------------------------------------------------------
 // Types (mirrors runCodex.ts)
@@ -273,6 +274,11 @@ export async function runCodexWithAppServer(opts: {
         model: mode.model,
     }));
 
+    // Race-recovery mirror of user prompts; snapshot is consumed by
+    // /compact's seed builder to cover prompts not yet flushed to
+    // rollout.jsonl. See `utils/recentUserBuffer.ts` for the full rationale.
+    const recentUserBuffer = createRecentUserBuffer();
+
     let currentPermissionMode: PermissionMode | undefined = undefined;
     let currentModel: string | undefined = undefined;
 
@@ -404,6 +410,10 @@ export async function runCodexWithAppServer(opts: {
             return;
         }
 
+        // Must precede messageQueue.push: a synchronous push failure would
+        // otherwise skip the record, leaving the prompt unrecoverable by the
+        // seed builder. All non-prompt traffic has been early-returned above.
+        recentUserBuffer.record(text);
         messageQueue.push(text, enhancedMode);
     });
 
@@ -524,6 +534,12 @@ export async function runCodexWithAppServer(opts: {
                 const built = await buildHeuristicSeed({
                     rolloutPath,
                     trailerNote: '请基于以上摘要继续。',
+                    // Race-recovery snapshot: any prompt accepted into the
+                    // queue but not yet flushed by codex into rollout.jsonl.
+                    // `snapshot()` returns a copy, so even though
+                    // compactInFlight gates onUserMessage during this await,
+                    // we hold a frozen view rather than a live reference.
+                    extraUserTexts: recentUserBuffer.snapshot(),
                 });
                 seedText = built.seedText;
                 seedStats = built.stats;
@@ -579,6 +595,16 @@ export async function runCodexWithAppServer(opts: {
             threadIdStored = false;
             opts.codexSessionId = undefined;
             compactState.pendingSeedText = seedText;
+
+            // Reset the race-recovery buffer in lock-step with the thread
+            // swap. Without this, prompts from the *prior* thread would be
+            // injected as `extraUserTexts` on the NEXT /compact, defeating
+            // SEED_SENTINEL's discard-older invariant (they'd reappear
+            // alongside the prior seed's compacted bucket → reverse the
+            // compaction work). The newly-started thread begins with an
+            // empty rollout AND an empty buffer; prompts that arrive after
+            // this point will populate both in sync.
+            recentUserBuffer.clear();
             logger.debug(`[CodexAppServer] ${autoTriggered ? '[auto] ' : ''}/${mode} completed`);
 
             // Protocol-level completion event. happy-app reducer matches these
