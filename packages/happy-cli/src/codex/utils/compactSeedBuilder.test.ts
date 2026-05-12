@@ -936,6 +936,36 @@ describe('buildHeuristicSeed', () => {
         expect(result.stats.droppedSections.some(s => s.startsWith('recent-shrunk'))).toBe(true);
     });
 
+    it('shrinkRecentRegion single-turn fallback still renders per-turn fileEdits', async () => {
+        // Forces the single-turn smartTruncate path (3 huge turns + tiny
+        // budget) AND ensures the surviving turn has fileEdits — verifies
+        // R2-1 contract: the **涉及文件** line stays symmetric with the
+        // normal renderRecentTurns path even in the shrink fallback.
+        const big = (label: string) => label + ' '.repeat(4000) + label + '_end';
+        const path = await writeRollout('shrink-with-files', [
+            userMessage(big('Q_OLDEST')),
+            assistantFinal(big('A_OLDEST')),
+            userMessage(big('Q_MID')),
+            assistantFinal(big('A_MID')),
+            userMessage(big('Q_NEWEST_with_files')),
+            shellCall('cat src/touched.ts'),
+            applyPatchCall('*** Update File: src/patched.ts\n+ line\n'),
+            assistantFinal(big('A_NEWEST_with_files')),
+        ]);
+        const result = await buildHeuristicSeed({
+            rolloutPath: path,
+            tokenBudget: 2000,
+            recentTurnsToKeep: 3,
+        });
+        // Newest turn body survives (smartTruncate keeps head + tail markers)
+        expect(result.seedText).toContain('Q_NEWEST_with_files');
+        expect(result.seedText).toContain('A_NEWEST_with_files');
+        // Per-turn file context survives the shrink path
+        expect(result.seedText).toMatch(/\*\*涉及文件\*\*:.*src\/touched\.ts/);
+        expect(result.seedText).toMatch(/\*\*涉及文件\*\*:.*src\/patched\.ts/);
+        expect(result.stats.droppedSections.some(s => s.startsWith('recent-shrunk'))).toBe(true);
+    });
+
     it('K = 0 disables must-keep region — entire conversation is summarisable', async () => {
         const path = await writeRollout('k-zero', [
             userMessage('hello'),
@@ -981,6 +1011,74 @@ describe('buildHeuristicSeed', () => {
         const ord = ['rollout turn 1', 'in-flight prompt A', 'in-flight prompt B'].map(s => result.seedText.indexOf(s));
         expect(ord[0]).toBeLessThan(ord[1]);
         expect(ord[1]).toBeLessThan(ord[2]);
+    });
+
+    it('per-turn file edits surface in the recent block (turn-anchored file context)', async () => {
+        // Recent turn touches src/a.ts and src/b.ts via shell, then patches
+        // src/c.ts. The recent block should label this turn with all three
+        // paths under `**涉及文件**:`. Files outside the recent block still
+        // appear in the cross-turn `### 涉及的文件路径` aggregate.
+        const path = await writeRollout('per-turn-files', [
+            userMessage('early Q'),
+            shellCall('cat src/old.ts'),
+            assistantFinal('early A'),
+            userMessage('recent Q: please fix the bug'),
+            shellCall('cat src/a.ts src/b.ts'),
+            applyPatchCall('*** Update File: src/c.ts\n+ new line\n'),
+            assistantFinal('recent A'),
+        ]);
+        const result = await buildHeuristicSeed({
+            rolloutPath: path,
+            recentTurnsToKeep: 1,
+        });
+        // The recent turn has its files surfaced inline
+        expect(result.seedText).toMatch(/\*\*涉及文件\*\*:.*src\/a\.ts/);
+        expect(result.seedText).toMatch(/\*\*涉及文件\*\*:.*src\/b\.ts/);
+        expect(result.seedText).toMatch(/\*\*涉及文件\*\*:.*src\/c\.ts/);
+        // The pre-recent file `src/old.ts` should NOT be in the per-turn line
+        // of the recent turn (it can only appear in the global files section).
+        const recentBlockStart = result.seedText.indexOf('### 最近 1 轮');
+        const recentBlock = result.seedText.slice(recentBlockStart);
+        expect(recentBlock).not.toContain('src/old.ts');
+    });
+
+    it('per-turn file edits omit the line when no files were touched', async () => {
+        // Pure chat turn — no shell, no apply_patch. The `**涉及文件**:` line
+        // must not render (no empty stub), and the global files section must
+        // also be absent (no edits anywhere).
+        const path = await writeRollout('per-turn-files-empty', [
+            userMessage('just chatting'),
+            assistantFinal('just answering'),
+        ]);
+        const result = await buildHeuristicSeed({
+            rolloutPath: path,
+            recentTurnsToKeep: 1,
+        });
+        expect(result.seedText).not.toContain('**涉及文件**');
+        expect(result.seedText).not.toContain('### 涉及的文件路径');
+    });
+
+    it('per-turn file edits de-duplicate within a turn (shell + patch on same path)', async () => {
+        // shell mentions src/x.ts, then apply_patch updates the same file —
+        // de-dupe so the line says "src/x.ts" once, not twice.
+        const path = await writeRollout('per-turn-files-dedupe', [
+            userMessage('update x.ts'),
+            shellCall('cat src/x.ts'),
+            applyPatchCall('*** Update File: src/x.ts\n+ added\n'),
+            assistantFinal('done'),
+        ]);
+        const result = await buildHeuristicSeed({
+            rolloutPath: path,
+            recentTurnsToKeep: 1,
+        });
+        const recentBlockStart = result.seedText.indexOf('### 最近 1 轮');
+        const recentBlock = result.seedText.slice(recentBlockStart);
+        // Count occurrences of src/x.ts inside the **涉及文件** line only
+        const filesLineMatch = recentBlock.match(/\*\*涉及文件\*\*: ([^\n]+)/);
+        expect(filesLineMatch).not.toBeNull();
+        if (!filesLineMatch) return;
+        const occurrences = (filesLineMatch[1].match(/src\/x\.ts/g) ?? []).length;
+        expect(occurrences).toBe(1);
     });
 
     it('commentary inside a turn is dropped; only final_answer enters assistant block', async () => {

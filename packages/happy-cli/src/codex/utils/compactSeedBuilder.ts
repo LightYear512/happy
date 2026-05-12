@@ -5,32 +5,52 @@
  * into the configured token budget and preserves load-bearing context for a
  * fresh codex conversation. Pure local CPU/IO; no LLM or network involved.
  *
- * Algorithm (single streaming pass + budget-driven composition):
- *  1. If the rollout contains a `compacted` record (codex's own auto-compact
- *     output), reuse its replacement_history as the basis and discard older
- *     dialog buckets. Multiple `compacted` records → keep the latest only.
- *  2. Bucket all subsequent response_items by role/type:
- *      - user message text (filter out env_context / permissions noise)
- *      - assistant message text where phase=final_answer
- *      - file paths mentioned in shell_command / apply_patch arguments
- *      - the most recent set_todos / update_todos arguments
- *  3. Compose markdown seed using **dynamic budget allocation**:
- *      - each bucket gets a share of the global char budget
- *      - within a bucket, walk newest-first; keep full messages while budget
- *        permits, then head/tail-collapse the message that overflows
- *      - the most recent USER_RECENT_FORCE_KEEP user turns are always kept
- *        verbatim (ground-truth intent must not be silently truncated)
- *  4. Append a default safety trailer warning the next session that the seed
- *     may be incomplete (prevents "false amnesia" — model claiming "we never
- *     discussed X" when the discussion is simply outside the seed).
- *  5. If the assembled seed still exceeds the global budget, fall back to a
- *     head-30% / tail-70% collapse with an explicit elision marker.
+ * Algorithm — turn-anchored must-keep + section-aware fallback:
  *
- * Rationale: 80%+ of rollout volume is tool stdout (function_call_output) and
- * encrypted reasoning, both of which are useless to a new conversation. The
- * static per-message char caps used previously (400/300) were catastrophic for
- * engineering sessions where a single assistant answer can run 5-10k chars —
- * dynamic allocation lets us spend the budget where it matters.
+ *  1. Stream the rollout. Each `user` message opens a new Turn; subsequent
+ *     `assistant final_answer` messages and `function_call` tool invocations
+ *     attach to the current Turn until the next user message. A `compacted`
+ *     record or a SEED_SENTINEL user message discards all prior Turns and
+ *     installs the payload as `lastCompacted`.
+ *
+ *  2. Splice in-memory extras (from `extraUserTexts`) as additional Turns at
+ *     the end, marked `hasFinalAnswer = false`. These are prompts that
+ *     reached happy but had not yet flushed to rollout.jsonl.
+ *
+ *  3. Split `allTurns` into:
+ *      - `recentTurns`  : the last K turns (K = recentTurnsToKeep, default 3)
+ *      - `earlyTurns`   : everything before that
+ *     `recentTurns` is the MUST-KEEP region — its contents are rendered
+ *     verbatim with role labels (`**用户**:` / `**我**:`) and per-turn file
+ *     context, and are NEVER cut by bucket budgets or the fallback.
+ *
+ *  4. Bucket-summarise `earlyTurns` and the global aggregates (compacted /
+ *     fileEdits / todos) into the SUMMARISED region. The bucket budget is
+ *     `charBudget − recentRegionSize − fixedOverhead`. Each bucket gets a
+ *     ratio share with priority-based surplus redistribution.
+ *
+ *  5. Section-aware fallback: if the assembled seed still exceeds budget,
+ *     drop early-region sections in priority order
+ *     (todos → files → early-assistant → early-user → compacted). The
+ *     must-keep recent block and the trailer are never touched.
+ *
+ *  6. Extreme overflow (must-keep itself exceeds budget): shrinkRecentRegion
+ *     drops oldest turns whole — message-boundary integrity is the industry
+ *     contract (Claude Code /compact, ChatGPT memory truncation, codex's own
+ *     `compacted.replacement_history`: none ever mid-cut a message). If a
+ *     single newest turn still overflows, fall through to smartTruncate on
+ *     its body with an explicit warning annotation.
+ *
+ *  7. Always-on safety trailer warns the next session that the seed may be
+ *     incomplete (prevents "false amnesia" — model claiming "we never
+ *     discussed X" when the discussion is simply outside the seed).
+ *
+ * Rationale: 80%+ of rollout volume is tool stdout (function_call_output)
+ * and encrypted reasoning, both useless to a new conversation. The previous
+ * static per-message char caps (400/300) were catastrophic for engineering
+ * sessions where a single assistant answer can run 5-10k chars. The
+ * turn-anchored model adds a recency guarantee on top: regardless of how
+ * the bucket math turns out, the user's most recent K turns survive intact.
  */
 
 import { createReadStream } from 'node:fs';
@@ -78,6 +98,24 @@ const BUCKET_RATIOS = {
     files: 0.08,
     todos: 0.05,
 } as const;
+
+// Empirical reserve for the top-of-seed scaffolding that always renders:
+// `## 上下文摘要…` header (~30 char), `### …` section titles for up to ~5
+// summarised sections (~30 char each), and Markdown spacers between sections.
+// Cap rationale: 200 covers worst case without eating too much earlyBudget;
+// underestimating just means buckets get a few-hundred extra chars that the
+// fallback can drop. Never underflows.
+const HEADER_OVERHEAD_RESERVE = 200;
+
+// Reserve for the `---` separator and the trailing blank line between the
+// last summarised section and the recent block / trailer.
+const SECTION_SEPARATOR_RESERVE = 40;
+
+// Reserve when shrinkRecentRegion has to truncate a single-turn body: the
+// `---`, section title, `#### 第 1 轮`, `**用户**:` / `**我**:` role labels
+// plus newlines around them. Same magnitude as HEADER_OVERHEAD_RESERVE but
+// scoped to the recent-block re-render path; named separately for clarity.
+const RECENT_SINGLE_TURN_HEADER_RESERVE = 200;
 
 // Anything below this many remaining chars in a bucket is not worth splicing
 // a head/tail-truncated message into — bail out instead.
@@ -737,33 +775,25 @@ function smartTruncate(text: string, maxChars: number): string {
 }
 
 /**
- * Pack messages newest-first into a budget. Each kept entry returns as `- {text}`.
- * Output is reversed back to chronological order on return.
- *
- * @param forceKeepCount how many of the newest messages must be kept
- *   verbatim regardless of budget (overflow falls through to global collapse)
+ * Pack messages newest-first into a char budget, returning each kept entry
+ * as `- {text}`. Order is restored to chronological (oldest → newest) on
+ * return. Buckets only summarise the EARLY region; the must-keep recent
+ * region is reserved by composeSeed before bucket allocation, so there is
+ * no "force-keep" mode here — overflow truncates the budget-overflowing
+ * message via smartTruncate (which preserves head + tail) and drops older
+ * messages entirely.
  */
 function packBucket(
     texts: string[],
     charBudget: number,
-    forceKeepCount: number,
 ): { lines: string[]; used: number } {
     const collected: string[] = [];
     let used = 0;
     const reversed = [...texts].reverse(); // newest first
 
-    for (let i = 0; i < reversed.length; i++) {
-        const t = reversed[i];
-        const isForceKeep = i < forceKeepCount;
+    for (const t of reversed) {
         const prefixCost = 4; // "- " + "\n"
         const fullCost = t.length + prefixCost;
-
-        if (isForceKeep) {
-            collected.push(t);
-            used += fullCost;
-            continue;
-        }
-
         const remaining = charBudget - used;
         if (fullCost <= remaining) {
             collected.push(t);
@@ -778,7 +808,6 @@ function packBucket(
         }
     }
 
-    // Reverse back to chronological (oldest → newest) for natural reading
     return {
         lines: collected.reverse().map(t => `- ${t}`),
         used,
@@ -873,12 +902,34 @@ function allocateBucketBudgets(wants: BucketWants, charBudget: number): BucketWa
 
 /**
  * Render the must-keep recent-turns block. Each turn is rendered as a
- * markdown section with "**用户**: …" and "**我**: …" sub-headers so a
- * downstream model reads them as cleanly-paired Q&A. Turns missing a
- * final_answer (typically the very last turn when /compact triggered
- * mid-response) get an explicit annotation so the next thread does not
- * pretend the user has already been answered.
+ * markdown section with "**用户**:" / "**我**:" / "**涉及文件**:" sub-headers
+ * so a downstream model reads them as cleanly-paired Q&A with per-turn file
+ * context. Turns missing a final_answer (typically the very last turn when
+ * /compact triggered mid-response) get an explicit annotation so the next
+ * thread does not pretend the user has already been answered.
+ *
+ * The per-turn `**涉及文件**:` line is the turn-anchored design's edge over
+ * the cross-turn `### 涉及的文件路径` aggregate: the model can correlate
+ * "what was edited" with "which prompt asked for the edit", not just see a
+ * flat union of every file ever touched in the conversation.
  */
+/**
+ * De-dupe file paths within a single turn while preserving first-seen order.
+ * apply_patch and shell calls within the same turn often mention the same
+ * file; we want one entry per file but in touch order so the model can see
+ * a coherent "read → patch" sequence.
+ */
+function dedupeFileEdits(fileEdits: string[]): string[] {
+    const seen = new Set<string>();
+    const ordered: string[] = [];
+    for (const p of fileEdits) {
+        if (seen.has(p)) continue;
+        seen.add(p);
+        ordered.push(p);
+    }
+    return ordered;
+}
+
 function renderRecentTurns(turns: Turn[]): string {
     if (turns.length === 0) return '';
     const lines: string[] = [];
@@ -895,6 +946,9 @@ function renderRecentTurns(turns: Turn[]): string {
         lines.push(`**用户**: ${t.userText}`);
         if (t.assistantTexts.length > 0) {
             lines.push(`**我**: ${t.assistantTexts.join('\n\n')}`);
+        }
+        if (t.fileEdits.length > 0) {
+            lines.push(`**涉及文件**: ${dedupeFileEdits(t.fileEdits).join(', ')}`);
         }
     }
     return lines.join('\n');
@@ -930,8 +984,7 @@ function shrinkRecentRegion(turns: Turn[], maxChars: number): { text: string; ke
     const heading = newest.hasFinalAnswer
         ? '\n#### 第 1 轮'
         : '\n#### 第 1 轮（回答未完成）';
-    const headerOverhead = 200; // separator + section title + heading + role labels
-    const bodyBudget = Math.max(MIN_TRUNCATE_CHARS, maxChars - headerOverhead);
+    const bodyBudget = Math.max(MIN_TRUNCATE_CHARS, maxChars - RECENT_SINGLE_TURN_HEADER_RESERVE);
     const userBudget = Math.floor(bodyBudget * 0.5);
     const assistantBudget = bodyBudget - userBudget;
     const userText = smartTruncate(newest.userText, userBudget);
@@ -943,6 +996,9 @@ function shrinkRecentRegion(turns: Turn[], maxChars: number): { text: string; ke
     const out: string[] = ['', '---', '', '### 最近 1 轮完整对话（不可压缩，请基于此继续）', heading];
     out.push(`**用户**: ${userText}`);
     if (assistantText) out.push(`**我**: ${assistantText}`);
+    if (newest.fileEdits.length > 0) {
+        out.push(`**涉及文件**: ${dedupeFileEdits(newest.fileEdits).join(', ')}`);
+    }
     return {
         text: out.join('\n'),
         keptCount: 1,
@@ -950,44 +1006,51 @@ function shrinkRecentRegion(turns: Turn[], maxChars: number): { text: string; ke
     };
 }
 
+type SectionKey =
+    | 'sentinel'
+    | 'header'
+    | 'compacted'
+    | 'early-user'
+    | 'early-assistant'
+    | 'files'
+    | 'todos'
+    | 'recent'
+    | 'trailer-spacer'
+    | 'trailer'
+    | 'trailer-note-spacer'
+    | 'trailer-note';
+
 interface Section {
-    key: string;
+    key: SectionKey;
     text: string;
     droppable: boolean;
     /** Lower priority is dropped first. Only meaningful when droppable=true. */
     dropPriority: number;
 }
 
-function composeSeed(
+type BucketUsage = ComposeResult['bucketUsage'];
+
+/**
+ * Build the ordered Section list. Always-on sections (sentinel, header,
+ * recent must-keep, trailer) are non-droppable; bucket-summarised early
+ * sections are droppable with a priority ordering used by applyDropFallback.
+ *
+ * Returns the populated section array along with per-bucket usage stats.
+ */
+function buildSeedSections(
     buckets: Buckets,
     earlyTurns: Turn[],
-    recentTurns: Turn[],
-    tokenBudget: number,
-    trailerNote?: string,
-): ComposeResult {
-    const charBudget = tokenBudget * TOKEN_CHAR_RATIO;
-    const usage = { compacted: 0, user: 0, assistant: 0, files: 0, todos: 0 };
-
-    // ─── Phase 1: reserve must-keep region first ───────────────────────────
-    // Recent turns are protected. We compute their rendered size up front and
-    // subtract from the global budget so bucket allocation only sees what's
-    // actually available for the summarised early region. Fixed overhead
-    // accounts for sentinel + header + trailer that always render.
-    const FIXED_OVERHEAD_ESTIMATE = SEED_SENTINEL.length + 200 + DEFAULT_TRAILER.length + (trailerNote?.length ?? 0) + 40;
-    let recentBlock = renderRecentTurns(recentTurns);
-    let recentChars = recentBlock.length;
-    const earlyBudget = Math.max(0, charBudget - recentChars - FIXED_OVERHEAD_ESTIMATE);
-
-    // ─── Phase 2: bucket allocation on the EARLY region only ───────────────
-    const wants = estimateBucketWants(buckets, earlyTurns);
-    const budgets = allocateBucketBudgets(wants, earlyBudget);
-
-    // ─── Phase 3: build sections list (always-on + droppable) ──────────────
+    recentBlock: string,
+    budgets: BucketWants,
+    trailerNote: string | undefined,
+): { sections: Section[]; usage: BucketUsage } {
     const sections: Section[] = [];
+    const usage: BucketUsage = { compacted: 0, user: 0, assistant: 0, files: 0, todos: 0 };
+
     sections.push({ key: 'sentinel', text: SEED_SENTINEL, droppable: false, dropPriority: 0 });
     sections.push({ key: 'header', text: '## 上下文摘要（happy /compact 本地重建）', droppable: false, dropPriority: 0 });
 
-    // 1. codex's own compacted history (early region — droppable)
+    // 1. codex's own compacted history (droppable, lowest urgency to keep)
     if (buckets.lastCompacted?.replacement_history?.length && budgets.compacted > 0) {
         const compactedTexts: string[] = [];
         for (const msg of buckets.lastCompacted.replacement_history) {
@@ -997,7 +1060,7 @@ function composeSeed(
             compactedTexts.push(text);
         }
         if (compactedTexts.length > 0) {
-            const packed = packBucket(compactedTexts, budgets.compacted, 0);
+            const packed = packBucket(compactedTexts, budgets.compacted);
             if (packed.lines.length > 0) {
                 const body = ['\n### codex 上次成功压缩的历史', ...packed.lines].join('\n');
                 sections.push({ key: 'compacted', text: body, droppable: true, dropPriority: 5 });
@@ -1006,10 +1069,10 @@ function composeSeed(
         }
     }
 
-    // 2. 早期用户指令时序 (early region — droppable)
+    // 2. 早期用户指令时序
     if (earlyTurns.length > 0 && budgets.user > 0) {
         const userTexts = earlyTurns.map(t => t.userText);
-        const packed = packBucket(userTexts, budgets.user, 0);
+        const packed = packBucket(userTexts, budgets.user);
         if (packed.lines.length > 0) {
             const body = [
                 `\n### 早期用户指令时序（共 ${earlyTurns.length} 条，节选 ${packed.lines.length}）`,
@@ -1020,12 +1083,12 @@ function composeSeed(
         }
     }
 
-    // 3. 早期 assistant final_answer (early region — droppable)
+    // 3. 早期 assistant final_answer
     if (earlyTurns.length > 0 && budgets.assistant > 0) {
         const ansTexts: string[] = [];
         for (const t of earlyTurns) ansTexts.push(...t.assistantTexts);
         if (ansTexts.length > 0) {
-            const packed = packBucket(ansTexts, budgets.assistant, 0);
+            const packed = packBucket(ansTexts, budgets.assistant);
             if (packed.lines.length > 0) {
                 const body = [
                     `\n### 我之前给出的关键回答（共 ${ansTexts.length} 条，节选 ${packed.lines.length}）`,
@@ -1037,7 +1100,7 @@ function composeSeed(
         }
     }
 
-    // 4. 涉及的文件路径 (droppable)
+    // 4. 涉及的文件路径 (cross-turn union)
     if (buckets.fileEdits.size > 0 && budgets.files > 0) {
         const allPaths = Array.from(buckets.fileEdits);
         const paths: string[] = [];
@@ -1061,7 +1124,7 @@ function composeSeed(
         }
     }
 
-    // 5. 当前 TODO 列表 (droppable, lowest priority — most easily rebuildable)
+    // 5. 当前 TODO 列表 (lowest priority — most easily rebuildable next turn)
     if (buckets.todos && budgets.todos > 0) {
         let todosBlock = '';
         try {
@@ -1079,12 +1142,12 @@ function composeSeed(
         }
     }
 
-    // 6. 必保区 (must-keep — NEVER droppable, NEVER mid-section cut)
+    // 6. 必保区
     if (recentBlock.length > 0) {
         sections.push({ key: 'recent', text: recentBlock, droppable: false, dropPriority: 0 });
     }
 
-    // 7. 默认安全 trailer + 用户额外 trailer (must-keep)
+    // 7. trailer (must-keep)
     sections.push({ key: 'trailer-spacer', text: '', droppable: false, dropPriority: 0 });
     sections.push({ key: 'trailer', text: DEFAULT_TRAILER, droppable: false, dropPriority: 0 });
     if (trailerNote) {
@@ -1092,60 +1155,137 @@ function composeSeed(
         sections.push({ key: 'trailer-note', text: trailerNote, droppable: false, dropPriority: 0 });
     }
 
-    // ─── Phase 4: assemble + section-aware fallback ────────────────────────
-    const join = (ss: Section[]) => ss.map(s => s.text).join('\n');
-    let seed = join(sections);
+    return { sections, usage };
+}
+
+function joinSections(sections: Section[]): string {
+    return sections.map(s => s.text).join('\n');
+}
+
+// Map droppable section keys to the bucket-usage field they account for.
+// Partial because non-droppable sections (sentinel, header, recent, trailer)
+// have no usage attribution. Typed against SectionKey so renaming a key in
+// the union immediately surfaces a TS error at every map entry, instead of
+// silently de-syncing the fallback bookkeeping.
+const USAGE_BUCKET_BY_SECTION: Partial<Record<SectionKey, keyof BucketUsage>> = {
+    'compacted': 'compacted',
+    'early-user': 'user',
+    'early-assistant': 'assistant',
+    'files': 'files',
+    'todos': 'todos',
+};
+
+/**
+ * Drop droppable early-region sections in priority order until total length
+ * fits budget. Section text is cleared to '' (in place) rather than spliced
+ * so indices stay stable. Returns the resulting seed text and the list of
+ * dropped section keys; also resets the corresponding bucket usage counters
+ * so stats reflect what actually rendered.
+ */
+function applyDropFallback(
+    sections: Section[],
+    charBudget: number,
+    usage: BucketUsage,
+): { seed: string; droppedSections: string[]; fallbackTriggered: boolean } {
+    let seed = joinSections(sections);
+    if (seed.length <= charBudget) {
+        return { seed, droppedSections: [], fallbackTriggered: false };
+    }
+
+    const dropOrder = sections
+        .map((s, i) => ({ s, i }))
+        .filter(x => x.s.droppable && x.s.text.length > 0)
+        .sort((a, b) => a.s.dropPriority - b.s.dropPriority);
+
     const droppedSections: string[] = [];
-    let fallbackTriggered = false;
+    for (const { i, s } of dropOrder) {
+        droppedSections.push(s.key);
+        const usageKey = USAGE_BUCKET_BY_SECTION[s.key];
+        if (usageKey) usage[usageKey] = 0;
+        sections[i].text = '';
+        seed = joinSections(sections);
+        if (seed.length <= charBudget) break;
+    }
+    return { seed, droppedSections, fallbackTriggered: true };
+}
 
-    if (seed.length > charBudget) {
-        fallbackTriggered = true;
-        // Drop early-region sections in priority order (todos → files →
-        // early-assistant → early-user → compacted). Each drop clears the
-        // section text to '' (preserves index for stable joins) and re-checks
-        // total length. The must-keep block and trailer are untouched.
-        const dropOrder = sections
-            .map((s, i) => ({ s, i }))
-            .filter(x => x.s.droppable && x.s.text.length > 0)
-            .sort((a, b) => a.s.dropPriority - b.s.dropPriority);
-
-        for (const { i, s } of dropOrder) {
-            droppedSections.push(s.key);
-            // Reset usage attribution for dropped buckets so stats reflect reality.
-            if (s.key === 'compacted') usage.compacted = 0;
-            else if (s.key === 'early-user') usage.user = 0;
-            else if (s.key === 'early-assistant') usage.assistant = 0;
-            else if (s.key === 'files') usage.files = 0;
-            else if (s.key === 'todos') usage.todos = 0;
-            sections[i].text = '';
-            seed = join(sections);
-            if (seed.length <= charBudget) break;
-        }
+/**
+ * Last-resort: after dropping every droppable section we're still over
+ * budget — the must-keep recent block alone exceeds the limit. Shrink it by
+ * dropping oldest turns whole (never mid-cut). Returns the new seed text and
+ * the updated rendered length of the recent block.
+ */
+function shrinkRecentIfNeeded(
+    sections: Section[],
+    recentTurns: Turn[],
+    charBudget: number,
+    seed: string,
+    droppedSections: string[],
+): { seed: string; recentChars: number } {
+    const recentIdx = sections.findIndex(s => s.key === 'recent');
+    if (seed.length <= charBudget || recentTurns.length === 0 || recentIdx < 0) {
+        return {
+            seed,
+            recentChars: recentIdx >= 0 ? sections[recentIdx].text.length : 0,
+        };
     }
 
-    // ─── Phase 5: extreme — must-keep region itself overflows ──────────────
-    // After dropping every early section, only sentinel + header + recent +
-    // trailer remain. If even that overflows, the recent block is what's too
-    // big. shrinkRecentRegion drops oldest turns whole; if a single newest
-    // turn still overflows, it smart-truncates that turn's body.
-    if (seed.length > charBudget && recentTurns.length > 0) {
-        const recentIdx = sections.findIndex(s => s.key === 'recent');
-        if (recentIdx >= 0) {
-            const fixedRemaining = seed.length - sections[recentIdx].text.length;
-            const recentMaxChars = Math.max(MIN_TRUNCATE_CHARS, charBudget - fixedRemaining);
-            const shrunk = shrinkRecentRegion(recentTurns, recentMaxChars);
-            sections[recentIdx].text = shrunk.text + (shrunk.warning ?? '');
-            recentChars = shrunk.text.length;
-            droppedSections.push(`recent-shrunk(kept-${shrunk.keptCount}/${recentTurns.length})`);
-            seed = join(sections);
-        }
-    }
+    const fixedRemaining = seed.length - sections[recentIdx].text.length;
+    const recentMaxChars = Math.max(MIN_TRUNCATE_CHARS, charBudget - fixedRemaining);
+    const shrunk = shrinkRecentRegion(recentTurns, recentMaxChars);
+    sections[recentIdx].text = shrunk.text + (shrunk.warning ?? '');
+    droppedSections.push(`recent-shrunk(kept-${shrunk.keptCount}/${recentTurns.length})`);
+    return {
+        seed: joinSections(sections),
+        recentChars: shrunk.text.length,
+    };
+}
+
+function composeSeed(
+    buckets: Buckets,
+    earlyTurns: Turn[],
+    recentTurns: Turn[],
+    tokenBudget: number,
+    trailerNote?: string,
+): ComposeResult {
+    const charBudget = tokenBudget * TOKEN_CHAR_RATIO;
+
+    // Phase 1: reserve must-keep region first. Recent turns are protected;
+    // we compute their rendered size up front and subtract from the global
+    // budget so bucket allocation only sees what's actually available for
+    // the summarised early region.
+    const fixedOverhead = SEED_SENTINEL.length
+        + HEADER_OVERHEAD_RESERVE
+        + DEFAULT_TRAILER.length
+        + (trailerNote?.length ?? 0)
+        + SECTION_SEPARATOR_RESERVE;
+    const recentBlock = renderRecentTurns(recentTurns);
+    const earlyBudget = Math.max(0, charBudget - recentBlock.length - fixedOverhead);
+
+    // Phase 2: bucket allocation on the EARLY region only.
+    const wants = estimateBucketWants(buckets, earlyTurns);
+    const budgets = allocateBucketBudgets(wants, earlyBudget);
+
+    // Phase 3: build sections.
+    const { sections, usage } = buildSeedSections(buckets, earlyTurns, recentBlock, budgets, trailerNote);
+
+    // Phase 4: section-aware fallback (drops early sections in priority order).
+    const dropResult = applyDropFallback(sections, charBudget, usage);
+
+    // Phase 5: must-keep region overflow handling (shrink whole turns, never mid-cut).
+    const shrinkResult = shrinkRecentIfNeeded(
+        sections,
+        recentTurns,
+        charBudget,
+        dropResult.seed,
+        dropResult.droppedSections,
+    );
 
     return {
-        seedText: seed,
+        seedText: shrinkResult.seed,
         bucketUsage: usage,
-        recentTurnsChars: recentChars,
-        fallbackTriggered,
-        droppedSections,
+        recentTurnsChars: shrinkResult.recentChars,
+        fallbackTriggered: dropResult.fallbackTriggered,
+        droppedSections: dropResult.droppedSections,
     };
 }
