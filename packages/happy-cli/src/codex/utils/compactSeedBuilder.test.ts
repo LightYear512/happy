@@ -237,15 +237,23 @@ describe('buildHeuristicSeed', () => {
         expect(result.seedText).not.toContain('5MB blob');
     });
 
-    it('truncates seed when total exceeds token budget', async () => {
+    it('section-aware fallback drops early sections when total exceeds token budget', async () => {
+        // 50 user turns × 2 KB each ≫ 4 KB budget. Most will land in early
+        // region and be summarised; fallback should drop early sections
+        // before touching the must-keep recent turns.
         const longText = 'x'.repeat(2000);
         const records: object[] = [];
         for (let i = 0; i < 50; i++) records.push(userMessage(`user ${i}: ${longText}`));
         const path = await writeRollout('overflow', records);
 
         const small = await buildHeuristicSeed({ rolloutPath: path, tokenBudget: 1000 });
-        expect(small.seedText.length).toBeLessThanOrEqual(1000 * 4 + 200); // budget + collapse marker
-        expect(small.seedText).toContain('省略中间内容');
+        // Seed stays within budget (small slack for shrink warnings)
+        expect(small.seedText.length).toBeLessThanOrEqual(1000 * 4 + 400);
+        // Fallback observable via stats, not legacy "省略中间内容" marker
+        expect(small.stats.fallbackTriggered).toBe(true);
+        expect(small.stats.droppedSections.length).toBeGreaterThan(0);
+        // Must-keep guarantee: the newest user message survives intact
+        expect(small.seedText).toContain('user 49');
     });
 
     it('tolerates malformed json lines (partial last line during active codex writes)', async () => {
@@ -320,13 +328,16 @@ describe('buildHeuristicSeed', () => {
     });
 
     it('returns bucketUsage stats for observability', async () => {
+        // bucketUsage describes the early/summarised region; disable
+        // recent-turns reservation so this single-turn fixture lands in
+        // the early region and exercises all buckets.
         const path = await writeRollout('usage', [
             userMessage('hello'),
             assistantFinal('world'),
             shellCall('ls src/foo.ts'),
             todoCall([{ id: 1, content: 'a', status: 'in_progress' }]),
         ]);
-        const result = await buildHeuristicSeed({ rolloutPath: path });
+        const result = await buildHeuristicSeed({ rolloutPath: path, recentTurnsToKeep: 0 });
         expect(result.stats.bucketUsage).toBeDefined();
         expect(result.stats.bucketUsage.user).toBeGreaterThan(0);
         expect(result.stats.bucketUsage.assistant).toBeGreaterThan(0);
@@ -474,15 +485,19 @@ describe('buildHeuristicSeed', () => {
     // ─── Top 2: cross-bucket budget reallocation ────────────────────────
 
     it('reallocates surplus budget from low-demand bucket to high-demand bucket', async () => {
-        // Tiny user messages (low demand) + long assistant answer (high demand).
-        // Old static-cap algorithm would have wasted user-bucket surplus.
+        // Cross-bucket reallocation is an early-region behaviour; disable
+        // recent-turns reservation so the test exercises it cleanly.
         const longAnswer = 'A'.repeat(20000);
         const path = await writeRollout('budget-realloc', [
             userMessage('hi'),
             userMessage('ok'),
             assistantFinal(longAnswer),
         ]);
-        const result = await buildHeuristicSeed({ rolloutPath: path, tokenBudget: 4000 });
+        const result = await buildHeuristicSeed({
+            rolloutPath: path,
+            tokenBudget: 4000,
+            recentTurnsToKeep: 0,
+        });
 
         // assistant bucket should have received more than its base 30% ratio
         // (4000 × 4 × 0.30 = 4800 chars). With reallocation it can borrow
@@ -491,13 +506,16 @@ describe('buildHeuristicSeed', () => {
     });
 
     it('respects priority order — user gets surplus before assistant when both want more', async () => {
-        // Both buckets want way more than their ratio cap; user should win.
         const longText = 'B'.repeat(15000);
         const records: object[] = [];
         for (let i = 0; i < 5; i++) records.push(userMessage(`U${i}: ${longText}`));
         for (let i = 0; i < 5; i++) records.push(assistantFinal(`A${i}: ${longText}`));
         const path = await writeRollout('priority', records);
-        const result = await buildHeuristicSeed({ rolloutPath: path, tokenBudget: 4000 });
+        const result = await buildHeuristicSeed({
+            rolloutPath: path,
+            tokenBudget: 4000,
+            recentTurnsToKeep: 0,
+        });
 
         // user bucket should consume meaningfully more than its 35% base
         // when both compete (35% × 16000 = 5600 chars baseline)
@@ -780,5 +798,227 @@ describe('buildHeuristicSeed', () => {
         // All three should produce structurally identical seeds.
         expect(b.seedText).toBe(a.seedText);
         expect(c.seedText).toBe(a.seedText);
+    });
+
+    // ─── Turn-anchored must-keep region (the "industry contract") ───────
+    //
+    // These tests enforce the recency guarantee: the last K conversation
+    // turns are kept verbatim regardless of any other pressure. Bucket
+    // budgets, the section-aware fallback, and even pathological inputs
+    // must NEVER mid-cut a turn nor silently drop a turn from this region.
+
+    it('last K turns are present verbatim in the must-keep section', async () => {
+        const path = await writeRollout('recent-verbatim', [
+            userMessage('turn 1 question'),
+            assistantFinal('turn 1 answer'),
+            userMessage('turn 2 question'),
+            assistantFinal('turn 2 answer'),
+            userMessage('turn 3 question'),
+            assistantFinal('turn 3 answer'),
+            userMessage('turn 4 question'),
+            assistantFinal('turn 4 answer'),
+        ]);
+        const result = await buildHeuristicSeed({
+            rolloutPath: path,
+            recentTurnsToKeep: 3,
+        });
+        // Recent section header present
+        expect(result.seedText).toContain('### 最近 3 轮完整对话');
+        // All last 3 turns present in full
+        for (const i of [2, 3, 4]) {
+            expect(result.seedText).toContain(`turn ${i} question`);
+            expect(result.seedText).toContain(`turn ${i} answer`);
+        }
+        // user/assistant rendered with role labels in the recent block
+        expect(result.seedText).toContain('**用户**: turn 4 question');
+        expect(result.seedText).toContain('**我**: turn 4 answer');
+        // Stats reflect the split
+        expect(result.stats.recentTurnsCount).toBe(3);
+        expect(result.stats.earlyTurnsCount).toBe(1);
+        expect(result.stats.recentTurnsChars).toBeGreaterThan(0);
+    });
+
+    it('user and assistant are paired within a turn (no cross-turn drift)', async () => {
+        // Verify that turn N's assistant appears AFTER turn N's user but
+        // BEFORE turn N+1's user — proves the turn boundary identification works.
+        const path = await writeRollout('pairing', [
+            userMessage('Q-A'),
+            assistantFinal('R-A'),
+            userMessage('Q-B'),
+            assistantFinal('R-B'),
+        ]);
+        const result = await buildHeuristicSeed({
+            rolloutPath: path,
+            recentTurnsToKeep: 2,
+        });
+        const idxQA = result.seedText.indexOf('Q-A');
+        const idxRA = result.seedText.indexOf('R-A');
+        const idxQB = result.seedText.indexOf('Q-B');
+        const idxRB = result.seedText.indexOf('R-B');
+        // All four found, in chronological order with correct pairing
+        for (const idx of [idxQA, idxRA, idxQB, idxRB]) expect(idx).toBeGreaterThan(-1);
+        expect(idxQA).toBeLessThan(idxRA);
+        expect(idxRA).toBeLessThan(idxQB);
+        expect(idxQB).toBeLessThan(idxRB);
+    });
+
+    it('a turn with no final_answer (mid-response /compact) is annotated', async () => {
+        // Simulate happy auto-rescue firing after user prompt but before
+        // codex's response — the last turn has user but no assistant.
+        const path = await writeRollout('incomplete-turn', [
+            userMessage('completed Q'),
+            assistantFinal('completed A'),
+            userMessage('pending Q'),
+            // no assistant message — turn was interrupted
+        ]);
+        const result = await buildHeuristicSeed({ rolloutPath: path });
+        expect(result.seedText).toContain('pending Q');
+        expect(result.seedText).toContain('回答未完成');
+        expect(result.stats.finalAnswers).toBe(1); // only "completed A" had a final_answer
+    });
+
+    it('force-keep guarantee under budget pressure — last 3 turns survive even with 50 noise turns', async () => {
+        // 50 large bogus turns + 3 small distinct recent turns + small budget.
+        // Old algorithm would slice into the recent turns via head/tail cut.
+        // New algorithm drops early sections whole; recent turns untouched.
+        const filler = 'F'.repeat(2000);
+        const records: object[] = [];
+        for (let i = 0; i < 50; i++) {
+            records.push(userMessage(`noise ${i} ${filler}`));
+            records.push(assistantFinal(`noise ans ${i} ${filler}`));
+        }
+        records.push(userMessage('CRITICAL_A'));
+        records.push(assistantFinal('CRITICAL_A_REPLY'));
+        records.push(userMessage('CRITICAL_B'));
+        records.push(assistantFinal('CRITICAL_B_REPLY'));
+        records.push(userMessage('CRITICAL_C'));
+        records.push(assistantFinal('CRITICAL_C_REPLY'));
+        const path = await writeRollout('force-keep-budget', records);
+
+        const result = await buildHeuristicSeed({
+            rolloutPath: path,
+            tokenBudget: 1000,
+            recentTurnsToKeep: 3,
+        });
+        for (const tag of ['CRITICAL_A', 'CRITICAL_A_REPLY', 'CRITICAL_B', 'CRITICAL_B_REPLY', 'CRITICAL_C', 'CRITICAL_C_REPLY']) {
+            expect(result.seedText, `must-keep contract: ${tag}`).toContain(tag);
+        }
+        // Recent block stays at the requested size, untouched by budget pressure.
+        expect(result.stats.recentTurnsCount).toBe(3);
+        // Seed stays within budget (small slack for headers/separators).
+        expect(result.seedText.length).toBeLessThanOrEqual(1000 * 4 + 600);
+    });
+
+    it('recent region itself overflowing the budget: drops oldest turn whole, never mid-cut', async () => {
+        // 3 turns × ~6 KB each = ~18 KB recent block, with budget=2000 (8 KB).
+        // shrinkRecentRegion should drop the oldest turn until the rest fits;
+        // it must NEVER produce a string mid-cut from one of the surviving turns.
+        const big = (label: string) => label + ' '.repeat(4000) + label + '_end';
+        const path = await writeRollout('recent-overflow', [
+            userMessage(big('Q_OLDEST')),
+            assistantFinal(big('A_OLDEST')),
+            userMessage(big('Q_MID')),
+            assistantFinal(big('A_MID')),
+            userMessage(big('Q_NEWEST')),
+            assistantFinal(big('A_NEWEST')),
+        ]);
+        const result = await buildHeuristicSeed({
+            rolloutPath: path,
+            tokenBudget: 2000,
+            recentTurnsToKeep: 3,
+        });
+        // Newest turn definitely survives in full (both start and end markers)
+        expect(result.seedText).toContain('Q_NEWEST');
+        expect(result.seedText).toContain('Q_NEWEST_end');
+        expect(result.seedText).toContain('A_NEWEST');
+        expect(result.seedText).toContain('A_NEWEST_end');
+        // shrink warning surfaces
+        expect(result.stats.droppedSections.some(s => s.startsWith('recent-shrunk'))).toBe(true);
+    });
+
+    it('K = 0 disables must-keep region — entire conversation is summarisable', async () => {
+        const path = await writeRollout('k-zero', [
+            userMessage('hello'),
+            assistantFinal('world'),
+            userMessage('again'),
+            assistantFinal('done'),
+        ]);
+        const result = await buildHeuristicSeed({
+            rolloutPath: path,
+            recentTurnsToKeep: 0,
+        });
+        // No must-keep block — only the early buckets
+        expect(result.seedText).not.toContain('最近 0 轮');
+        expect(result.seedText).not.toContain('最近 1 轮');
+        expect(result.stats.recentTurnsCount).toBe(0);
+        expect(result.stats.earlyTurnsCount).toBe(2);
+        // Content still surfaces through the early bucket
+        expect(result.seedText).toContain('hello');
+        expect(result.seedText).toContain('done');
+    });
+
+    it('extras land in the must-keep region as their own turns', async () => {
+        // 1 rollout turn + 2 extras → 3 total turns. With K=3 all should
+        // be in the recent block, each as its own annotated turn.
+        const path = await writeRollout('extras-as-turns', [
+            userMessage('rollout turn 1'),
+            assistantFinal('rollout reply 1'),
+        ]);
+        const result = await buildHeuristicSeed({
+            rolloutPath: path,
+            recentTurnsToKeep: 3,
+            extraUserTexts: ['in-flight prompt A', 'in-flight prompt B'],
+        });
+        expect(result.stats.recentTurnsCount).toBe(3);
+        // Rollout turn has its assistant — completed
+        expect(result.seedText).toContain('**用户**: rollout turn 1');
+        expect(result.seedText).toContain('**我**: rollout reply 1');
+        // Extras are turns without final_answer — annotated as such
+        expect(result.seedText).toContain('**用户**: in-flight prompt A');
+        expect(result.seedText).toContain('**用户**: in-flight prompt B');
+        expect(result.seedText).toContain('回答未完成');
+        // Ordering: rollout turn first, then extras in given order
+        const ord = ['rollout turn 1', 'in-flight prompt A', 'in-flight prompt B'].map(s => result.seedText.indexOf(s));
+        expect(ord[0]).toBeLessThan(ord[1]);
+        expect(ord[1]).toBeLessThan(ord[2]);
+    });
+
+    it('commentary inside a turn is dropped; only final_answer enters assistant block', async () => {
+        // commentary is codex's thinking-aloud — must not leak into the seed
+        // since it provides no value to the next thread.
+        const path = await writeRollout('commentary-drop', [
+            userMessage('Q'),
+            assistantCommentary('let me think aloud about Q...'),
+            assistantFinal('actual answer to Q'),
+        ]);
+        const result = await buildHeuristicSeed({ rolloutPath: path });
+        expect(result.seedText).toContain('actual answer to Q');
+        expect(result.seedText).not.toContain('let me think aloud');
+    });
+
+    it('SEED_SENTINEL in rollout clears all prior turns (sentinel-anchored discard)', async () => {
+        // Verifies the post-refactor sentinel routing still works: any user
+        // message starting with sentinel collapses prior history into
+        // lastCompacted, so the seed bloat loop is still broken.
+        const path = await writeRollout('sentinel-clear', [
+            userMessage('pre-sentinel turn 1'),
+            assistantFinal('pre-sentinel reply 1'),
+            userMessage('pre-sentinel turn 2'),
+            assistantFinal('pre-sentinel reply 2'),
+            userMessage(`${SEED_SENTINEL}\n## prior compact summary`),
+            userMessage('post-sentinel question'),
+            assistantFinal('post-sentinel reply'),
+        ]);
+        const result = await buildHeuristicSeed({ rolloutPath: path });
+        expect(result.stats.hadCompactedRecord).toBe(true);
+        // Everything before sentinel must be gone from the recent/early regions
+        expect(result.seedText).not.toContain('pre-sentinel turn 1');
+        expect(result.seedText).not.toContain('pre-sentinel turn 2');
+        expect(result.seedText).not.toContain('pre-sentinel reply 1');
+        // Post-sentinel content survives
+        expect(result.seedText).toContain('post-sentinel question');
+        expect(result.seedText).toContain('post-sentinel reply');
+        // Sentinel payload is in the compacted bucket
+        expect(result.seedText).toContain('prior compact summary');
     });
 });
