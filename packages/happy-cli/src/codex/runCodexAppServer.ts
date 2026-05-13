@@ -562,9 +562,21 @@ export async function runCodexWithAppServer(opts: {
                 // gets injected into the next thread's first user message,
                 // and applies regardless of auto-trigger.
                 if (l2.summary) {
-                    seedText = wrapL2SeedAsHeuristicSeed(l2.summary, '请基于以上摘要继续。');
+                    // Re-append the heuristic's verbatim recent-turns block
+                    // after the L2 narrative. L2 sees the recent block as
+                    // input (so its narrative is shaped by current focus),
+                    // but its ≤1500 字 叙事 prompt is allowed to compress
+                    // user/assistant content; without this re-splice, the
+                    // "recent K turns kept verbatim" contract that
+                    // `composeSeed` enforces in the heuristic would silently
+                    // die at the L2 boundary. The verbatim guarantee is now
+                    // code-enforced, not model-dependent.
+                    const body = built.recentBlock
+                        ? `${l2.summary}\n${built.recentBlock}`
+                        : l2.summary;
+                    seedText = wrapL2SeedAsHeuristicSeed(body, '请基于以上摘要继续。');
                     logger.debug(
-                        `[CodexAppServer] ${autoTriggered ? '[auto] ' : ''}/compact L2 succeeded: ${l2.elapsedMs}ms summary=${l2.summary.length} seed=${seedText.length}`,
+                        `[CodexAppServer] ${autoTriggered ? '[auto] ' : ''}/compact L2 succeeded: ${l2.elapsedMs}ms summary=${l2.summary.length} recentBlock=${built.recentBlock.length} seed=${seedText.length}`,
                     );
                 } else if (l2.skipped === 'short_circuit') {
                     logger.debug(

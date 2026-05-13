@@ -420,6 +420,17 @@ export interface BuildSeedOptions {
 
 export interface BuildSeedResult {
     seedText: string;
+    /**
+     * Final rendered text of the must-keep recent region (post-shrink),
+     * with the `### 最近 N 轮完整对话（不可压缩）` heading and verbatim
+     * `**用户**:` / `**我**:` turn bodies. Empty when no recent turns were
+     * reserved (caller set `recentTurnsToKeep: 0` or rollout had < 1 turn).
+     *
+     * The caller is expected to re-append this block when L2 replaces
+     * `seedText` with an LLM narrative — the heuristic's must-keep promise
+     * only survives if the verbatim text is re-spliced after L2.
+     */
+    recentBlock: string;
     stats: {
         /** Total conversation turns recognised (rollout + extras, post-sentinel). */
         userTurns: number;
@@ -523,6 +534,7 @@ export async function buildHeuristicSeed(opts: BuildSeedOptions): Promise<BuildS
 
     return {
         seedText: composed.seedText,
+        recentBlock: composed.recentBlock,
         stats: {
             userTurns: earlyTurns.length + recentTurns.length,
             finalAnswers: finalAnswerCount,
@@ -555,6 +567,14 @@ interface ComposeResult {
         todos: number;
     };
     recentTurnsChars: number;
+    /**
+     * Final rendered text of the must-keep recent region (post-shrink). Empty
+     * string when there are no recent turns. Exposed separately so the L2
+     * pipeline can re-append it verbatim after `wrapL2SeedAsHeuristicSeed`
+     * replaces the heuristic seed with the LLM narrative — the only way to
+     * keep the "recent K turns verbatim" contract intact when L2 succeeds.
+     */
+    recentBlock: string;
     fallbackTriggered: boolean;
     droppedSections: string[];
 }
@@ -1281,10 +1301,17 @@ function composeSeed(
         dropResult.droppedSections,
     );
 
+    // Snapshot the FINAL rendered recent-block text. `sections[recentIdx].text`
+    // reflects any shrink applied in Phase 5 (and the recent section itself is
+    // non-droppable in Phase 4). Empty when no recent turns were reserved.
+    const recentIdx = sections.findIndex(s => s.key === 'recent');
+    const recentBlock = recentIdx >= 0 ? sections[recentIdx].text : '';
+
     return {
         seedText: shrinkResult.seed,
         bucketUsage: usage,
         recentTurnsChars: shrinkResult.recentChars,
+        recentBlock,
         fallbackTriggered: dropResult.fallbackTriggered,
         droppedSections: dropResult.droppedSections,
     };

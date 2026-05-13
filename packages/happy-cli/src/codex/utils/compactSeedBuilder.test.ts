@@ -836,6 +836,28 @@ describe('buildHeuristicSeed', () => {
         expect(result.stats.recentTurnsCount).toBe(3);
         expect(result.stats.earlyTurnsCount).toBe(1);
         expect(result.stats.recentTurnsChars).toBeGreaterThan(0);
+        // recentBlock is exposed at the top level so the L2 pipeline can
+        // re-append it verbatim after the LLM narrative replaces seedText.
+        // It must contain the verbatim recent turns AND the must-keep heading.
+        expect(result.recentBlock).toContain('### 最近 3 轮完整对话');
+        expect(result.recentBlock).toContain('**用户**: turn 4 question');
+        expect(result.recentBlock).toContain('**我**: turn 4 answer');
+        // The recentBlock must be a substring of seedText (i.e. exactly what
+        // the heuristic embedded into its own seed — so re-appending it
+        // after an L2 narrative reproduces the must-keep contract bit-for-bit).
+        expect(result.seedText).toContain(result.recentBlock);
+    });
+
+    it('recentBlock is empty when caller disables must-keep (recentTurnsToKeep=0)', async () => {
+        const path = await writeRollout('recent-block-empty', [
+            userMessage('only turn'),
+            assistantFinal('only reply'),
+        ]);
+        const result = await buildHeuristicSeed({ rolloutPath: path, recentTurnsToKeep: 0 });
+        expect(result.recentBlock).toBe('');
+        expect(result.stats.recentTurnsCount).toBe(0);
+        // seedText must still produce a usable seed (heading + bucket content)
+        expect(result.seedText).toContain('## 上下文摘要');
     });
 
     it('user and assistant are paired within a turn (no cross-turn drift)', async () => {
