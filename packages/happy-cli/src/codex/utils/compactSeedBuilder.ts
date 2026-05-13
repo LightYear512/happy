@@ -1304,14 +1304,16 @@ function composeSeed(
     // Snapshot the FINAL rendered recent-block text. `sections[recentIdx].text`
     // reflects any shrink applied in Phase 5 (and the recent section itself is
     // non-droppable in Phase 4). Empty when no recent turns were reserved.
+    // Named `finalRecentBlock` to avoid shadowing the phase-1 `recentBlock`
+    // (pre-shrink render used for budget reservation, line ~1282).
     const recentIdx = sections.findIndex(s => s.key === 'recent');
-    const recentBlock = recentIdx >= 0 ? sections[recentIdx].text : '';
+    const finalRecentBlock = recentIdx >= 0 ? sections[recentIdx].text : '';
 
     return {
         seedText: shrinkResult.seed,
         bucketUsage: usage,
         recentTurnsChars: shrinkResult.recentChars,
-        recentBlock,
+        recentBlock: finalRecentBlock,
         fallbackTriggered: dropResult.fallbackTriggered,
         droppedSections: dropResult.droppedSections,
     };
