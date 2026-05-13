@@ -230,7 +230,15 @@ export function createAppServerStreamBridge(): {
 
         // -- turn/started ------------------------------------------------
         if (method === 'turn/started') {
-            const turnId = readString(record.turnId) ?? readString(record.id) ?? createId();
+            // codex 0.130.0 emits `turn_id` (snake_case) in notifications even
+            // though `turn/start` RPC response uses `turn.id`. Without snake_case
+            // fallback, this lands on `createId()` and the locally-fabricated
+            // CUID gets sent back as `turn/interrupt`'s turnId — codex rejects
+            // it, and stop-button breaks. See readTurnId in runCodexAppServer.ts.
+            const turnId = readString(record.turnId)
+                ?? readString(record.turn_id)
+                ?? readString(record.id)
+                ?? createId();
             currentTurnId = turnId;
             toolContextByCallId.clear();
 

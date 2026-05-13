@@ -80,30 +80,43 @@ interface EnhancedMode {
 
 type ThreadLikeResponse = Readonly<{
     threadId?: unknown;
+    thread_id?: unknown;
     id?: unknown;
-    thread?: Readonly<{ id?: unknown; threadId?: unknown }> | null;
+    thread?: Readonly<{ id?: unknown; threadId?: unknown; thread_id?: unknown }> | null;
 }>;
 
 type TurnLikeResponse = Readonly<{
     turnId?: unknown;
+    turn_id?: unknown;
     id?: unknown;
-    turn?: Readonly<{ id?: unknown; turnId?: unknown }> | null;
+    turn?: Readonly<{ id?: unknown; turnId?: unknown; turn_id?: unknown }> | null;
 }>;
 
 function readThreadId(value: unknown): string | null {
     if (!value || typeof value !== 'object') return null;
     const r = value as ThreadLikeResponse;
-    const candidates = [r.threadId, r.id, r.thread?.threadId, r.thread?.id];
+    const candidates = [
+        r.threadId, r.thread_id, r.id,
+        r.thread?.threadId, r.thread?.thread_id, r.thread?.id,
+    ];
     for (const c of candidates) {
         if (typeof c === 'string' && c.trim().length > 0) return c.trim();
     }
     return null;
 }
 
+// codex 0.130.0 emits `turn_id` (snake_case) in notifications such as
+// `turn/started` / `turn/completed` / `turn/interrupted`, while the `turn/start`
+// RPC response still nests the id under `turn.id`. Both styles must resolve or
+// we lose the real turn id, send a bogus one back as `turn/interrupt`'s param,
+// and codex silently rejects the stop request.
 function readTurnId(value: unknown): string | null {
     if (!value || typeof value !== 'object') return null;
     const r = value as TurnLikeResponse;
-    const candidates = [r.turnId, r.id, r.turn?.turnId, r.turn?.id];
+    const candidates = [
+        r.turnId, r.turn_id, r.id,
+        r.turn?.turnId, r.turn?.turn_id, r.turn?.id,
+    ];
     for (const c of candidates) {
         if (typeof c === 'string' && c.trim().length > 0) return c.trim();
     }
@@ -879,7 +892,11 @@ export async function runCodexWithAppServer(opts: {
                 await client.request('turn/interrupt', { threadId, turnId: activeTurnId });
             }
         } catch (error) {
-            logger.debug('[CodexAppServer] Error during abort:', error);
+            // logToFile uses JSON.stringify which swallows Error.message
+            // (non-enumerable); stringify the message explicitly so future
+            // protocol regressions surface in logs instead of showing `{}`.
+            const detail = error instanceof Error ? error.message : String(error);
+            logger.debug(`[CodexAppServer] Error during abort: ${detail}`);
         }
     }
 
