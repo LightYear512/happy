@@ -92,7 +92,9 @@ type TurnLikeResponse = Readonly<{
     turn?: Readonly<{ id?: unknown; turnId?: unknown; turn_id?: unknown }> | null;
 }>;
 
-function readThreadId(value: unknown): string | null {
+// Exported for unit tests so future protocol drift is caught at the reader
+// boundary (every notification handler in this file routes through here).
+export function readThreadId(value: unknown): string | null {
     if (!value || typeof value !== 'object') return null;
     const r = value as ThreadLikeResponse;
     const candidates = [
@@ -110,7 +112,7 @@ function readThreadId(value: unknown): string | null {
 // RPC response still nests the id under `turn.id`. Both styles must resolve or
 // we lose the real turn id, send a bogus one back as `turn/interrupt`'s param,
 // and codex silently rejects the stop request.
-function readTurnId(value: unknown): string | null {
+export function readTurnId(value: unknown): string | null {
     if (!value || typeof value !== 'object') return null;
     const r = value as TurnLikeResponse;
     const candidates = [
