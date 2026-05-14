@@ -57,8 +57,8 @@ import { createReadStream } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { logger } from '@/ui/logger';
 
-const TOKEN_CHAR_RATIO = 4; // rough ascii heuristic; codex sessions skew JSON/code
-const DEFAULT_TOKEN_BUDGET = 12000; // ~4.7% of a 256k context window
+export const TOKEN_CHAR_RATIO = 4; // rough ascii heuristic; codex sessions skew JSON/code
+export const DEFAULT_TOKEN_BUDGET = 12000; // ~4.7% of a 256k context window
 const MAX_FILE_PATHS = 50;
 
 /**
@@ -99,17 +99,41 @@ const BUCKET_RATIOS = {
     todos: 0.05,
 } as const;
 
+// Hard upper bound on the `compacted` bucket's final allocation, as a fraction
+// of earlyBudget. compacted holds codex's own backend-side LLM summary
+// (`replacement_history` from the rollout's `compacted` event). Each successive
+// /compact reads that summary, lets codex summarise it again next round, and
+// re-injects the new — slightly longer — summary. Production logs show this
+// compounding: 939 → 1536 → 3121 → 2966 → 3411 → 3661 chars across 6
+// consecutive auto-rescues (290% growth, monotonic when post-compact turns
+// are sparse). Without an absolute cap the surplus pass lets compacted swallow
+// the budget left behind by absent user/assistant buckets, accelerating the
+// next thread's context red-line.
+//
+// 0.30 = 20% static (BUCKET_RATIOS.compacted) + up to 10% surplus. Compared to
+// removing compacted from the surplus path entirely (which would leave 30%+
+// of earlyBudget unused in compacted-dominant sessions), this preserves
+// fill-rate while bounding summary-of-summary recursion.
+//
+// Industry reference: LangChain `ConversationSummaryBufferMemory` enforces an
+// equivalent `max_token_limit` on its moving summary buffer plus a verbatim
+// recent-message tail — same shape as our recent-K-turns + bounded compacted
+// section. Class lives under `langchain.memory` in the langchain-ai/langchain
+// repo; exact file path moves with the 0.1→0.2 monorepo restructure, the class
+// name is the stable anchor.
+export const COMPACTED_ABS_CAP_RATIO = 0.30;
+
 // Empirical reserve for the top-of-seed scaffolding that always renders:
 // `## 上下文摘要…` header (~30 char), `### …` section titles for up to ~5
 // summarised sections (~30 char each), and Markdown spacers between sections.
 // Cap rationale: 200 covers worst case without eating too much earlyBudget;
 // underestimating just means buckets get a few-hundred extra chars that the
 // fallback can drop. Never underflows.
-const HEADER_OVERHEAD_RESERVE = 200;
+export const HEADER_OVERHEAD_RESERVE = 200;
 
 // Reserve for the `---` separator and the trailing blank line between the
 // last summarised section and the recent block / trailer.
-const SECTION_SEPARATOR_RESERVE = 40;
+export const SECTION_SEPARATOR_RESERVE = 40;
 
 // Reserve when shrinkRecentRegion has to truncate a single-turn body: the
 // `---`, section title, `#### 第 1 轮`, `**用户**:` / `**我**:` role labels
@@ -121,7 +145,7 @@ const RECENT_SINGLE_TURN_HEADER_RESERVE = 200;
 // a head/tail-truncated message into — bail out instead.
 const MIN_TRUNCATE_CHARS = 120;
 
-const DEFAULT_TRAILER = [
+export const DEFAULT_TRAILER = [
     '---',
     '注意：以上摘要由 happy /compact 本地启发式生成，可能不完整（工具输出、推理过程、diff 详情已被丢弃）。',
     '若用户问及的内容不在摘要中，请勿假设"未讨论过" — 应当反问澄清或主动承认信息缺失。',
@@ -883,38 +907,59 @@ function estimateBucketWants(buckets: Buckets, earlyTurns: Turn[]): BucketWants 
     return { compacted, user, assistant, files, todos };
 }
 
+// All buckets that participate in Pass 1's static-ratio allocation. Order is
+// not significant here — each bucket independently takes min(want, cap) and
+// the sum is bounded by Σ BUCKET_RATIOS = 0.98 < 1.0.
+const BUCKET_KEYS: BucketKey[] = ['user', 'assistant', 'compacted', 'files', 'todos'];
+
+// Order in which Pass 2 distributes leftover budget. `compacted` is moved to
+// the *end* so user/assistant prompts win surplus first; `compacted` also
+// receives an absolute cap (COMPACTED_ABS_CAP_RATIO) inside the loop so it
+// cannot consume unbounded leftover when early user/assistant turns are
+// empty — see COMPACTED_ABS_CAP_RATIO comment for production evidence.
+const SURPLUS_PRIORITY: BucketKey[] = ['user', 'assistant', 'files', 'compacted', 'todos'];
+
 /**
  * Allocate the global char budget across buckets in two passes:
  *  Pass 1 — each bucket gets min(want, ratio × budget). Buckets with low demand
  *           leave surplus on the table.
- *  Pass 2 — surplus is distributed by priority order (user > assistant >
- *           compacted > files > todos) to buckets that still want more.
+ *  Pass 2 — surplus is distributed by SURPLUS_PRIORITY to buckets that still
+ *           want more. `compacted` is additionally capped by
+ *           COMPACTED_ABS_CAP_RATIO × charBudget to break the
+ *           summary-of-summary recursion observed in production.
  * This means a chat-heavy session can pour user-bucket leftover into a
  * code-heavy assistant answer, and vice versa.
  */
 function allocateBucketBudgets(wants: BucketWants, charBudget: number): BucketWants {
-    const PRIORITY: BucketKey[] = ['user', 'assistant', 'compacted', 'files', 'todos'];
     const allocated: BucketWants = { compacted: 0, user: 0, assistant: 0, files: 0, todos: 0 };
     let used = 0;
 
-    // Pass 1: each bucket's static ratio cap
-    for (const k of PRIORITY) {
+    // Pass 1: each bucket's static ratio cap (order-independent)
+    for (const k of BUCKET_KEYS) {
         const cap = Math.floor(charBudget * BUCKET_RATIOS[k]);
         const give = Math.min(wants[k], cap);
         allocated[k] = give;
         used += give;
     }
 
-    // Pass 2: distribute surplus by priority to buckets that still want more
+    // Pass 2: distribute surplus by SURPLUS_PRIORITY to buckets that still
+    // want more. `compacted` is additionally bounded by an absolute cap
+    // (COMPACTED_ABS_CAP_RATIO × charBudget) so it cannot swallow surplus
+    // left behind by absent user/assistant buckets, which would let codex's
+    // backend `replacement_history` compound across /compact rounds.
+    const compactedAbsCap = Math.floor(charBudget * COMPACTED_ABS_CAP_RATIO);
     let remaining = charBudget - used;
-    for (const k of PRIORITY) {
+    for (const k of SURPLUS_PRIORITY) {
         if (remaining <= 0) break;
         const stillWants = wants[k] - allocated[k];
-        if (stillWants > 0) {
-            const give = Math.min(stillWants, remaining);
-            allocated[k] += give;
-            remaining -= give;
+        if (stillWants <= 0) continue;
+        let give = Math.min(stillWants, remaining);
+        if (k === 'compacted') {
+            give = Math.min(give, Math.max(0, compactedAbsCap - allocated[k]));
         }
+        if (give <= 0) continue;
+        allocated[k] += give;
+        remaining -= give;
     }
 
     return allocated;

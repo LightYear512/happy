@@ -2,7 +2,16 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildHeuristicSeed, SEED_SENTINEL } from './compactSeedBuilder';
+import {
+    buildHeuristicSeed,
+    SEED_SENTINEL,
+    DEFAULT_TOKEN_BUDGET,
+    TOKEN_CHAR_RATIO,
+    DEFAULT_TRAILER,
+    HEADER_OVERHEAD_RESERVE,
+    SECTION_SEPARATOR_RESERVE,
+    COMPACTED_ABS_CAP_RATIO,
+} from './compactSeedBuilder';
 
 function jsonl(records: object[]): string {
     return records.map((r) => JSON.stringify(r)).join('\n') + '\n';
@@ -520,6 +529,85 @@ describe('buildHeuristicSeed', () => {
         // user bucket should consume meaningfully more than its 35% base
         // when both compete (35% × 16000 = 5600 chars baseline)
         expect(result.stats.bucketUsage.user).toBeGreaterThan(5600);
+    });
+
+    // ---- compacted bucket absolute cap (P1 fix) -------------------------
+    // Background: codex's backend writes a `compacted` event into rollout
+    // when it hits its own context red-line; the event carries an LLM
+    // summary in `replacement_history`. happy-cli's heuristic seed builder
+    // re-injects that summary as the `compacted` bucket, and codex
+    // summarises (seed + new turns) on the next auto-rescue — including a
+    // paraphrase of the prior summary. Production logs (lomur instance,
+    // 2026-05-14) show monotonic growth: 939 → 1536 → 3121 → 2966 → 3411
+    // → 3661 chars over 6 consecutive auto /compact rounds. Without an
+    // absolute cap, the surplus pass funnels leftover budget to compacted
+    // whenever post-compact user/assistant turns are sparse, compounding
+    // the next thread's context pressure.
+    //
+    // Fix: SURPLUS_PRIORITY puts `compacted` after user/assistant/files,
+    // and the loop applies COMPACTED_ABS_CAP_RATIO × charBudget on its
+    // total allocation. Equivalent to LangChain
+    // `ConversationSummaryBufferMemory`'s `max_token_limit` on the moving
+    // summary buffer — bounds summary-of-summary recursion at a constant
+    // fraction of context.
+
+    it('compacted bucket bounded by COMPACTED_ABS_CAP_RATIO when no user/asst competition', async () => {
+        // 60k-char compacted summary, no post-compact turns → user/asst/files/todos
+        // wants are all 0, so without the absolute cap compacted would absorb
+        // all surplus (Pass 1's 20% + Pass 2's leftover) and approach earlyBudget.
+        const longSummary = 'X'.repeat(60000);
+        const path = await writeRollout('compacted-only', [compacted([longSummary])]);
+        const result = await buildHeuristicSeed({
+            rolloutPath: path,
+            recentTurnsToKeep: 0,
+        });
+
+        // recompute earlyBudget the same way composeSeed does (no recent
+        // block since recentTurnsToKeep=0; no trailerNote).
+        const charBudget = DEFAULT_TOKEN_BUDGET * TOKEN_CHAR_RATIO;
+        const fixedOverhead = SEED_SENTINEL.length
+            + HEADER_OVERHEAD_RESERVE
+            + DEFAULT_TRAILER.length
+            + SECTION_SEPARATOR_RESERVE;
+        const earlyBudget = charBudget - fixedOverhead;
+        const absCap = Math.floor(earlyBudget * COMPACTED_ABS_CAP_RATIO);
+        const pass1Cap = Math.floor(earlyBudget * 0.20);
+
+        // Pass 1's 20% static cap held; Pass 2 distributed *some* surplus to
+        // compacted (otherwise the absolute cap is moot to test).
+        expect(result.stats.bucketUsage.compacted).toBeGreaterThan(pass1Cap);
+        // But the absolute cap held — compacted did NOT swallow all leftover.
+        expect(result.stats.bucketUsage.compacted).toBeLessThanOrEqual(absCap);
+    });
+
+    it('user preempts compacted surplus when both compete for leftover budget', async () => {
+        // user.want > Pass 1 cap → user takes Pass 2 surplus before compacted.
+        // compacted.want is huge but capped by absCap.
+        const longSummary = 'X'.repeat(60000);
+        const longUserText = 'U'.repeat(20000);
+        const path = await writeRollout('priority-with-compacted', [
+            compacted([longSummary]),
+            userMessage(longUserText),
+        ]);
+        const result = await buildHeuristicSeed({
+            rolloutPath: path,
+            recentTurnsToKeep: 0,
+        });
+
+        const charBudget = DEFAULT_TOKEN_BUDGET * TOKEN_CHAR_RATIO;
+        const fixedOverhead = SEED_SENTINEL.length
+            + HEADER_OVERHEAD_RESERVE
+            + DEFAULT_TRAILER.length
+            + SECTION_SEPARATOR_RESERVE;
+        const earlyBudget = charBudget - fixedOverhead;
+        const absCap = Math.floor(earlyBudget * COMPACTED_ABS_CAP_RATIO);
+        const userPass1 = Math.floor(earlyBudget * 0.35);
+
+        // user got surplus past its Pass 1 cap — confirms surplus order
+        // visits user before compacted.
+        expect(result.stats.bucketUsage.user).toBeGreaterThan(userPass1);
+        // compacted still bounded by abs cap despite the high want.
+        expect(result.stats.bucketUsage.compacted).toBeLessThanOrEqual(absCap);
     });
 
     // ─── Top 3.1: markdown table preservation ──────────────────────────
