@@ -230,21 +230,28 @@ export function createAppServerStreamBridge(): {
 
         // -- turn/started ------------------------------------------------
         if (method === 'turn/started') {
-            // codex 0.130.0 emits `turn_id` (snake_case) in notifications even
-            // though `turn/start` RPC response uses `turn.id`. Without snake_case
-            // fallback, this lands on `createId()` and the locally-fabricated
-            // CUID gets sent back as `turn/interrupt`'s turnId — codex rejects
-            // it, and stop-button breaks. See readTurnId in runCodexAppServer.ts.
+            // codex 0.130.0 emits `turn/started` with the turn id nested under
+            // a `turn` object (observed in production: record keys
+            // `["threadId","turn"]`), and uses `turn_id` snake_case in
+            // `turn/completed` / `turn/interrupted`. Older builds put it at the
+            // top level as `turnId`/`id`. Without resolving every variant we
+            // fall back to a locally-fabricated CUID, `turn/interrupt` sends
+            // that bogus id, codex rejects it, and the stop button silently
+            // fails. Mirrors readTurnId() in runCodexAppServer.ts.
+            const nested = asRecord(record.turn);
             const resolvedTurnId = readString(record.turnId)
                 ?? readString(record.turn_id)
-                ?? readString(record.id);
-            // If all known candidates miss, codex must have introduced yet
-            // another casing/path for turnId. Log loudly with the record's
-            // top-level keys so the next protocol drift is *observable*
-            // instead of silently breaking stop-button again. We deliberately
-            // stick to logger.debug (console is reserved for user-facing
-            // output, see ui/logger.ts) — the marker [WARN turn_id_fallback]
-            // makes the line greppable.
+                ?? readString(record.id)
+                ?? readString(nested?.turnId)
+                ?? readString(nested?.turn_id)
+                ?? readString(nested?.id);
+            // If every candidate misses, codex must have introduced yet
+            // another casing/path. Log loudly with the record's top-level keys
+            // so the next protocol drift is *observable* instead of silently
+            // breaking stop-button again. We deliberately stick to
+            // logger.debug (console is reserved for user-facing output, see
+            // ui/logger.ts) — the marker [WARN turn_id_fallback] makes the
+            // line greppable.
             if (!resolvedTurnId) {
                 logger.debug(`[appServerStreamBridge] [WARN turn_id_fallback] turn/started without recognizable turnId; fabricating local CUID. record keys=${JSON.stringify(Object.keys(record))}`);
             }

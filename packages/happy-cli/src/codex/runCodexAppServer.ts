@@ -107,11 +107,13 @@ export function readThreadId(value: unknown): string | null {
     return null;
 }
 
-// codex 0.130.0 emits `turn_id` (snake_case) in notifications such as
-// `turn/started` / `turn/completed` / `turn/interrupted`, while the `turn/start`
-// RPC response still nests the id under `turn.id`. Both styles must resolve or
-// we lose the real turn id, send a bogus one back as `turn/interrupt`'s param,
-// and codex silently rejects the stop request.
+// codex 0.130.0 emits the turn id under a nested `turn` object in
+// `turn/started` (record keys observed in production: `["threadId","turn"]`),
+// and uses `turn_id` snake_case in `turn/completed` / `turn/interrupted`. The
+// `turn/start` RPC response also nests it under `turn.id`. Resolving every
+// flat + nested + camel/snake variant is required — otherwise the real turn
+// id is lost, a locally-fabricated CUID gets sent back as `turn/interrupt`'s
+// `turnId`, and codex silently rejects the stop request.
 export function readTurnId(value: unknown): string | null {
     if (!value || typeof value !== 'object') return null;
     const r = value as TurnLikeResponse;
