@@ -114,6 +114,24 @@ describe('createAppServerStreamBridge.turn/started', () => {
         expect(pickTaskStartedTurnId(updates)).toBe('real-turn-via-id');
     });
 
+    it('reads nested turn.id (codex 0.130.x form: {threadId, turn:{id}})', () => {
+        // Real-world payload that broke stop-button: codex 0.130.x emits
+        // turn/started as { threadId, turn: { id, status, ... } } — turnId
+        // lives nested under `turn.id`, not at the top level. Prior fix only
+        // covered top-level snake_case, so every turn fabricated a CUID and
+        // turn/interrupt was rejected with "expected X but found <real-uuid>".
+        const bridge = createAppServerStreamBridge();
+        const updates = bridge.onNotification('turn/started', {
+            threadId: 'thr-1',
+            turn: { id: '019e20fc-e3aa-7c81-aa54-58e55e099b3f', status: 'inProgress' },
+        });
+        expect(pickTaskStartedTurnId(updates)).toBe('019e20fc-e3aa-7c81-aa54-58e55e099b3f');
+        const fallbackLog = debugSpy.mock.calls.find(
+            ([msg]) => typeof msg === 'string' && msg.includes('[WARN turn_id_fallback]'),
+        );
+        expect(fallbackLog).toBeUndefined();
+    });
+
     it('logs [WARN turn_id_fallback] when all candidates miss, before fabricating', () => {
         const bridge = createAppServerStreamBridge();
         const updates = bridge.onNotification('turn/started', { somethingElse: 'no-id-here' });
