@@ -184,6 +184,26 @@ function emptyBuckets(): Buckets {
     };
 }
 
+/**
+ * LRU-bounded ingest for buckets.fileEdits. Most recent touch moves the path
+ * to the "newest" end of the Set's insertion-order iteration; when the Set
+ * exceeds MAX_FILE_PATHS we drop the oldest entry. patchSummaries is
+ * intentionally NOT evicted in lock-step: it is only read at render time and
+ * carries no budget weight, while per-turn Turn.fileEdits arrays may still
+ * reference paths that have been evicted from the global Set (forward-compat
+ * for future per-turn +/- rendering). Memory cost stays at ~50B × unique
+ * paths in the session.
+ */
+function promoteAndEvictFilePath(buckets: Buckets, p: string): void {
+    if (buckets.fileEdits.has(p)) buckets.fileEdits.delete(p);
+    buckets.fileEdits.add(p);
+    while (buckets.fileEdits.size > MAX_FILE_PATHS) {
+        const oldest = buckets.fileEdits.values().next().value;
+        if (oldest === undefined) break;
+        buckets.fileEdits.delete(oldest);
+    }
+}
+
 function makeTurn(userText: string): Turn {
     return {
         userText,
@@ -273,7 +293,7 @@ function extractPatchSummary(args: Record<string, unknown>, buckets: Buckets, cu
     let minus = 0;
     const flush = () => {
         if (currentPath) {
-            buckets.fileEdits.add(currentPath);
+            promoteAndEvictFilePath(buckets, currentPath);
             if (currentTurn) currentTurn.fileEdits.push(currentPath);
             if (plus > 0 || minus > 0) {
                 const prev = buckets.patchSummaries.get(currentPath) ?? { plus: 0, minus: 0 };
@@ -359,12 +379,8 @@ function processResponseItem(payload: Record<string, unknown>, state: ScanState)
                 for (const m of cmdLine.matchAll(FILE_PATH_RE)) {
                     const p = m[1];
                     if (p && !p.startsWith('http') && p.length < 300) {
-                        buckets.fileEdits.add(p);
+                        promoteAndEvictFilePath(buckets, p);
                         if (state.currentTurn) state.currentTurn.fileEdits.push(p);
-                        if (buckets.fileEdits.size > MAX_FILE_PATHS * 4) {
-                            // Cap aggressive growth; composition picks top N.
-                            return;
-                        }
                     }
                 }
             }
@@ -1120,9 +1136,13 @@ function buildSeedSections(
         }
     }
 
-    // 4. 涉及的文件路径 (cross-turn union)
+    // 4. 涉及的文件路径 (cross-turn union, newest-touched first)
+    // LRU at ingest keeps the Set bounded at MAX_FILE_PATHS, so we display
+    // it in reverse iteration order (newest → oldest) — newer touches carry
+    // higher relevance for next-thread continuation, and LLM position
+    // encoding weights leading content more heavily.
     if (buckets.fileEdits.size > 0 && budgets.files > 0) {
-        const allPaths = Array.from(buckets.fileEdits);
+        const allPaths = Array.from(buckets.fileEdits).reverse();
         const paths: string[] = [];
         let pathUsed = 0;
         for (const p of allPaths) {
@@ -1133,7 +1153,7 @@ function buildSeedSections(
             pathUsed += cost;
         }
         if (paths.length > 0) {
-            const fileLines = [`\n### 涉及的文件路径（共 ${buckets.fileEdits.size}，截取前 ${paths.length}）`];
+            const fileLines = [`\n### 涉及的文件路径（共 ${buckets.fileEdits.size}，按最近触动倒序）`];
             for (const p of paths) {
                 const summary = buckets.patchSummaries.get(p);
                 const tag = summary ? ` (+${summary.plus}/-${summary.minus})` : '';

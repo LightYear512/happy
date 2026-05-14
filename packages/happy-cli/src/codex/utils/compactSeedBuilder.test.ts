@@ -590,6 +590,77 @@ describe('buildHeuristicSeed', () => {
         expect(result.seedText).toContain('涉及的文件路径');
     });
 
+    // ---- fileEdits LRU (P1 fix) -----------------------------------------
+    // Background: before this fix, buckets.fileEdits was a Set with
+    // unbounded growth up to MAX_FILE_PATHS*4=200, then a hard early-return
+    // dropped *new* paths silently. Set retains insertion order, and the
+    // composition layer's `slice(0, MAX_FILE_PATHS)` took the *oldest* 50 —
+    // so long sessions would freeze on the first 50 files ever touched,
+    // never showing the files the agent is currently working on.
+    //
+    // Fix: promote-on-touch (delete + re-add) + evict-oldest at MAX_FILE_PATHS.
+    // Newest-touched paths win; render order is reversed so the most recent
+    // file appears first in the section.
+
+    it('fileEdits LRU keeps newest MAX_FILE_PATHS unique paths, evicts oldest', async () => {
+        // 60 distinct paths in a single shell command → Set caps at 50,
+        // oldest 10 (file00..file09) get evicted, newest 50 (file10..file59) survive.
+        const cmd = Array.from({ length: 60 }, (_, i) =>
+            `src/file${i.toString().padStart(2, '0')}.ts`
+        ).join(' ');
+        const path = await writeRollout('lru-evict', [
+            userMessage('touch many files'),
+            shellCall(`cat ${cmd}`),
+            assistantFinal('done'),
+        ]);
+        // Disable the recent block: Turn.fileEdits is an unbounded per-turn
+        // snapshot that would re-render evicted paths in the **涉及文件**
+        // line and confuse the global-section assertions.
+        const result = await buildHeuristicSeed({ rolloutPath: path, recentTurnsToKeep: 0 });
+        // Set size hard-capped at MAX_FILE_PATHS=50.
+        expect(result.stats.fileEdits).toBe(50);
+        // Oldest 10 evicted.
+        expect(result.seedText).not.toContain('src/file00.ts');
+        expect(result.seedText).not.toContain('src/file09.ts');
+        // Newest 50 retained.
+        expect(result.seedText).toContain('src/file10.ts');
+        expect(result.seedText).toContain('src/file59.ts');
+        // Newest-first rendering: file59 appears before file10 in the
+        // 涉及的文件路径 section.
+        const filesSection = result.seedText.match(/### 涉及的文件路径[\s\S]*?(?=\n###|\n---|\n##|$)/);
+        expect(filesSection).toBeTruthy();
+        const idx59 = filesSection![0].indexOf('src/file59.ts');
+        const idx10 = filesSection![0].indexOf('src/file10.ts');
+        expect(idx59).toBeGreaterThanOrEqual(0);
+        expect(idx10).toBeGreaterThan(idx59);
+    });
+
+    it('fileEdits LRU promotes path on re-touch, survives subsequent eviction', async () => {
+        // Touch A, then fill the LRU with B00..B48 (Set: [A, B00..B48], 50 total).
+        // Re-touch A → A moves to newest position (Set: [B00..B48, A]).
+        // Touch B49 → B00 evicted as oldest (Set: [B01..B48, A, B49]).
+        // Without promote-on-touch, A would be the oldest and get evicted instead.
+        const fillerPaths = Array.from({ length: 49 }, (_, i) =>
+            `src/B${i.toString().padStart(2, '0')}.ts`
+        ).join(' ');
+        const path = await writeRollout('lru-promote', [
+            userMessage('start'),
+            shellCall('cat src/A.ts'),
+            shellCall(`cat ${fillerPaths}`),
+            shellCall('cat src/A.ts'),
+            shellCall('cat src/B49.ts'),
+            assistantFinal('done'),
+        ]);
+        const result = await buildHeuristicSeed({ rolloutPath: path, recentTurnsToKeep: 0 });
+        expect(result.stats.fileEdits).toBe(50);
+        // A survived because re-touch promoted it past the oldest position.
+        expect(result.seedText).toContain('src/A.ts');
+        // B00 evicted — it was oldest after A's promotion.
+        expect(result.seedText).not.toContain('src/B00.ts');
+        // Newest entry B49 present.
+        expect(result.seedText).toContain('src/B49.ts');
+    });
+
     // ---- seed sentinel detection (compaction-loop fix) ------------------
     // Background: prior to 2026-04-25, every /compact prepended the previous
     // seed to the next user prompt as plain text, so codex persisted the
