@@ -643,6 +643,26 @@ export async function runCodexWithAppServer(opts: {
             const completionMessage = mode === 'compact' ? 'Compaction completed' : 'Context was reset';
             session.sendSessionEvent({ type: 'message', message: completionMessage });
             session.sendSessionEvent({ type: 'ready' });
+
+            // Auto-rescue resume: push a synthetic "继续" so the turn loop
+            // re-enters with the freshly stashed seed. Without this, the user
+            // would have to manually type something (log analysis: 54.6% of
+            // users type exactly "继续"; another ~25% type a near-equivalent
+            // catch-up phrase; total replay rate ~80%). M1 is NOT re-pushed —
+            // it already lives in the seed's recent block, so re-injecting it
+            // would duplicate the user turn and confuse referential phrases
+            // like "开始吧". "继续" mirrors what users do today, byte-for-byte.
+            // Manual /compact stays user-driven (no auto-replay).
+            if (mode === 'compact' && autoTriggered) {
+                const replayText = '继续';
+                const replayMode: EnhancedMode = {
+                    permissionMode: currentPermissionMode || 'default',
+                    model: currentModel,
+                };
+                recentUserBuffer.record(replayText);
+                messageQueue.push(replayText, replayMode);
+                logger.debug(`[CodexAppServer] [auto] /compact resume: pushed '${replayText}' to queue`);
+            }
         } finally {
             compactInFlight = false;
         }
