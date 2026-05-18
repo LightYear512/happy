@@ -69,6 +69,72 @@ describe('shouldAutoRescue', () => {
     });
 });
 
+describe('shouldAutoRescue — real-world param shapes', () => {
+    // Captured verbatim from ~/.happy/logs/2026-04-27-20-27-34-pid-31752.log:772
+    // emitted by the now-removed `!simcompact` dev bang command, which
+    // synthesised what was believed to be the wire shape of a real codex
+    // compact failure (also matches the happier-reference fake-codex shape).
+    // This is the ONLY real-world fallback params capture present across all
+    // ~/.happy/logs/ on this machine — older logs (5944, 2516, 2568) either
+    // predate the auto-rescue log line or only logged a side-channel message
+    // without dumping the params object.
+    it('rescues on captured !simcompact-injected codex error notification', () => {
+        const captured = {
+            error: {
+                message:
+                    'Error running remote compact task: stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses/compact)',
+                codexErrorInfo: 'other',
+                additionalDetails: null,
+            },
+            willRetry: false,
+            threadId: 'simcompact-fake-thread',
+            turnId: 'simcompact-fake-turn',
+        };
+        expect(shouldAutoRescue(captured)).toBe(true);
+    });
+
+    // Mirrors the wire shape emitted by happier's fake codex in
+    // E:/happy-claude/workspace/happier/apps/cli/src/backends/codex/appServer/runtime.test.ts:241
+    // — the reference shape for a real codex network failure. The original
+    // fixture's message ("unexpected status 401 …") would NOT trigger rescue
+    // by design (different class of error), so this case substitutes the
+    // compact-task needle in the same envelope to assert the wrapper shape
+    // itself doesn't break extraction.
+    it('rescues on happier-style real-codex error envelope (camelCase fields)', () => {
+        const reference = {
+            threadId: '019dbd63-50f0-74d2-bffc-dec119b3371b',
+            turnId: '019dbdb1-25a6-7e71-9b8e-ef50e8e22e66',
+            willRetry: false,
+            error: {
+                message: 'Error running remote compact task: upstream returned 502',
+                codexErrorInfo: 'other',
+                additionalDetails: null,
+            },
+        };
+        expect(shouldAutoRescue(reference)).toBe(true);
+    });
+
+    // Negative-control: same envelope shape as the happier reference, but
+    // with the original (non-compact-task) error message verbatim. Documents
+    // that unrelated codex errors do NOT trigger rescue — only the specific
+    // compact-task failure does. If a future codex protocol change makes
+    // ordinary 401s look like compact-task errors, this test should still
+    // hold (the needle is the contract, not the envelope).
+    it('does not rescue on real codex 401 — out of scope for compact rescue', () => {
+        const realCodex401 = {
+            threadId: '019dbd63-50f0-74d2-bffc-dec119b3371b',
+            turnId: '019dbdb1-25a6-7e71-9b8e-ef50e8e22e66',
+            willRetry: false,
+            error: {
+                message: 'unexpected status 401 Unauthorized: ...',
+                codexErrorInfo: 'other',
+                additionalDetails: null,
+            },
+        };
+        expect(shouldAutoRescue(realCodex401)).toBe(false);
+    });
+});
+
 describe('createRescueGate', () => {
     it('first call always succeeds', () => {
         const gate = createRescueGate(30_000);

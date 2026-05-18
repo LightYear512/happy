@@ -153,6 +153,12 @@ function sanitizeEnv(
  * `codex` and let the shell resolve it (same as codexMcpClient).
  */
 function resolveCodexBinary(): string {
+    // Test override (mirrors happier's HAPPIER_CODEX_APP_SERVER_BIN) — lets
+    // integration tests point at a fake codex script without a real install.
+    const override = process.env.HAPPY_CODEX_APP_SERVER_BIN;
+    if (typeof override === 'string' && override.length > 0) {
+        return override;
+    }
     try {
         execSync('codex --version', { encoding: 'utf8', windowsHide: true });
         return 'codex';
