@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import * as ts from 'typescript';
+import { findAllNodes, findFirstNode, findMethodCalls } from './astHelpers';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SOURCE_PATH = resolve(__dirname, '..', 'runCodexAppServer.ts');
@@ -30,37 +31,7 @@ const SF = ts.createSourceFile(SOURCE_PATH, SOURCE, ts.ScriptTarget.Latest, true
  * inspect actual assignment expressions and call expression arguments.
  */
 
-// --- AST helpers --------------------------------------------------------
-
-function findFirstNode<T extends ts.Node>(
-    root: ts.Node,
-    predicate: (node: ts.Node) => node is T,
-): T | null {
-    let found: T | null = null;
-    const visit = (node: ts.Node): void => {
-        if (found) return;
-        if (predicate(node)) {
-            found = node;
-            return;
-        }
-        ts.forEachChild(node, visit);
-    };
-    visit(root);
-    return found;
-}
-
-function findAllNodes<T extends ts.Node>(
-    root: ts.Node,
-    predicate: (node: ts.Node) => node is T,
-): T[] {
-    const acc: T[] = [];
-    const visit = (node: ts.Node): void => {
-        if (predicate(node)) acc.push(node);
-        ts.forEachChild(node, visit);
-    };
-    visit(root);
-    return acc;
-}
+// --- AST helpers (generic traversal lives in ./astHelpers; locals below) ---
 
 function isAssignmentTo(node: ts.Node, identifierName: string): boolean {
     if (!ts.isBinaryExpression(node)) return false;
@@ -273,16 +244,6 @@ describe('runCodexAppServer — AST regression contracts', () => {
     // The buffer FIFO behaviour itself is covered in `recentUserBuffer.test.ts`
     // — these contracts only enforce wiring at the call site, not algorithm.
     describe('race-recovery buffer wiring contracts', () => {
-        // Find every `<obj>.<method>(...)` call expression in a subtree.
-        const findMethodCalls = (root: ts.Node, obj: string, method: string) =>
-            findAllNodes(root, (n): n is ts.CallExpression =>
-                ts.isCallExpression(n)
-                && ts.isPropertyAccessExpression(n.expression)
-                && ts.isIdentifier(n.expression.expression)
-                && n.expression.expression.text === obj
-                && n.expression.name.text === method,
-            );
-
         // Find an assignment `target = <literal>` whose RHS is a specific
         // SyntaxKind (e.g. TrueKeyword / FalseKeyword).
         const findLiteralAssignment = (root: ts.Node, target: string, valueKind: ts.SyntaxKind) =>
