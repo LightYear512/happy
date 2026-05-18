@@ -106,13 +106,26 @@ The smoke test proves the testkit chain (env override → spawn → JSONRPC → 
 
 Writing that test is blocked by a hard dependency: `runCodexWithAppServer`'s first ~50 lines call `ApiClient.create() → getOrCreateMachine() → getOrCreateSession() → setupOfflineReconnection()`, all against a live happy-server. There is no injection seam between `opts.credentials` and these calls.
 
-Three concrete options to unblock (recommendation: **A**):
+After two test-writing attempts (Wave 2 Part 2 and Wave 3 Path X), the verified conclusion is that **Option B is the only clean unblock** — Path A (local dev server) and Path X (real production server with the user's own credentials) both hit the same architectural wall that B resolves.
 
-| # | Option | Effort | Trade-off |
+| # | Option | Effort | Status |
 |---|---|---|---|
-| **A** | Bring up local dev happy-server (`HAPPY_SERVER_URL=http://localhost:3005`) + provision `~/.happy-dev-test/access.key` via `happy auth login`. Then use `describe.skipIf(!await isServerHealthy())` (matches `daemon.integration.test.ts` precedent). | ~1 h | Production-shape, zero mocking. Cost: every dev/CI must run the server. Also unblocks the currently-skipped `*.integration.test.ts` family. |
-| **B** | Refactor `runCodexWithAppServer` to accept `opts.deps?: { apiClient?, sessionFactory? }`. Production callers pass nothing. Tests construct an ApiClient that talks to an in-memory ApiSessionClient. **Not a mock framework** — a deps object IS production. | ~3 h + human sign-off | Cleanest long-term, but requires architectural decision. |
-| **C** | `vi.mock('@/api/api', ...)` to stub ApiClient. Violates the project rule ("No mocking — tests make real API calls" from `packages/happy-cli/CLAUDE.md`). **Not recommended** — once one mock lands, the next is easier to justify and the rule erodes. | ~30 min | Quick win at long-term cost. |
+| **A** | Bring up local dev happy-server (`HAPPY_SERVER_URL=http://localhost:3005`) + provision `~/.happy-dev-test/access.key` via `happy auth login`. Then use `describe.skipIf(!await isServerHealthy())`. | Originally estimated ~1 h; on Windows actually 2–8 h (Docker Desktop + Postgres + Redis + Prisma migrate + fixing `lsof` incompatibility in `yarn dev` script) | **Setup-blocked on Windows.** Even if started, both blockers below still apply. |
+| **X** | Use the user's existing `~/.happy/access.key` against production `api.cluster-fluster.com`, opt-in via `HAPPY_TEST_REAL_SERVER=1` (mirrors `HAPPY_TEST_REAL_CODEX=1`). | Estimated 1–1.5 h; actually impossible in current architecture (verified Wave 3) | **Architecturally blocked.** See "Two architectural walls" below. |
+| **B** | Refactor `runCodexWithAppServer` to accept `opts.deps?: { apiClient?, sessionFactory? }`. Production callers pass nothing. Tests construct an ApiClient + ApiSessionClient. **Not a mock framework** — a deps object IS production. Resolves BOTH walls in one stroke (test owns lifecycle AND can `injectPendingMessage()` directly via `apiSession.ts:228-234`, which already exists for restore). | ~3–4 h refactor + ~1.5–2 h test = **~5 h total** | **Only viable path forward.** Requires architectural sign-off. |
+| **C** | `vi.mock('@/api/api', ...)`. Violates `packages/happy-cli/CLAUDE.md` rule ("No mocking — tests make real API calls"). | ~30 min | **Not recommended** — rule erosion. |
+
+### Two architectural walls (why Path A and Path X both fail)
+
+1. **No exit signal reachable from outside the closure.** `runCodexWithAppServer` has four shutdown surfaces, none usable from test code:
+   - Ink Ctrl-C (`runCodexAppServer.ts:704-708`) — needs real TTY raw-mode stdin
+   - `handleKillSession` (`L939-968`) — calls `process.exit(0)`, killing vitest worker
+   - `registerShutdownHandlers` SIGTERM/SIGINT — Windows `process.kill` uses `TerminateProcess` and **does not run handlers** (see `shutdownHandlers.ts:11`)
+   - `messageQueue.close()` — only callable from inside the runtime's closure
+
+2. **No user-message send path from outside.** `session.onUserMessage` is the only entry to the turn loop, but `ApiSessionClient` exposes no external send-user-message helper. A test would have to reconstruct happy-app's encrypted `socket.emit('message', ...)` shape (`sync.ts:209-287`) — ~150 lines of duplicated encryption + normalize-message infrastructure, since `happy-agent` is not a happy-cli dependency.
+
+Both walls dissolve under Option B: the test owns its own `ApiSessionClient` and uses `injectPendingMessage()` to push messages, and owns the lifecycle directly so the runtime can return naturally after `messageQueue.close()`.
 
 Until one of these is chosen, the auto-rescue fallback chain (`runManualCompact` → `push '继续'`) is covered only by:
 
