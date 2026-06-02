@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { mkdtemp, writeFile, rm, chmod } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { tmpdir, platform } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
@@ -60,13 +60,25 @@ describe('compactViaCodexExec', () => {
     });
 
     it('respects timeout when child hangs', async () => {
-        // We need a fake codex bin that ignores all args + stdin and just
-        // runs forever. /bin/sleep rejects extra args as "invalid time
-        // interval", so write a tiny shell script that does the right thing.
+        // A cross-platform fake codex: drain stdin, then hang forever so the
+        // SIGTERM→SIGKILL timeout path is what ends it. The previous POSIX-only
+        // `#!/bin/sh … sleep 60` did NOT hang on Windows (no shebang support):
+        // the child exited at once, the out-file was never written, and the
+        // test only "passed" when concurrent load happened to slow the child
+        // past the 800ms timeout. Use a node hang script via the production
+        // spawn path (.cmd shim on Windows, sh wrapper on POSIX).
         const dir = await mkdtemp(join(tmpdir(), 'happy-fake-codex-'));
-        const fakeBin = join(dir, 'fake-codex.sh');
-        await writeFile(fakeBin, '#!/bin/sh\ncat >/dev/null\nsleep 60\n');
-        await chmod(fakeBin, 0o755);
+        const hangMjs = join(dir, 'hang.mjs');
+        await writeFile(hangMjs, 'process.stdin.resume();process.stdin.on("data",()=>{});setInterval(()=>{},1e9);\n');
+        let fakeBin: string;
+        if (platform() === 'win32') {
+            fakeBin = join(dir, 'fake-codex.cmd');
+            await writeFile(fakeBin, `@echo off\r\nnode "${hangMjs}" %*\r\n`);
+        } else {
+            fakeBin = join(dir, 'fake-codex');
+            await writeFile(fakeBin, `#!/bin/sh\nexec node "${hangMjs}" "$@"\n`);
+            await chmod(fakeBin, 0o755);
+        }
 
         try {
             const longSeed = 'x'.repeat(2000);
