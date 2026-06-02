@@ -37,6 +37,15 @@ function resolveDefaultDocsMaxChars(): number {
 export const DEFAULT_DOCS_MAX_CHARS = resolveDefaultDocsMaxChars();
 
 /**
+ * Hard cap on bytes read from disk. Content is char-capped later by
+ * truncateAtBoundary, so we never need more than the char budget (×4 for the
+ * worst-case UTF-8 expansion) plus headroom. Reading only the head means a
+ * mistakenly-huge or runaway file can't blow up memory/CPU before truncation
+ * even runs.
+ */
+const READ_BYTE_LIMIT = DEFAULT_DOCS_MAX_CHARS * 4 + 4096;
+
+/**
  * Break only *complete* sentinel strings so the doc body can't forge a boundary
  * that stripProjectDocs would mis-cut. Bare mentions of the core id in prose
  * are left intact.
@@ -65,12 +74,31 @@ function truncateAtBoundary(body: string, maxChars: number): string {
 }
 
 /**
+ * Read at most READ_BYTE_LIMIT bytes from the head of `path`. Using open()+read()
+ * (rather than readFile) bounds memory regardless of the on-disk size, and folds
+ * ENOENT / EISDIR (a directory at the path) / EACCES / ELOOP into a thrown error
+ * the caller turns into ''. A multi-byte char split at the boundary just decodes
+ * to U+FFFD, which truncateAtBoundary discards anyway.
+ */
+async function readDocHead(path: string): Promise<string> {
+    const handle = await fsp.open(path, 'r');
+    try {
+        const buf = Buffer.alloc(READ_BYTE_LIMIT);
+        const { bytesRead } = await handle.read(buf, 0, READ_BYTE_LIMIT, 0);
+        return buf.subarray(0, bytesRead).toString('utf-8');
+    } finally {
+        await handle.close();
+    }
+}
+
+/**
  * Load + render the project doc, or '' if absent/empty/unreadable.
  *
- * Fixed order: read → strip BOM → trim → sanitize sentinels → high-confidence
- * redact → boundary truncate → wrap. Truncation runs AFTER sanitize so no
- * half-sentinel can appear at the cut. Never throws — every failure folds into
- * '' so the caller (runManualCompact) can append unconditionally.
+ * Fixed order: bounded head read → strip BOM → trim → sanitize sentinels →
+ * high-confidence redact → boundary truncate → wrap. Truncation runs AFTER
+ * sanitize so no half-sentinel can appear at the cut. Never throws — every
+ * failure folds into '' so the caller (runManualCompact) can append
+ * unconditionally.
  */
 export async function loadFallbackCompactDocs(
     cwd: string,
@@ -79,14 +107,17 @@ export async function loadFallbackCompactDocs(
     const path = join(cwd, FALLBACK_DOC_DIRNAME, FALLBACK_DOC_FILENAME);
     let raw: string;
     try {
-        raw = await fsp.readFile(path, 'utf-8');
+        raw = await readDocHead(path);
     } catch (err) {
-        // ENOENT / permission / is-a-directory / symlink loop — graceful skip.
         logger.debug(`[projectFallbackDocs] no docs at ${path}: ${(err as Error).message}`);
         return '';
     }
 
-    const trimmed = raw.replace(/^\\uFEFF/, '').trim();
+    // Strip a real leading BOM (U+FEFF) by code point, then trim. Detecting the
+    // actual char — not a regex over the literal text "﻿" — is the correct
+    // contract; .trim() then handles any other leading/trailing whitespace.
+    const noBom = raw.charCodeAt(0) === 0xFEFF ? raw.slice(1) : raw;
+    const trimmed = noBom.trim();
     if (!trimmed) return '';
 
     const body = truncateAtBoundary(

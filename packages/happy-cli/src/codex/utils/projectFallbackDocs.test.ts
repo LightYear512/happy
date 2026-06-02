@@ -34,6 +34,17 @@ describe('projectFallbackDocs', () => {
             expect(await loadFallbackCompactDocs(cwd)).toBe('');
         });
 
+        it('returns "" when .happy/ exists but the doc file does not', async () => {
+            await mkdir(join(cwd, FALLBACK_DOC_DIRNAME), { recursive: true });
+            expect(await loadFallbackCompactDocs(cwd)).toBe('');
+        });
+
+        it('returns "" when the doc path is a directory, not a file', async () => {
+            // .happy/on-fallback-compact.md present, but as a directory → open/read throws → caught.
+            await mkdir(join(cwd, FALLBACK_DOC_DIRNAME, FALLBACK_DOC_FILENAME), { recursive: true });
+            expect(await loadFallbackCompactDocs(cwd)).toBe('');
+        });
+
         it('returns "" when the file is empty or whitespace-only', async () => {
             await writeDoc('   \n\t  \n');
             expect(await loadFallbackCompactDocs(cwd)).toBe('');
@@ -48,11 +59,13 @@ describe('projectFallbackDocs', () => {
             expect(out).toContain(FALLBACK_DOC_FILENAME);
         });
 
-        it('strips a leading BOM', async () => {
-            await writeDoc('\\uFEFF内容X');
+        it('strips a real leading BOM (U+FEFF, not the literal text)', async () => {
+            const BOM = String.fromCharCode(0xFEFF);
+            await writeDoc(BOM + '内容X');
             const out = await loadFallbackCompactDocs(cwd);
             expect(out).toContain('内容X');
-            expect(out.includes('\\uFEFF内容X')).toBe(false);
+            // The real BOM prefix must be gone — not left behind for trim() to mask.
+            expect(out.includes(BOM + '内容X')).toBe(false);
         });
 
         it('redacts high-confidence secrets but keeps name=value doc examples', async () => {
@@ -78,6 +91,13 @@ describe('projectFallbackDocs', () => {
             expect(out).toContain('已按行边界截断');
             expect((out.match(/```/g) ?? []).length % 2).toBe(0); // fences balanced
             expect(out.length).toBeLessThan(big.length);
+        });
+
+        it('bounds the disk read so a mistakenly-huge file cannot blow up (still truncates)', async () => {
+            await writeDoc('A'.repeat(5 * 1024 * 1024)); // 5 MB, far beyond READ_BYTE_LIMIT
+            const out = await loadFallbackCompactDocs(cwd);
+            expect(out).toContain('已按行边界截断');
+            expect(out.length).toBeLessThan(100_000); // bounded read, not 5 MB injected
         });
 
         it('treats non-positive / non-finite maxChars as the default cap (no slice(0,-n) tail-chop)', async () => {
