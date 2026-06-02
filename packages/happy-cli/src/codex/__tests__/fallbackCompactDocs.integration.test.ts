@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { mkdtemp, mkdir, writeFile, rm, chmod } from 'node:fs/promises';
+import { tmpdir, platform } from 'node:os';
 import { join } from 'node:path';
 
 import { buildHeuristicSeed, SEED_SENTINEL } from '../utils/compactSeedBuilder';
@@ -14,30 +14,31 @@ const DOC_MARKER = 'FALLBACK_DOC_MARKER_九九八十一';
  * End-to-end-ish check of the project fallback-docs feature along the REAL
  * trigger path, with real functions only — no mocked return values.
  *
- * The true trigger is codex's SERVER-SIDE compact failure (the
- * `willRetry:false` + "Error running remote compact task" notification), which
- * shouldAutoRescue classifies → runManualCompact('compact', autoTriggered) →
- * buildHeuristicSeed → compactViaCodexExec (L2) → append loadFallbackCompactDocs.
+ * Trigger: codex's SERVER-SIDE compact failure (the `willRetry:false` +
+ * "Error running remote compact task" notification), which shouldAutoRescue
+ * classifies → runManualCompact('compact', autoTriggered) → buildHeuristicSeed
+ * → compactViaCodexExec (L2) → append loadFallbackCompactDocs.
  *
+ * Both L2 branches spawn a REAL child through the production spawn path:
+ *   - L2 SUCCESS: a working fake `codex exec` binary (codex's local exec is
+ *     healthy in the real auto-rescue scenario — only the server compact failed).
+ *   - L2 FAILURE: a missing binary (instant ENOENT).
  * runManualCompact's own shell can't be invoked (testkit/README.md wall), so we
- * reproduce its compose orchestration with real functions. We deliberately do
- * NOT spawn a fake "successful" codex here: a heavy node child raced the
- * full-suite's timing tests. L2-success spawn is already covered by
- * codexExecCompact.test.ts's real-runtime test — so the L2-success case below
- * verifies the COMPOSE+APPEND step runManualCompact performs once a summary
- * exists, independent of how the summary was produced. The L2-FAILURE case
- * still spawns a real (missing) binary — that path is light (instant ENOENT).
+ * reproduce its compose orchestration; that boundary is held by the AST contract
+ * in autoResumeAfterFallback.test.ts.
  */
 describe('fallback-compact docs — real trigger path (codex server compact error)', () => {
     let rolloutDir: string;
     let projectDir: string;
+    let binDir: string;
 
     beforeEach(async () => {
         rolloutDir = await mkdtemp(join(tmpdir(), 'fb-rollout-'));
         projectDir = await mkdtemp(join(tmpdir(), 'fb-proj-'));
+        binDir = await mkdtemp(join(tmpdir(), 'fb-bin-'));
     });
     afterEach(async () => {
-        for (const d of [rolloutDir, projectDir]) {
+        for (const d of [rolloutDir, projectDir, binDir]) {
             await rm(d, { recursive: true, force: true });
         }
     });
@@ -69,6 +70,39 @@ describe('fallback-compact docs — real trigger path (codex server compact erro
         return writeRollout('conversation', records);
     }
 
+    /**
+     * A real, working fake `codex exec` binary: parses `-o <outFile>`, drains
+     * stdin, writes `summary` to the out-file, exits 0 — exercising the real
+     * compactViaCodexExec spawn/read path (Windows `.cmd` shim → node; sh wrapper
+     * on POSIX). Lightweight enough to run under the full suite without the flaky
+     * timeout-test interaction that was fixed in codexExecCompact.test.ts.
+     */
+    async function writeFakeCodexExec(summary: string): Promise<string> {
+        const mjs = join(binDir, 'fake-codex.mjs');
+        const src = [
+            "import { writeFileSync } from 'node:fs';",
+            'const args = process.argv.slice(2);',
+            "const oIdx = args.indexOf('-o');",
+            'const outFile = oIdx >= 0 ? args[oIdx + 1] : null;',
+            "process.stdin.on('data', () => {});",
+            "process.stdin.on('end', () => {",
+            `  if (outFile) writeFileSync(outFile, ${JSON.stringify(summary)});`,
+            '  process.exit(0);',
+            '});',
+            'process.stdin.resume();',
+        ].join('\n');
+        await writeFile(mjs, src, 'utf-8');
+        if (platform() === 'win32') {
+            const cmd = join(binDir, 'fake-codex.cmd');
+            await writeFile(cmd, `@echo off\r\nnode "${mjs}" %*\r\n`, 'utf-8');
+            return cmd;
+        }
+        const sh = join(binDir, 'fake-codex');
+        await writeFile(sh, `#!/bin/sh\nexec node "${mjs}" "$@"\n`, 'utf-8');
+        await chmod(sh, 0o755);
+        return sh;
+    }
+
     it('a real codex server-side compact error is what triggers the rescue (shouldAutoRescue=true)', () => {
         // Captured-shape codex compact failure (cf. codexAutoRescue.test.ts).
         // THIS — not a missing binary — is the real entry into fallback compaction.
@@ -88,21 +122,27 @@ describe('fallback-compact docs — real trigger path (codex server compact erro
         expect(shouldAutoRescue({ ...codexCompactError, willRetry: true })).toBe(false);
     });
 
-    it('appends project docs on the L2-SUCCESS compose branch (the real auto-rescue scenario), then strips next compaction', async () => {
+    it('appends project docs on the L2-SUCCESS path with a REAL codex exec spawn, then strips next compaction', async () => {
         const rolloutPath = await buildConversation();
         await writeProjectDoc(`# 项目宪法\n本项目使用 codex app-server 后端。\n${DOC_MARKER}`);
 
         const built = await buildHeuristicSeed({ rolloutPath, trailerNote: '请基于以上摘要继续。', extraUserTexts: [] });
 
-        // In the real auto-rescue scenario codex's local exec is healthy and L2
-        // succeeds. The L2 spawn itself is covered by codexExecCompact.test.ts's
-        // real-runtime test; here we exercise runManualCompact's L2-success
-        // compose branch (wrap summary + verbatim recent block) + the append.
-        const l2Summary = '用户希望在 fallback 压缩时注入项目级固定文档；已实现哨兵包裹、高置信脱敏与下一轮剥离防膨胀。';
-        const body = built.recentBlock ? `${l2Summary}\n${built.recentBlock}` : l2Summary;
-        let seedText = wrapL2SeedAsHeuristicSeed(body, '请基于以上摘要继续。');
+        // Real auto-rescue scenario: codex's local exec is healthy, only the
+        // server compact failed → L2 SUCCEEDS. Spawn a real (fake) codex exec
+        // through the production path so the summary is produced for real.
+        const fakeBin = await writeFakeCodexExec(
+            '这是 fake codex exec 进程产出的 L2 叙事摘要：用户希望在 fallback 压缩时注入项目级固定文档，'
+            + '已实现哨兵包裹、高置信脱敏与下一轮剥离防膨胀；结论是该机制在 L2 成功与失败两条路径上都会附加文档。',
+        );
+        const l2 = await compactViaCodexExec({ heuristicSeed: built.seedText, codexBin: fakeBin, timeoutMs: 20_000 });
+        expect(l2.summary, 'L2 must SUCCEED with a working (fake) codex exec').not.toBeNull();
+        expect(l2.skipped, 'a real success, not a short-circuit').toBeUndefined();
 
-        // The feature under test: append the project doc.
+        // runManualCompact's L2-success compose branch (wrap summary + verbatim
+        // recent block) + the append.
+        const body = built.recentBlock ? `${l2.summary}\n${built.recentBlock}` : (l2.summary as string);
+        let seedText = wrapL2SeedAsHeuristicSeed(body, '请基于以上摘要继续。');
         seedText += await loadFallbackCompactDocs(projectDir);
 
         expect(seedText).toContain(PROJECT_DOCS_OPEN);
@@ -114,7 +154,7 @@ describe('fallback-compact docs — real trigger path (codex server compact erro
         const nextSeed = await buildHeuristicSeed({ rolloutPath: nextRollout, trailerNote: '请基于以上摘要继续。', extraUserTexts: [] });
         expect(nextSeed.seedText, 'docs stripped on the next compaction').not.toContain(DOC_MARKER);
         expect(nextSeed.seedText).not.toContain(PROJECT_DOCS_OPEN);
-    });
+    }, 30_000);
 
     it('appends docs on the L2-FAILURE path too — a real (missing) exec → append is independent of L2', async () => {
         const rolloutPath = await buildConversation();
