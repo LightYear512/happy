@@ -12,6 +12,7 @@ import {
     SECTION_SEPARATOR_RESERVE,
     COMPACTED_ABS_CAP_RATIO,
 } from './compactSeedBuilder';
+import { PROJECT_DOCS_OPEN, PROJECT_DOCS_CLOSE } from './projectFallbackDocs';
 
 function jsonl(records: object[]): string {
     return records.map((r) => JSON.stringify(r)).join('\n') + '\n';
@@ -143,6 +144,25 @@ describe('buildHeuristicSeed', () => {
         await writeFile(path, jsonl(records));
         return path;
     }
+
+    it('strips re-injected project docs from a SEED_SENTINEL message (anti-accumulation)', async () => {
+        // Mirrors what runManualCompact injects: a SEED_SENTINEL-prefixed
+        // message whose tail carries a PROJECT_DOCS block. The builder must
+        // strip that block before it lands in the compacted bucket — otherwise
+        // the doc accumulates round after round (the bug this feature avoids).
+        const docsBlock = `${PROJECT_DOCS_OPEN}\n## 项目固定上下文\nPROJECT_DOC_MARKER_xyz\n${PROJECT_DOCS_CLOSE}`;
+        const seedMessage = `${SEED_SENTINEL}\n## 上下文摘要\n旧摘要内容\n${docsBlock}`;
+        const path = await writeRollout('strip-docs', [
+            userMessage(seedMessage),
+            userMessage('新的真实问题'),
+        ]);
+        const result = await buildHeuristicSeed({ rolloutPath: path });
+        // The summary half of the SEED message still lands in the compacted bucket...
+        expect(result.seedText).toContain('旧摘要内容');
+        // ...but the re-injected project doc block is stripped.
+        expect(result.seedText).not.toContain('PROJECT_DOC_MARKER_xyz');
+        expect(result.seedText).not.toContain(PROJECT_DOCS_OPEN);
+    });
 
     it('preserves user turns and final answers, drops commentary and reasoning', async () => {
         const path = await writeRollout('basic', [

@@ -423,4 +423,46 @@ describe('runCodexAppServer — auto-resume after fallback compact', () => {
             expect(seedText).toContain('最近');
         }, 30_000);
     });
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Project fallback docs injection (.happy/on-fallback-compact.md). The
+    // append happens inside runManualCompact; the integration path is blocked by
+    // the testkit architectural wall (see testkit/README.md), so this AST
+    // contract is the only guard against the append being removed or reordered.
+    // ─────────────────────────────────────────────────────────────────────────
+    describe('project fallback docs injection', () => {
+        it('runManualCompact calls loadFallbackCompactDocs before committing pendingSeedText', () => {
+            const compactFn = findRunManualCompact();
+            expect(compactFn, 'runManualCompact must exist (anchor)').not.toBeNull();
+            if (!compactFn) return;
+
+            const docCalls = findAllNodes(compactFn, (n): n is ts.CallExpression =>
+                ts.isCallExpression(n)
+                && ts.isIdentifier(n.expression)
+                && n.expression.text === 'loadFallbackCompactDocs',
+            );
+            expect(
+                docCalls.length,
+                'runManualCompact must call loadFallbackCompactDocs to append the project doc',
+            ).toBeGreaterThan(0);
+
+            const seedAssign = findFirstNode(compactFn, (n): n is ts.BinaryExpression =>
+                ts.isBinaryExpression(n)
+                && n.operatorToken.kind === ts.SyntaxKind.EqualsToken
+                && ts.isPropertyAccessExpression(n.left)
+                && ts.isIdentifier(n.left.expression)
+                && n.left.expression.text === 'compactState'
+                && n.left.name.text === 'pendingSeedText',
+            );
+            expect(seedAssign, '`compactState.pendingSeedText = seedText` must exist').not.toBeNull();
+            if (!seedAssign) return;
+
+            const earliestDocCall = Math.min(...docCalls.map((c) => c.getStart(SF)));
+            expect(
+                earliestDocCall,
+                'loadFallbackCompactDocs must be called BEFORE pendingSeedText is committed, '
+                + 'so the appended docs are part of the stashed seed',
+            ).toBeLessThan(seedAssign.getStart(SF));
+        });
+    });
 });

@@ -135,6 +135,38 @@ describe('shouldAutoRescue — real-world param shapes', () => {
     });
 });
 
+describe('shouldAutoRescue — only a server compact failure appends the project doc', () => {
+    // Auto-rescue is the ONLY automatic path into runManualCompact('compact'),
+    // which is where .happy/on-fallback-compact.md is appended. So "could this
+    // error append the project doc?" reduces to "does shouldAutoRescue return
+    // true?". Every non-compact error below must return false → no append.
+    it('does NOT trigger (→ never appends the doc) on non-compact errors', () => {
+        const nonCompact: Array<{ label: string; params: unknown }> = [
+            { label: 'rate limit', params: { error: { message: 'Rate limit exceeded, slow down' }, willRetry: false } },
+            { label: '401 auth', params: { error: { message: 'unexpected status 401 Unauthorized' }, willRetry: false } },
+            { label: 'context length exceeded', params: { error: { message: 'context_length_exceeded: maximum is 256000 tokens' }, willRetry: false } },
+            { label: 'bare stream disconnect (not a compact task)', params: { error: { message: 'stream disconnected before completion' }, willRetry: false } },
+            { label: 'generic turn error', params: { error: { message: 'Turn failed: internal server error' }, willRetry: false } },
+            { label: 'request timeout', params: { error: { message: 'request timed out after 60s' }, willRetry: false } },
+            { label: 'the word "compact" but not the needle', params: { error: { message: 'Compaction completed successfully' }, willRetry: false } },
+            { label: 'real compact failure but codex WILL retry', params: { error: { message: 'Error running remote compact task: transient blip' }, willRetry: true } },
+            { label: 'empty object', params: {} },
+            { label: 'null', params: null },
+            { label: 'string (non-object)', params: 'some error string' },
+        ];
+        for (const { label, params } of nonCompact) {
+            expect(shouldAutoRescue(params), `"${label}" must NOT trigger auto-rescue (would wrongly append the doc)`).toBe(false);
+        }
+    });
+
+    it('DOES trigger only on a genuine server compact failure (willRetry:false + needle)', () => {
+        expect(shouldAutoRescue({
+            error: { message: 'Error running remote compact task: stream disconnected before completion' },
+            willRetry: false,
+        })).toBe(true);
+    });
+});
+
 describe('createRescueGate', () => {
     it('first call always succeeds', () => {
         const gate = createRescueGate(30_000);

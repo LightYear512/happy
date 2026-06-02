@@ -56,6 +56,8 @@
 import { createReadStream } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { logger } from '@/ui/logger';
+import { redactSensitive } from './redactSecrets';
+import { stripProjectDocs } from './projectFallbackDocs';
 
 export const TOKEN_CHAR_RATIO = 4; // rough ascii heuristic; codex sessions skew JSON/code
 export const DEFAULT_TOKEN_BUDGET = 12000; // ~4.7% of a 256k context window
@@ -268,38 +270,10 @@ function isNoiseUserMessage(text: string): boolean {
     return false;
 }
 
-// Sensitive value patterns. Anything matching is replaced before the text
-// enters the seed — including user prompts, assistant answers and shell
-// commands. Replacements preserve enough surrounding context that the next
-// session can still see "we set api_key = [REDACTED]" rather than losing the
-// fact entirely.
-const SENSITIVE_PATTERNS: Array<[RegExp, string]> = [
-    // OpenAI / Anthropic style keys (sk-..., sk-ant-...)
-    [/sk-(?:ant-)?[A-Za-z0-9_\-]{20,}/g, '[REDACTED-API-KEY]'],
-    // GitHub personal access tokens
-    [/\bghp_[A-Za-z0-9]{30,}/g, '[REDACTED-GH-PAT]'],
-    [/\bgithub_pat_[A-Za-z0-9_]{50,}/g, '[REDACTED-GH-PAT]'],
-    // Slack bot/user/app tokens
-    [/\bxox[abprs]-[A-Za-z0-9\-]{10,}/g, '[REDACTED-SLACK]'],
-    // AWS access key id
-    [/\bAKIA[0-9A-Z]{16}\b/g, '[REDACTED-AWS]'],
-    // JWT (header.payload.signature)
-    [/\beyJ[A-Za-z0-9\-_]{10,}\.[A-Za-z0-9\-_]{10,}\.[A-Za-z0-9\-_]{10,}\b/g, '[REDACTED-JWT]'],
-    // HTTP Authorization header (bearer / basic)
-    [/(Authorization\s*:\s*)(?:Bearer|Basic|Token)\s+\S+/gi, '$1[REDACTED]'],
-    // Generic name=value (api_key, secret, password, access_token, ...)
-    // Capture the variable name + delimiter, replace only the value.
-    [/\b((?:api[_-]?key|secret|access[_-]?token|password|passwd|auth[_-]?token|bearer|client[_-]?secret)["']?\s*[:=]\s*["']?)([A-Za-z0-9_\-+=/.~]{8,})/gi, '$1[REDACTED]'],
-];
-
-function redactSensitive(text: string): string {
-    if (!text) return text;
-    let result = text;
-    for (const [re, replacement] of SENSITIVE_PATTERNS) {
-        result = result.replace(re, replacement);
-    }
-    return result;
-}
+// `redactSensitive` now lives in ./redactSecrets (a shared leaf module) so
+// projectFallbackDocs can reuse the high-confidence subset without forming a
+// circular import. The full-set behaviour is unchanged from when it was defined
+// inline here.
 
 /**
  * Extract a per-file +N/-M change summary from an apply_patch invocation.
@@ -360,12 +334,17 @@ function processResponseItem(payload: Record<string, unknown>, state: ScanState)
             // loop documented at SEED_SENTINEL.
             if (text.startsWith(SEED_SENTINEL)) {
                 flushCurrentTurn(state);
+                // Strip any re-injected project docs (.happy/on-fallback-compact.md)
+                // before storing: they are re-read from disk and re-appended on
+                // every compaction, so keeping them here would let them accumulate
+                // in the compacted bucket round after round.
+                const cleaned = stripProjectDocs(text);
                 buckets.lastCompacted = {
                     message: 'happy-injected seed',
                     replacement_history: [{
                         type: 'message',
                         role: 'user',
-                        content: [{ type: 'input_text', text }],
+                        content: [{ type: 'input_text', text: cleaned }],
                     }],
                 };
                 // Discard everything before sentinel: the seed already

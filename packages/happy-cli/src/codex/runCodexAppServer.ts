@@ -59,6 +59,7 @@ import { parseSpecialCommand } from '@/parsers/specialCommands';
 import { findRolloutByConversationId, getDefaultCodexSessionsRoot } from './utils/rolloutDiscovery';
 import { buildHeuristicSeed } from './utils/compactSeedBuilder';
 import { compactViaCodexExec, wrapL2SeedAsHeuristicSeed } from './utils/codexExecCompact';
+import { loadFallbackCompactDocs } from './utils/projectFallbackDocs';
 import { shouldAutoRescue, createRescueGate } from './utils/codexAutoRescue';
 import { createTurnLifecycle } from './utils/turnLifecycle';
 import { createRecentUserBuffer } from './utils/recentUserBuffer';
@@ -454,6 +455,11 @@ export async function runCodexWithAppServer(opts: {
     const compactState: { pendingSeedText: string | null } = { pendingSeedText: null };
     let compactInFlight = false;
 
+    // SSoT for the codex session working directory — the same value used for
+    // sandbox writableRoots and the turn-message cwd. Project-level fallback
+    // docs (.happy/on-fallback-compact.md) are resolved relative to it.
+    const sessionCwd = process.cwd();
+
     // Auto-rescue gate: when codex's auto pre-sampling compaction fails
     // (`willRetry: false`, message contains "Error running remote compact task")
     // we trigger /compact for the user automatically. The cooldown prevents a
@@ -614,6 +620,19 @@ export async function runCodexWithAppServer(opts: {
                 // legacy behavior: the protocol-level "Compaction started"
                 // / "Compaction completed" banners are enough signalling.
                 // The seed itself is still injected on the next turn.
+
+                // Append project-level fallback docs (.happy/on-fallback-compact.md),
+                // read fresh from disk every compaction so the user's authoritative
+                // project context survives the compaction. Wrapped in PROJECT_DOCS
+                // sentinels so the next compaction's seed builder strips them rather
+                // than accumulating them into the compacted bucket.
+                if (seedText) {
+                    const projectDocs = await loadFallbackCompactDocs(sessionCwd);
+                    if (projectDocs) {
+                        seedText += projectDocs;
+                        logger.debug(`[CodexAppServer] ${autoTriggered ? '[auto] ' : ''}/compact appended .happy docs (${projectDocs.length} chars)`);
+                    }
+                }
             }
 
             // Reset thread state. The turn loop's `if (!threadId)` branch will
@@ -1373,7 +1392,7 @@ export async function runCodexWithAppServer(opts: {
                         // Start new thread
                         logger.debug('[CodexAppServer] Starting new thread');
                         const threadResponse = await client.request('thread/start', {
-                            cwd: process.cwd(),
+                            cwd: sessionCwd,
                             approvalPolicy: toApprovalPolicy(executionPolicy.approvalPolicy),
                             sandbox: executionPolicy.sandbox,
                             experimentalRawEvents: true,
@@ -1414,7 +1433,7 @@ export async function runCodexWithAppServer(opts: {
                     threadId,
                     input: [{ type: 'text', text: turnInputText }],
                     approvalPolicy: toApprovalPolicy(executionPolicy.approvalPolicy),
-                    sandboxPolicy: toSandboxPolicy(executionPolicy.sandbox, process.cwd()),
+                    sandboxPolicy: toSandboxPolicy(executionPolicy.sandbox, sessionCwd),
                     ...(message.mode.model ? { model: message.mode.model } : {}),
                 });
                 if (injectSystemPrompt) {
