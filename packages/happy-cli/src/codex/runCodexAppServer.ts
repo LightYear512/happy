@@ -199,6 +199,21 @@ export async function runCodexWithAppServer(opts: {
     noSandbox?: boolean;
     restoreSessionId?: string;
     codexSessionId?: string;
+    /**
+     * Test-only injection seam. Production callers pass nothing → the original
+     * server-backed init path runs verbatim. `session` lets a test drive the
+     * runtime fully offline with a SessionLike; `apiClient` skips
+     * `ApiClient.create`; `onRuntimeReady` hands back a `requestExit` so the
+     * test can unblock the main loop (production's exit is Ink Ctrl-C, which is
+     * unreachable without a TTY).
+     */
+    deps?: {
+        apiClient?: ApiClient;
+        session?: ApiSessionClient;
+        /** Override the session working dir (sandbox roots / .happy doc lookup). */
+        cwd?: string;
+        onRuntimeReady?: (handles: { requestExit: () => void }) => void;
+    };
 }): Promise<void> {
     //
     // Apply default codex profile if CODEX_HOME is not set
@@ -219,67 +234,80 @@ export async function runCodexWithAppServer(opts: {
     const sessionTag = randomUUID();
     connectionState.setBackend('Codex');
 
-    const api = await ApiClient.create(opts.credentials);
+    const api = opts.deps?.apiClient ?? await ApiClient.create(opts.credentials);
     logger.debug(`[CodexAppServer] Starting with options: startedBy=${opts.startedBy || 'terminal'}`);
 
     const settings = await readSettings();
-    let machineId = settings?.machineId;
     const sandboxConfig = opts.noSandbox ? undefined : settings?.sandboxConfig;
-    if (!machineId) {
-        console.error(`[START] No machine ID found in settings, which is unexpected since authAndSetupMachineIfNeeded should have created it. Please report this issue on https://github.com/slopus/happy-cli/issues`);
-        process.exit(1);
-    }
-    logger.debug(`Using machineId: ${machineId}`);
-    await api.getOrCreateMachine({ machineId, metadata: initialMachineMetadata });
 
-    const { state, metadata } = createSessionMetadata({
-        flavor: 'codex',
-        machineId,
-        startedBy: opts.startedBy,
-        sandbox: sandboxConfig,
-    });
-
-    let response;
-    if (opts.restoreSessionId) {
-        response = await api.getSessionById(opts.restoreSessionId);
-        if (response) {
-            logger.debug(`[CodexAppServer] Restored session ${opts.restoreSessionId}`);
-        } else {
-            logger.debug(`[CodexAppServer] Failed to restore session ${opts.restoreSessionId}, creating new session`);
-            response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
-        }
-    } else {
-        response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
-    }
-
+    // `session` is normally created by the server-backed init below. Tests may
+    // inject a SessionLike via `opts.deps.session` to drive the runtime fully
+    // offline. `response` and `reconnectionHandle` are hoisted out here because
+    // they're read later (the restore branch near turn/start, and the finally
+    // block); `sandboxConfig` is hoisted because the turn loop reads it.
     let session: ApiSessionClient;
     let permissionHandler: CodexPermissionHandler;
-    const { session: initialSession, reconnectionHandle } = setupOfflineReconnection({
-        api,
-        sessionTag,
-        metadata,
-        state,
-        response,
-        onSessionSwap: (newSession) => {
-            session = newSession;
-            if (permissionHandler) {
-                permissionHandler.updateSession(newSession);
-            }
-        },
-    });
-    session = initialSession;
+    let reconnectionHandle: ReturnType<typeof setupOfflineReconnection>['reconnectionHandle'] = null;
+    let response: Awaited<ReturnType<typeof api.getOrCreateSession>> | undefined;
 
-    if (response) {
-        try {
-            logger.debug(`[START] Reporting session ${response.id} to daemon`);
-            const result = await notifyDaemonSessionStarted(response.id, metadata);
-            if (result.error) {
-                logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
+    if (opts.deps?.session) {
+        session = opts.deps.session;
+    } else {
+        const machineId = settings?.machineId;
+        if (!machineId) {
+            console.error(`[START] No machine ID found in settings, which is unexpected since authAndSetupMachineIfNeeded should have created it. Please report this issue on https://github.com/slopus/happy-cli/issues`);
+            process.exit(1);
+        }
+        logger.debug(`Using machineId: ${machineId}`);
+        await api.getOrCreateMachine({ machineId, metadata: initialMachineMetadata });
+
+        const { state, metadata } = createSessionMetadata({
+            flavor: 'codex',
+            machineId,
+            startedBy: opts.startedBy,
+            sandbox: sandboxConfig,
+        });
+
+        if (opts.restoreSessionId) {
+            response = await api.getSessionById(opts.restoreSessionId);
+            if (response) {
+                logger.debug(`[CodexAppServer] Restored session ${opts.restoreSessionId}`);
             } else {
-                logger.debug(`[START] Reported session ${response.id} to daemon`);
+                logger.debug(`[CodexAppServer] Failed to restore session ${opts.restoreSessionId}, creating new session`);
+                response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
             }
-        } catch (error) {
-            logger.debug('[START] Failed to report to daemon (may not be running):', error);
+        } else {
+            response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
+        }
+
+        const reconnection = setupOfflineReconnection({
+            api,
+            sessionTag,
+            metadata,
+            state,
+            response,
+            onSessionSwap: (newSession) => {
+                session = newSession;
+                if (permissionHandler) {
+                    permissionHandler.updateSession(newSession);
+                }
+            },
+        });
+        session = reconnection.session;
+        reconnectionHandle = reconnection.reconnectionHandle;
+
+        if (response) {
+            try {
+                logger.debug(`[START] Reporting session ${response.id} to daemon`);
+                const result = await notifyDaemonSessionStarted(response.id, metadata);
+                if (result.error) {
+                    logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
+                } else {
+                    logger.debug(`[START] Reported session ${response.id} to daemon`);
+                }
+            } catch (error) {
+                logger.debug('[START] Failed to report to daemon (may not be running):', error);
+            }
         }
     }
 
@@ -458,7 +486,7 @@ export async function runCodexWithAppServer(opts: {
     // SSoT for the codex session working directory — the same value used for
     // sandbox writableRoots and the turn-message cwd. Project-level fallback
     // docs (.happy/on-fallback-compact.md) are resolved relative to it.
-    const sessionCwd = process.cwd();
+    const sessionCwd = opts.deps?.cwd ?? process.cwd();
 
     // Auto-rescue gate: when codex's auto pre-sampling compaction fails
     // (`willRetry: false`, message contains "Error running remote compact task")
@@ -1263,6 +1291,13 @@ export async function runCodexWithAppServer(opts: {
 
         let currentModeHash: string | null = null;
         let pending: { message: string; mode: EnhancedMode; isolate: boolean; hash: string } | null = null;
+
+        // Test seam: hand the test a way to unblock the main loop (production
+        // exits via the Ink Ctrl-C handler, which needs a TTY). No-op in
+        // production (deps.onRuntimeReady absent).
+        opts.deps?.onRuntimeReady?.({
+            requestExit: () => { shouldExit = true; messageQueue.close(); },
+        });
 
         while (!shouldExit) {
             // Consume pending !auth-all --codex account swap before anything else.
