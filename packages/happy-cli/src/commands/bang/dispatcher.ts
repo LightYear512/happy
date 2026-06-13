@@ -2,9 +2,10 @@ import { logger } from '@/ui/logger';
 import { handleAuthBangCommand, handleAuthAllBangCommand } from './authCommand';
 import { handleLoginBangCommand } from './loginCommand';
 import { handleRestartBangCommand, handleRestartAllBangCommand } from './restartCommand';
-import { handleUsageBangCommand } from './usageCommand';
+import { getCachedProfileUsageEntry, handleUsageBangCommand, type ProfileUsageEntry } from './usageCommand';
 import { handleTestBangCommand } from './testCommand';
-import { SEPARATOR, type BangCommandContext, type BangCommandHandler, type BangCommandResult } from './types';
+import { SEPARATOR, type BangCommandContext, type BangCommandHandler, type BangCommandResult, type BangOptionSuggestion } from './types';
+import { getCurrentProfileForFlavor, readCcsProfiles, readCodexDefaultProfile, type AuthFlavor } from './ccsProfiles';
 
 export { SEPARATOR };
 export { hasActiveInteractiveSession, handleInteractiveInput } from './interactiveSession';
@@ -17,8 +18,8 @@ export { hasActiveInteractiveSession, handleInteractiveInput } from './interacti
 const commands: Record<string, { handler: BangCommandHandler; desc: string; loadingMsg?: string; sessionOnly?: boolean; consoleOnly?: boolean; hidden?: boolean }> = {
     'auth':        { handler: handleAuthBangCommand,        desc: '切换 CCS 账号', sessionOnly: true },
     'login':       { handler: handleLoginBangCommand,       desc: '登录账户' },
-    'usage':       { handler: handleUsageBangCommand,       desc: '查看 API 用量' },
-    'auth-all':    { handler: handleAuthAllBangCommand,     desc: '切换全部会话账号', consoleOnly: true },
+    'usage':       { handler: handleUsageBangCommand,       desc: '⏱️查看Claude 用量' },
+    'auth-all':    { handler: handleAuthAllBangCommand,     desc: '🔑切换Claude账号', consoleOnly: true },
     'restart':     { handler: handleRestartBangCommand,     desc: '重启会话', sessionOnly: true },
     'restart-all': { handler: handleRestartAllBangCommand,  desc: '重启全部会话', consoleOnly: true },
     // TODO: !session / !open 暂停使用，待 multi-backend 会话浏览重构后恢复。实现保留在 sessionCommand.ts / openCommand.ts。
@@ -31,37 +32,195 @@ const commands: Record<string, { handler: BangCommandHandler; desc: string; load
 const aliases: Record<string, string> = {
     a: 'auth',
     aa: 'auth-all',
+    'aa-codex': 'auth-all',
     l: 'login',
+    'l-codex': 'login',
     // o: 'open', // TODO: 暂停使用
     r: 'restart',
     ra: 'restart-all',
     u: 'usage',
+    'u-codex': 'usage',
     h: 'help',
     // s: 'session', // TODO: 暂停使用
 };
 
+const aliasArgs: Record<string, string> = {
+    'aa-codex': '--codex',
+    'l-codex': '--codex',
+    'u-codex': '--codex',
+};
+
+const COMMAND_PREFIX = '!';
+const ALIAS_PREFIX = '@';
+
+function formatCommand(name: string): string {
+    return `${COMMAND_PREFIX}${name}`;
+}
+
+function formatAlias(alias: string): string {
+    return `${ALIAS_PREFIX}${alias}`;
+}
+
+function formatPrimaryInvocation(name: string): string {
+    const alias = Object.entries(aliases).find(([, target]) => target === name)?.[0];
+    return alias ? formatAlias(alias) : formatCommand(name);
+}
+
+function formatPrimaryInvocationWithArgs(name: string, args: string): string {
+    const alias = Object.entries(aliases).find(([aliasName, target]) => target === name && aliasArgs[aliasName] === args)?.[0];
+    if (alias) return formatAlias(alias);
+    return `${formatPrimaryInvocation(name)} ${args}`.trim();
+}
+
+function formatCommandDisplay(name: string): string {
+    const primary = formatPrimaryInvocation(name);
+    const full = formatCommand(name);
+    return primary === full ? full : `${primary} (${full})`;
+}
+
+function formatCommandDisplayWithArgs(name: string, args: string): string {
+    const primary = formatPrimaryInvocationWithArgs(name, args);
+    const full = `${formatCommand(name)} ${args}`.trim();
+    return primary === full ? full : `${primary} (${full})`;
+}
+
+function compactOption(commandText: string, desc: string): string {
+    return `${commandText}｜${desc}`;
+}
+
+const MAIN_MENU_OPTION = '❇️ @@ 主菜单';
+const CACHE_AGE_DISPLAY_MIN_MS = 5 * 60 * 1000;
+
+function formatCompactResetTime(resetsAt: string | null): string | null {
+    if (!resetsAt) return null;
+    const resetDate = new Date(resetsAt);
+    const diffMs = resetDate.getTime() - Date.now();
+    if (!Number.isFinite(diffMs)) return null;
+    const totalMin = Math.max(0, Math.ceil(diffMs / 60000));
+    const hours = Math.floor(totalMin / 60);
+    const minutes = totalMin % 60;
+    return `下${hours}:${minutes.toString().padStart(2, '0')}时`;
+}
+
+function formatCompactSevenDayResetTime(resetsAt: string | null): string | null {
+    if (!resetsAt) return null;
+    const resetDate = new Date(resetsAt);
+    const diffMs = resetDate.getTime() - Date.now();
+    if (!Number.isFinite(diffMs)) return null;
+    const totalHours = Math.max(0, Math.floor(diffMs / 3600000));
+    const days = Math.floor(totalHours / 24);
+    const hours = totalHours % 24;
+    return `${days}D:${hours}h`;
+}
+
+function formatCompactCacheAge(cachedAt: number): string {
+    const ageMin = Math.max(0, Math.floor((Date.now() - cachedAt) / 60000));
+    if (ageMin < 60) return `${ageMin}m`;
+    const ageHours = Math.floor(ageMin / 60);
+    if (ageHours < 24) return `${ageHours}h`;
+    return `${Math.floor(ageHours / 24)}d`;
+}
+
+function formatCompactDataAge(entry: ProfileUsageEntry): string | null {
+    if (!entry.cachedAt) return null;
+    if (Date.now() - entry.cachedAt < CACHE_AGE_DISPLAY_MIN_MS) return null;
+    return `${entry.stale ? '缓' : '取'}${formatCompactCacheAge(entry.cachedAt)}`;
+}
+
+function formatCurrentUsage(entry: ProfileUsageEntry | null): string[] {
+    if (!entry) return ['用量未知'];
+    const parts: string[] = [];
+    if (entry.fiveHourPercent != null) {
+        parts.push(`5h:${entry.fiveHourPercent.toFixed(0)}%`);
+        if (entry.full) {
+            const resetText = formatCompactResetTime(entry.fiveHourResetAt);
+            if (resetText) parts.push(resetText);
+        }
+    }
+    if (entry.sevenDayPercent != null) {
+        parts.push(`7d:${entry.sevenDayPercent.toFixed(0)}%`);
+        const resetText = formatCompactSevenDayResetTime(entry.sevenDayResetAt);
+        if (resetText) parts.push(resetText);
+    }
+    if (parts.length === 0 && entry.summary) parts.push(entry.summary);
+    const dataAge = formatCompactDataAge(entry);
+    if (dataAge) parts.push(dataAge);
+    return parts.length > 0 ? parts : ['用量未知'];
+}
+
+function buildQuickSessionMenu(ctx: BangCommandContext): BangCommandResult {
+    const flavor: AuthFlavor = ctx.flavor === 'codex' ? 'codex' : 'claude';
+    const defaultProfile = flavor === 'codex' ? readCodexDefaultProfile() : readCcsProfiles().defaultProfile;
+    const currentProfile = getCurrentProfileForFlavor(flavor) ?? defaultProfile;
+    const usage = currentProfile ? getCachedProfileUsageEntry(currentProfile, flavor) : null;
+    const parts = [
+        `当前账号：${currentProfile ?? '未知'}`,
+        flavor === 'codex' ? 'Codex' : 'Claude',
+    ];
+    if (currentProfile && currentProfile === defaultProfile) parts.push('默认');
+    parts.push(...formatCurrentUsage(usage));
+    return {
+        message: parts.join('｜'),
+        action: 'none',
+        suggestions: [
+            compactOption('@u', flavor === 'codex' ? '⏱️查看codex用量' : '⏱️查看Claude 用量'),
+            compactOption(ctx.isConsoleSession ? '@aa' : '@a', flavor === 'codex' ? '🔑切换codex账号' : '🔑切换Claude账号'),
+        ],
+    };
+}
+
+function stripLeadingCommandDecorations(text: string): string {
+    return text.replace(/^(?:(?:[🟢💚💔🔵🚫🟣❇️]|[0-5]️⃣)\s*)+/u, '').trim();
+}
+
+function stripOptionSuffix(text: string): string {
+    const stripped = stripLeadingCommandDecorations(text.trim().split(/[｜|]/, 1)[0].trim());
+    return stripped.startsWith('@@ ') ? '@@' : stripped;
+}
+
+function optionCommandText(option: BangOptionSuggestion): string {
+    return typeof option === 'string' ? option : option.value ?? option.label;
+}
+
+function withMainMenuOption(result: BangCommandResult): BangCommandResult {
+    if (!result.suggestions?.length) return result;
+    const suggestions = result.suggestions.filter(option => stripOptionSuffix(optionCommandText(option)) !== '@@');
+    return {
+        ...result,
+        suggestions: [...suggestions, MAIN_MENU_OPTION],
+    };
+}
+
 /**
- * Check if a message is a bang command (starts with `!`).
+ * Check if a message is a command (`!full-command`) or short alias (`@alias`).
  */
 export function isBangCommand(text: string): boolean {
-    const trimmed = text.trim();
-    return trimmed.startsWith('!') && trimmed.length > 1 && trimmed[1] !== ' ';
+    const trimmed = stripOptionSuffix(text);
+    if (trimmed.length <= 1 || trimmed[1] === ' ') return false;
+    if (trimmed.startsWith(COMMAND_PREFIX)) return true;
+    if (!trimmed.startsWith(ALIAS_PREFIX)) return false;
+    if (trimmed === '@@') return true;
+
+    const spaceIndex = trimmed.indexOf(' ');
+    const alias = trimmed.slice(1, spaceIndex === -1 ? undefined : spaceIndex).toLowerCase();
+    return aliases[alias] !== undefined;
 }
 
 /**
  * Parse a bang command into its name and arguments.
  */
-function parseBangCommand(text: string): { name: string; args: string } {
-    const trimmed = text.trim();
-    // Remove leading `!`
+function parseBangCommand(text: string): { prefix: string; name: string; args: string } {
+    const trimmed = stripOptionSuffix(text);
+    const prefix = trimmed[0] ?? COMMAND_PREFIX;
     const body = trimmed.slice(1);
     const spaceIndex = body.indexOf(' ');
 
     if (spaceIndex === -1) {
-        return { name: body.toLowerCase(), args: '' };
+        return { prefix, name: body.toLowerCase(), args: '' };
     }
 
     return {
+        prefix,
         name: body.slice(0, spaceIndex).toLowerCase(),
         args: body.slice(spaceIndex + 1),
     };
@@ -76,9 +235,9 @@ const helpHidden = new Set(['restart-all']);
 /** Commands that support --codex flag, with their codex-specific descriptions. */
 const codexVariants: Record<string, string> = {
     'auth':     '切换当前会话 Codex 账号',
-    'auth-all': '切换全部会话 Codex 账号',
+    'auth-all': '🔑切换codex账号',
     'login':    '登录 Codex 账号',
-    'usage':    '查看 Codex 用量',
+    'usage':    '⏱️查看codex用量',
 };
 
 function buildHelp(isConsole: boolean): BangCommandResult {
@@ -86,41 +245,24 @@ function buildHelp(isConsole: boolean): BangCommandResult {
         .filter(([name, entry]) => !entry.hidden && !helpHidden.has(name) && !(isConsole && entry.sessionOnly) && !(!isConsole && entry.consoleOnly))
         .map(([name, { desc }]) => [name, desc] as [string, string]);
 
-    const messages: string[] = [
-        '📖 快捷命令',
-        SEPARATOR,
-    ];
-
     const suggestions: string[] = [];
 
     for (const [name, desc] of baseCommands) {
-        const cmdAliases = Object.entries(aliases)
-            .filter(([, target]) => target === name)
-            .map(([alias]) => `!${alias}`);
-
-        const aliasStr = cmdAliases.length > 0 ? ` (${cmdAliases.join(', ')})` : '';
-        messages.push(`!${name}${aliasStr} → ${desc}`);
-        suggestions.push(`!${name}`);
+        suggestions.push(compactOption(formatPrimaryInvocation(name), desc));
         if (isConsole && codexVariants[name]) {
-            messages.push(`!${name} --codex → ${codexVariants[name]}`);
-            suggestions.push(`!${name} --codex`);
+            suggestions.push(compactOption(formatPrimaryInvocationWithArgs(name, '--codex'), codexVariants[name]));
         }
     }
 
-    messages.push(`!help (!h) → 显示帮助`);
-    suggestions.push('!help');
-
-    messages.push(SEPARATOR);
-
     return {
-        message: messages,
+        message: [],
         action: 'none',
         suggestions,
     };
 }
 
 /** Commands hidden from console welcome (available via !help but not shown on launch). */
-const consoleWelcomeHidden = new Set(['restart-all']);
+const consoleWelcomeHidden = new Set(['restart-all', 'login']);
 
 /**
  * Build the console welcome message listing key commands.
@@ -129,8 +271,6 @@ const consoleWelcomeHidden = new Set(['restart-all']);
 export function buildConsoleWelcome(): BangCommandResult {
     const messages: string[] = [
         '🖥️ 控制台',
-        '常驻轻量级会话，仅处理 ! 指令\n不启动 Claude，不消耗 API 额度',
-        SEPARATOR,
     ];
 
     // Show commands available in console (consoleOnly + shared, exclude hidden and welcome-hidden)
@@ -139,27 +279,15 @@ export function buildConsoleWelcome(): BangCommandResult {
 
     const suggestions: string[] = [];
     for (const [name, { desc }] of consoleCommands) {
-        const cmdAliases = Object.entries(aliases)
-            .filter(([, target]) => target === name)
-            .map(([alias]) => `!${alias}`);
-        const aliasStr = cmdAliases.length > 0 ? ` (${cmdAliases.join(', ')})` : '';
-        messages.push(`!${name}${aliasStr} → ${desc}`);
-        suggestions.push(`!${name}`);
+        suggestions.push(compactOption(formatPrimaryInvocation(name), desc));
         if (codexVariants[name]) {
-            messages.push(`!${name} --codex → ${codexVariants[name]}`);
-            suggestions.push(`!${name} --codex`);
+            suggestions.push(compactOption(formatPrimaryInvocationWithArgs(name, '--codex'), codexVariants[name]));
         }
     }
-    messages.push(`!help (!h) → 显示全部命令`);
-    suggestions.push('!help');
-
-    messages.push(SEPARATOR);
-    messages.push('普通消息不会被处理，请使用 ! 开头的命令');
-
     return {
         message: messages,
         action: 'none',
-        suggestions,
+        suggestions: [...suggestions, MAIN_MENU_OPTION],
     };
 }
 
@@ -178,18 +306,16 @@ export function buildSessionWelcome(): BangCommandResult {
     for (const [name, { desc }] of sessionCommands) {
         const cmdAliases = Object.entries(aliases)
             .filter(([, target]) => target === name)
-            .map(([alias]) => `!${alias}`);
+            .map(([alias]) => formatAlias(alias));
         const aliasStr = cmdAliases.length > 0 ? ` (${cmdAliases.join(', ')})` : '';
-        messages.push(`!${name}${aliasStr} → ${desc}`);
+        messages.push(`${formatCommandDisplay(name)}${aliasStr && formatPrimaryInvocation(name) === formatCommand(name) ? aliasStr : ''} → ${desc}`);
     }
-    messages.push(`!help (!h) → 显示帮助`);
-
     messages.push(SEPARATOR);
 
     return {
         message: messages,
         action: 'none',
-        suggestions: [...sessionCommands.map(([name]) => `!${name}`), '!help'],
+        suggestions: sessionCommands.map(([name]) => formatPrimaryInvocation(name)),
     };
 }
 
@@ -197,11 +323,25 @@ export function buildSessionWelcome(): BangCommandResult {
  * Execute a bang command. Returns null if the command is not recognized.
  */
 export async function executeBangCommand(text: string, ctx: BangCommandContext): Promise<BangCommandResult> {
-    let { name, args } = parseBangCommand(text);
-    logger.debug(`[bang] Executing command: !${name} args="${args}"`);
+    let { prefix, name, args } = parseBangCommand(text);
+    const originalCommand = `${prefix}${name}`;
+    logger.debug(`[bang] Executing command: ${originalCommand} args="${args}"`);
 
-    // Resolve alias
-    if (aliases[name]) {
+    // Short aliases moved from !a/!h/!u to @a/@h/@u.
+    if (prefix === ALIAS_PREFIX) {
+        if (name === '@') {
+            return ctx.isConsoleSession ? buildConsoleWelcome() : buildQuickSessionMenu(ctx);
+        }
+        if (!aliases[name]) {
+            return withMainMenuOption({
+                message: [`❌ 未知命令 "${originalCommand}"`, `输入 ${formatCommand('help')} 或 ${formatAlias('h')} 查看可用命令。`],
+                action: 'none',
+                suggestions: [formatCommand('help'), formatAlias('h')],
+            });
+        }
+        if (aliasArgs[name]) {
+            args = `${aliasArgs[name]} ${args}`.trim();
+        }
         name = aliases[name];
     }
 
@@ -218,21 +358,21 @@ export async function executeBangCommand(text: string, ctx: BangCommandContext):
     const entry = commands[name];
 
     if (!entry) {
-        return {
-            message: [`❌ 未知命令 "!${name}"`, '输入 !help 查看可用命令。'],
+        return withMainMenuOption({
+            message: [`❌ 未知命令 "${originalCommand}"`, `输入 ${formatCommand('help')} 或 ${formatAlias('h')} 查看可用命令。`],
             action: 'none',
-            suggestions: ['!help'],
-        };
+            suggestions: [formatCommand('help'), formatAlias('h')],
+        });
     }
 
     // Block session-only commands in console
     if (ctx.isConsoleSession && entry.sessionOnly) {
-        return { message: `ℹ️ !${name} 仅在会话中可用`, action: 'none' };
+        return { message: `ℹ️ ${originalCommand} 仅在会话中可用`, action: 'none' };
     }
 
     // Block console-only commands in normal sessions
     if (!ctx.isConsoleSession && entry.consoleOnly) {
-        return { message: `ℹ️ !${name} 仅在控制台中可用`, action: 'none' };
+        return { message: `ℹ️ ${originalCommand} 仅在控制台中可用`, action: 'none' };
     }
 
     // Send loading indicator before async commands
@@ -241,11 +381,11 @@ export async function executeBangCommand(text: string, ctx: BangCommandContext):
     }
 
     try {
-        return await entry.handler(args, ctx);
+        return withMainMenuOption(await entry.handler(args, ctx));
     } catch (error) {
-        logger.debug(`[bang] Command !${name} failed:`, error);
+        logger.debug(`[bang] Command ${originalCommand} failed:`, error);
         return {
-            message: `❌ !${name} 失败: ${error instanceof Error ? error.message : '未知错误'}`,
+            message: `❌ ${originalCommand} 失败: ${error instanceof Error ? error.message : '未知错误'}`,
             action: 'none',
         };
     }

@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
@@ -13,6 +13,8 @@ import { formatRelativeTime } from './relativeTime';
 const USAGE_API_URL = 'https://api.anthropic.com/api/oauth/usage';
 /** Fresh TTL: cache is considered authoritative within this window (no revalidate). */
 const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+const CACHE_AGE_DISPLAY_MIN_MS = 5 * 60 * 1000; // Hide cache age while it is effectively fresh.
+const USAGE_UNAVAILABLE_PERCENT = 95;
 /** Stale TTL: beyond fresh but within stale — cached value is still shown with ⏳ marker, and a background revalidate fires. */
 const STALE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
@@ -233,26 +235,152 @@ function usageBar(utilization: number): string {
     return `[${bar}] ${utilization.toFixed(0)}%`;
 }
 
+function formatClockTime(resetsAt: string): string {
+    const date = new Date(resetsAt);
+    if (Number.isNaN(date.getTime())) return '';
+    return date.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+}
+
+function formatAvailability(resetsAt: string | null | undefined): string {
+    if (!resetsAt) return '重置时间未知';
+    const relative = formatResetTime(resetsAt);
+    const clock = formatClockTime(resetsAt);
+    return clock ? `${relative}后可用｜${clock}` : `${relative}后可用`;
+}
+
+function formatClaudeUsageSummary(data: UsageData): string | null {
+    const parts: string[] = [];
+    if (data.five_hour) {
+        const fiveHour = `5h: ${data.five_hour.utilization.toFixed(0)}%`;
+        parts.push(data.five_hour.utilization >= USAGE_UNAVAILABLE_PERCENT
+            ? `${fiveHour}｜${formatAvailability(data.five_hour.resets_at)}`
+            : fiveHour);
+    }
+    if (data.seven_day) {
+        const sevenDay = `7d: ${data.seven_day.utilization.toFixed(0)}%`;
+        parts.push(data.seven_day.utilization >= USAGE_UNAVAILABLE_PERCENT
+            ? `${sevenDay}｜${formatAvailability(data.seven_day.resets_at)}`
+            : sevenDay);
+    }
+    return parts.length > 0 ? parts.join('｜') : null;
+}
+
+function formatCodexUsageSummary(data: CodexUsageData): string | null {
+    const parts: string[] = [];
+    if (data.primaryWindow) {
+        const fiveHour = `5h: ${data.primaryWindow.usedPercent.toFixed(0)}%`;
+        const resetAt = data.primaryWindow.resetAt ? new Date(data.primaryWindow.resetAt * 1000).toISOString() : null;
+        parts.push(data.primaryWindow.usedPercent >= USAGE_UNAVAILABLE_PERCENT
+            ? `${fiveHour}｜${formatAvailability(resetAt)}`
+            : fiveHour);
+    }
+    if (data.secondaryWindow) {
+        const sevenDay = `7d: ${data.secondaryWindow.usedPercent.toFixed(0)}%`;
+        const resetAt = data.secondaryWindow.resetAt ? new Date(data.secondaryWindow.resetAt * 1000).toISOString() : null;
+        parts.push(data.secondaryWindow.usedPercent >= USAGE_UNAVAILABLE_PERCENT
+            ? `${sevenDay}｜${formatAvailability(resetAt)}`
+            : sevenDay);
+    }
+    return parts.length > 0 ? parts.join('｜') : null;
+}
+
+function isClaudeFiveHourFull(data: UsageData): boolean {
+    return (data.five_hour?.utilization ?? 0) >= USAGE_UNAVAILABLE_PERCENT;
+}
+
+function isCodexFiveHourFull(data: CodexUsageData): boolean {
+    return (data.primaryWindow?.usedPercent ?? 0) >= USAGE_UNAVAILABLE_PERCENT;
+}
+
+function isClaudeSevenDayFull(data: UsageData): boolean {
+    return (data.seven_day?.utilization ?? 0) >= USAGE_UNAVAILABLE_PERCENT;
+}
+
+function isCodexSevenDayFull(data: CodexUsageData): boolean {
+    return (data.secondaryWindow?.usedPercent ?? 0) >= USAGE_UNAVAILABLE_PERCENT;
+}
+
 /**
  * Get a one-line usage summary from cache for a given config dir (used by !auth after switch).
  * Returns null if no cached data is available.
  */
 export function getCachedUsageSummary(cacheKey: string): string | null {
+    ensureHydrated();
     const cached = cache.get(cacheKey);
     if (!cached || (Date.now() - cached.fetchedAt) >= CACHE_TTL_MS) return null;
     return formatClaudeUsageSummary(cached.data);
+}
+
+/** Read a profile usage summary from the shared file-backed cache without network I/O. */
+export function getCachedProfileUsageEntry(profileName: string, flavor: AuthFlavor): ProfileUsageEntry | null {
+    ensureHydrated();
+    const isCodex = flavor === 'codex';
+    const cacheKey = isCodex ? getCodexInstancePath(profileName) : getInstancePath(profileName);
+    const cached = isCodex ? codexCache.get(cacheKey) : cache.get(cacheKey);
+    if (!cached) return null;
+
+    const age = Date.now() - cached.fetchedAt;
+    if (age >= STALE_TTL_MS) return null;
+
+    return isCodex
+        ? makeCodexEntry((cached as CachedCodexUsage).data, cached.fetchedAt, age >= CACHE_TTL_MS)
+        : makeClaudeEntry((cached as CachedUsage).data, cached.fetchedAt, age >= CACHE_TTL_MS);
 }
 
 /** Usage summary result for !auth profile list. */
 export interface ProfileUsageEntry {
     /** Formatted one-line summary if available (may come from stale cache). */
     summary: string | null;
+    /** 5h utilization percentage for compact account menus. */
+    fiveHourPercent: number | null;
+    /** 5h reset timestamp, ISO string, for compact account menus. */
+    fiveHourResetAt: string | null;
+    /** 7d utilization percentage for compact account menus. */
+    sevenDayPercent: number | null;
+    /** 7d reset timestamp, ISO string, for compact account menus. */
+    sevenDayResetAt: string | null;
+    /** True when the 5h window is at or above 100%. */
+    full: boolean;
+    /** True when the 7d window is at or above 100%. */
+    sevenDayFull: boolean;
     /** True when the fetch failed because the OAuth token is expired/invalid (401/403). */
     authExpired: boolean;
     /** True when the summary was served from the stale-TTL window (fresh expired but still within STALE_TTL_MS). */
     stale: boolean;
     /** Unix ms when the underlying data was fetched, or null if no data. */
     cachedAt: number | null;
+}
+
+function makeClaudeEntry(data: UsageData, cachedAt: number, stale = false, authExpired = false): ProfileUsageEntry {
+    return {
+        summary: formatClaudeUsageSummary(data),
+        fiveHourPercent: data.five_hour?.utilization ?? null,
+        fiveHourResetAt: data.five_hour?.resets_at ?? null,
+        sevenDayPercent: data.seven_day?.utilization ?? null,
+        sevenDayResetAt: data.seven_day?.resets_at ?? null,
+        full: isClaudeFiveHourFull(data),
+        sevenDayFull: isClaudeSevenDayFull(data),
+        authExpired,
+        stale,
+        cachedAt,
+    };
+}
+
+function makeCodexEntry(data: CodexUsageData, cachedAt: number, stale = false, authExpired = false): ProfileUsageEntry {
+    const resetAt = data.primaryWindow?.resetAt ? new Date(data.primaryWindow.resetAt * 1000).toISOString() : null;
+    const sevenDayResetAt = data.secondaryWindow?.resetAt ? new Date(data.secondaryWindow.resetAt * 1000).toISOString() : null;
+    return {
+        summary: formatCodexUsageSummary(data),
+        fiveHourPercent: data.primaryWindow?.usedPercent ?? null,
+        fiveHourResetAt: resetAt,
+        sevenDayPercent: data.secondaryWindow?.usedPercent ?? null,
+        sevenDayResetAt,
+        full: isCodexFiveHourFull(data),
+        sevenDayFull: isCodexSevenDayFull(data),
+        authExpired,
+        stale,
+        cachedAt,
+    };
 }
 
 /** Detect whether a thrown fetch error is an auth-expired error (401/403). */
@@ -332,40 +460,42 @@ export async function fetchProfileUsageSummary(profileName: string, flavor: Auth
             const cached = codexCache.get(cacheKey);
             const age = cached ? Date.now() - cached.fetchedAt : Infinity;
             if (cached && age < CACHE_TTL_MS) {
-                return { summary: formatCodexUsageSummary(cached.data), authExpired: false, stale: false, cachedAt: cached.fetchedAt };
+                return makeCodexEntry(cached.data, cached.fetchedAt);
             }
             if (cached && age < STALE_TTL_MS) {
                 backgroundRevalidateCodex(cacheKey, profileName);
-                return { summary: formatCodexUsageSummary(cached.data), authExpired: false, stale: true, cachedAt: cached.fetchedAt };
+                return makeCodexEntry(cached.data, cached.fetchedAt, true);
             }
             const token = readCodexAccessToken(cacheKey);
-            if (!token) return { summary: null, authExpired: false, stale: false, cachedAt: null };
+            if (!token) return { summary: null, fiveHourPercent: null, fiveHourResetAt: null, sevenDayPercent: null, sevenDayResetAt: null, full: false, sevenDayFull: false, authExpired: false, stale: false, cachedAt: null };
             const data = await Promise.race([
                 fetchCodexUsage(token, profileName),
                 new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000)),
             ]);
-            setCodexCache(cacheKey, { data, fetchedAt: Date.now() });
-            return { summary: formatCodexUsageSummary(data), authExpired: false, stale: false, cachedAt: Date.now() };
+            const now = Date.now();
+            setCodexCache(cacheKey, { data, fetchedAt: now });
+            return makeCodexEntry(data, now);
         }
 
         // Claude
         const cached = cache.get(cacheKey);
         const age = cached ? Date.now() - cached.fetchedAt : Infinity;
         if (cached && age < CACHE_TTL_MS) {
-            return { summary: formatClaudeUsageSummary(cached.data), authExpired: false, stale: false, cachedAt: cached.fetchedAt };
+            return makeClaudeEntry(cached.data, cached.fetchedAt);
         }
         if (cached && age < STALE_TTL_MS) {
             backgroundRevalidateClaude(cacheKey, profileName);
-            return { summary: formatClaudeUsageSummary(cached.data), authExpired: false, stale: true, cachedAt: cached.fetchedAt };
+            return makeClaudeEntry(cached.data, cached.fetchedAt, true);
         }
         const token = readOAuthToken(cacheKey);
-        if (!token) return { summary: null, authExpired: false, stale: false, cachedAt: null };
+        if (!token) return { summary: null, fiveHourPercent: null, fiveHourResetAt: null, sevenDayPercent: null, sevenDayResetAt: null, full: false, sevenDayFull: false, authExpired: false, stale: false, cachedAt: null };
         const data = await Promise.race([
             fetchUsage(token, profileName),
             new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000)),
         ]);
-        setClaudeCache(cacheKey, { data, fetchedAt: Date.now() });
-        return { summary: formatClaudeUsageSummary(data), authExpired: false, stale: false, cachedAt: Date.now() };
+        const now = Date.now();
+        setClaudeCache(cacheKey, { data, fetchedAt: now });
+        return makeClaudeEntry(data, now);
     } catch (err) {
         logger.debug(`[!usage] fetchProfileUsageSummary failed for ${profileName}:`, err);
         // Fetch failed → fall back to any cached value still within stale window, so users
@@ -373,32 +503,27 @@ export async function fetchProfileUsageSummary(profileName: string, flavor: Auth
         const authExpired = isAuthExpiredError(err);
         const cached = isCodex ? codexCache.get(cacheKey) : cache.get(cacheKey);
         if (cached && (Date.now() - cached.fetchedAt) < STALE_TTL_MS) {
-            const summary = isCodex
-                ? formatCodexUsageSummary((cached as CachedCodexUsage).data)
-                : formatClaudeUsageSummary((cached as CachedUsage).data);
-            return { summary, authExpired, stale: true, cachedAt: cached.fetchedAt };
+            return isCodex
+                ? makeCodexEntry((cached as CachedCodexUsage).data, cached.fetchedAt, true, authExpired)
+                : makeClaudeEntry((cached as CachedUsage).data, cached.fetchedAt, true, authExpired);
         }
-        return { summary: null, authExpired, stale: false, cachedAt: null };
+        return { summary: null, fiveHourPercent: null, fiveHourResetAt: null, sevenDayPercent: null, sevenDayResetAt: null, full: false, sevenDayFull: false, authExpired, stale: false, cachedAt: null };
     }
-}
-
-function formatClaudeUsageSummary(data: UsageData): string | null {
-    const parts: string[] = [];
-    if (data.five_hour) parts.push(`5h: ${data.five_hour.utilization.toFixed(0)}%`);
-    if (data.seven_day) parts.push(`7d: ${data.seven_day.utilization.toFixed(0)}%`);
-    return parts.length > 0 ? `📊 ${parts.join(' · ')}` : null;
-}
-
-function formatCodexUsageSummary(data: CodexUsageData): string | null {
-    const parts: string[] = [];
-    if (data.primaryWindow) parts.push(`5h: ${data.primaryWindow.usedPercent.toFixed(0)}%`);
-    if (data.secondaryWindow) parts.push(`7d: ${data.secondaryWindow.usedPercent.toFixed(0)}%`);
-    return parts.length > 0 ? `📊 ${parts.join(' · ')}` : null;
 }
 
 /**
  * Format the usage data into a readable, centered message.
  */
+function formatDetailedDataAge(cachedAt: number): string | null {
+    const ageMs = Date.now() - cachedAt;
+    if (ageMs < CACHE_AGE_DISPLAY_MIN_MS) return null;
+    if (ageMs < CACHE_TTL_MS) {
+        const remainMin = Math.ceil((CACHE_TTL_MS - ageMs) / 60000);
+        return `ℹ️ 数据获取于 ${formatRelativeTime(cachedAt)}（${remainMin} 分钟内复用缓存）`;
+    }
+    return `ℹ️ 旧缓存获取于 ${formatRelativeTime(cachedAt)}（已超过 15 分钟）`;
+}
+
 export function formatUsage(data: UsageData, profileLabel: string, cachedAt: number): string[] {
     const messages: string[] = [`📊 用量 — ${profileLabel}`];
 
@@ -444,12 +569,8 @@ export function formatUsage(data: UsageData, profileLabel: string, cachedAt: num
         messages.push(parts.join('\n'));
     }
 
-    // Cache info
-    const ageMs = Date.now() - cachedAt;
-    if (ageMs >= 6000) {
-        const remainMin = Math.ceil((CACHE_TTL_MS - ageMs) / 60000);
-        messages.push(`ℹ️ 缓存于 ${formatRelativeTime(cachedAt)}（${remainMin} 分钟后刷新）`);
-    }
+    const dataAge = formatDetailedDataAge(cachedAt);
+    if (dataAge) messages.push(dataAge);
 
     return messages;
 }
@@ -490,12 +611,14 @@ interface CachedCodexUsage {
 const codexCache = new Map<string, CachedCodexUsage>();
 
 // ---------------------------------------------------------------------------
-// Disk persistence (stale-while-revalidate support)
+// Disk persistence (file-backed cache for cross-session consistency)
 // ---------------------------------------------------------------------------
 //
 // Both `cache` (Claude) and `codexCache` (Codex) are mirrored to a single
-// JSON file under `$HAPPY_HOME_DIR/usage-cache.json`. Load is lazy (first
-// access), save is debounced (`PERSIST_DEBOUNCE_MS` after any mutation).
+// JSON file under `$HAPPY_HOME_DIR/usage-cache.json`. Usage commands are
+// low-frequency, so every read reloads this file and every write immediately
+// performs a merge + atomic rename. This keeps console and session views aligned
+// across separate Happy processes.
 //
 // Format:
 // {
@@ -505,26 +628,26 @@ const codexCache = new Map<string, CachedCodexUsage>();
 // }
 
 const USAGE_CACHE_FILE = join(configuration.happyHomeDir, 'usage-cache.json');
+const USAGE_CACHE_LOCK_FILE = `${USAGE_CACHE_FILE}.lock`;
 const USAGE_CACHE_VERSION = 1;
-const PERSIST_DEBOUNCE_MS = 500;
 
-let hydrated = false;
-let persistTimer: NodeJS.Timeout | null = null;
+type UsageCachePayload = {
+    version: number;
+    claude: Record<string, CachedUsage>;
+    codex: Record<string, CachedCodexUsage>;
+};
 
-function ensureHydrated(): void {
-    if (hydrated) return;
-    hydrated = true;
-    let raw: string;
+function emptyUsageCachePayload(): UsageCachePayload {
+    return { version: USAGE_CACHE_VERSION, claude: {}, codex: {} };
+}
+
+function sleepSync(ms: number): void {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function readUsageCachePayload(): UsageCachePayload {
     try {
-        raw = readFileSync(USAGE_CACHE_FILE, 'utf-8');
-    } catch (err) {
-        // Missing file on first run is the expected path — ignore silently.
-        if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
-            logger.debug('[!usage] failed to read usage-cache:', err);
-        }
-        return;
-    }
-    try {
+        const raw = readFileSync(USAGE_CACHE_FILE, 'utf-8');
         const parsed = JSON.parse(raw) as {
             version?: number;
             claude?: Record<string, CachedUsage>;
@@ -532,53 +655,113 @@ function ensureHydrated(): void {
         };
         if (parsed.version !== USAGE_CACHE_VERSION) {
             logger.debug(`[!usage] usage-cache version mismatch (${parsed.version} vs ${USAGE_CACHE_VERSION}), ignoring`);
-            return;
+            return emptyUsageCachePayload();
         }
-        const now = Date.now();
-        for (const [key, entry] of Object.entries(parsed.claude ?? {})) {
-            if (!entry || typeof entry.fetchedAt !== 'number') continue;
-            if ((now - entry.fetchedAt) >= STALE_TTL_MS) continue; // drop ancient entries
-            cache.set(key, entry);
-        }
-        for (const [key, entry] of Object.entries(parsed.codex ?? {})) {
-            if (!entry || typeof entry.fetchedAt !== 'number') continue;
-            if ((now - entry.fetchedAt) >= STALE_TTL_MS) continue;
-            codexCache.set(key, entry);
-        }
-        logger.debug(`[!usage] hydrated usage-cache: claude=${cache.size} codex=${codexCache.size}`);
+        return {
+            version: USAGE_CACHE_VERSION,
+            claude: parsed.claude ?? {},
+            codex: parsed.codex ?? {},
+        };
     } catch (err) {
-        logger.debug('[!usage] failed to hydrate usage-cache:', err);
+        if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+            logger.debug('[!usage] failed to read usage-cache:', err);
+        }
+        return emptyUsageCachePayload();
     }
 }
 
-function schedulePersist(): void {
-    if (persistTimer) return;
-    persistTimer = setTimeout(() => {
-        persistTimer = null;
-        try {
-            const payload = {
-                version: USAGE_CACHE_VERSION,
-                claude: Object.fromEntries(cache.entries()),
-                codex: Object.fromEntries(codexCache.entries()),
-            };
-            writeFileSync(USAGE_CACHE_FILE, JSON.stringify(payload), 'utf-8');
-        } catch (err) {
-            logger.debug('[!usage] failed to persist usage-cache:', err);
-        }
-    }, PERSIST_DEBOUNCE_MS);
-    persistTimer.unref?.();
+function loadUsageCacheIntoMemory(payload: UsageCachePayload): void {
+    cache.clear();
+    codexCache.clear();
+    const now = Date.now();
+    for (const [key, entry] of Object.entries(payload.claude)) {
+        if (!entry || typeof entry.fetchedAt !== 'number') continue;
+        if ((now - entry.fetchedAt) >= STALE_TTL_MS) continue;
+        cache.set(key, entry);
+    }
+    for (const [key, entry] of Object.entries(payload.codex)) {
+        if (!entry || typeof entry.fetchedAt !== 'number') continue;
+        if ((now - entry.fetchedAt) >= STALE_TTL_MS) continue;
+        codexCache.set(key, entry);
+    }
 }
 
-/** Write to the Claude usage cache and schedule a debounced disk flush. */
+function ensureHydrated(): void {
+    loadUsageCacheIntoMemory(readUsageCachePayload());
+}
+
+function writeUsageCachePayload(payload: UsageCachePayload): void {
+    mkdirSync(configuration.happyHomeDir, { recursive: true });
+    const tmp = `${USAGE_CACHE_FILE}.${process.pid}.${Date.now()}.tmp`;
+    writeFileSync(tmp, JSON.stringify(payload), 'utf-8');
+    renameSync(tmp, USAGE_CACHE_FILE);
+}
+
+function withUsageCacheLock<T>(operation: () => T): T {
+    const deadline = Date.now() + 3000;
+    while (Date.now() < deadline) {
+        let fd: number | null = null;
+        try {
+            fd = openSync(USAGE_CACHE_LOCK_FILE, 'wx');
+            try {
+                return operation();
+            } finally {
+                closeSync(fd);
+                unlinkSync(USAGE_CACHE_LOCK_FILE);
+            }
+        } catch (err) {
+            if (fd !== null) {
+                try { closeSync(fd); } catch { /* ignore */ }
+            }
+            const code = (err as NodeJS.ErrnoException)?.code;
+            if (code !== 'EEXIST') throw err;
+            try {
+                const stat = statSync(USAGE_CACHE_LOCK_FILE);
+                if (Date.now() - stat.mtimeMs > 10_000) unlinkSync(USAGE_CACHE_LOCK_FILE);
+            } catch {
+                // Another process may have released the lock between checks.
+            }
+            sleepSync(50);
+        }
+    }
+    logger.debug('[!usage] usage-cache lock timeout, writing without lock');
+    return operation();
+}
+
+function writeUsageEntry(section: 'claude' | 'codex', key: string, entry: CachedUsage | CachedCodexUsage): void {
+    withUsageCacheLock(() => {
+        const payload = readUsageCachePayload();
+        if (section === 'claude') {
+            payload.claude[key] = entry as CachedUsage;
+        } else {
+            payload.codex[key] = entry as CachedCodexUsage;
+        }
+        const now = Date.now();
+        for (const [cacheKey, cached] of Object.entries(payload.claude)) {
+            if (!cached || typeof cached.fetchedAt !== 'number' || (now - cached.fetchedAt) >= STALE_TTL_MS) {
+                delete payload.claude[cacheKey];
+            }
+        }
+        for (const [cacheKey, cached] of Object.entries(payload.codex)) {
+            if (!cached || typeof cached.fetchedAt !== 'number' || (now - cached.fetchedAt) >= STALE_TTL_MS) {
+                delete payload.codex[cacheKey];
+            }
+        }
+        writeUsageCachePayload(payload);
+        loadUsageCacheIntoMemory(payload);
+    });
+}
+
+/** Write to the Claude usage cache and immediately merge it to disk. */
 function setClaudeCache(key: string, entry: CachedUsage): void {
     cache.set(key, entry);
-    schedulePersist();
+    writeUsageEntry('claude', key, entry);
 }
 
-/** Write to the Codex usage cache and schedule a debounced disk flush. */
+/** Write to the Codex usage cache and immediately merge it to disk. */
 function setCodexCache(key: string, entry: CachedCodexUsage): void {
     codexCache.set(key, entry);
-    schedulePersist();
+    writeUsageEntry('codex', key, entry);
 }
 
 /** Read access_token from a codex auth.json file. */
@@ -705,38 +888,208 @@ function formatCodexUsage(data: CodexUsageData, profileLabel: string, cachedAt: 
         messages.push('暂无用量数据');
     }
 
-    const ageMs = Date.now() - cachedAt;
-    const ageSec = Math.floor(ageMs / 1000);
-    if (ageSec > 5) {
-        const ageMin = Math.floor(ageSec / 60);
-        const ageStr = ageMin > 0 ? `${ageMin} 分钟前` : `${ageSec} 秒前`;
-        const remainMs = CACHE_TTL_MS - ageMs;
-        const remainMin = Math.ceil(remainMs / 60000);
-        messages.push(`ℹ️ 缓存于 ${ageStr}（${remainMin} 分钟后刷新）`);
-    }
+    const dataAge = formatDetailedDataAge(cachedAt);
+    if (dataAge) messages.push(dataAge);
 
     return messages;
 }
 
+function formatCompactResetTime(resetsAt: string | null): string | null {
+    if (!resetsAt) return null;
+    const resetDate = new Date(resetsAt);
+    const diffMs = resetDate.getTime() - Date.now();
+    if (!Number.isFinite(diffMs)) return null;
+    const totalMin = Math.max(0, Math.ceil(diffMs / 60000));
+    const hours = Math.floor(totalMin / 60);
+    const minutes = totalMin % 60;
+    return `下${hours}:${minutes.toString().padStart(2, '0')}时`;
+}
+
+function formatCompactSevenDayResetTime(resetsAt: string | null): string | null {
+    if (!resetsAt) return null;
+    const resetDate = new Date(resetsAt);
+    const diffMs = resetDate.getTime() - Date.now();
+    if (!Number.isFinite(diffMs)) return null;
+    const totalHours = Math.max(0, Math.floor(diffMs / 3600000));
+    const days = Math.floor(totalHours / 24);
+    const hours = totalHours % 24;
+    return `${days}D:${hours}h`;
+}
+
+function formatCompactCacheAge(cachedAt: number): string {
+    const ageMin = Math.max(0, Math.floor((Date.now() - cachedAt) / 60000));
+    if (ageMin < 60) return `${ageMin}m`;
+    const ageHours = Math.floor(ageMin / 60);
+    if (ageHours < 24) return `${ageHours}h`;
+    return `${Math.floor(ageHours / 24)}d`;
+}
+
+function formatCompactDataAge(entry: ProfileUsageEntry): string | null {
+    if (!entry.cachedAt) return null;
+    if (Date.now() - entry.cachedAt < CACHE_AGE_DISPLAY_MIN_MS) return null;
+    return `${entry.stale ? '缓' : '取'}${formatCompactCacheAge(entry.cachedAt)}`;
+}
+
+function formatCompactProfileUsage(entry: ProfileUsageEntry | null): string[] {
+    if (!entry) return ['用量未知'];
+    const parts: string[] = [];
+    if (entry.fiveHourPercent != null) {
+        parts.push(`5h:${entry.fiveHourPercent.toFixed(0)}%`);
+        if (entry.full) {
+            const resetText = formatCompactResetTime(entry.fiveHourResetAt);
+            if (resetText) parts.push(resetText);
+        }
+    }
+    if (entry.sevenDayPercent != null) {
+        parts.push(`7d:${entry.sevenDayPercent.toFixed(0)}%`);
+        const resetText = formatCompactSevenDayResetTime(entry.sevenDayResetAt);
+        if (resetText) parts.push(resetText);
+    }
+    if (parts.length === 0 && entry.summary) parts.push(entry.summary);
+    const dataAge = formatCompactDataAge(entry);
+    if (dataAge) parts.push(dataAge);
+    return parts.length > 0 ? parts : ['用量未知'];
+}
+
+function isGuessAvailableAfterReset(entry: ProfileUsageEntry | null): boolean {
+    if (!entry || (!entry.full && !entry.sevenDayFull)) return false;
+    return !isFiveHourBlocked(entry) && !isSevenDayBlocked(entry);
+}
+
+const DEFAULT_PROFILE_MARKER = '💚';
+const DEFAULT_HIGH_USAGE_PROFILE_MARKER = '💔';
+const USABLE_PROFILE_MARKER = '🔵';
+const UNAVAILABLE_PROFILE_MARKER = '🚫';
+const GUESS_AVAILABLE_PROFILE_MARKER = '🟣';
+const DEFAULT_HIGH_USAGE_PERCENT = 85;
+const UNAVAILABLE_DAY_MARKERS = ['0️⃣', '1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'] as const;
+
+function usageProfileUnavailable(entry: ProfileUsageEntry | null): boolean {
+    return !entry || !!entry.authExpired || isFiveHourBlocked(entry) || isSevenDayBlocked(entry);
+}
+
+function defaultProfileHighUsage(entry: ProfileUsageEntry | null): boolean {
+    return (entry?.fiveHourPercent != null && entry.fiveHourPercent > DEFAULT_HIGH_USAGE_PERCENT)
+        || (entry?.sevenDayPercent != null && entry.sevenDayPercent > DEFAULT_HIGH_USAGE_PERCENT);
+}
+
+function usageProfileMarker(entry: ProfileUsageEntry | null, isDefault = false): string {
+    if (isDefault && defaultProfileHighUsage(entry)) return DEFAULT_HIGH_USAGE_PROFILE_MARKER;
+    if (usageProfileUnavailable(entry)) return UNAVAILABLE_PROFILE_MARKER;
+    if (isGuessAvailableAfterReset(entry)) return GUESS_AVAILABLE_PROFILE_MARKER;
+    if (isDefault) return DEFAULT_PROFILE_MARKER;
+    return USABLE_PROFILE_MARKER;
+}
+
+function usageAvailablePercent(entry: ProfileUsageEntry | null): number | null {
+    if (entry?.fiveHourPercent == null) return null;
+    return Math.max(0, 100 - entry.fiveHourPercent);
+}
+
+function resetPassed(resetsAt: string | null | undefined): boolean {
+    if (!resetsAt) return false;
+    const resetAt = new Date(resetsAt).getTime();
+    return Number.isFinite(resetAt) && resetAt <= Date.now();
+}
+
+function isFiveHourBlocked(entry: ProfileUsageEntry): boolean {
+    return entry.full && !resetPassed(entry.fiveHourResetAt);
+}
+
+function isSevenDayBlocked(entry: ProfileUsageEntry): boolean {
+    return entry.sevenDayFull && !resetPassed(entry.sevenDayResetAt);
+}
+
+function resetDelayMs(resetsAt: string | null | undefined): number | null {
+    if (!resetsAt) return null;
+    const resetAt = new Date(resetsAt).getTime();
+    if (!Number.isFinite(resetAt)) return null;
+    return Math.max(0, resetAt - Date.now());
+}
+
+function usageResetDelayMs(entry: ProfileUsageEntry | null): number | null {
+    if (!entry) return null;
+    const delays: number[] = [];
+    if (entry.full && !resetPassed(entry.fiveHourResetAt)) {
+        const delay = resetDelayMs(entry.fiveHourResetAt);
+        if (delay == null) return null;
+        delays.push(delay);
+    }
+    if (entry.sevenDayFull && !resetPassed(entry.sevenDayResetAt)) {
+        const delay = resetDelayMs(entry.sevenDayResetAt);
+        if (delay == null) return null;
+        delays.push(delay);
+    }
+    return delays.length > 0 ? Math.max(...delays) : null;
+}
+
+function unavailableDayMarker(delayMs: number | null): string | null {
+    if (delayMs == null) return null;
+    const days = Math.max(0, Math.min(5, Math.floor(delayMs / 86400000)));
+    return UNAVAILABLE_DAY_MARKERS[days];
+}
+
+function usageUnavailablePrefix(entry: ProfileUsageEntry | null): string | null {
+    const marker = unavailableDayMarker(usageResetDelayMs(entry));
+    if (!marker || !entry) return marker;
+    if (isSevenDayBlocked(entry)) return `${UNAVAILABLE_PROFILE_MARKER} ${marker}`;
+    if (isFiveHourBlocked(entry)) return marker;
+    return marker;
+}
+
+function usageSort(entry: ProfileUsageEntry | null): { sortGroup: number; sortValue: number } {
+    if (!usageProfileUnavailable(entry)) {
+        const available = usageAvailablePercent(entry);
+        return available == null
+            ? { sortGroup: 1, sortValue: 0 }
+            : { sortGroup: 0, sortValue: -available };
+    }
+
+    const delay = usageResetDelayMs(entry);
+    return delay == null
+        ? { sortGroup: 3, sortValue: Number.POSITIVE_INFINITY }
+        : { sortGroup: 2, sortValue: delay };
+}
+
+function compareUsageMenuItems(
+    a: { name: string; entry: ProfileUsageEntry | null },
+    b: { name: string; entry: ProfileUsageEntry | null },
+): number {
+    const aSort = usageSort(a.entry);
+    const bSort = usageSort(b.entry);
+    return aSort.sortGroup - bSort.sortGroup
+        || aSort.sortValue - bSort.sortValue
+        || a.name.localeCompare(b.name);
+}
+
+function usageMenuOption(command: string, profileName: string, entry: ProfileUsageEntry | null, isDefault = false): string {
+    const unavailablePrefix = usageProfileUnavailable(entry) ? usageUnavailablePrefix(entry) : null;
+    const statusMarker = usageProfileMarker(entry, isDefault);
+    const markerPrefix = unavailablePrefix ?? statusMarker;
+    const parts = [`${markerPrefix} ${command} ${profileName}`.trim()];
+    if (entry?.authExpired) parts.push('过期');
+    parts.push(...formatCompactProfileUsage(entry));
+    return parts.filter(Boolean).join('｜');
+}
+
 /** Handle !usage for codex flavor. */
 async function handleCodexUsage(profileArg: string, ctx: BangCommandContext): Promise<BangCommandResult> {
-    // Console without profile arg: list Codex accounts
-    if (ctx.isConsoleSession && !profileArg) {
+    // Without profile arg: list Codex accounts. In normal Codex sessions this
+    // avoids a blocking network query and gives immediate selectable feedback.
+    if (!profileArg) {
         const codexProfiles = readCodexProfiles();
 
         if (codexProfiles.length === 0) {
             return { message: '❌ 未找到已登录的 Codex 账户。', action: 'none' };
         }
 
-        const messages: string[] = ['📊 请选择要查询的 Codex 账户:', SEPARATOR];
-        for (const p of codexProfiles) {
-            messages.push(p.name);
-        }
-        messages.push(SEPARATOR);
-        messages.push('用法: !usage --codex <账户名>');
-
-        const suggestions = codexProfiles.map(p => `!usage --codex ${p.name}`);
-        return { message: messages, action: 'none', suggestions };
+        const defaultProfile = getCurrentCodexProfile();
+        const command = ctx.isConsoleSession ? '@u-codex' : '@u';
+        const suggestions = codexProfiles
+            .map(p => ({ name: p.name, entry: getCachedProfileUsageEntry(p.name, 'codex') }))
+            .sort(compareUsageMenuItems)
+            .map(item => usageMenuOption(command, item.name, item.entry, item.name === defaultProfile));
+        return { message: [], action: 'none', suggestions };
     }
 
     const resolved = resolveCodexToken(profileArg || undefined);
@@ -752,6 +1105,7 @@ async function handleCodexUsage(profileArg: string, ctx: BangCommandContext): Pr
     ctx.client.sendSessionEvent({ type: 'message', message: '⏳ 正在查询 Codex 用量...' });
 
     const { token, profileLabel, cacheKey } = resolved;
+    ensureHydrated();
     const cached = codexCache.get(cacheKey);
     if (cached && (Date.now() - cached.fetchedAt) < CACHE_TTL_MS) {
         return { message: formatCodexUsage(cached.data, profileLabel, cached.fetchedAt), action: 'none' };
@@ -807,17 +1161,11 @@ export async function handleUsageBangCommand(args: string, ctx: BangCommandConte
             return { message: '❌ 未找到已登录的 Claude 账户。', action: 'none' };
         }
 
-        const messages: string[] = ['📊 请选择要查询的 Claude 账户:', SEPARATOR];
-
-        for (const p of claudeProfiles) {
-            const marker = p.name === defaultProfile ? ' (默认)' : '';
-            messages.push(`${p.name}${marker}`);
-        }
-        messages.push(SEPARATOR);
-        messages.push('用法: !usage <账户名>');
-
-        const suggestions = claudeProfiles.map(p => `!usage ${p.name}`);
-        return { message: messages, action: 'none', suggestions };
+        const suggestions = claudeProfiles
+            .map(p => ({ name: p.name, entry: getCachedProfileUsageEntry(p.name, 'claude') }))
+            .sort(compareUsageMenuItems)
+            .map(item => usageMenuOption('@u', item.name, item.entry, item.name === defaultProfile));
+        return { message: [], action: 'none', suggestions };
     }
 
     // Resolve token: by profile name arg, or current session
@@ -844,6 +1192,7 @@ export async function handleUsageBangCommand(args: string, ctx: BangCommandConte
     const { token, profileLabel, cacheKey } = resolved;
 
     // Check cache
+    ensureHydrated();
     const cached = cache.get(cacheKey);
     if (cached && (Date.now() - cached.fetchedAt) < CACHE_TTL_MS) {
         logger.debug(`[!usage] Returning cached usage for profile: ${profileLabel}`);
@@ -941,6 +1290,7 @@ export async function queryRateLimitContext(): Promise<RateLimitContext | null> 
     const { token, profileLabel, cacheKey } = resolved;
 
     // Fetch current profile usage (use cache if fresh)
+    ensureHydrated();
     let data: UsageData;
     const cached = cache.get(cacheKey);
     if (cached && (Date.now() - cached.fetchedAt) < CACHE_TTL_MS) {

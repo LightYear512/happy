@@ -13,9 +13,48 @@ import {
     type AuthFlavor,
 } from './ccsProfiles';
 import { configuration } from '@/configuration';
-import { getCachedUsageSummary, readOAuthToken, fetchProfileUsageSummary, type ProfileUsageEntry } from './usageCommand';
-import { formatRelativeTime } from './relativeTime';
-import { SEPARATOR, parseCodexFlag, rejectCodexFlagInSession, type BangCommandContext, type BangCommandResult } from './types';
+import { getCachedUsageSummary, getCachedProfileUsageEntry, fetchProfileUsageSummary, readOAuthToken, type ProfileUsageEntry } from './usageCommand';
+import { parseCodexFlag, rejectCodexFlagInSession, type BangCommandContext, type BangCommandResult } from './types';
+
+type ProfileOptionSuggestion = {
+    label: string;
+    value: string;
+    disabled: boolean;
+    sortGroup: number;
+    sortValue: number;
+    name: string;
+    unavailableDelayMs: number | null;
+    unavailablePrefix: string | null;
+};
+
+const OPTION_INFO_SEPARATOR = '｜';
+const BROADCAST_COMPAT_REPLAY_DELAY_MS = 350;
+const LEGACY_DEFAULT_PROFILE_MARKER = '🟢';
+const DEFAULT_PROFILE_MARKER = '💚';
+const DEFAULT_HIGH_USAGE_PROFILE_MARKER = '💔';
+const USABLE_PROFILE_MARKER = '🔵';
+const UNAVAILABLE_PROFILE_MARKER = '🚫';
+const GUESS_AVAILABLE_PROFILE_MARKER = '🟣';
+const CACHE_AGE_DISPLAY_MIN_MS = 5 * 60 * 1000;
+const DEFAULT_HIGH_USAGE_PERCENT = 85;
+const UNAVAILABLE_DAY_MARKERS = ['0️⃣', '1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'] as const;
+
+function isProfileUnavailable(status: string, entry: ProfileUsageEntry | undefined): boolean {
+    return !!status || !!entry?.authExpired || isFiveHourBlocked(entry) || isSevenDayBlocked(entry);
+}
+
+function defaultProfileHighUsage(entry: ProfileUsageEntry | undefined): boolean {
+    return (entry?.fiveHourPercent != null && entry.fiveHourPercent > DEFAULT_HIGH_USAGE_PERCENT)
+        || (entry?.sevenDayPercent != null && entry.sevenDayPercent > DEFAULT_HIGH_USAGE_PERCENT);
+}
+
+function profileMarker(isDefault: boolean, status: string, entry: ProfileUsageEntry | undefined): string {
+    if (isDefault && defaultProfileHighUsage(entry)) return DEFAULT_HIGH_USAGE_PROFILE_MARKER;
+    if (isProfileUnavailable(status, entry)) return UNAVAILABLE_PROFILE_MARKER;
+    if (isGuessAvailableAfterReset(entry)) return GUESS_AVAILABLE_PROFILE_MARKER;
+    if (isDefault) return DEFAULT_PROFILE_MARKER;
+    return USABLE_PROFILE_MARKER;
+}
 
 /** Convert CodexProfileInfo[] to CcsProfileInfo[] for unified profile handling. */
 function codexToCcsProfiles(codexProfiles: ReturnType<typeof readCodexProfiles>): CcsProfileInfo[] {
@@ -143,57 +182,262 @@ function getProfileStatus(profile: CcsProfileInfo, flavor: AuthFlavor = 'claude'
     return '';
 }
 
-/**
- * Fetch usage summaries for a list of profiles in parallel.
- * Each call is individually bounded by a 5s timeout inside fetchProfileUsageSummary.
- * The returned map carries both summary and authExpired status so callers can
- * surface a refresh hint when a profile's OAuth token has expired.
- */
-async function fetchUsageSummaries(profileNames: string[], flavor: AuthFlavor): Promise<Map<string, ProfileUsageEntry>> {
-    const results = await Promise.all(
-        profileNames.map(async name => ({
-            name,
-            entry: await fetchProfileUsageSummary(name, flavor),
-        }))
-    );
+/** Read usage summaries from the shared file-backed cache. */
+function readCachedUsageSummaries(profileNames: string[], flavor: AuthFlavor): Map<string, ProfileUsageEntry> {
     const map = new Map<string, ProfileUsageEntry>();
-    for (const { name, entry } of results) {
-        map.set(name, entry);
+    for (const name of profileNames) {
+        const entry = getCachedProfileUsageEntry(name, flavor);
+        if (entry) map.set(name, entry);
     }
     return map;
 }
 
-/** Format a profile line with optional usage summary, stale marker, auth-expired marker and default indicator. */
-function profileLine(marker: string, name: string, status: string, entry: ProfileUsageEntry | undefined, isDefault?: boolean): string {
-    const parts = [marker, name];
-    if (isDefault) parts.push('(默认)');
-    if (status) parts.push(status);
-    if (entry?.summary) {
-        parts.push(entry.summary);
-        if (entry.stale && entry.cachedAt) {
-            parts.push(`⏳ ${formatRelativeTime(entry.cachedAt)}`);
+async function refreshMissingCodexUsageSummaries(
+    profileNames: string[],
+    flavor: AuthFlavor,
+    usageMap: Map<string, ProfileUsageEntry>
+): Promise<void> {
+    if (flavor !== 'codex') return;
+    const missing = profileNames.filter(name => !usageMap.has(name));
+    if (missing.length === 0) return;
+
+    const tasks = missing.map(async name => {
+        try {
+            const entry = await fetchProfileUsageSummary(name, flavor);
+            if (entry.summary || entry.cachedAt || entry.authExpired) usageMap.set(name, entry);
+        } catch (err) {
+            logger.debug(`[!auth] codex usage refresh skipped for ${name}:`, err);
         }
-        if (entry.authExpired) {
-            parts.push('🔒 令牌过期');
-        }
-    } else if (entry?.authExpired) {
-        parts.push('🔒 令牌过期');
-    }
-    return parts.filter(Boolean).join(' ');
+    });
+
+    await Promise.race([
+        Promise.allSettled(tasks),
+        new Promise(resolve => setTimeout(resolve, 1800)),
+    ]);
 }
 
-/** True if any profile entry in the map has an expired OAuth token. */
-function hasAuthExpired(map: Map<string, ProfileUsageEntry>): boolean {
-    for (const entry of map.values()) {
-        if (entry.authExpired) return true;
-    }
-    return false;
+function formatCompactResetTime(resetsAt: string | null | undefined): string | null {
+    if (!resetsAt) return null;
+    const resetDate = new Date(resetsAt);
+    const diffMs = resetDate.getTime() - Date.now();
+    if (!Number.isFinite(diffMs)) return null;
+    const totalMin = Math.max(0, Math.ceil(diffMs / 60000));
+    const hours = Math.floor(totalMin / 60);
+    const minutes = totalMin % 60;
+    return `下${hours}:${minutes.toString().padStart(2, '0')}时`;
 }
 
-const REFRESH_HINT = '💡 令牌过期：切换到该账号并发送任意消息即可刷新令牌';
+function formatCompactSevenDayResetTime(resetsAt: string | null | undefined): string | null {
+    if (!resetsAt) return null;
+    const resetDate = new Date(resetsAt);
+    const diffMs = resetDate.getTime() - Date.now();
+    if (!Number.isFinite(diffMs)) return null;
+    const totalHours = Math.max(0, Math.floor(diffMs / 3600000));
+    const days = Math.floor(totalHours / 24);
+    const hours = totalHours % 24;
+    return `${days}D:${hours}h`;
+}
+
+function formatCompactCacheAge(cachedAt: number): string {
+    const ageMin = Math.max(0, Math.floor((Date.now() - cachedAt) / 60000));
+    if (ageMin < 60) return `${ageMin}m`;
+    const ageHours = Math.floor(ageMin / 60);
+    if (ageHours < 24) return `${ageHours}h`;
+    return `${Math.floor(ageHours / 24)}d`;
+}
+
+function formatCompactDataAge(entry: ProfileUsageEntry): string | null {
+    if (!entry.cachedAt) return null;
+    if (Date.now() - entry.cachedAt < CACHE_AGE_DISPLAY_MIN_MS) return null;
+    return `${entry.stale ? '缓' : '取'}${formatCompactCacheAge(entry.cachedAt)}`;
+}
+
+function formatCompactUsage(entry: ProfileUsageEntry | undefined): string[] {
+    if (!entry) return ['用量未知'];
+    const parts: string[] = [];
+    if (entry.fiveHourPercent != null) {
+        parts.push(`5h:${entry.fiveHourPercent.toFixed(0)}%`);
+        if (entry.full) {
+            const resetText = formatCompactResetTime(entry.fiveHourResetAt);
+            if (resetText) parts.push(resetText);
+        }
+    }
+    if (entry.sevenDayPercent != null) {
+        parts.push(`7d:${entry.sevenDayPercent.toFixed(0)}%`);
+        const resetText = formatCompactSevenDayResetTime(entry.sevenDayResetAt);
+        if (resetText) parts.push(resetText);
+    }
+    if (parts.length === 0 && entry.summary) parts.push(entry.summary);
+    const dataAge = formatCompactDataAge(entry);
+    if (dataAge) parts.push(dataAge);
+    return parts.length > 0 ? parts : ['用量未知'];
+}
+
+function isGuessAvailableAfterReset(entry: ProfileUsageEntry | undefined): boolean {
+    if (!entry || (!entry.full && !entry.sevenDayFull)) return false;
+    return !isFiveHourBlocked(entry) && !isSevenDayBlocked(entry);
+}
+
+function profileOptionLabel(name: string, status: string, entry: ProfileUsageEntry | undefined, isDefault: boolean, isCurrent: boolean): string {
+    const parts = [name, profileMarker(isDefault, status, entry)];
+    if (isCurrent) parts.push('当前');
+    if (status) parts.push('异常');
+    if (entry?.authExpired) parts.push('过期');
+    parts.push(...formatCompactUsage(entry));
+    return parts.filter(Boolean).join('｜');
+}
+
+function availablePercent(entry: ProfileUsageEntry | undefined): number | null {
+    if (entry?.fiveHourPercent == null) return null;
+    return Math.max(0, 100 - entry.fiveHourPercent);
+}
+
+function resetPassed(resetsAt: string | null | undefined): boolean {
+    if (!resetsAt) return false;
+    const resetAt = new Date(resetsAt).getTime();
+    return Number.isFinite(resetAt) && resetAt <= Date.now();
+}
+
+function isFiveHourBlocked(entry: ProfileUsageEntry | undefined): boolean {
+    return !!entry?.full && !resetPassed(entry.fiveHourResetAt);
+}
+
+function isSevenDayBlocked(entry: ProfileUsageEntry | undefined): boolean {
+    return !!entry?.sevenDayFull && !resetPassed(entry.sevenDayResetAt);
+}
+
+function resetTimeDelayMs(resetsAt: string | null | undefined): number | null {
+    if (!resetsAt) return null;
+    const resetAt = new Date(resetsAt).getTime();
+    if (!Number.isFinite(resetAt)) return null;
+    return Math.max(0, resetAt - Date.now());
+}
+
+function resetDelayMs(entry: ProfileUsageEntry | undefined): number | null {
+    if (!entry) return null;
+    const delays: number[] = [];
+    if (entry.full && !resetPassed(entry.fiveHourResetAt)) {
+        const delay = resetTimeDelayMs(entry.fiveHourResetAt);
+        if (delay == null) return null;
+        delays.push(delay);
+    }
+    if (entry.sevenDayFull && !resetPassed(entry.sevenDayResetAt)) {
+        const delay = resetTimeDelayMs(entry.sevenDayResetAt);
+        if (delay == null) return null;
+        delays.push(delay);
+    }
+    return delays.length > 0 ? Math.max(...delays) : null;
+}
+
+function unavailableDayMarker(delayMs: number | null): string | null {
+    if (delayMs == null) return null;
+    const days = Math.max(0, Math.min(5, Math.floor(delayMs / 86400000)));
+    return UNAVAILABLE_DAY_MARKERS[days];
+}
+
+function unavailablePrefix(entry: ProfileUsageEntry | undefined): string | null {
+    const marker = unavailableDayMarker(resetDelayMs(entry));
+    if (!marker) return null;
+    if (isSevenDayBlocked(entry)) return `${UNAVAILABLE_PROFILE_MARKER} ${marker}`;
+    if (isFiveHourBlocked(entry)) return marker;
+    return marker;
+}
+
+function profileOptionSort(status: string, entry: ProfileUsageEntry | undefined): { sortGroup: number; sortValue: number } {
+    const unavailable = isProfileUnavailable(status, entry);
+    if (!unavailable) {
+        const available = availablePercent(entry);
+        return available == null
+            ? { sortGroup: 1, sortValue: 0 }
+            : { sortGroup: 0, sortValue: -available };
+    }
+
+    const delay = resetDelayMs(entry);
+    return delay == null
+        ? { sortGroup: 3, sortValue: Number.POSITIVE_INFINITY }
+        : { sortGroup: 2, sortValue: delay };
+}
+
+function stripOptionInfo(value: string): string {
+    return value.split(/[｜|]/, 1)[0].trim();
+}
+
+function menuOptionText(option: ProfileOptionSuggestion): string {
+    const labelParts = option.label.split(OPTION_INFO_SEPARATOR);
+    const detailParts = labelParts[0] === option.name ? labelParts.slice(1) : labelParts;
+    const markerIndex = detailParts.findIndex(isProfileMarker);
+    const marker = markerIndex === -1 ? null : detailParts.splice(markerIndex, 1)[0];
+    const commandText = marker ? `${marker} ${option.value}` : option.value;
+    const detail = detailParts.join(OPTION_INFO_SEPARATOR);
+    return detail ? `${commandText}${OPTION_INFO_SEPARATOR}${detail}` : commandText;
+}
+
+function disabledInfoText(option: ProfileOptionSuggestion): string {
+    const text = option.label
+        .split(OPTION_INFO_SEPARATOR)
+        .filter(part => !isProfileMarker(part) && part !== '满' && part !== '猜')
+        .join(OPTION_INFO_SEPARATOR);
+    return option.unavailablePrefix ? `${option.unavailablePrefix} ${text}` : text;
+}
+
+function isProfileMarker(part: string): boolean {
+    return part === LEGACY_DEFAULT_PROFILE_MARKER
+        || part === DEFAULT_PROFILE_MARKER
+        || part === DEFAULT_HIGH_USAGE_PROFILE_MARKER
+        || part === USABLE_PROFILE_MARKER
+        || part === UNAVAILABLE_PROFILE_MARKER
+        || part === GUESS_AVAILABLE_PROFILE_MARKER;
+}
+
+function buildProfileOptions(
+    profiles: CcsProfileInfo[],
+    usageMap: Map<string, ProfileUsageEntry>,
+    opts: {
+        command: '@a' | '@aa' | '@aa-codex';
+        currentProfile?: string | null;
+        defaultProfile?: string | null;
+        flavor: AuthFlavor;
+        codexNames?: Set<string>;
+    }
+): ProfileOptionSuggestion[] {
+    return profiles
+        .map(profile => {
+            const entry = usageMap.get(profile.name);
+            const status = getProfileStatus(profile, opts.flavor, opts.codexNames);
+            const isCurrent = profile.name === opts.currentProfile;
+            const unavailable = isProfileUnavailable(status, entry);
+            const disabled = isCurrent || unavailable;
+            const sort = profileOptionSort(status, entry);
+            return {
+                label: profileOptionLabel(profile.name, status, entry, profile.name === opts.defaultProfile, isCurrent),
+                value: `${opts.command} ${profile.name}`.trim(),
+                disabled,
+                unavailableDelayMs: unavailable ? resetDelayMs(entry) : null,
+                unavailablePrefix: unavailable ? unavailablePrefix(entry) : null,
+                ...sort,
+                name: profile.name,
+            };
+        })
+        .sort((a, b) => a.sortGroup - b.sortGroup || a.sortValue - b.sortValue || a.name.localeCompare(b.name));
+}
+
+function buildLegacyProfileListResult(options: ReturnType<typeof buildProfileOptions>, flavorLabel: string): BangCommandResult {
+    const enabled = options.filter(option => !option.disabled);
+    const disabled = options.filter(option => option.disabled);
+    const result: BangCommandResult = {
+        message: `请选择要切换的 ${flavorLabel} 账户：`,
+        action: 'none',
+    };
+    if (enabled.length > 0) result.suggestions = enabled.map(menuOptionText);
+    if (disabled.length === 0) return result;
+    return {
+        ...result,
+        afterSuggestionsMessage: ['不可用：', ...disabled.map(disabledInfoText)].join('\n'),
+    };
+}
 
 async function listProfiles(isConsole: boolean, flavor: AuthFlavor = 'claude'): Promise<BangCommandResult> {
-    const { profiles: ccsProfiles } = readCcsProfiles();
+    const { profiles: ccsProfiles, defaultProfile: claudeDefault } = readCcsProfiles();
     const codexProfiles = flavor === 'codex' ? readCodexProfiles() : [];
 
     if (flavor === 'codex' && codexProfiles.length === 0) {
@@ -206,6 +450,7 @@ async function listProfiles(isConsole: boolean, flavor: AuthFlavor = 'claude'): 
 
     const codexNames = flavor === 'codex' ? new Set(codexProfiles.map(p => p.name)) : undefined;
     const codexDefault = flavor === 'codex' ? readCodexDefaultProfile() : null;
+    const defaultProfile = flavor === 'codex' ? codexDefault : claudeDefault;
 
     const flavorLabel = flavor === 'codex' ? 'Codex' : 'Claude';
 
@@ -214,80 +459,52 @@ async function listProfiles(isConsole: boolean, flavor: AuthFlavor = 'claude'): 
         if (profiles.length === 0) {
             return { message: `❌ 未找到 CCS 配置。(${flavorLabel})`, action: 'none' };
         }
-        const usageMap = await fetchUsageSummaries(profiles.map(p => p.name), flavor);
-        const codexPrefix = flavor === 'codex' ? '--codex ' : '';
-        const messages: string[] = [`📋 账号列表 (${flavorLabel})`];
-        messages.push(SEPARATOR);
-        for (const p of profiles) {
-            const status = getProfileStatus(p, flavor, codexNames);
-            messages.push(profileLine('', p.name, status, usageMap.get(p.name), p.name === codexDefault));
-        }
-        messages.push(SEPARATOR);
-
-        if (profiles.length > 1) {
-            messages.push(`!auth-all ${codexPrefix}<名称> → 切换全部会话`);
-            if (hasAuthExpired(usageMap)) messages.push(REFRESH_HINT);
-            const suggestions = profiles.map(p => `!auth-all ${codexPrefix}${p.name}`);
-            return { message: messages, action: 'none', suggestions };
-        } else {
-            messages.push('暂无其他可切换账号。');
-            if (hasAuthExpired(usageMap)) messages.push(REFRESH_HINT);
-            return { message: messages, action: 'none' };
-        }
+        const profileNames = profiles.map(p => p.name);
+        const usageMap = readCachedUsageSummaries(profileNames, flavor);
+        await refreshMissingCodexUsageSummaries(profileNames, flavor, usageMap);
+        const suggestions = buildProfileOptions(profiles, usageMap, {
+            command: flavor === 'codex' ? '@aa-codex' : '@aa',
+            defaultProfile,
+            flavor,
+            codexNames,
+        });
+        return buildLegacyProfileListResult(suggestions, flavorLabel);
     }
 
     const currentProfile = getCurrentProfileForFlavor(flavor);
 
     // Normal session not launched via CCS — no current profile to anchor on.
     if (!currentProfile) {
-        const messages: string[] = [`📋 当前无 CCS 配置。(${flavorLabel})`];
         if (profiles.length > 0) {
-            const usageMap = await fetchUsageSummaries(profiles.map(p => p.name), flavor);
-            messages.push(SEPARATOR);
-            for (const p of profiles) {
-                const status = getProfileStatus(p, flavor, codexNames);
-                messages.push(profileLine('○', p.name, status, usageMap.get(p.name), p.name === codexDefault));
-            }
-            messages.push(SEPARATOR);
-            if (hasAuthExpired(usageMap)) messages.push(REFRESH_HINT);
-        } else {
-            messages.push('未找到 CCS 配置。');
+            const profileNames = profiles.map(p => p.name);
+            const usageMap = readCachedUsageSummaries(profileNames, flavor);
+            await refreshMissingCodexUsageSummaries(profileNames, flavor, usageMap);
+            const suggestions = buildProfileOptions(profiles, usageMap, {
+                command: '@a',
+                defaultProfile,
+                flavor,
+                codexNames,
+            });
+            return buildLegacyProfileListResult(suggestions, flavorLabel);
         }
-        return { message: messages, action: 'none' };
+        return { message: `❌ 未找到 CCS 配置。(${flavorLabel})`, action: 'none' };
     }
 
-    // Normal session: show current profile with ● indicator
-    const switchable = profiles.filter(p => p.name !== currentProfile);
-
-    const usageMap = await fetchUsageSummaries(profiles.map(p => p.name), flavor);
-    const messages: string[] = [`📋 账号列表 (${flavorLabel})`];
-
-    const current = profiles.find(p => p.name === currentProfile);
-    const currentStatus = current ? getProfileStatus(current, flavor, codexNames) : '';
-
-    messages.push(SEPARATOR);
-    messages.push(profileLine('●', currentProfile, currentStatus, usageMap.get(currentProfile), currentProfile === codexDefault));
-
-    if (switchable.length > 0) {
-        for (const profile of switchable) {
-            const status = getProfileStatus(profile, flavor, codexNames);
-            messages.push(profileLine('○', profile.name, status, usageMap.get(profile.name), profile.name === codexDefault));
-        }
-        messages.push(SEPARATOR);
-        messages.push('!auth <名称> → 切换当前会话');
-        if (hasAuthExpired(usageMap)) messages.push(REFRESH_HINT);
-
-        const suggestions = switchable.map(p => `!auth ${p.name}`);
-        return { message: messages, action: 'none', suggestions };
-    }
-
-    messages.push(SEPARATOR);
-    messages.push('暂无其他可切换账号。');
-    if (hasAuthExpired(usageMap)) messages.push(REFRESH_HINT);
-    return { message: messages, action: 'none' };
+    const profileNames = profiles.map(p => p.name);
+    const usageMap = readCachedUsageSummaries(profileNames, flavor);
+    await refreshMissingCodexUsageSummaries(profileNames, flavor, usageMap);
+    const suggestions = buildProfileOptions(profiles, usageMap, {
+        command: '@a',
+        currentProfile,
+        defaultProfile,
+        flavor,
+        codexNames,
+    });
+    return buildLegacyProfileListResult(suggestions, flavorLabel);
 }
 
 function switchProfile(profileName: string, flavor: AuthFlavor = 'claude'): BangCommandResult {
+    profileName = stripOptionInfo(profileName);
     const { profiles: ccsProfiles } = readCcsProfiles();
     const profiles: CcsProfileInfo[] = flavor === 'codex'
         ? codexToCcsProfiles(readCodexProfiles())
@@ -356,12 +573,26 @@ function defaultProfileMessage(profileName: string, updated: boolean): string {
         : '⚠ 默认账号未更新（新会话仍使用旧默认）';
 }
 
+function writeProfileBroadcastFile(filePath: string, profileName: string, flavor: AuthFlavor): void {
+    writeFileSync(filePath, profileName, 'utf-8');
+    const replayTimer = setTimeout(() => {
+        try {
+            writeFileSync(filePath, profileName, 'utf-8');
+            logger.debug(`[!auth] Replayed global active profile (${flavor}): ${profileName}`);
+        } catch (err) {
+            logger.debug('[!auth] Failed to replay global profile file:', err);
+        }
+    }, BROADCAST_COMPAT_REPLAY_DELAY_MS);
+    replayTimer.unref?.();
+}
+
 /**
  * Switch all sessions on this machine to the specified profile.
  * Validates and switches the current session, then writes the profile name
  * to a global file so other sessions pick it up via fs.watch.
  */
 function switchAllProfiles(profileName: string, flavor: AuthFlavor = 'claude'): BangCommandResult {
+    profileName = stripOptionInfo(profileName);
     const { profiles: ccsProfiles } = readCcsProfiles();
     const profiles: CcsProfileInfo[] = flavor === 'codex'
         ? codexToCcsProfiles(readCodexProfiles())
@@ -385,7 +616,7 @@ function switchAllProfiles(profileName: string, flavor: AuthFlavor = 'claude'): 
         ? configuration.activeCodexProfileFile
         : configuration.activeProfileFile;
     try {
-        writeFileSync(broadcastFile, profileName, 'utf-8');
+        writeProfileBroadcastFile(broadcastFile, profileName, flavor);
         logger.debug(`[!auth] Wrote global active profile (${flavor}): ${profileName}`);
     } catch (err) {
         logger.debug('[!auth] Failed to write global profile file:', err);
