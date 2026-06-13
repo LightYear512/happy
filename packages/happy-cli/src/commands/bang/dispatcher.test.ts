@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import { isBangCommand, buildConsoleWelcome, executeBangCommand, SEPARATOR } from './dispatcher';
+import type { BangOptionSuggestion } from './types';
+
+function optionLabel(option: BangOptionSuggestion): string {
+    return typeof option === 'string' ? option : option.label;
+}
 
 describe('isBangCommand', () => {
     it('should detect bang commands', () => {
@@ -63,8 +68,8 @@ describe('executeBangCommand aliases', () => {
 
     it('shows @reminder only in the ordinary @@ quick menu', async () => {
         const menu = await executeBangCommand('@@', ctx);
-        expect(menu.suggestions).toContain('@u｜⏱️查看Claude 用量');
-        expect(menu.suggestions).toContain('@a｜🔑切换Claude账号');
+        expect(menu.suggestions).toContain('@u｜当前账号流量');
+        expect(menu.suggestions).toContain('@a｜切换账号');
         expect(menu.suggestions).toContainEqual({ label: '@reminder｜设置/取消提示', value: '@reminder' });
 
         const consoleMenu = await executeBangCommand('@@', { ...ctx, isConsoleSession: true });
@@ -113,11 +118,11 @@ describe('buildConsoleWelcome', () => {
     it('lists login/usage/auth-all in registry order with codex variants interleaved', () => {
         const messages = buildConsoleWelcome().suggestions!;
         const indices = {
-            usage: messages.findIndex(m => m.startsWith('@u｜')),
-            usageCodex: messages.findIndex(m => m.startsWith('@u-codex｜')),
-            authAll: messages.findIndex(m => m.startsWith('@aa｜')),
-            authAllCodex: messages.findIndex(m => m.startsWith('@aa-codex｜')),
-            mainMenu: messages.findIndex(m => m.startsWith('❇️ @@')),
+            usage: messages.findIndex(m => optionLabel(m).startsWith('@u｜')),
+            usageCodex: messages.findIndex(m => optionLabel(m).startsWith('@u-codex｜')),
+            authAll: messages.findIndex(m => optionLabel(m).startsWith('@aa｜')),
+            authAllCodex: messages.findIndex(m => optionLabel(m).startsWith('@aa-codex｜')),
+            mainMenu: messages.findIndex(m => optionLabel(m).startsWith('❇️ @@')),
         };
         for (const [k, v] of Object.entries(indices)) {
             expect(v, `${k} not found`).toBeGreaterThanOrEqual(0);
