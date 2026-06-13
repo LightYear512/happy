@@ -17,7 +17,7 @@ describe('isBangCommand', () => {
         expect(isBangCommand('@a')).toBe(true);
         expect(isBangCommand('@h')).toBe(true);
         expect(isBangCommand('@u')).toBe(true);
-        expect(isBangCommand('@reminder')).toBe(false);
+        expect(isBangCommand('@reminder')).toBe(true);
         expect(isBangCommand('@usage')).toBe(false);
     });
 

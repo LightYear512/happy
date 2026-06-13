@@ -4,6 +4,7 @@ import { handleLoginBangCommand } from './loginCommand';
 import { handleRestartBangCommand, handleRestartAllBangCommand } from './restartCommand';
 import { getCachedProfileUsageEntry, handleUsageBangCommand, type ProfileUsageEntry } from './usageCommand';
 import { handleTestBangCommand } from './testCommand';
+import { handleReminderBangCommand } from './reminderCommand';
 import { SEPARATOR, type BangCommandContext, type BangCommandHandler, type BangCommandResult, type BangOptionSuggestion } from './types';
 import { getCurrentProfileForFlavor, readCcsProfiles, readCodexDefaultProfile, type AuthFlavor } from './ccsProfiles';
 
@@ -22,6 +23,7 @@ const commands: Record<string, { handler: BangCommandHandler; desc: string; load
     'auth-all':    { handler: handleAuthAllBangCommand,     desc: '🔑切换Claude账号', consoleOnly: true },
     'restart':     { handler: handleRestartBangCommand,     desc: '重启会话', sessionOnly: true },
     'restart-all': { handler: handleRestartAllBangCommand,  desc: '重启全部会话', consoleOnly: true },
+    'reminder':    { handler: handleReminderBangCommand,    desc: '设置/取消提示', sessionOnly: true, hidden: true },
     // TODO: !session / !open 暂停使用，待 multi-backend 会话浏览重构后恢复。实现保留在 sessionCommand.ts / openCommand.ts。
     // 'session':     { handler: handleSessionsBangCommand,    desc: '浏览项目目录和会话', loadingMsg: '⏳ 正在扫描会话...', consoleOnly: true },
     // 'open':        { handler: handleOpenBangCommand,        desc: '打开会话', loadingMsg: '⏳ 正在打开会话...', consoleOnly: true },
@@ -40,6 +42,7 @@ const aliases: Record<string, string> = {
     ra: 'restart-all',
     u: 'usage',
     'u-codex': 'usage',
+    reminder: 'reminder',
     h: 'help',
     // s: 'session', // TODO: 暂停使用
 };
