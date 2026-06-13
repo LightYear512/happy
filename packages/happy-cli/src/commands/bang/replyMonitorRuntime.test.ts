@@ -6,6 +6,7 @@ import {
     REPLY_MONITOR_ALERT_DELAY_MS,
     REPLY_MONITOR_POLL_INTERVAL_MS,
     ReplyMonitorRuntime,
+    TASK_MESSAGE_REMINDER_INTERVAL_MS,
     readReplyMonitorBinding,
     type TaskMessageRecord,
 } from './replyMonitorRuntime';
@@ -19,6 +20,7 @@ function createMonitor(options?: {
     initialTitle?: string | null;
     now?: () => number;
     pollMs?: number;
+    taskMessageReminderMs?: number;
 }) {
     const titles: string[] = [];
     const taskMessages: string[] = [];
@@ -30,6 +32,7 @@ function createMonitor(options?: {
         canonicalTitle: options?.canonical ?? (() => '🔵 [0001-任务 0/1] 做事'),
         pendingMessages: options?.messages,
         deliverMessage: options?.deliver,
+        taskMessageReminderMs: options?.taskMessageReminderMs,
         currentTitle: () => current,
         now: options?.now,
         sendTitle: title => {
@@ -64,6 +67,7 @@ describe('ReplyMonitorRuntime', () => {
 
         expect(REPLY_MONITOR_POLL_INTERVAL_MS).toBe(2_000);
         expect(REPLY_MONITOR_ALERT_DELAY_MS).toBe(60_000);
+        expect(TASK_MESSAGE_REMINDER_INTERVAL_MS).toBe(60_000);
 
         await vi.advanceTimersByTimeAsync(1_999);
         expect(titles).toEqual([]);
@@ -180,7 +184,7 @@ describe('ReplyMonitorRuntime', () => {
         monitor.dispose();
     });
 
-    it('does not repeatedly inject delivered-but-unacked messages', async () => {
+    it('throttles delivered-but-unacked task message reminders', async () => {
         vi.useFakeTimers();
         let status = 'pending';
         const deliver = vi.fn(() => {
@@ -188,6 +192,7 @@ describe('ReplyMonitorRuntime', () => {
             return 'ignored htask inject text';
         });
         const { monitor, taskMessages } = createMonitor({
+            taskMessageReminderMs: 10_000,
             messages: () => [{
                 message_id: 'TM-1',
                 status,
@@ -202,12 +207,17 @@ describe('ReplyMonitorRuntime', () => {
         await vi.advanceTimersByTimeAsync(2_000);
         expect(deliver).toHaveBeenCalledTimes(1);
         expect(taskMessages).toEqual([taskMessageOptions()]);
+        await vi.advanceTimersByTimeAsync(7_999);
+        expect(taskMessages).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(taskMessages).toEqual([taskMessageOptions(), taskMessageOptions()]);
         monitor.dispose();
     });
 
-    it('sends one lightweight reminder for already delivered unacked messages', async () => {
+    it('repeats lightweight reminders for already delivered unacked messages until ack or dismiss', async () => {
         vi.useFakeTimers();
         const { monitor, taskMessages } = createMonitor({
+            taskMessageReminderMs: 10_000,
             messages: () => [{
                 message_id: 'TM-1',
                 status: 'delivered',
@@ -221,6 +231,10 @@ describe('ReplyMonitorRuntime', () => {
         await vi.advanceTimersByTimeAsync(2_000);
         expect(taskMessages).toEqual([taskMessageOptions()]);
         expect(taskMessages[0]).not.toContain('message_id=');
+        await vi.advanceTimersByTimeAsync(7_999);
+        expect(taskMessages).toHaveLength(1);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(taskMessages).toEqual([taskMessageOptions(), taskMessageOptions()]);
         monitor.dispose();
     });
 

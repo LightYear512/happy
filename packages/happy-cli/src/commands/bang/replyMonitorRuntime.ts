@@ -9,6 +9,7 @@ import { findHtaskRoot, htaskCanonicalTitle, runHtask } from './htaskCommand';
 
 export const REPLY_MONITOR_ALERT_DELAY_MS = 60_000;
 export const REPLY_MONITOR_POLL_INTERVAL_MS = 2_000;
+export const TASK_MESSAGE_REMINDER_INTERVAL_MS = 60_000;
 const REPLY_MONITOR_ALERT_MARKER = '⚠️';
 const HTASK_CONTROL_CENTER_TITLE_MARKER = '❇️';
 const HTASK_SAFE_REF = /^[A-Za-z0-9_.-]+$/;
@@ -20,6 +21,7 @@ export interface ReplyMonitorRuntimeOptions {
     canonicalTitle: () => string | null | Promise<string | null>;
     pendingMessages?: () => TaskMessageRecord[] | Promise<TaskMessageRecord[]>;
     deliverMessage?: (messageId: string) => string | null | Promise<string | null>;
+    taskMessageReminderMs?: number;
     currentTitle?: () => string | null;
     sendTitle: (title: string) => void;
     sendTaskMessage?: (message: string) => void;
@@ -49,9 +51,10 @@ export class ReplyMonitorRuntime {
     private interval: ReturnType<typeof setInterval> | null = null;
     private disposed = false;
     private syncInFlight = false;
-    private readonly deliveredReminderIds = new Set<string>();
+    private readonly taskMessageReminderSentAt = new Map<string, number>();
     private lastActivityAt: number | null = null;
     private readonly idleMs: number;
+    private readonly taskMessageReminderMs: number;
     private readonly isEnabled: ReplyMonitorRuntimeOptions['isEnabled'];
     private readonly canonicalTitle: ReplyMonitorRuntimeOptions['canonicalTitle'];
     private readonly pendingMessages: NonNullable<ReplyMonitorRuntimeOptions['pendingMessages']>;
@@ -64,6 +67,7 @@ export class ReplyMonitorRuntime {
 
     constructor(options: ReplyMonitorRuntimeOptions) {
         this.idleMs = options.idleMs ?? REPLY_MONITOR_ALERT_DELAY_MS;
+        this.taskMessageReminderMs = options.taskMessageReminderMs ?? TASK_MESSAGE_REMINDER_INTERVAL_MS;
         this.isEnabled = options.isEnabled;
         this.canonicalTitle = options.canonicalTitle;
         this.pendingMessages = options.pendingMessages ?? (async () => []);
@@ -151,18 +155,24 @@ export class ReplyMonitorRuntime {
     private async syncTaskMessages(reason: string): Promise<void> {
         try {
             const messages = await this.pendingMessages();
+            const visibleIds = new Set(messages.map(message => message.message_id));
+            for (const messageId of this.taskMessageReminderSentAt.keys()) {
+                if (!visibleIds.has(messageId)) {
+                    this.taskMessageReminderSentAt.delete(messageId);
+                }
+            }
             for (const message of messages) {
                 if (message.status === 'pending') {
                     const text = await this.deliverMessage(message.message_id);
                     if (text !== null) {
-                        this.deliveredReminderIds.add(message.message_id);
+                        this.recordTaskMessageReminder(message.message_id);
                         this.sendTaskMessage(formatTaskMessageNotification(message));
                         this.debug(`[reply-monitor] task message delivered reason=${reason} message=${message.message_id}`);
                     }
                     continue;
                 }
-                if (message.status === 'delivered' && !this.deliveredReminderIds.has(message.message_id)) {
-                    this.deliveredReminderIds.add(message.message_id);
+                if (message.status === 'delivered' && this.shouldSendTaskMessageReminder(message.message_id)) {
+                    this.recordTaskMessageReminder(message.message_id);
                     this.sendTaskMessage(formatTaskMessageNotification(message));
                     this.debug(`[reply-monitor] task message pending acknowledgement reason=${reason} message=${message.message_id}`);
                 }
@@ -170,6 +180,15 @@ export class ReplyMonitorRuntime {
         } catch (error) {
             this.debug('[reply-monitor] task message sync skipped', error);
         }
+    }
+
+    private shouldSendTaskMessageReminder(messageId: string): boolean {
+        const lastSentAt = this.taskMessageReminderSentAt.get(messageId);
+        return lastSentAt === undefined || this.now() - lastSentAt >= this.taskMessageReminderMs;
+    }
+
+    private recordTaskMessageReminder(messageId: string): void {
+        this.taskMessageReminderSentAt.set(messageId, this.now());
     }
 }
 
