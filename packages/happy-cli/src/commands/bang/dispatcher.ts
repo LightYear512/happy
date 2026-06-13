@@ -165,7 +165,7 @@ function buildQuickSessionMenu(ctx: BangCommandContext): BangCommandResult {
         suggestions: [
             compactOption('@u', '当前账号流量'),
             compactOption('@a', '切换账号'),
-            { label: compactOption('@reminder', '设置/取消提示'), value: '@reminder' },
+            compactOption('@reminder', '设置/取消提示'),
         ],
     };
 }

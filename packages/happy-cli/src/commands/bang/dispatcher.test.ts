@@ -70,7 +70,7 @@ describe('executeBangCommand aliases', () => {
         const menu = await executeBangCommand('@@', ctx);
         expect(menu.suggestions).toContain('@u｜当前账号流量');
         expect(menu.suggestions).toContain('@a｜切换账号');
-        expect(menu.suggestions).toContainEqual({ label: '@reminder｜设置/取消提示', value: '@reminder' });
+        expect(menu.suggestions).toContain('@reminder｜设置/取消提示');
 
         const consoleMenu = await executeBangCommand('@@', { ...ctx, isConsoleSession: true });
         expect(consoleMenu.suggestions?.join('\n')).not.toContain('@reminder');
