@@ -1074,9 +1074,9 @@ function usageMenuOption(command: string, profileName: string, entry: ProfileUsa
 
 /** Handle !usage for codex flavor. */
 async function handleCodexUsage(profileArg: string, ctx: BangCommandContext): Promise<BangCommandResult> {
-    // Without profile arg: list Codex accounts. In normal Codex sessions this
-    // avoids a blocking network query and gives immediate selectable feedback.
-    if (!profileArg) {
+    // In console mode, `@u-codex` without a profile is an account picker.
+    // In a normal Codex session, bare `@u` reports the current account directly.
+    if (!profileArg && ctx.isConsoleSession) {
         const codexProfiles = readCodexProfiles();
 
         if (codexProfiles.length === 0) {
