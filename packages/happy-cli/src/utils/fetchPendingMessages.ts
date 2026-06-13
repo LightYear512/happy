@@ -3,6 +3,34 @@ import { logger } from '@/ui/logger';
 import type { ApiClient } from '@/api/api';
 import type { ApiSessionClient } from '@/api/apiSession';
 
+const RESTORE_BANG_DUPLICATE_WINDOW_MS = 15_000;
+
+function restoreBangDedupeKey(message: any): string {
+    const text = message?.content?.type === 'text' && typeof message.content.text === 'string'
+        ? message.content.text.trim()
+        : '';
+    if (!text || !/^[!@]/.test(text)) return '';
+    return text;
+}
+
+export function dedupePendingRestoreMessages<T extends { message: any, createdAt: number }>(messages: T[]): T[] {
+    const kept: T[] = [];
+    const lastByKey = new Map<string, number>();
+    for (const message of messages) {
+        const key = restoreBangDedupeKey(message.message);
+        if (key) {
+            const lastAt = lastByKey.get(key);
+            if (lastAt !== undefined && Math.abs(message.createdAt - lastAt) <= RESTORE_BANG_DUPLICATE_WINDOW_MS) {
+                logger.debug(`[restore] Skipping duplicate pending bang message: "${key.substring(0, 50)}"`);
+                continue;
+            }
+            lastByKey.set(key, message.createdAt);
+        }
+        kept.push(message);
+    }
+    return kept;
+}
+
 /**
  * After a session restore, fetch user messages that arrived while the CLI was offline
  * (between session close and this CLI reconnecting). These trigger messages are stored
@@ -38,12 +66,13 @@ export async function fetchAndInjectPendingMessages(
     }
     // Inject in chronological order (API returns desc, we need asc)
     pendingMessages.reverse();
-    for (const pm of pendingMessages) {
+    const dedupedMessages = dedupePendingRestoreMessages(pendingMessages);
+    for (const pm of dedupedMessages) {
         logger.debug(`${logPrefix} Injecting pending message from restore: "${pm.message.content?.text?.substring(0, 50)}"`);
         session.injectPendingMessage(pm.message);
     }
-    if (pendingMessages.length > 0) {
-        logger.debug(`${logPrefix} Injected ${pendingMessages.length} pending message(s) from restore`);
+    if (dedupedMessages.length > 0) {
+        logger.debug(`${logPrefix} Injected ${dedupedMessages.length} pending message(s) from restore`);
     }
-    return pendingMessages.length;
+    return dedupedMessages.length;
 }
