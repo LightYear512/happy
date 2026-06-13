@@ -136,6 +136,13 @@ function AgentEventBlock(props: {
       </View>
     );
   }
+  if (props.event.type === 'options') {
+    return (
+      <View style={[styles.agentEventContainer, styles.agentEventMessageContainer]}>
+        <MarkdownView markdown={formatOptionsEventMarkdown(props.event)} onOptionPress={handleOptionPress} />
+      </View>
+    );
+  }
   if (props.event.type === 'limit-reached') {
     const formatTime = (timestamp: number): string => {
       try {
@@ -159,6 +166,40 @@ function AgentEventBlock(props: {
       <Text style={styles.agentEventText}>{t('message.unknownEvent')}</Text>
     </View>
   );
+}
+
+function escapeOptionText(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function escapeOptionAttribute(value: string): string {
+  return escapeOptionText(value)
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function formatOptionsEventMarkdown(event: Extract<AgentEvent, { type: 'options' }>): string {
+  const lines: string[] = [];
+  if (event.message) {
+    lines.push(event.message);
+  }
+  lines.push('<options>');
+  for (const option of event.options) {
+    const attrs: string[] = [];
+    if (option.value && option.value !== option.label) {
+      attrs.push(`value="${escapeOptionAttribute(option.value)}"`);
+    }
+    if (option.disabled) {
+      attrs.push('disabled="true"');
+    }
+    const attrText = attrs.length > 0 ? ` ${attrs.join(' ')}` : '';
+    lines.push(`<option${attrText}>${escapeOptionText(option.label)}</option>`);
+  }
+  lines.push('</options>');
+  return lines.join('\n');
 }
 
 function ToolCallBlock(props: {

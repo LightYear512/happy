@@ -24,7 +24,7 @@ export interface ReplyMonitorRuntimeOptions {
     taskMessageReminderMs?: number;
     currentTitle?: () => string | null;
     sendTitle: (title: string) => void;
-    sendTaskMessage?: (message: string, visibleFallback?: string) => void;
+    sendTaskMessage?: (message: string, visibleFallback?: string, options?: BangOptionSuggestion[]) => void;
     now?: () => number;
     debug?: (message: string, error?: unknown) => void;
 }
@@ -166,14 +166,22 @@ export class ReplyMonitorRuntime {
                     const text = await this.deliverMessage(message.message_id);
                     if (text !== null) {
                         this.recordTaskMessageReminder(message.message_id);
-                        this.sendTaskMessage(formatTaskMessageNotification(message), formatTaskMessagePlainNotification(message));
+                        this.sendTaskMessage(
+                            formatTaskMessageNotification(message),
+                            formatTaskMessagePlainNotification(message),
+                            taskMessageActionOptions(message),
+                        );
                         this.debug(`[reply-monitor] task message delivered reason=${reason} message=${message.message_id}`);
                     }
                     continue;
                 }
                 if (message.status === 'delivered' && this.shouldSendTaskMessageReminder(message.message_id)) {
                     this.recordTaskMessageReminder(message.message_id);
-                    this.sendTaskMessage(formatTaskMessageNotification(message), formatTaskMessagePlainNotification(message));
+                    this.sendTaskMessage(
+                        formatTaskMessageNotification(message),
+                        formatTaskMessagePlainNotification(message),
+                        taskMessageActionOptions(message),
+                    );
                     this.debug(`[reply-monitor] task message pending acknowledgement reason=${reason} message=${message.message_id}`);
                 }
             }
@@ -247,6 +255,20 @@ function taskMessageActionOptions(message: TaskMessageRecord): BangOptionSuggest
             value: `@task-dismiss ${message.message_id}`,
         },
     ];
+}
+
+function normalizeOptionSuggestion(suggestion: BangOptionSuggestion): { label: string; value?: string; disabled?: boolean } {
+    if (typeof suggestion === 'string') {
+        return {
+            label: suggestion,
+            value: suggestion,
+        };
+    }
+    return {
+        label: suggestion.label,
+        ...(suggestion.value ? { value: suggestion.value } : {}),
+        ...(suggestion.disabled ? { disabled: true } : {}),
+    };
 }
 
 export function formatTaskMessageNotification(message: TaskMessageRecord): string {
@@ -404,9 +426,16 @@ export function createHtaskReplyMonitorRuntime(
         },
         currentTitle: () => session.getSummaryText(),
         sendTitle: titleSender,
-        sendTaskMessage: (message, visibleFallback) => {
+        sendTaskMessage: (message, visibleFallback, options) => {
             session.sendSessionEvent({ type: 'message', message: visibleFallback ?? message });
-            session.sendCodexMessage({ type: 'message', message });
+            if (options && options.length > 0) {
+                session.sendSessionEvent({
+                    type: 'options',
+                    options: options.map(normalizeOptionSuggestion),
+                });
+                return;
+            }
+            session.sendCodexMessage({ type: 'message', message, id: randomUUID() });
         },
     });
 }

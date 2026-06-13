@@ -17,12 +17,22 @@ const usageDataSchema = z.object({
 
 export type UsageData = z.infer<typeof usageDataSchema>;
 
+const agentOptionSchema = z.object({
+    label: z.string(),
+    value: z.string().optional(),
+    disabled: z.boolean().optional(),
+});
+
 const agentEventSchema = z.discriminatedUnion('type', [z.object({
     type: z.literal('switch'),
     mode: z.enum(['local', 'remote'])
 }), z.object({
     type: z.literal('message'),
     message: z.string(),
+}), z.object({
+    type: z.literal('options'),
+    message: z.string().optional(),
+    options: z.array(agentOptionSchema),
 }), z.object({
     type: z.literal('limit-reached'),
     endsAt: z.number(),

@@ -277,9 +277,9 @@ describe('ReplyMonitorRuntime', () => {
         expect(text).not.toContain('TM-1');
     });
 
-    it('passes a plain visible fallback alongside the clickable options payload', async () => {
+    it('passes a plain visible fallback alongside structured clickable options', async () => {
         vi.useFakeTimers();
-        const calls: Array<{ options: string; fallback?: string }> = [];
+        const calls: Array<{ markdown: string; fallback?: string; options?: unknown[] }> = [];
         const monitor = new ReplyMonitorRuntime({
             idleMs: REPLY_MONITOR_ALERT_DELAY_MS,
             pollMs: 2_000,
@@ -294,15 +294,20 @@ describe('ReplyMonitorRuntime', () => {
             }],
             currentTitle: () => null,
             sendTitle: () => undefined,
-            sendTaskMessage: (options, fallback) => calls.push({ options, fallback }),
+            sendTaskMessage: (markdown, fallback, options) => calls.push({ markdown, fallback, options }),
         });
 
         await vi.advanceTimersByTimeAsync(2_000);
         expect(calls).toHaveLength(1);
-        expect(calls[0].options).toContain('<options>');
+        expect(calls[0].markdown).toContain('<options>');
         expect(calls[0].fallback).toContain('任务消息｜来源 HT-0282');
         expect(calls[0].fallback).not.toContain('<options>');
         expect(calls[0].fallback).not.toContain('TM-1');
+        expect(calls[0].options).toEqual([
+            expect.objectContaining({ label: expect.stringContaining('任务消息｜来源 HT-0282'), disabled: true }),
+            expect.objectContaining({ label: '已处理，确认', value: '@task-ack TM-1' }),
+            expect.objectContaining({ label: '重复/不处理，忽略', value: '@task-dismiss TM-1' }),
+        ]);
         monitor.dispose();
     });
 

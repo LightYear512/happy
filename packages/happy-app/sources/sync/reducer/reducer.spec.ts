@@ -374,6 +374,48 @@ describe('reducer', () => {
             // Summary messages should be processed but may not appear in output
             expect(result).toBeDefined();
         });
+
+        it('should surface structured options events as agent events', () => {
+            const state = createReducer();
+            const messages: NormalizedMessage[] = [
+                {
+                    id: 'event-options-1',
+                    localId: null,
+                    createdAt: 1000,
+                    role: 'event',
+                    content: {
+                        type: 'options',
+                        options: [
+                            {
+                                label: '任务消息｜来源 HT-0282｜发送 2026-06-13 23:26｜preview',
+                                disabled: true,
+                            },
+                            {
+                                label: '已处理，确认',
+                                value: '@task-ack TM-1',
+                            },
+                            {
+                                label: '重复/不处理，忽略',
+                                value: '@task-dismiss TM-1',
+                            },
+                        ],
+                    },
+                    isSidechain: false,
+                },
+            ];
+
+            const result = reducer(state, messages);
+
+            expect(result.messages).toHaveLength(1);
+            expect(result.messages[0].kind).toBe('agent-event');
+            if (result.messages[0].kind === 'agent-event') {
+                expect(result.messages[0].event.type).toBe('options');
+                if (result.messages[0].event.type === 'options') {
+                    expect(result.messages[0].event.options).toHaveLength(3);
+                    expect(result.messages[0].event.options[1].value).toBe('@task-ack TM-1');
+                }
+            }
+        });
     });
 
     describe('AgentState permissions', () => {

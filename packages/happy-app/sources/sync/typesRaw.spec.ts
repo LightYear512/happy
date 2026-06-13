@@ -935,6 +935,45 @@ describe('Zod Transform - WOLOG Content Normalization', () => {
             }
         });
 
+        it('accepts structured options events without markdown XML in storage', () => {
+            const eventMessage = {
+                role: 'agent',
+                content: {
+                    type: 'event',
+                    id: 'event-options-123',
+                    data: {
+                        type: 'options',
+                        options: [
+                            {
+                                label: '任务消息｜来源 HT-0282｜发送 2026-06-13 23:26｜preview',
+                                disabled: true
+                            },
+                            {
+                                label: '已处理，确认',
+                                value: '@task-ack TM-1'
+                            },
+                            {
+                                label: '重复/不处理，忽略',
+                                value: '@task-dismiss TM-1'
+                            }
+                        ]
+                    }
+                }
+            };
+
+            const result = RawRecordSchema.safeParse(eventMessage);
+
+            expect(result.success).toBe(true);
+            if (result.success && result.data.content.type === 'event') {
+                expect(result.data.content.data.type).toBe('options');
+                if (result.data.content.data.type === 'options') {
+                    expect(result.data.content.data.options).toHaveLength(3);
+                    expect(result.data.content.data.options[0].disabled).toBe(true);
+                    expect(JSON.stringify(result.data.content.data)).not.toContain('<options>');
+                }
+            }
+        });
+
         it('handles user role messages with text content', () => {
             const userMessage = {
                 role: 'user',
