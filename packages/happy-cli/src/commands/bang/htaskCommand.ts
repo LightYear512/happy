@@ -1,8 +1,10 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 import { logger } from '@/ui/logger';
 import type { BangCommandContext } from './types';
+
+const HTASK_SAFE_REF = /^[A-Za-z0-9_.-]+$/;
 
 export function findHtaskRoot(): string | null {
     let dir = resolve(process.env.CLAUDE_PROJECT_DIR || process.cwd());
@@ -35,6 +37,46 @@ export function runHtask(root: string, args: string[], input = ''): Promise<{ co
 export function currentHappyId(ctx: BangCommandContext): string {
     const clientSessionId = (ctx.client as unknown as { sessionId?: string }).sessionId;
     return (clientSessionId || process.env.HTASK_SESSION_CONFIG_ID || process.env.HAPPY_SESSION_ID || '').trim();
+}
+
+function isSafeHtaskRef(value: unknown): value is string {
+    return typeof value === 'string' && HTASK_SAFE_REF.test(value);
+}
+
+function readJsonObject(path: string, debugLabel: string): Record<string, unknown> | null {
+    try {
+        const parsed = JSON.parse(readFileSync(path, 'utf8'));
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+            ? parsed as Record<string, unknown>
+            : null;
+    } catch (error) {
+        logger.debug(`[bang:htask] ${debugLabel} read skipped:`, error);
+        return null;
+    }
+}
+
+function readStableHappyFromSessionConfig(root: string, sessionId: string): { happyId: string; taskId: string } | null {
+    if (!isSafeHtaskRef(sessionId)) return null;
+    const config = readJsonObject(join(root, '.happy', 'session-config', `${sessionId}.json`), `session-config ${sessionId}`);
+    const skills = config?.skills;
+    const htask = skills && typeof skills === 'object' && !Array.isArray(skills)
+        ? (skills as { htask?: unknown }).htask
+        : null;
+    if (!htask || typeof htask !== 'object' || Array.isArray(htask)) return null;
+    const rec = htask as { bound?: unknown; stable_happy?: unknown; happy_id?: unknown; task_id?: unknown };
+    if (rec.bound !== true) return null;
+    const happyId = isSafeHtaskRef(rec.stable_happy) ? rec.stable_happy : rec.happy_id;
+    const taskId = rec.task_id;
+    if (!isSafeHtaskRef(happyId) || !isSafeHtaskRef(taskId)) return null;
+
+    const cfg = readJsonObject(join(root, '.htask', 'cfg', `${happyId}.json`), `cfg ${happyId}`);
+    return cfg?.task_id === taskId ? { happyId, taskId } : null;
+}
+
+export function resolveHtaskHappyId(root: string, sessionId: string): string {
+    const projected = readStableHappyFromSessionConfig(root, sessionId);
+    if (projected) return projected.happyId;
+    return isSafeHtaskRef(sessionId) ? sessionId : '';
 }
 
 export function htaskBlock(text: string, pattern: RegExp): string | null {

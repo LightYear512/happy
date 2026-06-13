@@ -228,13 +228,22 @@ function readStableHappyFromSessionConfig(root: string, sessionId: string): { ha
     return { happyId, taskId };
 }
 
-export function readReplyMonitorBinding(root: string, sessionId: string): ReplyMonitorBinding | null {
-    const direct = readBindingFromHtaskHappy(root, sessionId);
-    if (direct) return direct;
+function hasBoundHtaskSessionConfig(root: string, sessionId: string): boolean {
+    if (!isSafeHtaskRef(sessionId)) return false;
+    const config = readJsonObject(join(root, '.happy', 'session-config', `${sessionId}.json`), `session-config ${sessionId}`);
+    const skills = config?.skills;
+    const htask = skills && typeof skills === 'object' && !Array.isArray(skills)
+        ? (skills as { htask?: unknown }).htask
+        : null;
+    return !!htask && typeof htask === 'object' && !Array.isArray(htask)
+        && (htask as { bound?: unknown }).bound === true;
+}
 
+export function readReplyMonitorBinding(root: string, sessionId: string): ReplyMonitorBinding | null {
     const projected = readStableHappyFromSessionConfig(root, sessionId);
-    if (!projected) return null;
-    return readBindingFromHtaskHappy(root, projected.happyId, projected.taskId);
+    if (projected) return readBindingFromHtaskHappy(root, projected.happyId, projected.taskId);
+    if (hasBoundHtaskSessionConfig(root, sessionId)) return null;
+    return readBindingFromHtaskHappy(root, sessionId);
 }
 
 function readReplyMonitorTask(root: string, happyId: string): Record<string, unknown> | null {

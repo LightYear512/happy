@@ -1,5 +1,5 @@
 import type { BangCommandContext, BangCommandResult } from './types';
-import { currentHappyId, findHtaskRoot, htaskBlock, runHtask } from './htaskCommand';
+import { currentHappyId, findHtaskRoot, htaskBlock, resolveHtaskHappyId, runHtask } from './htaskCommand';
 
 function replyMonitorBlock(text: string): string | null {
     return htaskBlock(text, /@reply-monitor (?:已|未修改)/);
@@ -14,8 +14,13 @@ export async function handleReplyMonitorBangCommand(_args: string, ctx: BangComm
         };
     }
 
-    const happyId = currentHappyId(ctx);
-    const payload = JSON.stringify({ session_id: happyId, prompt: '@reply-monitor' });
+    const nativeSessionId = currentHappyId(ctx);
+    const happyId = resolveHtaskHappyId(root, nativeSessionId);
+    const payload = JSON.stringify({
+        session_id: happyId || nativeSessionId,
+        native_session_id: nativeSessionId,
+        prompt: '@reply-monitor',
+    });
     const result = await runHtask(root, ['inject', '--stdin-hook'], payload);
     if (result.code !== 0) {
         return {

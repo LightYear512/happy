@@ -8,6 +8,7 @@ import {
     ReplyMonitorRuntime,
     readReplyMonitorBinding,
 } from './replyMonitorRuntime';
+import { resolveHtaskHappyId } from './htaskCommand';
 
 function createMonitor(options?: {
     enabled?: () => boolean;
@@ -248,6 +249,10 @@ describe('ReplyMonitorRuntime', () => {
                 happy_id: 'STABLE-1',
                 task_id: 'HT-0001',
             }));
+            writeFileSync(join(root, '.htask', 'cfg', 'NATIVE-1.json'), JSON.stringify({
+                happy_id: 'NATIVE-1',
+                task_id: 'HT-0001',
+            }));
             writeFileSync(join(root, '.htask', 'task', 'HT-0001.json'), JSON.stringify({
                 task_id: 'HT-0001',
                 title: '目标任务',
@@ -258,6 +263,7 @@ describe('ReplyMonitorRuntime', () => {
             expect(binding?.happyId).toBe('STABLE-1');
             expect(binding?.taskId).toBe('HT-0001');
             expect(binding?.task.reply_monitor).toBe(true);
+            expect(resolveHtaskHappyId(root, 'NATIVE-1')).toBe('STABLE-1');
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
