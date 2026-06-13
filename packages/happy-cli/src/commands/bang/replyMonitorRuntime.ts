@@ -374,6 +374,6 @@ export function createHtaskReplyMonitorRuntime(
         },
         currentTitle: () => session.getSummaryText(),
         sendTitle: titleSender,
-        sendTaskMessage: message => session.sendSessionEvent({ type: 'message', message }),
+        sendTaskMessage: message => session.sendCodexMessage({ type: 'message', message }),
     });
 }
