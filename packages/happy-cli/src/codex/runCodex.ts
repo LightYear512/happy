@@ -45,6 +45,7 @@ import {
     handleInteractiveInput,
     buildSessionWelcome,
 } from '@/commands/bang/dispatcher';
+import { renderOptionsBlock } from '@/commands/bang/types';
 import type { EnhancedMode as ClaudeEnhancedMode } from '@/claude/loop';
 
 // ---------------------------------------------------------------------------
@@ -269,7 +270,7 @@ export async function runCodex(opts: {
             return;
         }
 
-        // Check for bang commands (! prefix) - handle without invoking Codex model
+        // Check for bang commands (! full commands or @ short aliases) - handle without invoking Codex model
         if (isBangCommand(text)) {
             const claudeShapedMode: ClaudeEnhancedMode = {
                 permissionMode: enhancedMode.permissionMode,
@@ -294,9 +295,15 @@ export async function runCodex(opts: {
                     await new Promise(resolve => setTimeout(resolve, 50));
                 }
                 if (result.suggestions && result.suggestions.length > 0) {
-                    const options = result.suggestions.map(s => `<option>${s}</option>`).join('\n');
-                    session.sendCodexMessage({ type: 'message', message: `<options>\n${options}\n</options>` });
+                    session.sendCodexMessage({ type: 'message', message: renderOptionsBlock(result.suggestions) });
                     await new Promise(resolve => setTimeout(resolve, 50));
+                }
+                if (result.afterSuggestionsMessage) {
+                    const afterMessages = Array.isArray(result.afterSuggestionsMessage) ? result.afterSuggestionsMessage : [result.afterSuggestionsMessage];
+                    for (const msg of afterMessages) {
+                        session.sendSessionEvent({ type: 'message', message: msg });
+                        await new Promise(resolve => setTimeout(resolve, 50));
+                    }
                 }
                 session.sendSessionEvent({ type: 'ready' });
 
@@ -730,19 +737,6 @@ export async function runCodex(opts: {
         logger.debug('[codex]: client.connect begin');
         await client.connect();
         logger.debug('[codex]: client.connect done');
-
-        // Send welcome message with available bang commands
-        {
-            const welcome = buildSessionWelcome();
-            const msgs = Array.isArray(welcome.message) ? welcome.message : [welcome.message];
-            for (const msg of msgs) {
-                session.sendSessionEvent({ type: 'message', message: msg });
-            }
-            if (welcome.suggestions && welcome.suggestions.length > 0) {
-                const options = welcome.suggestions.map(s => `<option>${s}</option>`).join('\n');
-                session.sendCodexMessage({ type: 'message', message: `<options>\n${options}\n</options>` });
-            }
-        }
 
         // After restore, fetch pending user messages that arrived while CLI was offline.
         if (opts.restoreSessionId && response) {

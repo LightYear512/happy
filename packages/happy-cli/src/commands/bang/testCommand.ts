@@ -22,13 +22,13 @@ function testHelp(): string[] {
         label('!help 输出'),
         '📖 快捷命令',
         SEPARATOR,
-        '!auth-all (!aa) → 切换全部会话账号',
-        '!login (!l) → 登录账户',
-        '!restart-all (!ra) → 重启全部会话',
-        '!usage (!u) → 查看 API 用量',
-        '!session (!s) → 浏览项目目录和会话',
-        '!open (!o) → 打开会话',
-        '!help (!h) → 显示帮助',
+        '@aa (!auth-all) → 切换全部会话账号',
+        '!login (@l) → 登录账户',
+        '!restart-all (@ra) → 重启全部会话',
+        '@u (!usage) → 查看 API 用量',
+        '!session (@s) → 浏览项目目录和会话',
+        '!open (@o) → 打开会话',
+        '@h (!help) → 显示帮助',
         SEPARATOR,
     ];
 }
@@ -184,7 +184,7 @@ function testEdgeCases(): string[] {
     return [
         label('未知命令'),
         '❌ 未知命令 "!foo"',
-        '输入 !help 查看可用命令。',
+        '输入 !help 或 @h 查看可用命令。',
 
         label('会话专属命令被阻止'),
         'ℹ️ !auth 仅在 Claude 会话中可用',

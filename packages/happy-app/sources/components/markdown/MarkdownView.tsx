@@ -1,4 +1,4 @@
-import { MarkdownSpan, parseMarkdown } from './parseMarkdown';
+import { parseMarkdown, type MarkdownSpan, type MarkdownOption } from './parseMarkdown';
 import { Link } from 'expo-router';
 import * as React from 'react';
 import { Pressable, ScrollView, View, Platform } from 'react-native';
@@ -182,7 +182,7 @@ function RenderCodeBlock(props: { content: string, language: string | null, firs
 }
 
 function RenderOptionsBlock(props: { 
-    items: string[], 
+    items: MarkdownOption[], 
     first: boolean, 
     last: boolean, 
     selectable: boolean,
@@ -191,7 +191,7 @@ function RenderOptionsBlock(props: {
     return (
         <View style={[style.optionsContainer, props.first && style.first, props.last && style.last]}>
             {props.items.map((item, index) => {
-                if (props.onOptionPress) {
+                if (props.onOptionPress && !item.disabled) {
                     return (
                         <Pressable 
                             key={index} 
@@ -199,15 +199,15 @@ function RenderOptionsBlock(props: {
                                 style.optionItem,
                                 pressed && style.optionItemPressed
                             ]}
-                            onPress={() => props.onOptionPress?.({ title: item })}
+                            onPress={() => props.onOptionPress?.({ title: item.value })}
                         >
-                            <Text selectable={props.selectable} style={style.optionText}>{item}</Text>
+                            <Text selectable={props.selectable} style={style.optionText}>{item.label}</Text>
                         </Pressable>
                     );
                 } else {
                     return (
-                        <View key={index} style={style.optionItem}>
-                            <Text selectable={props.selectable} style={style.optionText}>{item}</Text>
+                        <View key={index} style={[style.optionItem, item.disabled && style.optionItemDisabled]}>
+                            <Text selectable={props.selectable} style={[style.optionText, item.disabled && style.optionTextDisabled]}>{item.label}</Text>
                         </View>
                     );
                 }
@@ -487,11 +487,18 @@ const style = StyleSheet.create((theme) => ({
         opacity: 0.7,
         backgroundColor: theme.colors.surfaceHigh,
     },
+    optionItemDisabled: {
+        opacity: 0.55,
+        backgroundColor: theme.colors.surface,
+    },
     optionText: {
         ...Typography.default(),
         fontSize: 16,
         lineHeight: 24,
         color: theme.colors.text,
+    },
+    optionTextDisabled: {
+        color: theme.colors.textSecondary,
     },
 
     //

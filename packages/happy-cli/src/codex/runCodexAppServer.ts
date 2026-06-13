@@ -55,6 +55,7 @@ import {
     handleInteractiveInput,
     buildSessionWelcome,
 } from '@/commands/bang/dispatcher';
+import { renderOptionsBlock } from '@/commands/bang/types';
 import { parseSpecialCommand } from '@/parsers/specialCommands';
 import { findRolloutByConversationId, getDefaultCodexSessionsRoot } from './utils/rolloutDiscovery';
 import { buildHeuristicSeed } from './utils/compactSeedBuilder';
@@ -426,9 +427,15 @@ export async function runCodexWithAppServer(opts: {
                     await new Promise(resolve => setTimeout(resolve, 50));
                 }
                 if (result.suggestions && result.suggestions.length > 0) {
-                    const options = result.suggestions.map(s => `<option>${s}</option>`).join('\n');
-                    session.sendCodexMessage({ type: 'message', message: `<options>\n${options}\n</options>` });
+                    session.sendCodexMessage({ type: 'message', message: renderOptionsBlock(result.suggestions) });
                     await new Promise(resolve => setTimeout(resolve, 50));
+                }
+                if (result.afterSuggestionsMessage) {
+                    const afterMessages = Array.isArray(result.afterSuggestionsMessage) ? result.afterSuggestionsMessage : [result.afterSuggestionsMessage];
+                    for (const msg of afterMessages) {
+                        session.sendSessionEvent({ type: 'message', message: msg });
+                        await new Promise(resolve => setTimeout(resolve, 50));
+                    }
                 }
                 // Route a bang-requested session restart through the same
                 // pendingAccountSwap path used by !auth-all --codex (broadcast
@@ -1262,19 +1269,6 @@ export async function runCodexWithAppServer(opts: {
 
         // Register notification + request handlers BEFORE starting any thread
         registerClientHandlers(client);
-
-        // Send welcome message
-        {
-            const welcome = buildSessionWelcome();
-            const msgs = Array.isArray(welcome.message) ? welcome.message : [welcome.message];
-            for (const msg of msgs) {
-                session.sendSessionEvent({ type: 'message', message: msg });
-            }
-            if (welcome.suggestions && welcome.suggestions.length > 0) {
-                const options = welcome.suggestions.map(s => `<option>${s}</option>`).join('\n');
-                session.sendCodexMessage({ type: 'message', message: `<options>\n${options}\n</options>` });
-            }
-        }
 
         // After restore, fetch pending user messages
         if (opts.restoreSessionId && response) {

@@ -24,7 +24,7 @@ export interface BangSessionLike {
 
 /**
  * Context available to bang command handlers.
- * Bang commands are prefixed with `!` and intercepted before reaching the agent.
+ * Bang commands use `!` for full commands and `@` for short aliases before reaching the agent.
  */
 export interface BangCommandContext {
     /** API session client for sending messages back to mobile */
@@ -47,10 +47,54 @@ export interface BangCommandResult {
     /** Action to perform after sending the message */
     action: 'none' | 'restart-session';
     /** Optional clickable quick-reply suggestions rendered as <options> buttons after the message. */
-    suggestions?: string[];
+    suggestions?: BangOptionSuggestion[];
+    /** Optional message(s) sent after suggestions; useful for secondary, non-clickable details. */
+    afterSuggestionsMessage?: string | string[];
 }
 
 export type BangCommandHandler = (args: string, ctx: BangCommandContext) => Promise<BangCommandResult>;
+
+export type BangOptionSuggestion = string | {
+    /** Visible option text. */
+    label: string;
+    /** Command sent when clicked. Defaults to label for legacy behavior. */
+    value?: string;
+    /** Render greyed out and non-clickable in clients that support structured options. */
+    disabled?: boolean;
+};
+
+function escapeOptionText(value: string): string {
+    return value
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+function escapeOptionAttribute(value: string): string {
+    return escapeOptionText(value)
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+export function renderOptionSuggestion(suggestion: BangOptionSuggestion): string {
+    if (typeof suggestion === 'string') {
+        return `<option>${escapeOptionText(suggestion)}</option>`;
+    }
+
+    const attrs: string[] = [];
+    if (suggestion.value && suggestion.value !== suggestion.label) {
+        attrs.push(`value="${escapeOptionAttribute(suggestion.value)}"`);
+    }
+    if (suggestion.disabled) {
+        attrs.push('disabled="true"');
+    }
+    const attrText = attrs.length > 0 ? ` ${attrs.join(' ')}` : '';
+    return `<option${attrText}>${escapeOptionText(suggestion.label)}</option>`;
+}
+
+export function renderOptionsBlock(suggestions: BangOptionSuggestion[]): string {
+    return `<options>\n${suggestions.map(renderOptionSuggestion).join('\n')}\n</options>`;
+}
 
 /** Parse `--codex` flag from args string; returns cleaned args and whether flag was present. */
 export function parseCodexFlag(args: string): { cleanArgs: string; hasCodexFlag: boolean } {

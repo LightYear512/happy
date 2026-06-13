@@ -15,6 +15,7 @@ import { startCaffeinate, stopCaffeinate } from '@/utils/caffeinate';
 import { extractSDKMetadataAsync } from '@/claude/sdk/metadataExtractor';
 import { parseSpecialCommand } from '@/parsers/specialCommands';
 import { isBangCommand, executeBangCommand, hasActiveInteractiveSession, handleInteractiveInput, buildConsoleWelcome, buildSessionWelcome } from '@/commands/bang/dispatcher';
+import { renderOptionsBlock } from '@/commands/bang/types';
 import { getEnvironmentInfo } from '@/ui/doctor';
 import { configuration } from '@/configuration';
 import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
@@ -255,8 +256,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 session.sendSessionEvent({ type: 'message', message: msg });
             }
             if (welcome.suggestions && welcome.suggestions.length > 0) {
-                const options = welcome.suggestions.map(s => `<option>${s}</option>`).join('\n');
-                session.sendCodexMessage({ type: 'message', message: `<options>\n${options}\n</options>` });
+                session.sendCodexMessage({ type: 'message', message: renderOptionsBlock(welcome.suggestions) });
             }
             session.sendSessionEvent({ type: 'ready' });
         }).catch(error => {
@@ -277,23 +277,6 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             logger.debug(`[START] Restored resume title: ${resumeTitle}`);
         }).catch(error => {
             logger.debug('[START] Failed to restore resume title:', error);
-        });
-    }
-
-    // Normal session: send welcome message with available commands
-    if (!isConsoleSession) {
-        session.waitForConnect().then(() => {
-            const welcome = buildSessionWelcome();
-            const welcomeMessages = Array.isArray(welcome.message) ? welcome.message : [welcome.message];
-            for (const msg of welcomeMessages) {
-                session.sendSessionEvent({ type: 'message', message: msg });
-            }
-            if (welcome.suggestions && welcome.suggestions.length > 0) {
-                const options = welcome.suggestions.map(s => `<option>${s}</option>`).join('\n');
-                session.sendCodexMessage({ type: 'message', message: `<options>\n${options}\n</options>` });
-            }
-        }).catch(e => {
-            logger.debug('[START] Session welcome socket connect failed:', e);
         });
     }
 
@@ -516,7 +499,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             return;
         }
 
-        // Check for bang commands (! prefix) - handle without LLM
+        // Check for bang commands (! full commands or @ short aliases) - handle without LLM
         if (isBangCommand(message.content.text)) {
             const enhancedMode: EnhancedMode = {
                 permissionMode: messagePermissionMode || 'default',
@@ -543,9 +526,15 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                     await new Promise(resolve => setTimeout(resolve, 50));
                 }
                 if (result.suggestions && result.suggestions.length > 0) {
-                    const options = result.suggestions.map(s => `<option>${s}</option>`).join('\n');
-                    session.sendCodexMessage({ type: 'message', message: `<options>\n${options}\n</options>` });
+                    session.sendCodexMessage({ type: 'message', message: renderOptionsBlock(result.suggestions) });
                     await new Promise(resolve => setTimeout(resolve, 50));
+                }
+                if (result.afterSuggestionsMessage) {
+                    const afterMessages = Array.isArray(result.afterSuggestionsMessage) ? result.afterSuggestionsMessage : [result.afterSuggestionsMessage];
+                    for (const msg of afterMessages) {
+                        session.sendSessionEvent({ type: 'message', message: msg });
+                        await new Promise(resolve => setTimeout(resolve, 50));
+                    }
                 }
                 session.sendSessionEvent({ type: 'ready' });
 
@@ -570,7 +559,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
         // Console session: reject non-bang messages
         if (isConsoleSession) {
-            session.sendSessionEvent({ type: 'message', message: '⚠️ 控制台仅支持 ! 命令，输入 !help 查看可用命令' });
+            session.sendSessionEvent({ type: 'message', message: '⚠️ 控制台仅支持 ! 命令或 @ 短指令，输入 !help 或 @h 查看可用命令' });
             session.sendSessionEvent({ type: 'ready' });
             return;
         }

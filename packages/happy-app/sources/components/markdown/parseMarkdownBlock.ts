@@ -1,5 +1,42 @@
-import type { MarkdownBlock } from "./parseMarkdown";
+import type { MarkdownBlock, MarkdownOption } from "./parseMarkdown";
 import { parseMarkdownSpans } from "./parseMarkdownSpans";
+
+function decodeOptionText(value: string): string {
+    return value
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&gt;/g, '>')
+        .replace(/&lt;/g, '<')
+        .replace(/&amp;/g, '&');
+}
+
+function parseOptionAttributes(raw: string): Record<string, string | true> {
+    const attrs: Record<string, string | true> = {};
+    const attrPattern = /([a-zA-Z_:][\w:.-]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>/]+)))?/g;
+    let match: RegExpExecArray | null;
+    while ((match = attrPattern.exec(raw)) !== null) {
+        const [, name, doubleQuoted, singleQuoted, bare] = match;
+        attrs[name.toLowerCase()] = doubleQuoted ?? singleQuoted ?? bare ?? true;
+    }
+    return attrs;
+}
+
+function parseOptionLine(line: string): MarkdownOption | null {
+    const optionMatch = line.match(/<option(?:\s+([^>]*))?>(.*?)<\/option>/);
+    if (!optionMatch) return null;
+
+    const attrs = parseOptionAttributes(optionMatch[1] ?? '');
+    const label = decodeOptionText(optionMatch[2]);
+    const valueAttr = attrs.value;
+    const disabledAttr = attrs.disabled;
+    const disabled = disabledAttr === true || String(disabledAttr).toLowerCase() === 'true';
+
+    return {
+        label,
+        value: typeof valueAttr === 'string' ? decodeOptionText(valueAttr) : label,
+        disabled,
+    };
+}
 
 function parseTable(lines: string[], startIndex: number): { table: MarkdownBlock | null; nextIndex: number } {
     let index = startIndex;
@@ -111,17 +148,16 @@ export function parseMarkdownBlock(markdown: string) {
 
         // Options block
         if (trimmed.startsWith('<options>')) {
-            let items: string[] = [];
+            let items: MarkdownOption[] = [];
             while (index < lines.length) {
                 const nextLine = lines[index];
                 if (nextLine.trim() === '</options>') {
                     index++;
                     break;
                 }
-                // Extract content from <option> tags
-                const optionMatch = nextLine.match(/<option>(.*?)<\/option>/);
-                if (optionMatch) {
-                    items.push(optionMatch[1]);
+                const option = parseOptionLine(nextLine);
+                if (option) {
+                    items.push(option);
                 }
                 index++;
             }

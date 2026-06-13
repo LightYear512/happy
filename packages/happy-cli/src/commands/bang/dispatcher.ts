@@ -165,6 +165,7 @@ function buildQuickSessionMenu(ctx: BangCommandContext): BangCommandResult {
         suggestions: [
             compactOption('@u', flavor === 'codex' ? '⏱️查看codex用量' : '⏱️查看Claude 用量'),
             compactOption(ctx.isConsoleSession ? '@aa' : '@a', flavor === 'codex' ? '🔑切换codex账号' : '🔑切换Claude账号'),
+            { label: compactOption('@reminder', '设置/取消提示'), value: '@reminder' },
         ],
     };
 }
