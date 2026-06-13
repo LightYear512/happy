@@ -31,6 +31,12 @@ export interface TaskMessageRecord {
     status: 'pending' | 'delivered' | 'acked' | 'dismissed' | string;
 }
 
+export interface ReplyMonitorBinding {
+    happyId: string;
+    taskId: string;
+    task: Record<string, unknown>;
+}
+
 export class ReplyMonitorRuntime {
     private interval: ReturnType<typeof setInterval> | null = null;
     private disposed = false;
@@ -171,30 +177,64 @@ function titleWithAlert(canonical: string): string {
     return `${REPLY_MONITOR_ALERT_MARKER} ${canonical}`;
 }
 
-function readReplyMonitorBinding(root: string, happyId: string): { taskId: string; task: Record<string, unknown> } | null {
-    if (!happyId || !HTASK_SAFE_REF.test(happyId)) return null;
-    let cfg: unknown;
-    try {
-        cfg = JSON.parse(readFileSync(join(root, '.htask', 'cfg', `${happyId}.json`), 'utf8'));
-    } catch (error) {
-        logger.debug('[reply-monitor] cfg read skipped', error);
-        return null;
-    }
-    const taskId = cfg && typeof cfg === 'object' ? (cfg as { task_id?: unknown }).task_id : null;
-    if (typeof taskId !== 'string' || !HTASK_SAFE_REF.test(taskId)) return null;
+function isSafeHtaskRef(value: unknown): value is string {
+    return typeof value === 'string' && HTASK_SAFE_REF.test(value);
+}
 
+function readJsonObject(path: string, debugLabel: string): Record<string, unknown> | null {
     try {
-        const parsed = JSON.parse(readFileSync(join(root, '.htask', 'task', `${taskId}.json`), 'utf8'));
-        if (!parsed || typeof parsed !== 'object') return null;
-        const task = (parsed as { task?: unknown }).task;
-        return {
-            taskId,
-            task: task && typeof task === 'object' ? task as Record<string, unknown> : parsed as Record<string, unknown>,
-        };
+        const parsed = JSON.parse(readFileSync(path, 'utf8'));
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+            ? parsed as Record<string, unknown>
+            : null;
     } catch (error) {
-        logger.debug('[reply-monitor] task read failed', error);
+        logger.debug(`[reply-monitor] ${debugLabel} read skipped`, error);
         return null;
     }
+}
+
+function readBindingFromHtaskHappy(root: string, happyId: string, expectedTaskId = ''): ReplyMonitorBinding | null {
+    if (!isSafeHtaskRef(happyId)) return null;
+    const cfg = readJsonObject(join(root, '.htask', 'cfg', `${happyId}.json`), `cfg ${happyId}`);
+    const taskId = cfg?.task_id;
+    if (!isSafeHtaskRef(taskId)) return null;
+    if (expectedTaskId && taskId !== expectedTaskId) return null;
+
+    const parsed = readJsonObject(join(root, '.htask', 'task', `${taskId}.json`), `task ${taskId}`);
+    if (!parsed) return null;
+    const task = parsed.task;
+    return {
+        happyId,
+        taskId,
+        task: task && typeof task === 'object' && !Array.isArray(task)
+            ? task as Record<string, unknown>
+            : parsed,
+    };
+}
+
+function readStableHappyFromSessionConfig(root: string, sessionId: string): { happyId: string; taskId: string } | null {
+    if (!isSafeHtaskRef(sessionId)) return null;
+    const config = readJsonObject(join(root, '.happy', 'session-config', `${sessionId}.json`), `session-config ${sessionId}`);
+    const skills = config?.skills;
+    const htask = skills && typeof skills === 'object' && !Array.isArray(skills)
+        ? (skills as { htask?: unknown }).htask
+        : null;
+    if (!htask || typeof htask !== 'object' || Array.isArray(htask)) return null;
+    const rec = htask as { bound?: unknown; stable_happy?: unknown; happy_id?: unknown; task_id?: unknown };
+    if (rec.bound !== true) return null;
+    const happyId = isSafeHtaskRef(rec.stable_happy) ? rec.stable_happy : rec.happy_id;
+    const taskId = rec.task_id;
+    if (!isSafeHtaskRef(happyId) || !isSafeHtaskRef(taskId)) return null;
+    return { happyId, taskId };
+}
+
+export function readReplyMonitorBinding(root: string, sessionId: string): ReplyMonitorBinding | null {
+    const direct = readBindingFromHtaskHappy(root, sessionId);
+    if (direct) return direct;
+
+    const projected = readStableHappyFromSessionConfig(root, sessionId);
+    if (!projected) return null;
+    return readBindingFromHtaskHappy(root, projected.happyId, projected.taskId);
 }
 
 function readReplyMonitorTask(root: string, happyId: string): Record<string, unknown> | null {
@@ -236,7 +276,9 @@ export function createHtaskReplyMonitorRuntime(
         },
         canonicalTitle: async () => {
             const root = findHtaskRoot();
-            return root ? htaskCanonicalTitle(root, session.sessionId, flavor) : null;
+            if (!root) return null;
+            const binding = readReplyMonitorBinding(root, session.sessionId);
+            return binding ? htaskCanonicalTitle(root, binding.happyId, flavor) : null;
         },
         pendingMessages: async () => {
             const root = findHtaskRoot();
@@ -252,7 +294,9 @@ export function createHtaskReplyMonitorRuntime(
         deliverMessage: async (messageId: string) => {
             const root = findHtaskRoot();
             if (!root) return null;
-            const result = await runHtask(root, ['message-deliver', '--happy', session.sessionId, '--message-id', messageId]);
+            const binding = readReplyMonitorBinding(root, session.sessionId);
+            if (!binding) return null;
+            const result = await runHtask(root, ['message-deliver', '--happy', binding.happyId, '--message-id', messageId]);
             if (result.code !== 0) {
                 throw new Error(result.stderr || result.stdout || 'message-deliver failed');
             }

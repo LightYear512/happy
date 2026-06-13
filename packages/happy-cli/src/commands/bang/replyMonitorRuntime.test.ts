@@ -1,8 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
     REPLY_MONITOR_ALERT_DELAY_MS,
     REPLY_MONITOR_POLL_INTERVAL_MS,
     ReplyMonitorRuntime,
+    readReplyMonitorBinding,
 } from './replyMonitorRuntime';
 
 function createMonitor(options?: {
@@ -221,5 +225,41 @@ describe('ReplyMonitorRuntime', () => {
         expect(titles).toEqual(['🔵 [0001-任务 0/1] 做事']);
         expect(taskMessages).toEqual([]);
         monitor.dispose();
+    });
+
+    it('resolves native session ids to stable htask happy ids through session-config', () => {
+        const root = mkdtempSync(join(tmpdir(), 'reply-monitor-binding-'));
+        try {
+            mkdirSync(join(root, '.happy', 'session-config'), { recursive: true });
+            mkdirSync(join(root, '.htask', 'cfg'), { recursive: true });
+            mkdirSync(join(root, '.htask', 'task'), { recursive: true });
+            writeFileSync(join(root, '.happy', 'session-config', 'NATIVE-1.json'), JSON.stringify({
+                version: 1,
+                skills: {
+                    htask: {
+                        bound: true,
+                        happy_id: 'STABLE-1',
+                        stable_happy: 'STABLE-1',
+                        task_id: 'HT-0001',
+                    },
+                },
+            }));
+            writeFileSync(join(root, '.htask', 'cfg', 'STABLE-1.json'), JSON.stringify({
+                happy_id: 'STABLE-1',
+                task_id: 'HT-0001',
+            }));
+            writeFileSync(join(root, '.htask', 'task', 'HT-0001.json'), JSON.stringify({
+                task_id: 'HT-0001',
+                title: '目标任务',
+                reply_monitor: true,
+            }));
+
+            const binding = readReplyMonitorBinding(root, 'NATIVE-1');
+            expect(binding?.happyId).toBe('STABLE-1');
+            expect(binding?.taskId).toBe('HT-0001');
+            expect(binding?.task.reply_monitor).toBe(true);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
     });
 });
