@@ -106,6 +106,17 @@ export function resolveHtaskHappyId(root: string, sessionId: string): string {
     return readHtaskDirectBinding(root, sessionId)?.happyId ?? '';
 }
 
+export function buildHtaskPromptPayload(sessionId: string, happyId: string, prompt: string): string {
+    const payload: Record<string, string> = {
+        session_id: happyId || sessionId,
+        prompt,
+    };
+    if (sessionId && (!happyId || happyId !== sessionId)) {
+        payload.native_session_id = sessionId;
+    }
+    return JSON.stringify(payload);
+}
+
 export function htaskBlock(text: string, pattern: RegExp): string | null {
     const matches = [...text.matchAll(/<htask>([\s\S]*?)<\/htask>/g)];
     for (const match of matches) {

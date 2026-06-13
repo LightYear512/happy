@@ -8,7 +8,7 @@ import {
     ReplyMonitorRuntime,
     readReplyMonitorBinding,
 } from './replyMonitorRuntime';
-import { resolveHtaskHappyId } from './htaskCommand';
+import { buildHtaskPromptPayload, resolveHtaskHappyId } from './htaskCommand';
 
 function createMonitor(options?: {
     enabled?: () => boolean;
@@ -319,5 +319,22 @@ describe('ReplyMonitorRuntime', () => {
         } finally {
             rmSync(root, { recursive: true, force: true });
         }
+    });
+
+    it('omits native proof only for an already-validated direct current binding payload', () => {
+        expect(JSON.parse(buildHtaskPromptPayload('NATIVE-1', 'STABLE-1', '@reply-monitor'))).toEqual({
+            session_id: 'STABLE-1',
+            native_session_id: 'NATIVE-1',
+            prompt: '@reply-monitor',
+        });
+        expect(JSON.parse(buildHtaskPromptPayload('NATIVE-CURRENT', 'NATIVE-CURRENT', '@reply-monitor'))).toEqual({
+            session_id: 'NATIVE-CURRENT',
+            prompt: '@reply-monitor',
+        });
+        expect(JSON.parse(buildHtaskPromptPayload('NATIVE-OLD', '', '@reply-monitor'))).toEqual({
+            session_id: 'NATIVE-OLD',
+            native_session_id: 'NATIVE-OLD',
+            prompt: '@reply-monitor',
+        });
     });
 });
