@@ -47,10 +47,9 @@ function createMonitor(options?: {
     return { monitor, titles, taskMessages, currentTitle: () => current };
 }
 
-function taskMessageOptions(messageId = 'TM-1', body = 'hello'): string {
+function taskMessageOptions(messageId = 'TM-1'): string {
     return [
         '<options>',
-        `<option disabled="true">任务消息｜来源 HT-0282｜发送 2026-06-13 15:46｜${body}</option>`,
         `<option value="@task-ack ${messageId}">已处理，确认</option>`,
         `<option value="@task-dismiss ${messageId}">重复/不处理，忽略</option>`,
         '</options>',
@@ -239,26 +238,20 @@ describe('ReplyMonitorRuntime', () => {
         monitor.dispose();
     });
 
-    it('truncates long task message bodies to the first and last 200 characters', async () => {
-        vi.useFakeTimers();
+    it('truncates long task message bodies to the first and last 200 characters', () => {
         const head = 'A'.repeat(205);
         const middle = 'MIDDLE-SHOULD-BE-HIDDEN';
         const tail = 'B'.repeat(205);
-        const { monitor, taskMessages } = createMonitor({
-            messages: () => [{
-                message_id: 'TM-1',
-                status: 'delivered',
-                from_task_id: 'HT-0282',
-                created_at: '2026-06-13T15:46:03',
-                body: `${head}${middle}${tail}`,
-            }],
+        const fallback = formatTaskMessagePlainNotification({
+            message_id: 'TM-1',
+            status: 'delivered',
+            from_task_id: 'HT-0282',
+            created_at: '2026-06-13T15:46:03',
+            body: `${head}${middle}${tail}`,
         });
 
-        await vi.advanceTimersByTimeAsync(2_000);
-        expect(taskMessages).toHaveLength(1);
-        expect(taskMessages[0]).toContain(`${'A'.repeat(200)} … ${'B'.repeat(200)}`);
-        expect(taskMessages[0]).not.toContain(middle);
-        monitor.dispose();
+        expect(fallback).toContain(`${'A'.repeat(200)} … ${'B'.repeat(200)}`);
+        expect(fallback).not.toContain(middle);
     });
 
     it('formats the visible task message fallback without option XML or message ids', () => {

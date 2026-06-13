@@ -257,6 +257,19 @@ function taskMessageActionOptions(message: TaskMessageRecord): BangOptionSuggest
     ];
 }
 
+function taskMessageButtonOptions(message: TaskMessageRecord): BangOptionSuggestion[] {
+    return [
+        {
+            label: '已处理，确认',
+            value: `@task-ack ${message.message_id}`,
+        },
+        {
+            label: '重复/不处理，忽略',
+            value: `@task-dismiss ${message.message_id}`,
+        },
+    ];
+}
+
 function normalizeOptionSuggestion(suggestion: BangOptionSuggestion): { label: string; value?: string; disabled?: boolean } {
     if (typeof suggestion === 'string') {
         return {
@@ -272,7 +285,7 @@ function normalizeOptionSuggestion(suggestion: BangOptionSuggestion): { label: s
 }
 
 export function formatTaskMessageNotification(message: TaskMessageRecord): string {
-    return renderOptionsBlock(taskMessageActionOptions(message));
+    return renderOptionsBlock(taskMessageButtonOptions(message));
 }
 
 export function formatTaskMessagePlainNotification(message: TaskMessageRecord): string {
@@ -428,6 +441,10 @@ export function createHtaskReplyMonitorRuntime(
         sendTitle: titleSender,
         sendTaskMessage: (message, visibleFallback, options) => {
             session.sendSessionEvent({ type: 'message', message: visibleFallback ?? message });
+            if (typeof session.sendCodexMessage === 'function') {
+                session.sendCodexMessage({ type: 'message', message, id: randomUUID() });
+                return;
+            }
             if (options && options.length > 0) {
                 session.sendSessionEvent({
                     type: 'options',
@@ -435,7 +452,6 @@ export function createHtaskReplyMonitorRuntime(
                 });
                 return;
             }
-            session.sendCodexMessage({ type: 'message', message, id: randomUUID() });
         },
     });
 }
