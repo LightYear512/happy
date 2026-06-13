@@ -153,6 +153,7 @@ function readToolContextFromItem(item: RecordLike): ToolContext | null {
 
 export type AppServerStreamUpdate =
     | { type: 'envelope'; envelope: SessionEnvelope }
+    | { type: 'receive-activity'; reason: string }
     | { type: 'agent-message'; message: string; id?: string }
     | { type: 'reasoning-delta'; delta: string }
     | { type: 'reasoning-final'; text: string }
@@ -350,8 +351,12 @@ export function createAppServerStreamBridge(): {
 
         // -- item/started ------------------------------------------------
         if (method === 'item/started') {
+            const item = readItem(params);
+            const itemType = item ? readItemType(item) : null;
             const resolved = resolveToolContext(params);
-            if (!resolved) return [];
+            if (!resolved) {
+                return [{ type: 'receive-activity', reason: `item-started:${itemType ?? 'unknown'}` }];
+            }
 
             const { callId, toolContext } = resolved;
             const command = toolContext.toolKind === 'command'
@@ -379,17 +384,21 @@ export function createAppServerStreamBridge(): {
                     : {}) as Record<string, unknown>,
             }, opts());
 
-            return [{ type: 'envelope', envelope }];
+            return [
+                { type: 'receive-activity', reason: `item-started:${itemType ?? toolContext.toolKind}` },
+                { type: 'envelope', envelope },
+            ];
         }
 
         // -- item/completed ----------------------------------------------
         if (method === 'item/completed') {
             const item = readItem(params);
-            if (!item) return [];
+            if (!item) return [{ type: 'receive-activity', reason: 'item-completed:unknown' }];
             const itemId = readItemId(item);
             const itemType = readItemType(item);
+            const activity: AppServerStreamUpdate = { type: 'receive-activity', reason: `item-completed:${itemType ?? 'unknown'}` };
             logger.debug(`[appServerStreamBridge] item/completed diag itemType=${itemType} itemId=${itemId} keys=${item ? Object.keys(item).join(',') : 'null'}`);
-            if (!itemId) return [];
+            if (!itemId) return [activity];
 
             // Agent message completed — emit text envelope
             if (itemType === 'agentmessage' || itemType === 'plan') {
@@ -397,11 +406,11 @@ export function createAppServerStreamBridge(): {
                 logger.debug(`[appServerStreamBridge] item/completed agentMessage text=${text ? `len=${text.length}` : 'MISSING'} rawText=${typeof item.text} rawMessage=${typeof item.message}`);
                 if (!text) {
                     logger.debug(`[appServerStreamBridge] item/completed agentMessage DROPPED (no text) — consumer will only get delta-accumulated message via task-complete path`);
-                    return [];
+                    return [activity];
                 }
                 const envelope = createEnvelope('agent', { t: 'text', text }, opts());
                 logger.debug(`[appServerStreamBridge] item/completed agentMessage EMIT text envelope id=${envelope.id} turn=${currentTurnId} len=${text.length}`);
-                return [{ type: 'envelope', envelope }];
+                return [activity, { type: 'envelope', envelope }];
             }
 
             // Reasoning completed — emit final reasoning
@@ -413,17 +422,17 @@ export function createAppServerStreamBridge(): {
                     ? (item.summary as unknown[]).filter((e): e is string => typeof e === 'string' && e.length > 0)
                     : [];
                 const text = content.length > 0 ? content.join('\n\n') : (summary.length > 0 ? summary.join('\n\n') : null);
-                if (!text) return [];
-                return [{ type: 'reasoning-final', text }];
+                if (!text) return [activity];
+                return [activity, { type: 'reasoning-final', text }];
             }
 
             // Tool completed — emit tool-call-end (and maybe a synthesized tool-call-start if we missed item/started)
             const rememberedCtx = toolContextByCallId.get(itemId) ?? null;
             const synthesizedCtx = rememberedCtx ?? readToolContextFromItem(item);
-            if (!synthesizedCtx) return [];
+            if (!synthesizedCtx) return [activity];
             toolContextByCallId.delete(itemId);
 
-            const updates: AppServerStreamUpdate[] = [];
+            const updates: AppServerStreamUpdate[] = [activity];
 
             // If we never saw item/started for this tool, emit a synthetic tool-call-start first
             if (!rememberedCtx) {

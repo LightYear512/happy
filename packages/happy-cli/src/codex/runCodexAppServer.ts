@@ -64,6 +64,7 @@ import { loadFallbackCompactDocs } from './utils/projectFallbackDocs';
 import { shouldAutoRescue, createRescueGate } from './utils/codexAutoRescue';
 import { createTurnLifecycle } from './utils/turnLifecycle';
 import { createRecentUserBuffer } from './utils/recentUserBuffer';
+import { createHtaskReplyMonitorRuntime } from '@/commands/bang/replyMonitorRuntime';
 
 // ---------------------------------------------------------------------------
 // Types (mirrors runCodex.ts)
@@ -320,6 +321,7 @@ export async function runCodexWithAppServer(opts: {
         permissionMode: mode.permissionMode,
         model: mode.model,
     }));
+    const replyMonitor = createHtaskReplyMonitorRuntime(session, 'codex');
 
     // Race-recovery mirror of user prompts; snapshot is consumed by
     // /compact's seed builder to cover prompts not yet flushed to
@@ -466,6 +468,7 @@ export async function runCodexWithAppServer(opts: {
         // Must precede messageQueue.push: a synchronous push failure would
         // otherwise skip the record, leaving the prompt unrecoverable by the
         // seed builder. All non-prompt traffic has been early-returned above.
+        replyMonitor.observeUserMessage();
         recentUserBuffer.record(text);
         messageQueue.push(text, enhancedMode);
     });
@@ -807,6 +810,7 @@ export async function runCodexWithAppServer(opts: {
             }
         }
         try {
+            replyMonitor.dispose();
             session.sendSessionDeath();
             await session.flush();
         } catch {}
@@ -846,6 +850,7 @@ export async function runCodexWithAppServer(opts: {
             switch (update.type) {
                 case 'envelope': {
                     const envelope = update.envelope;
+                    replyMonitor.observeReceiveActivity(`envelope:${envelope.ev.t}`);
                     logger.debug(`[CodexAppServer] DISPATCH envelope t=${envelope.ev.t} id=${envelope.id} turn=${envelope.turn ?? 'none'} time=${envelope.time}`);
                     session.sendSessionProtocolMessage(envelope);
                     // Older happy-app builds render codex content, not session
@@ -884,7 +889,12 @@ export async function runCodexWithAppServer(opts: {
                     break;
                 }
 
+                case 'receive-activity':
+                    replyMonitor.observeReceiveActivity(update.reason);
+                    break;
+
                 case 'agent-message':
+                    replyMonitor.observeReceiveActivity('agent-message');
                     // Buffer deltas only for the turn-aborted fallback below.
                     // The authoritative delivery happens on item/completed via
                     // the envelope t:'text' branch above.
@@ -892,18 +902,22 @@ export async function runCodexWithAppServer(opts: {
                     break;
 
                 case 'reasoning-delta':
+                    replyMonitor.observeReceiveActivity('reasoning-delta');
                     reasoningProcessor.processDelta(update.delta);
                     break;
 
                 case 'reasoning-final':
+                    replyMonitor.observeReceiveActivity('reasoning-final');
                     reasoningProcessor.complete(update.text);
                     break;
 
                 case 'turn-diff':
+                    replyMonitor.observeReceiveActivity('turn-diff');
                     diffProcessor.processDiff(update.unifiedDiff);
                     break;
 
                 case 'task-started': {
+                    replyMonitor.observeReceiveActivity('task-started');
                     activeTurnId = update.turnId;
                     if (!thinking) {
                         logger.debug('[CodexAppServer] thinking started');
@@ -925,6 +939,7 @@ export async function runCodexWithAppServer(opts: {
                 }
 
                 case 'task-complete': {
+                    replyMonitor.observeReceiveActivity('task-complete');
                     if (thinking) {
                         logger.debug('[CodexAppServer] thinking completed');
                         thinking = false;
@@ -941,6 +956,7 @@ export async function runCodexWithAppServer(opts: {
                 }
 
                 case 'turn-aborted': {
+                    replyMonitor.observeReceiveActivity('turn-aborted');
                     // Flush any partial agent text
                     const partialText = pendingAgentText.trim();
                     if (partialText) {
@@ -987,6 +1003,8 @@ export async function runCodexWithAppServer(opts: {
             // protocol regressions surface in logs instead of showing `{}`.
             const detail = error instanceof Error ? error.message : String(error);
             logger.debug(`[CodexAppServer] Error during abort: ${detail}`);
+        } finally {
+            replyMonitor.observeReceiveActivity('abort');
         }
     }
 
@@ -996,6 +1014,7 @@ export async function runCodexWithAppServer(opts: {
 
         try {
             if (session) {
+                replyMonitor.dispose();
                 session.updateMetadata((currentMetadata) => ({
                     ...currentMetadata,
                     lifecycleState: 'archived',
@@ -1174,6 +1193,7 @@ export async function runCodexWithAppServer(opts: {
                 return;
             }
 
+            replyMonitor.observeReceiveActivity('error');
             logger.warn('[CodexAppServer] Codex error notification:', params);
             session.sendSessionEvent({
                 type: 'message',
@@ -1483,6 +1503,7 @@ export async function runCodexWithAppServer(opts: {
                 logger.debug('[CodexAppServer] Turn fully completed');
             } catch (error) {
                 logger.warn('[CodexAppServer] Error in app-server session:', error);
+                replyMonitor.observeReceiveActivity('turn-error');
                 // Settle the pending promise on RPC failure (the only path that
                 // legitimately rejects). Idempotent if it was already settled
                 // by an error notification handler that beat us here.
@@ -1519,6 +1540,7 @@ export async function runCodexWithAppServer(opts: {
     } finally {
         // Clean up resources
         logger.debug('[CodexAppServer] Final cleanup start');
+        replyMonitor.dispose();
 
         removeShutdownHandlers();
         try { codexProfileWatcher?.close(); } catch { /* best effort */ }

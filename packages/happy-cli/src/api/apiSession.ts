@@ -233,6 +233,10 @@ export class ApiSessionClient extends EventEmitter {
         }
     }
 
+    getSummaryText(): string | null {
+        return this.metadata?.summary?.text ?? null;
+    }
+
     /**
      * Send message to session
      * @param body - Message body (can be MessageContent or raw content for agent messages)

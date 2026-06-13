@@ -45,6 +45,7 @@ import {
     handleInteractiveInput,
     buildSessionWelcome,
 } from '@/commands/bang/dispatcher';
+import { createHtaskReplyMonitorRuntime } from '@/commands/bang/replyMonitorRuntime';
 import { renderOptionsBlock } from '@/commands/bang/types';
 import type { EnhancedMode as ClaudeEnhancedMode } from '@/claude/loop';
 
@@ -230,6 +231,7 @@ export async function runCodex(opts: {
         permissionMode: mode.permissionMode,
         model: mode.model,
     }));
+    const replyMonitor = createHtaskReplyMonitorRuntime(session, 'codex');
 
     // Track current overrides to apply per message
     // Use shared PermissionMode type from api/types for cross-agent compatibility
@@ -327,6 +329,7 @@ export async function runCodex(opts: {
             return;
         }
 
+        replyMonitor.observeUserMessage();
         messageQueue.push(text, enhancedMode);
     });
     let thinking = false;
@@ -402,6 +405,7 @@ export async function runCodex(opts: {
             
             abortController.abort();
             reasoningProcessor.abort();
+            replyMonitor.observeReceiveActivity('abort');
             logger.debug('[Codex] Abort completed - session remains active');
         } catch (error) {
             logger.debug('[Codex] Error during abort:', error);
@@ -433,6 +437,7 @@ export async function runCodex(opts: {
                 }));
                 
                 // Send session death message
+                replyMonitor.dispose();
                 session.sendSessionDeath();
                 await session.flush();
                 await session.close();
@@ -592,6 +597,7 @@ export async function runCodex(opts: {
         // Also send agent_message directly to server — the session protocol mapper doesn't
         // handle this type, so without this fallback the app never sees the AI response.
         if (msg.type === 'agent_message') {
+            replyMonitor.observeReceiveActivity('agent-message');
             messageBuffer.addMessage(msg.message, 'assistant');
             session.sendCodexMessage({
                 type: 'message',
@@ -599,12 +605,16 @@ export async function runCodex(opts: {
                 id: randomUUID()
             });
         } else if (msg.type === 'agent_reasoning_delta') {
+            replyMonitor.observeReceiveActivity('agent-reasoning-delta');
             // Skip reasoning deltas in the UI to reduce noise
         } else if (msg.type === 'agent_reasoning') {
+            replyMonitor.observeReceiveActivity('agent-reasoning');
             messageBuffer.addMessage(`[Thinking] ${msg.text.substring(0, 100)}...`, 'system');
         } else if (msg.type === 'exec_command_begin') {
+            replyMonitor.observeReceiveActivity('exec-command-begin');
             messageBuffer.addMessage(`Executing: ${msg.command}`, 'tool');
         } else if (msg.type === 'exec_command_end') {
+            replyMonitor.observeReceiveActivity('exec-command-end');
             const output = msg.output || msg.error || 'Command completed';
             const truncatedOutput = output.substring(0, 200);
             messageBuffer.addMessage(
@@ -612,8 +622,10 @@ export async function runCodex(opts: {
                 'result'
             );
         } else if (msg.type === 'task_started') {
+            replyMonitor.observeReceiveActivity('task-started');
             messageBuffer.addMessage('Starting task...', 'status');
         } else if (msg.type === 'task_complete') {
+            replyMonitor.observeReceiveActivity('task-complete');
             messageBuffer.addMessage('Task completed', 'status');
             // Auto-update session title on first task completion
             if (first && msg.last_agent_message) {
@@ -629,6 +641,7 @@ export async function runCodex(opts: {
             }
             sendReady();
         } else if (msg.type === 'turn_aborted') {
+            replyMonitor.observeReceiveActivity('turn-aborted');
             messageBuffer.addMessage('Turn aborted', 'status');
             sendReady();
         }
@@ -962,6 +975,7 @@ export async function runCodex(opts: {
         // Clean up resources when main loop exits
         logger.debug('[codex]: Final cleanup start');
         logActiveHandles('cleanup-start');
+        replyMonitor.dispose();
         removeShutdownHandlers();
         try { codexProfileWatcher?.close(); } catch { /* best effort */ }
 

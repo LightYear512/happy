@@ -1,0 +1,168 @@
+import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { logger } from '@/ui/logger';
+import type { ApiSessionClient } from '@/api/apiSession';
+import type { BangCommandContext } from './types';
+import { findHtaskRoot, htaskCanonicalTitle } from './htaskCommand';
+
+export const REPLY_MONITOR_ALERT_DELAY_MS = 60_000;
+export const REPLY_MONITOR_POLL_INTERVAL_MS = 10_000;
+const REPLY_MONITOR_ALERT_MARKER = '⚠️';
+const HTASK_SAFE_REF = /^[A-Za-z0-9_.-]+$/;
+
+export interface ReplyMonitorRuntimeOptions {
+    idleMs?: number;
+    pollMs?: number;
+    isEnabled: () => boolean | Promise<boolean>;
+    canonicalTitle: () => string | null | Promise<string | null>;
+    currentTitle?: () => string | null;
+    sendTitle: (title: string) => void;
+    now?: () => number;
+    debug?: (message: string, error?: unknown) => void;
+}
+
+export class ReplyMonitorRuntime {
+    private interval: ReturnType<typeof setInterval> | null = null;
+    private disposed = false;
+    private syncInFlight = false;
+    private lastActivityAt: number | null = null;
+    private readonly idleMs: number;
+    private readonly isEnabled: ReplyMonitorRuntimeOptions['isEnabled'];
+    private readonly canonicalTitle: ReplyMonitorRuntimeOptions['canonicalTitle'];
+    private readonly currentTitle: NonNullable<ReplyMonitorRuntimeOptions['currentTitle']>;
+    private readonly sendTitle: ReplyMonitorRuntimeOptions['sendTitle'];
+    private readonly now: NonNullable<ReplyMonitorRuntimeOptions['now']>;
+    private readonly debug: NonNullable<ReplyMonitorRuntimeOptions['debug']>;
+
+    constructor(options: ReplyMonitorRuntimeOptions) {
+        this.idleMs = options.idleMs ?? REPLY_MONITOR_ALERT_DELAY_MS;
+        this.isEnabled = options.isEnabled;
+        this.canonicalTitle = options.canonicalTitle;
+        this.currentTitle = options.currentTitle ?? (() => null);
+        this.sendTitle = options.sendTitle;
+        this.now = options.now ?? (() => Date.now());
+        this.debug = options.debug ?? ((message, error) => logger.debug(message, error));
+        const pollMs = options.pollMs ?? REPLY_MONITOR_POLL_INTERVAL_MS;
+        this.interval = setInterval(() => {
+            void this.syncTitle('poll');
+        }, pollMs);
+    }
+
+    observeUserMessage(): void {
+        this.markActivity('user-message');
+    }
+
+    observeReceiveActivity(reason = 'receive'): void {
+        this.markActivity(reason);
+    }
+
+    observeAssistantReply(): void {
+        this.observeReceiveActivity('assistant-reply');
+    }
+
+    stopMonitoring(reason = 'stop'): void {
+        this.debug(`[reply-monitor] stop requested reason=${reason}`);
+        this.lastActivityAt = null;
+        void this.syncTitle(reason);
+    }
+
+    dispose(): void {
+        this.disposed = true;
+        if (this.interval) {
+            clearInterval(this.interval);
+            this.interval = null;
+        }
+    }
+
+    async syncTitle(reason = 'manual'): Promise<void> {
+        if (this.disposed || this.syncInFlight) return;
+        this.syncInFlight = true;
+        try {
+            const canonical = await this.canonicalTitle();
+            if (!canonical) {
+                this.debug(`[reply-monitor] title sync skipped missing-title reason=${reason}`);
+                return;
+            }
+
+            const enabled = await this.isEnabled();
+            const idle = enabled
+                && this.lastActivityAt !== null
+                && this.now() - this.lastActivityAt >= this.idleMs;
+            const expected = idle && !canonical.startsWith(`${REPLY_MONITOR_ALERT_MARKER} `)
+                ? `${REPLY_MONITOR_ALERT_MARKER} ${canonical}`
+                : canonical;
+            const current = this.currentTitle();
+            if (current === expected) {
+                this.debug(`[reply-monitor] title unchanged reason=${reason} idle=${idle}`);
+                return;
+            }
+            this.sendTitle(expected);
+            this.debug(`[reply-monitor] title sent reason=${reason} idle=${idle}`);
+        } catch (error) {
+            this.debug('[reply-monitor] title sync skipped', error);
+        } finally {
+            this.syncInFlight = false;
+        }
+    }
+
+    private markActivity(reason: string): void {
+        this.lastActivityAt = this.now();
+        this.debug(`[reply-monitor] activity reason=${reason} at=${this.lastActivityAt}`);
+    }
+}
+
+function readReplyMonitorTask(root: string, happyId: string): Record<string, unknown> | null {
+    if (!happyId || !HTASK_SAFE_REF.test(happyId)) return null;
+    let cfg: unknown;
+    try {
+        cfg = JSON.parse(readFileSync(join(root, '.htask', 'cfg', `${happyId}.json`), 'utf8'));
+    } catch (error) {
+        logger.debug('[reply-monitor] cfg read skipped', error);
+        return null;
+    }
+    const taskId = cfg && typeof cfg === 'object' ? (cfg as { task_id?: unknown }).task_id : null;
+    if (typeof taskId !== 'string' || !HTASK_SAFE_REF.test(taskId)) return null;
+
+    try {
+        const parsed = JSON.parse(readFileSync(join(root, '.htask', 'task', `${taskId}.json`), 'utf8'));
+        if (!parsed || typeof parsed !== 'object') return null;
+        const task = (parsed as { task?: unknown }).task;
+        return task && typeof task === 'object' ? task as Record<string, unknown> : parsed as Record<string, unknown>;
+    } catch (error) {
+        logger.debug('[reply-monitor] task read failed', error);
+        return null;
+    }
+}
+
+export function createHtaskReplyMonitorRuntime(
+    session: ApiSessionClient,
+    flavor: BangCommandContext['flavor'],
+    idleMs = REPLY_MONITOR_ALERT_DELAY_MS,
+    pollMs = REPLY_MONITOR_POLL_INTERVAL_MS,
+): ReplyMonitorRuntime {
+    const titleSender = (summary: string) => {
+        session.sendClaudeSessionMessage({
+            type: 'summary',
+            summary,
+            leafUuid: randomUUID(),
+        } as never);
+    };
+
+    return new ReplyMonitorRuntime({
+        idleMs,
+        pollMs,
+        isEnabled: async () => {
+            const root = findHtaskRoot();
+            if (!root) return false;
+            const task = readReplyMonitorTask(root, session.sessionId);
+            return task?.reply_monitor === true;
+        },
+        canonicalTitle: async () => {
+            const root = findHtaskRoot();
+            return root ? htaskCanonicalTitle(root, session.sessionId, flavor) : null;
+        },
+        currentTitle: () => session.getSummaryText(),
+        sendTitle: titleSender,
+    });
+}
