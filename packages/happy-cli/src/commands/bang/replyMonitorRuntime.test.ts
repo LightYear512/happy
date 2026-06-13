@@ -233,6 +233,7 @@ describe('ReplyMonitorRuntime', () => {
         try {
             mkdirSync(join(root, '.happy', 'session-config'), { recursive: true });
             mkdirSync(join(root, '.htask', 'cfg'), { recursive: true });
+            mkdirSync(join(root, '.htask', 'lease', 'task'), { recursive: true });
             mkdirSync(join(root, '.htask', 'task'), { recursive: true });
             writeFileSync(join(root, '.happy', 'session-config', 'NATIVE-1.json'), JSON.stringify({
                 version: 1,
@@ -248,10 +249,24 @@ describe('ReplyMonitorRuntime', () => {
             writeFileSync(join(root, '.htask', 'cfg', 'STABLE-1.json'), JSON.stringify({
                 happy_id: 'STABLE-1',
                 task_id: 'HT-0001',
+                writer_lease: {
+                    token: 'stable-token',
+                    epoch: 1,
+                },
             }));
             writeFileSync(join(root, '.htask', 'cfg', 'NATIVE-1.json'), JSON.stringify({
                 happy_id: 'NATIVE-1',
                 task_id: 'HT-0001',
+                writer_lease: {
+                    token: 'stale-token',
+                    epoch: 1,
+                },
+            }));
+            writeFileSync(join(root, '.htask', 'lease', 'task', 'HT-0001.json'), JSON.stringify({
+                happy_id: 'STABLE-1',
+                task_id: 'HT-0001',
+                token: 'stable-token',
+                epoch: 1,
             }));
             writeFileSync(join(root, '.htask', 'task', 'HT-0001.json'), JSON.stringify({
                 task_id: 'HT-0001',
@@ -264,6 +279,43 @@ describe('ReplyMonitorRuntime', () => {
             expect(binding?.taskId).toBe('HT-0001');
             expect(binding?.task.reply_monitor).toBe(true);
             expect(resolveHtaskHappyId(root, 'NATIVE-1')).toBe('STABLE-1');
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
+    it('rejects direct htask cfg fallback unless its writer lease snapshot is current', () => {
+        const root = mkdtempSync(join(tmpdir(), 'reply-monitor-direct-binding-'));
+        try {
+            mkdirSync(join(root, '.htask', 'cfg'), { recursive: true });
+            mkdirSync(join(root, '.htask', 'lease', 'task'), { recursive: true });
+            mkdirSync(join(root, '.htask', 'task'), { recursive: true });
+            writeFileSync(join(root, '.htask', 'task', 'HT-0001.json'), JSON.stringify({
+                task_id: 'HT-0001',
+                title: '旧任务',
+                reply_monitor: true,
+            }));
+            writeFileSync(join(root, '.htask', 'cfg', 'NATIVE-OLD.json'), JSON.stringify({
+                happy_id: 'NATIVE-OLD',
+                task_id: 'HT-0001',
+                writer_lease: { token: 'old-token', epoch: 1 },
+            }));
+            writeFileSync(join(root, '.htask', 'cfg', 'NATIVE-CURRENT.json'), JSON.stringify({
+                happy_id: 'NATIVE-CURRENT',
+                task_id: 'HT-0001',
+                writer_lease: { token: 'current-token', epoch: 2 },
+            }));
+            writeFileSync(join(root, '.htask', 'lease', 'task', 'HT-0001.json'), JSON.stringify({
+                happy_id: 'NATIVE-CURRENT',
+                task_id: 'HT-0001',
+                token: 'current-token',
+                epoch: 2,
+            }));
+
+            expect(readReplyMonitorBinding(root, 'NATIVE-OLD')).toBeNull();
+            expect(resolveHtaskHappyId(root, 'NATIVE-OLD')).toBe('');
+            expect(readReplyMonitorBinding(root, 'NATIVE-CURRENT')?.happyId).toBe('NATIVE-CURRENT');
+            expect(resolveHtaskHappyId(root, 'NATIVE-CURRENT')).toBe('NATIVE-CURRENT');
         } finally {
             rmSync(root, { recursive: true, force: true });
         }

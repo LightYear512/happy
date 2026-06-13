@@ -199,6 +199,13 @@ function readBindingFromHtaskHappy(root: string, happyId: string, expectedTaskId
     const taskId = cfg?.task_id;
     if (!isSafeHtaskRef(taskId)) return null;
     if (expectedTaskId && taskId !== expectedTaskId) return null;
+    const cfgLease = cfg.writer_lease;
+    const lease = readJsonObject(join(root, '.htask', 'lease', 'task', `${taskId}.json`), `lease ${taskId}`);
+    if (!cfgLease || typeof cfgLease !== 'object' || Array.isArray(cfgLease) || !lease) return null;
+    const cfgLeaseRec = cfgLease as { token?: unknown; epoch?: unknown };
+    if (lease.happy_id !== happyId || lease.task_id !== taskId) return null;
+    if (!cfgLeaseRec.token || lease.token !== cfgLeaseRec.token) return null;
+    if (Number(lease.epoch || 0) !== Number(cfgLeaseRec.epoch || 0)) return null;
 
     const parsed = readJsonObject(join(root, '.htask', 'task', `${taskId}.json`), `task ${taskId}`);
     if (!parsed) return null;

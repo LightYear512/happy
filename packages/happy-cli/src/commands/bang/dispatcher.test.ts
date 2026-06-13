@@ -19,6 +19,9 @@ describe('isBangCommand', () => {
         expect(isBangCommand('@u')).toBe(true);
         expect(isBangCommand('@reminder')).toBe(true);
         expect(isBangCommand('@reply-monitor')).toBe(true);
+        expect(isBangCommand('A\n@reply-monitor | 回复监控开关')).toBe(true);
+        expect(isBangCommand('1、@reply-monitor｜回复监控开关')).toBe(true);
+        expect(isBangCommand('• @reminder｜设置/取消提示')).toBe(true);
         expect(isBangCommand('@usage')).toBe(false);
     });
 

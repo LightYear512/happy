@@ -178,7 +178,11 @@ function buildQuickSessionMenu(ctx: BangCommandContext): BangCommandResult {
 }
 
 function stripLeadingCommandDecorations(text: string): string {
-    return text.replace(/^(?:(?:[🟢💚💔🔵🚫🟣❇️]|[0-5]️⃣)\s*)+/u, '').trim();
+    return text
+        .replace(/^(?:(?:[🟢💚💔🔵🚫🟣❇️]|[0-5]️⃣)\s*)+/u, '')
+        .replace(/^(?:[A-Z]|\d+)[\s.、:：)）-]+(?=[!@])/iu, '')
+        .replace(/^[•·▪︎-]+\s*(?=[!@])/u, '')
+        .trim();
 }
 
 function stripOptionSuffix(text: string): string {
