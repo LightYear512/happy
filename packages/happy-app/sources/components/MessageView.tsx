@@ -55,7 +55,7 @@ function RenderBlock(props: {
       />;
 
     case 'agent-event':
-      return <AgentEventBlock event={props.message.event} metadata={props.metadata} />;
+      return <AgentEventBlock event={props.message.event} metadata={props.metadata} sessionId={props.sessionId} />;
 
 
     default:
@@ -109,7 +109,12 @@ function AgentTextBlock(props: {
 function AgentEventBlock(props: {
   event: AgentEvent;
   metadata: Metadata | null;
+  sessionId: string;
 }) {
+  const handleOptionPress = React.useCallback((option: Option) => {
+    sync.sendMessage(props.sessionId, option.title);
+  }, [props.sessionId]);
+
   if (props.event.type === 'switch') {
     return (
       <View style={styles.agentEventContainer}>
@@ -118,9 +123,16 @@ function AgentEventBlock(props: {
     );
   }
   if (props.event.type === 'message') {
+    if (!props.event.message.includes('<options>')) {
+      return (
+        <View style={styles.agentEventContainer}>
+          <Text style={styles.agentEventText}>{props.event.message}</Text>
+        </View>
+      );
+    }
     return (
-      <View style={styles.agentEventContainer}>
-        <Text style={styles.agentEventText}>{props.event.message}</Text>
+      <View style={[styles.agentEventContainer, styles.agentEventMessageContainer]}>
+        <MarkdownView markdown={props.event.message} onOptionPress={handleOptionPress} />
       </View>
     );
   }
@@ -207,6 +219,9 @@ const styles = StyleSheet.create((theme) => ({
     marginHorizontal: 8,
     alignItems: 'center',
     paddingVertical: 8,
+  },
+  agentEventMessageContainer: {
+    alignItems: 'stretch',
   },
   agentEventText: {
     color: theme.colors.agentEventText,
