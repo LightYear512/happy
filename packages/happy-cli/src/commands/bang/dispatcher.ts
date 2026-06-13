@@ -6,6 +6,7 @@ import { getCachedProfileUsageEntry, handleUsageBangCommand, type ProfileUsageEn
 import { handleTestBangCommand } from './testCommand';
 import { handleReminderBangCommand } from './reminderCommand';
 import { handleReplyMonitorBangCommand } from './replyMonitorCommand';
+import { handleTaskMessageAckBangCommand, handleTaskMessageDismissBangCommand } from './taskMessageCommand';
 import { SEPARATOR, type BangCommandContext, type BangCommandHandler, type BangCommandResult, type BangOptionSuggestion } from './types';
 import { getCurrentProfileForFlavor, readCcsProfiles, readCodexDefaultProfile, type AuthFlavor } from './ccsProfiles';
 
@@ -26,6 +27,8 @@ const commands: Record<string, { handler: BangCommandHandler; desc: string; load
     'restart-all': { handler: handleRestartAllBangCommand,  desc: '重启全部会话', consoleOnly: true },
     'reminder':    { handler: handleReminderBangCommand,    desc: '设置/取消提示', sessionOnly: true, hidden: true },
     'reply-monitor': { handler: handleReplyMonitorBangCommand, desc: '回复监控开关', sessionOnly: true, hidden: true },
+    'task-ack': { handler: handleTaskMessageAckBangCommand, desc: '确认任务消息', sessionOnly: true, hidden: true },
+    'task-dismiss': { handler: handleTaskMessageDismissBangCommand, desc: '忽略任务消息', sessionOnly: true, hidden: true },
     // TODO: !session / !open 暂停使用，待 multi-backend 会话浏览重构后恢复。实现保留在 sessionCommand.ts / openCommand.ts。
     // 'session':     { handler: handleSessionsBangCommand,    desc: '浏览项目目录和会话', loadingMsg: '⏳ 正在扫描会话...', consoleOnly: true },
     // 'open':        { handler: handleOpenBangCommand,        desc: '打开会话', loadingMsg: '⏳ 正在打开会话...', consoleOnly: true },
@@ -46,6 +49,8 @@ const aliases: Record<string, string> = {
     'u-codex': 'usage',
     reminder: 'reminder',
     'reply-monitor': 'reply-monitor',
+    'task-ack': 'task-ack',
+    'task-dismiss': 'task-dismiss',
     h: 'help',
     // s: 'session', // TODO: 暂停使用
 };

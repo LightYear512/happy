@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { logger } from '@/ui/logger';
 import type { ApiSessionClient } from '@/api/apiSession';
 import type { BangCommandContext } from './types';
+import { renderOptionsBlock, type BangOptionSuggestion } from './types';
 import { findHtaskRoot, htaskCanonicalTitle, runHtask } from './htaskCommand';
 
 export const REPLY_MONITOR_ALERT_DELAY_MS = 60_000;
@@ -29,6 +30,13 @@ export interface ReplyMonitorRuntimeOptions {
 export interface TaskMessageRecord {
     message_id: string;
     status: 'pending' | 'delivered' | 'acked' | 'dismissed' | string;
+    from_task_id?: string;
+    to_task_id?: string;
+    kind?: string;
+    body?: string;
+    ref?: string;
+    created_at?: string;
+    updated_at?: string;
 }
 
 export interface ReplyMonitorBinding {
@@ -146,16 +154,16 @@ export class ReplyMonitorRuntime {
             for (const message of messages) {
                 if (message.status === 'pending') {
                     const text = await this.deliverMessage(message.message_id);
-                    if (text) {
+                    if (text !== null) {
                         this.deliveredReminderIds.add(message.message_id);
-                        this.sendTaskMessage(text);
+                        this.sendTaskMessage(formatTaskMessageNotification(message));
                         this.debug(`[reply-monitor] task message delivered reason=${reason} message=${message.message_id}`);
                     }
                     continue;
                 }
                 if (message.status === 'delivered' && !this.deliveredReminderIds.has(message.message_id)) {
                     this.deliveredReminderIds.add(message.message_id);
-                    this.sendTaskMessage(`【任务消息待处理，不是用户原话；message_id=${message.message_id}】该消息已投递但尚未 ack/dismiss。`);
+                    this.sendTaskMessage(formatTaskMessageNotification(message));
                     this.debug(`[reply-monitor] task message pending acknowledgement reason=${reason} message=${message.message_id}`);
                 }
             }
@@ -179,6 +187,51 @@ function titleWithAlert(canonical: string): string {
 
 function isSafeHtaskRef(value: unknown): value is string {
     return typeof value === 'string' && HTASK_SAFE_REF.test(value);
+}
+
+function previewTaskMessageBody(body: unknown): string {
+    const text = typeof body === 'string'
+        ? body.replace(/\s+/g, ' ').trim()
+        : '';
+    if (!text) return '无正文';
+    const chars = Array.from(text);
+    if (chars.length <= 400) return text;
+    return `${chars.slice(0, 200).join('')} … ${chars.slice(-200).join('')}`;
+}
+
+function formatTaskMessageTime(createdAt: unknown): string {
+    if (typeof createdAt !== 'string' || !createdAt.trim()) return '时间未知';
+    const date = new Date(createdAt);
+    if (Number.isNaN(date.getTime())) return createdAt.trim();
+    const pad = (value: number) => value.toString().padStart(2, '0');
+    return [
+        `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`,
+        `${pad(date.getHours())}:${pad(date.getMinutes())}`,
+    ].join(' ');
+}
+
+function taskMessageActionOptions(message: TaskMessageRecord): BangOptionSuggestion[] {
+    const source = message.from_task_id || '外部';
+    const sentAt = formatTaskMessageTime(message.created_at);
+    const preview = previewTaskMessageBody(message.body);
+    return [
+        {
+            label: `任务消息｜来源 ${source}｜发送 ${sentAt}｜${preview}`,
+            disabled: true,
+        },
+        {
+            label: '已处理，确认',
+            value: `@task-ack ${message.message_id}`,
+        },
+        {
+            label: '重复/不处理，忽略',
+            value: `@task-dismiss ${message.message_id}`,
+        },
+    ];
+}
+
+export function formatTaskMessageNotification(message: TaskMessageRecord): string {
+    return renderOptionsBlock(taskMessageActionOptions(message));
 }
 
 function readJsonObject(path: string, debugLabel: string): Record<string, unknown> | null {
@@ -263,7 +316,7 @@ function parseTaskMessages(stdout: string): TaskMessageRecord[] {
     return parsed.messages.filter((message): message is TaskMessageRecord => {
         if (!message || typeof message !== 'object') return false;
         const rec = message as { message_id?: unknown; status?: unknown };
-        return typeof rec.message_id === 'string' && typeof rec.status === 'string';
+        return isSafeHtaskRef(rec.message_id) && typeof rec.status === 'string';
     });
 }
 

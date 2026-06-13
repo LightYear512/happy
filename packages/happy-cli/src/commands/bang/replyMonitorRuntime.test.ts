@@ -7,13 +7,14 @@ import {
     REPLY_MONITOR_POLL_INTERVAL_MS,
     ReplyMonitorRuntime,
     readReplyMonitorBinding,
+    type TaskMessageRecord,
 } from './replyMonitorRuntime';
 import { buildHtaskPromptPayload, resolveHtaskHappyId } from './htaskCommand';
 
 function createMonitor(options?: {
     enabled?: () => boolean;
     canonical?: () => string | null;
-    messages?: () => Array<{ message_id: string; status: string }> | Promise<Array<{ message_id: string; status: string }>>;
+    messages?: () => TaskMessageRecord[] | Promise<TaskMessageRecord[]>;
     deliver?: (messageId: string) => string | null | Promise<string | null>;
     initialTitle?: string | null;
     now?: () => number;
@@ -40,6 +41,16 @@ function createMonitor(options?: {
         },
     });
     return { monitor, titles, taskMessages, currentTitle: () => current };
+}
+
+function taskMessageOptions(messageId = 'TM-1', body = 'hello'): string {
+    return [
+        '<options>',
+        `<option disabled="true">任务消息｜来源 HT-0282｜发送 2026-06-13 15:46｜${body}</option>`,
+        `<option value="@task-ack ${messageId}">已处理，确认</option>`,
+        `<option value="@task-dismiss ${messageId}">重复/不处理，忽略</option>`,
+        '</options>',
+    ].join('\n');
 }
 
 describe('ReplyMonitorRuntime', () => {
@@ -149,16 +160,23 @@ describe('ReplyMonitorRuntime', () => {
 
     it('delivers one pending task message on the scanner poll', async () => {
         vi.useFakeTimers();
-        const deliver = vi.fn((messageId: string) => `【任务消息，不是用户原话；message_id=${messageId}】hello`);
+        const deliver = vi.fn(() => 'ignored htask inject text');
         const { monitor, taskMessages } = createMonitor({
-            messages: () => [{ message_id: 'TM-1', status: 'pending' }],
+            messages: () => [{
+                message_id: 'TM-1',
+                status: 'pending',
+                from_task_id: 'HT-0282',
+                created_at: '2026-06-13T15:46:03',
+                body: 'hello',
+            }],
             deliver,
         });
 
         await vi.advanceTimersByTimeAsync(2_000);
         expect(deliver).toHaveBeenCalledTimes(1);
         expect(deliver).toHaveBeenCalledWith('TM-1');
-        expect(taskMessages).toEqual(['【任务消息，不是用户原话；message_id=TM-1】hello']);
+        expect(taskMessages).toEqual([taskMessageOptions()]);
+        expect(taskMessages[0]).not.toContain('message_id=');
         monitor.dispose();
     });
 
@@ -167,40 +185,81 @@ describe('ReplyMonitorRuntime', () => {
         let status = 'pending';
         const deliver = vi.fn(() => {
             status = 'delivered';
-            return '【任务消息，不是用户原话；message_id=TM-1】hello';
+            return 'ignored htask inject text';
         });
         const { monitor, taskMessages } = createMonitor({
-            messages: () => [{ message_id: 'TM-1', status }],
+            messages: () => [{
+                message_id: 'TM-1',
+                status,
+                from_task_id: 'HT-0282',
+                created_at: '2026-06-13T15:46:03',
+                body: 'hello',
+            }],
             deliver,
         });
 
         await vi.advanceTimersByTimeAsync(2_000);
         await vi.advanceTimersByTimeAsync(2_000);
         expect(deliver).toHaveBeenCalledTimes(1);
-        expect(taskMessages).toEqual(['【任务消息，不是用户原话；message_id=TM-1】hello']);
+        expect(taskMessages).toEqual([taskMessageOptions()]);
         monitor.dispose();
     });
 
     it('sends one lightweight reminder for already delivered unacked messages', async () => {
         vi.useFakeTimers();
         const { monitor, taskMessages } = createMonitor({
-            messages: () => [{ message_id: 'TM-1', status: 'delivered' }],
+            messages: () => [{
+                message_id: 'TM-1',
+                status: 'delivered',
+                from_task_id: 'HT-0282',
+                created_at: '2026-06-13T15:46:03',
+                body: 'hello',
+            }],
         });
 
         await vi.advanceTimersByTimeAsync(2_000);
         await vi.advanceTimersByTimeAsync(2_000);
-        expect(taskMessages).toEqual(['【任务消息待处理，不是用户原话；message_id=TM-1】该消息已投递但尚未 ack/dismiss。']);
+        expect(taskMessages).toEqual([taskMessageOptions()]);
+        expect(taskMessages[0]).not.toContain('message_id=');
+        monitor.dispose();
+    });
+
+    it('truncates long task message bodies to the first and last 200 characters', async () => {
+        vi.useFakeTimers();
+        const head = 'A'.repeat(205);
+        const middle = 'MIDDLE-SHOULD-BE-HIDDEN';
+        const tail = 'B'.repeat(205);
+        const { monitor, taskMessages } = createMonitor({
+            messages: () => [{
+                message_id: 'TM-1',
+                status: 'delivered',
+                from_task_id: 'HT-0282',
+                created_at: '2026-06-13T15:46:03',
+                body: `${head}${middle}${tail}`,
+            }],
+        });
+
+        await vi.advanceTimersByTimeAsync(2_000);
+        expect(taskMessages).toHaveLength(1);
+        expect(taskMessages[0]).toContain(`${'A'.repeat(200)} … ${'B'.repeat(200)}`);
+        expect(taskMessages[0]).not.toContain(middle);
         monitor.dispose();
     });
 
     it('stops notifying after ack clears the pending message list', async () => {
         vi.useFakeTimers();
-        let messages: Array<{ message_id: string; status: string }> = [
-            { message_id: 'TM-1', status: 'pending' },
+        let messages: TaskMessageRecord[] = [
+            {
+                message_id: 'TM-1',
+                status: 'pending',
+                from_task_id: 'HT-0282',
+                created_at: '2026-06-13T15:46:03',
+                body: 'hello',
+            },
         ];
         const deliver = vi.fn(() => {
             messages = [];
-            return '【任务消息，不是用户原话；message_id=TM-1】hello';
+            return 'ignored htask inject text';
         });
         const { monitor, taskMessages } = createMonitor({
             messages: () => messages,
@@ -210,7 +269,7 @@ describe('ReplyMonitorRuntime', () => {
         await vi.advanceTimersByTimeAsync(2_000);
         await vi.advanceTimersByTimeAsync(2_000);
         expect(deliver).toHaveBeenCalledTimes(1);
-        expect(taskMessages).toEqual(['【任务消息，不是用户原话；message_id=TM-1】hello']);
+        expect(taskMessages).toEqual([taskMessageOptions()]);
         monitor.dispose();
     });
 

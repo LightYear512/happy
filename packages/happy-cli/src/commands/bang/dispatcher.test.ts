@@ -19,7 +19,10 @@ describe('isBangCommand', () => {
         expect(isBangCommand('@u')).toBe(true);
         expect(isBangCommand('@reminder')).toBe(true);
         expect(isBangCommand('@reply-monitor')).toBe(true);
+        expect(isBangCommand('@task-ack TM-2026-06-13T154603-354522Z-78772d21f1')).toBe(true);
+        expect(isBangCommand('@task-dismiss TM-2026-06-13T154603-354522Z-78772d21f1')).toBe(true);
         expect(isBangCommand('A\n@reply-monitor | 回复监控开关')).toBe(true);
+        expect(isBangCommand('2、@task-ack TM-1｜已处理，确认')).toBe(true);
         expect(isBangCommand('1、@reply-monitor｜回复监控开关')).toBe(true);
         expect(isBangCommand('• @reminder｜设置/取消提示')).toBe(true);
         expect(isBangCommand('@usage')).toBe(false);
@@ -28,6 +31,7 @@ describe('isBangCommand', () => {
     it('should reject non-bang messages', () => {
         expect(isBangCommand('hello')).toBe(false);
         expect(isBangCommand('/compact')).toBe(false);
+        expect(isBangCommand('请确认 @task-ack TM-1')).toBe(false);
         expect(isBangCommand('')).toBe(false);
     });
 
@@ -77,6 +81,8 @@ describe('executeBangCommand aliases', () => {
         expect(menu.suggestions).toContain('@a｜切换账号');
         expect(menu.suggestions).toContain('@reminder｜设置/取消提示');
         expect(menu.suggestions).toContain('@reply-monitor｜回复监控开关');
+        expect(menu.suggestions?.join('\n')).not.toContain('@task-ack');
+        expect(menu.suggestions?.join('\n')).not.toContain('@task-dismiss');
 
         const legacyMenu = await executeBangCommand('@@', ctx);
         expect(legacyMenu.suggestions).toContain('@reply-monitor｜回复监控开关');
