@@ -24,7 +24,7 @@ export interface ReplyMonitorRuntimeOptions {
     taskMessageReminderMs?: number;
     currentTitle?: () => string | null;
     sendTitle: (title: string) => void;
-    sendTaskMessage?: (message: string) => void;
+    sendTaskMessage?: (message: string, visibleFallback?: string) => void;
     now?: () => number;
     debug?: (message: string, error?: unknown) => void;
 }
@@ -166,14 +166,14 @@ export class ReplyMonitorRuntime {
                     const text = await this.deliverMessage(message.message_id);
                     if (text !== null) {
                         this.recordTaskMessageReminder(message.message_id);
-                        this.sendTaskMessage(formatTaskMessageNotification(message));
+                        this.sendTaskMessage(formatTaskMessageNotification(message), formatTaskMessagePlainNotification(message));
                         this.debug(`[reply-monitor] task message delivered reason=${reason} message=${message.message_id}`);
                     }
                     continue;
                 }
                 if (message.status === 'delivered' && this.shouldSendTaskMessageReminder(message.message_id)) {
                     this.recordTaskMessageReminder(message.message_id);
-                    this.sendTaskMessage(formatTaskMessageNotification(message));
+                    this.sendTaskMessage(formatTaskMessageNotification(message), formatTaskMessagePlainNotification(message));
                     this.debug(`[reply-monitor] task message pending acknowledgement reason=${reason} message=${message.message_id}`);
                 }
             }
@@ -251,6 +251,17 @@ function taskMessageActionOptions(message: TaskMessageRecord): BangOptionSuggest
 
 export function formatTaskMessageNotification(message: TaskMessageRecord): string {
     return renderOptionsBlock(taskMessageActionOptions(message));
+}
+
+export function formatTaskMessagePlainNotification(message: TaskMessageRecord): string {
+    const source = message.from_task_id || '外部';
+    const sentAt = formatTaskMessageTime(message.created_at);
+    const preview = previewTaskMessageBody(message.body);
+    return [
+        `任务消息｜来源 ${source}｜发送 ${sentAt}`,
+        preview,
+        '操作按钮已另行发送；如果按钮未出现，请刷新客户端。',
+    ].join('\n');
 }
 
 function readJsonObject(path: string, debugLabel: string): Record<string, unknown> | null {
@@ -393,6 +404,9 @@ export function createHtaskReplyMonitorRuntime(
         },
         currentTitle: () => session.getSummaryText(),
         sendTitle: titleSender,
-        sendTaskMessage: message => session.sendSessionEvent({ type: 'message', message }),
+        sendTaskMessage: (message, visibleFallback) => {
+            session.sendSessionEvent({ type: 'message', message: visibleFallback ?? message });
+            session.sendCodexMessage({ type: 'message', message });
+        },
     });
 }

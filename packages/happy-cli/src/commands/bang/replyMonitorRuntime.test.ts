@@ -7,6 +7,7 @@ import {
     REPLY_MONITOR_POLL_INTERVAL_MS,
     ReplyMonitorRuntime,
     TASK_MESSAGE_REMINDER_INTERVAL_MS,
+    formatTaskMessagePlainNotification,
     readReplyMonitorBinding,
     type TaskMessageRecord,
 } from './replyMonitorRuntime';
@@ -257,6 +258,51 @@ describe('ReplyMonitorRuntime', () => {
         expect(taskMessages).toHaveLength(1);
         expect(taskMessages[0]).toContain(`${'A'.repeat(200)} … ${'B'.repeat(200)}`);
         expect(taskMessages[0]).not.toContain(middle);
+        monitor.dispose();
+    });
+
+    it('formats the visible task message fallback without option XML or message ids', () => {
+        const text = formatTaskMessagePlainNotification({
+            message_id: 'TM-1',
+            status: 'delivered',
+            from_task_id: 'HT-0282',
+            created_at: '2026-06-13T15:46:03',
+            body: 'hello',
+        });
+
+        expect(text).toContain('任务消息｜来源 HT-0282｜发送 2026-06-13 15:46');
+        expect(text).toContain('hello');
+        expect(text).not.toContain('<options>');
+        expect(text).not.toContain('<option');
+        expect(text).not.toContain('TM-1');
+    });
+
+    it('passes a plain visible fallback alongside the clickable options payload', async () => {
+        vi.useFakeTimers();
+        const calls: Array<{ options: string; fallback?: string }> = [];
+        const monitor = new ReplyMonitorRuntime({
+            idleMs: REPLY_MONITOR_ALERT_DELAY_MS,
+            pollMs: 2_000,
+            isEnabled: () => true,
+            canonicalTitle: () => '🔵 [0001-任务 0/1] 做事',
+            pendingMessages: () => [{
+                message_id: 'TM-1',
+                status: 'delivered',
+                from_task_id: 'HT-0282',
+                created_at: '2026-06-13T15:46:03',
+                body: 'hello',
+            }],
+            currentTitle: () => null,
+            sendTitle: () => undefined,
+            sendTaskMessage: (options, fallback) => calls.push({ options, fallback }),
+        });
+
+        await vi.advanceTimersByTimeAsync(2_000);
+        expect(calls).toHaveLength(1);
+        expect(calls[0].options).toContain('<options>');
+        expect(calls[0].fallback).toContain('任务消息｜来源 HT-0282');
+        expect(calls[0].fallback).not.toContain('<options>');
+        expect(calls[0].fallback).not.toContain('TM-1');
         monitor.dispose();
     });
 
