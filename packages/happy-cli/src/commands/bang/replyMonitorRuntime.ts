@@ -304,14 +304,22 @@ export function sendTaskMessageToSession(
     visibleFallback?: string,
     options?: BangOptionSuggestion[],
 ): void {
+    if (visibleFallback) {
+        logger.debug('[reply-monitor] task message sending fallback event');
+        session.sendSessionEvent({ type: 'message', message: visibleFallback });
+    }
     if (options && options.length > 0) {
+        logger.debug(`[reply-monitor] task message sending options event count=${options.length}`);
         session.sendSessionEvent({
             type: 'options',
             options: options.map(normalizeOptionSuggestion),
         });
         return;
     }
-    session.sendSessionEvent({ type: 'message', message: visibleFallback ?? message });
+    if (!visibleFallback) {
+        logger.debug('[reply-monitor] task message sending message event');
+        session.sendSessionEvent({ type: 'message', message });
+    }
 }
 
 function readJsonObject(path: string, debugLabel: string): Record<string, unknown> | null {

@@ -328,6 +328,10 @@ describe('ReplyMonitorRuntime', () => {
         expect(codexMessages).toEqual([]);
         expect(events).toEqual([
             {
+                type: 'message',
+                message: 'plain fallback',
+            },
+            {
                 type: 'options',
                 options: [
                     { label: '任务消息｜来源 HT-0282｜发送 2026-06-13 15:46｜hello', disabled: true },
