@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { isBangCommand, buildConsoleWelcome, executeBangCommand, SEPARATOR } from './dispatcher';
-import type { BangOptionSuggestion } from './types';
+import { renderOptionSuggestion, type BangOptionSuggestion } from './types';
+import { buildTaskMessageActionSuggestions } from './taskMessageCommand';
 
 function optionLabel(option: BangOptionSuggestion): string {
     return typeof option === 'string' ? option : option.label;
@@ -19,6 +20,8 @@ describe('isBangCommand', () => {
         expect(isBangCommand('@u')).toBe(true);
         expect(isBangCommand('@reminder')).toBe(true);
         expect(isBangCommand('@reply-monitor')).toBe(true);
+        expect(isBangCommand('@task')).toBe(true);
+        expect(isBangCommand('@task-ack m12-1｜1 已处理，确认')).toBe(true);
         expect(isBangCommand('@task-ack TM-2026-06-13T154603-354522Z-78772d21f1')).toBe(true);
         expect(isBangCommand('@task-dismiss TM-2026-06-13T154603-354522Z-78772d21f1')).toBe(true);
         expect(isBangCommand('A\n@reply-monitor | 回复监控开关')).toBe(true);
@@ -83,6 +86,7 @@ describe('executeBangCommand aliases', () => {
         expect(menu.suggestions).toContain('@reply-monitor｜回复监控开关');
         expect(menu.suggestions?.join('\n')).not.toContain('@task-ack');
         expect(menu.suggestions?.join('\n')).not.toContain('@task-dismiss');
+        expect(menu.suggestions?.join('\n')).not.toContain('@task｜');
 
         const legacyMenu = await executeBangCommand('@@', ctx);
         expect(legacyMenu.suggestions).toContain('@reply-monitor｜回复监控开关');
@@ -90,6 +94,23 @@ describe('executeBangCommand aliases', () => {
         const consoleMenu = await executeBangCommand('@', { ...ctx, isConsoleSession: true });
         expect(consoleMenu.suggestions?.join('\n')).not.toContain('@reminder');
         expect(consoleMenu.suggestions?.join('\n')).not.toContain('@reply-monitor');
+    });
+});
+
+describe('@task action suggestions', () => {
+    it('uses hidden durable values instead of visible volatile refs', () => {
+        const suggestions = buildTaskMessageActionSuggestions([
+            { message_id: 'TM-2026-06-13T152633-813599Z-ef493ff1c5' },
+        ]);
+
+        expect(suggestions).toEqual([
+            { label: '1 已处理，确认', value: '@task-ack TM-2026-06-13T152633-813599Z-ef493ff1c5' },
+            { label: '1 重复/不处理，忽略', value: '@task-dismiss TM-2026-06-13T152633-813599Z-ef493ff1c5' },
+        ]);
+        expect(renderOptionSuggestion(suggestions[0])).toBe(
+            '<option value="@task-ack TM-2026-06-13T152633-813599Z-ef493ff1c5">1 已处理，确认</option>',
+        );
+        expect(renderOptionSuggestion(suggestions[0])).not.toContain('m1-1');
     });
 });
 

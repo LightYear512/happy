@@ -6,7 +6,7 @@ import { getCachedProfileUsageEntry, handleUsageBangCommand, type ProfileUsageEn
 import { handleTestBangCommand } from './testCommand';
 import { handleReminderBangCommand } from './reminderCommand';
 import { handleReplyMonitorBangCommand } from './replyMonitorCommand';
-import { handleTaskMessageAckBangCommand, handleTaskMessageDismissBangCommand } from './taskMessageCommand';
+import { buildTaskMessageMenuSuggestions, handleTaskMessageAckBangCommand, handleTaskMessageDismissBangCommand, handleTaskMessagesBangCommand } from './taskMessageCommand';
 import { SEPARATOR, type BangCommandContext, type BangCommandHandler, type BangCommandResult, type BangOptionSuggestion } from './types';
 import { getCurrentProfileForFlavor, readCcsProfiles, readCodexDefaultProfile, type AuthFlavor } from './ccsProfiles';
 
@@ -27,6 +27,7 @@ const commands: Record<string, { handler: BangCommandHandler; desc: string; load
     'restart-all': { handler: handleRestartAllBangCommand,  desc: '重启全部会话', consoleOnly: true },
     'reminder':    { handler: handleReminderBangCommand,    desc: '设置/取消提示', sessionOnly: true, hidden: true },
     'reply-monitor': { handler: handleReplyMonitorBangCommand, desc: '回复监控开关', sessionOnly: true, hidden: true },
+    'task': { handler: handleTaskMessagesBangCommand, desc: '任务消息', sessionOnly: true, hidden: true },
     'task-ack': { handler: handleTaskMessageAckBangCommand, desc: '确认任务消息', sessionOnly: true, hidden: true },
     'task-dismiss': { handler: handleTaskMessageDismissBangCommand, desc: '忽略任务消息', sessionOnly: true, hidden: true },
     // TODO: !session / !open 暂停使用，待 multi-backend 会话浏览重构后恢复。实现保留在 sessionCommand.ts / openCommand.ts。
@@ -49,6 +50,7 @@ const aliases: Record<string, string> = {
     'u-codex': 'usage',
     reminder: 'reminder',
     'reply-monitor': 'reply-monitor',
+    task: 'task',
     'task-ack': 'task-ack',
     'task-dismiss': 'task-dismiss',
     h: 'help',
@@ -159,11 +161,12 @@ function formatCurrentUsage(entry: ProfileUsageEntry | null): string[] {
     return parts.length > 0 ? parts : ['用量未知'];
 }
 
-function buildQuickSessionMenu(ctx: BangCommandContext): BangCommandResult {
+async function buildQuickSessionMenu(ctx: BangCommandContext): Promise<BangCommandResult> {
     const flavor: AuthFlavor = ctx.flavor === 'codex' ? 'codex' : 'claude';
     const defaultProfile = flavor === 'codex' ? readCodexDefaultProfile() : readCcsProfiles().defaultProfile;
     const currentProfile = getCurrentProfileForFlavor(flavor) ?? defaultProfile;
     const usage = currentProfile ? getCachedProfileUsageEntry(currentProfile, flavor) : null;
+    const taskMessageSuggestions = await buildTaskMessageMenuSuggestions(ctx);
     const parts = [
         `当前账号：${currentProfile ?? '未知'}`,
         flavor === 'codex' ? 'Codex' : 'Claude',
@@ -174,6 +177,7 @@ function buildQuickSessionMenu(ctx: BangCommandContext): BangCommandResult {
         message: parts.join('｜'),
         action: 'none',
         suggestions: [
+            ...taskMessageSuggestions,
             compactOption('@u', '当前账号流量'),
             compactOption('@a', '切换账号'),
             compactOption('@reminder', '设置/取消提示'),
@@ -355,7 +359,7 @@ export async function executeBangCommand(text: string, ctx: BangCommandContext):
     // Short aliases moved from !a/!h/!u to @a/@h/@u.
     if (prefix === ALIAS_PREFIX) {
         if (name === '@') {
-            return ctx.isConsoleSession ? buildConsoleWelcome() : buildQuickSessionMenu(ctx);
+            return ctx.isConsoleSession ? buildConsoleWelcome() : await buildQuickSessionMenu(ctx);
         }
         if (!aliases[name]) {
             return withMainMenuOption({

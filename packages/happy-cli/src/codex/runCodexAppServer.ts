@@ -321,7 +321,6 @@ export async function runCodexWithAppServer(opts: {
         permissionMode: mode.permissionMode,
         model: mode.model,
     }));
-    const replyMonitor = createHtaskReplyMonitorRuntime(session, 'codex');
 
     // Race-recovery mirror of user prompts; snapshot is consumed by
     // /compact's seed builder to cover prompts not yet flushed to
@@ -330,6 +329,14 @@ export async function runCodexWithAppServer(opts: {
 
     let currentPermissionMode: PermissionMode | undefined = undefined;
     let currentModel: string | undefined = undefined;
+    const replyMonitor = createHtaskReplyMonitorRuntime(session, 'codex', undefined, undefined, (text) => {
+        const enhancedMode: EnhancedMode = {
+            permissionMode: currentPermissionMode || 'default',
+            model: currentModel,
+        };
+        logger.debug(`[CodexAppServer] Enqueueing delivered task message: "${text.substring(0, 80)}"`);
+        messageQueue.push(text, enhancedMode);
+    });
 
     session.onUserMessage((message) => {
         let messagePermissionMode = currentPermissionMode;
@@ -917,7 +924,7 @@ export async function runCodexWithAppServer(opts: {
                     break;
 
                 case 'task-started': {
-                    replyMonitor.observeReceiveActivity('task-started');
+                    replyMonitor.beginActiveReply('task-started');
                     activeTurnId = update.turnId;
                     if (!thinking) {
                         logger.debug('[CodexAppServer] thinking started');
@@ -939,7 +946,7 @@ export async function runCodexWithAppServer(opts: {
                 }
 
                 case 'task-complete': {
-                    replyMonitor.observeReceiveActivity('task-complete');
+                    replyMonitor.endActiveReply('task-complete');
                     if (thinking) {
                         logger.debug('[CodexAppServer] thinking completed');
                         thinking = false;
@@ -956,7 +963,7 @@ export async function runCodexWithAppServer(opts: {
                 }
 
                 case 'turn-aborted': {
-                    replyMonitor.observeReceiveActivity('turn-aborted');
+                    replyMonitor.endActiveReply('turn-aborted');
                     // Flush any partial agent text
                     const partialText = pendingAgentText.trim();
                     if (partialText) {
@@ -1004,7 +1011,7 @@ export async function runCodexWithAppServer(opts: {
             const detail = error instanceof Error ? error.message : String(error);
             logger.debug(`[CodexAppServer] Error during abort: ${detail}`);
         } finally {
-            replyMonitor.observeReceiveActivity('abort');
+            replyMonitor.endActiveReply('abort');
         }
     }
 
@@ -1193,7 +1200,7 @@ export async function runCodexWithAppServer(opts: {
                 return;
             }
 
-            replyMonitor.observeReceiveActivity('error');
+            replyMonitor.endActiveReply('error');
             logger.warn('[CodexAppServer] Codex error notification:', params);
             session.sendSessionEvent({
                 type: 'message',
@@ -1458,6 +1465,7 @@ export async function runCodexWithAppServer(opts: {
                 }
 
                 logger.debug(`[CodexAppServer] Starting turn on thread ${threadId}`);
+                replyMonitor.beginActiveReply('turn-start');
 
                 // turn/start RPC returns immediately with turnId; the turn itself
                 // completes asynchronously via turn/completed notification. Set up
@@ -1503,7 +1511,7 @@ export async function runCodexWithAppServer(opts: {
                 logger.debug('[CodexAppServer] Turn fully completed');
             } catch (error) {
                 logger.warn('[CodexAppServer] Error in app-server session:', error);
-                replyMonitor.observeReceiveActivity('turn-error');
+                replyMonitor.endActiveReply('turn-error');
                 // Settle the pending promise on RPC failure (the only path that
                 // legitimately rejects). Idempotent if it was already settled
                 // by an error notification handler that beat us here.
@@ -1518,6 +1526,7 @@ export async function runCodexWithAppServer(opts: {
                     session.sendSessionEvent({ type: 'message', message: `Error: ${errorMessage}` });
                 }
             } finally {
+                replyMonitor.endActiveReply('turn-finally');
                 permissionHandler.reset();
                 reasoningProcessor.abort();
                 diffProcessor.reset();

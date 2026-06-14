@@ -16,6 +16,7 @@ import { extractSDKMetadataAsync } from '@/claude/sdk/metadataExtractor';
 import { parseSpecialCommand } from '@/parsers/specialCommands';
 import { isBangCommand, executeBangCommand, hasActiveInteractiveSession, handleInteractiveInput, buildConsoleWelcome, buildSessionWelcome } from '@/commands/bang/dispatcher';
 import { renderOptionsBlock } from '@/commands/bang/types';
+import { findHtaskRoot, restoreHtaskSessionConfig } from '@/commands/bang/htaskCommand';
 import { getEnvironmentInfo } from '@/ui/doctor';
 import { configuration } from '@/configuration';
 import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
@@ -215,6 +216,12 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // Create realtime session BEFORE extractSDKMetadataAsync to avoid creating
     // a second session-scoped WebSocket that triggers stale-socket kicking
     const session = api.sessionSyncClient(response);
+    const htaskRoot = findHtaskRoot();
+    const restoreHtaskProjection = (reason: string) => {
+        if (!htaskRoot || !session.sessionId) return;
+        void restoreHtaskSessionConfig(htaskRoot, session.sessionId, reason);
+    };
+    restoreHtaskProjection(options.restoreSessionId ? 'claude-restore' : 'claude-start');
 
     // Extract SDK metadata in background and update session when ready
     // Skip for console sessions — they don't use Claude SDK and the SDK query
@@ -704,6 +711,9 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         onSessionReady: (sessionInstance) => {
             // Store reference for hook server callback
             currentSession = sessionInstance;
+            sessionInstance.addSessionFoundCallback(() => {
+                restoreHtaskProjection('claude-session-found');
+            });
         },
         mcpServers: {
             'happy': {

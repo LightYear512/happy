@@ -231,12 +231,19 @@ export async function runCodex(opts: {
         permissionMode: mode.permissionMode,
         model: mode.model,
     }));
-    const replyMonitor = createHtaskReplyMonitorRuntime(session, 'codex');
 
     // Track current overrides to apply per message
     // Use shared PermissionMode type from api/types for cross-agent compatibility
     let currentPermissionMode: import('@/api/types').PermissionMode | undefined = undefined;
     let currentModel: string | undefined = undefined;
+    const replyMonitor = createHtaskReplyMonitorRuntime(session, 'codex', undefined, undefined, (text) => {
+        const enhancedMode: EnhancedMode = {
+            permissionMode: currentPermissionMode || 'default',
+            model: currentModel,
+        };
+        logger.debug(`[Codex] Enqueueing delivered task message: "${text.substring(0, 80)}"`);
+        messageQueue.push(text, enhancedMode);
+    });
 
     session.onUserMessage((message) => {
         // Resolve permission mode (accept all modes, will be mapped in switch statement)
@@ -405,7 +412,7 @@ export async function runCodex(opts: {
             
             abortController.abort();
             reasoningProcessor.abort();
-            replyMonitor.observeReceiveActivity('abort');
+            replyMonitor.endActiveReply('abort');
             logger.debug('[Codex] Abort completed - session remains active');
         } catch (error) {
             logger.debug('[Codex] Error during abort:', error);
@@ -622,10 +629,10 @@ export async function runCodex(opts: {
                 'result'
             );
         } else if (msg.type === 'task_started') {
-            replyMonitor.observeReceiveActivity('task-started');
+            replyMonitor.beginActiveReply('task-started');
             messageBuffer.addMessage('Starting task...', 'status');
         } else if (msg.type === 'task_complete') {
-            replyMonitor.observeReceiveActivity('task-complete');
+            replyMonitor.endActiveReply('task-complete');
             messageBuffer.addMessage('Task completed', 'status');
             // Auto-update session title on first task completion
             if (first && msg.last_agent_message) {
@@ -641,7 +648,7 @@ export async function runCodex(opts: {
             }
             sendReady();
         } else if (msg.type === 'turn_aborted') {
-            replyMonitor.observeReceiveActivity('turn-aborted');
+            replyMonitor.endActiveReply('turn-aborted');
             messageBuffer.addMessage('Turn aborted', 'status');
             sendReady();
         }
@@ -865,6 +872,7 @@ export async function runCodex(opts: {
             // Display user messages in the UI
             messageBuffer.addMessage(message.message, 'user');
             currentModeHash = message.hash;
+            replyMonitor.beginActiveReply('turn-start');
 
             try {
                 // Map permission mode to approval policy and sandbox for startSession
@@ -955,6 +963,7 @@ export async function runCodex(opts: {
                     }
                 }
             } finally {
+                replyMonitor.endActiveReply('turn-finally');
                 // Reset permission handler, reasoning processor, and diff processor
                 permissionHandler.reset();
                 reasoningProcessor.abort();  // Use abort to properly finish any in-progress tool calls

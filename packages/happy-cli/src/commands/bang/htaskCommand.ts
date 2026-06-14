@@ -16,11 +16,17 @@ export function findHtaskRoot(): string | null {
     }
 }
 
-export function runHtask(root: string, args: string[], input = ''): Promise<{ code: number; stdout: string; stderr: string }> {
+export function runHtask(
+    root: string,
+    args: string[],
+    input = '',
+    env?: Record<string, string | undefined>,
+): Promise<{ code: number; stdout: string; stderr: string }> {
     return new Promise((resolveRun, reject) => {
         const child = spawn('python3', [join(root, '.agents', 'htask', 'htask.py'), ...args], {
             cwd: root,
             stdio: ['pipe', 'pipe', 'pipe'],
+            env: env ? { ...process.env, ...env } : process.env,
         });
         let stdout = '';
         let stderr = '';
@@ -115,6 +121,21 @@ export function buildHtaskPromptPayload(sessionId: string, happyId: string, prom
         payload.native_session_id = sessionId;
     }
     return JSON.stringify(payload);
+}
+
+export async function restoreHtaskSessionConfig(root: string, sessionId: string, reason: string): Promise<boolean> {
+    if (!isSafeHtaskRef(sessionId)) return false;
+    const result = await runHtask(root, ['session-config-restore', '--reason', reason], '', {
+        HTASK_SESSION_CONFIG_ID: sessionId,
+        HAPPY_SESSION_ID: sessionId,
+        HAPPY_CHAT_ID: sessionId,
+    });
+    if (result.code !== 0) {
+        logger.debug(`[bang:htask] session-config restore skipped: ${result.stderr || result.stdout}`);
+        return false;
+    }
+    logger.debug(`[bang:htask] session-config restored: ${result.stdout.trim()}`);
+    return true;
 }
 
 export function htaskBlock(text: string, pattern: RegExp): string | null {

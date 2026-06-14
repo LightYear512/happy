@@ -26,6 +26,7 @@ function createMonitor(options?: {
 }) {
     const titles: string[] = [];
     const taskMessages: string[] = [];
+    const enqueuedTaskMessages: string[] = [];
     let current = options?.initialTitle ?? null;
     const monitor = new ReplyMonitorRuntime({
         idleMs: REPLY_MONITOR_ALERT_DELAY_MS,
@@ -41,11 +42,14 @@ function createMonitor(options?: {
             current = title;
             titles.push(title);
         },
+        enqueueTaskMessage: message => {
+            enqueuedTaskMessages.push(message);
+        },
         sendTaskMessage: message => {
             taskMessages.push(message);
         },
     });
-    return { monitor, titles, taskMessages, currentTitle: () => current };
+    return { monitor, titles, taskMessages, enqueuedTaskMessages, currentTitle: () => current };
 }
 
 function taskMessageOptions(messageId = 'TM-1'): string {
@@ -67,7 +71,7 @@ describe('ReplyMonitorRuntime', () => {
         const { monitor, titles } = createMonitor();
 
         expect(REPLY_MONITOR_POLL_INTERVAL_MS).toBe(2_000);
-        expect(REPLY_MONITOR_ALERT_DELAY_MS).toBe(60_000);
+        expect(REPLY_MONITOR_ALERT_DELAY_MS).toBe(20_000);
         expect(TASK_MESSAGE_REMINDER_INTERVAL_MS).toBe(60_000);
 
         await vi.advanceTimersByTimeAsync(1_999);
@@ -86,7 +90,7 @@ describe('ReplyMonitorRuntime', () => {
         await vi.advanceTimersByTimeAsync(2_000);
         expect(titles).toEqual(['🔵 [0001-任务 0/1] 做事']);
 
-        await vi.advanceTimersByTimeAsync(57_999);
+        await vi.advanceTimersByTimeAsync(17_999);
         expect(titles).toEqual(['🔵 [0001-任务 0/1] 做事']);
 
         await vi.advanceTimersByTimeAsync(1);
@@ -104,7 +108,7 @@ describe('ReplyMonitorRuntime', () => {
 
         monitor.observeUserMessage();
         enabled = false;
-        await vi.advanceTimersByTimeAsync(60_000);
+        await vi.advanceTimersByTimeAsync(20_000);
         expect(titles).toEqual(['🔵 [0001-任务 0/1] 做事']);
         monitor.dispose();
     });
@@ -114,9 +118,30 @@ describe('ReplyMonitorRuntime', () => {
         const { monitor, titles } = createMonitor();
 
         monitor.observeUserMessage();
-        await vi.advanceTimersByTimeAsync(44_000);
+        await vi.advanceTimersByTimeAsync(14_000);
         monitor.observeReceiveActivity('text');
-        await vi.advanceTimersByTimeAsync(59_999);
+        await vi.advanceTimersByTimeAsync(19_999);
+        expect(titles).toEqual(['🔵 [0001-任务 0/1] 做事']);
+
+        await vi.advanceTimersByTimeAsync(1);
+        expect(titles).toEqual([
+            '🔵 [0001-任务 0/1] 做事',
+            '⚠️ 🔵 [0001-任务 0/1] 做事',
+        ]);
+        monitor.dispose();
+    });
+
+    it('does not alert while an agent turn is still active', async () => {
+        vi.useFakeTimers();
+        const { monitor, titles } = createMonitor();
+
+        monitor.observeUserMessage();
+        monitor.beginActiveReply('turn-start');
+        await vi.advanceTimersByTimeAsync(120_000);
+        expect(titles).toEqual(['🔵 [0001-任务 0/1] 做事']);
+
+        monitor.endActiveReply('turn-complete');
+        await vi.advanceTimersByTimeAsync(19_999);
         expect(titles).toEqual(['🔵 [0001-任务 0/1] 做事']);
 
         await vi.advanceTimersByTimeAsync(1);
@@ -134,7 +159,7 @@ describe('ReplyMonitorRuntime', () => {
         });
 
         monitor.observeUserMessage();
-        await vi.advanceTimersByTimeAsync(60_000);
+        await vi.advanceTimersByTimeAsync(20_000);
         expect(titles).toEqual([
             '❇️ 🔅 🔵 [0001-任务 0/1] 做事',
             '❇️ ⚠️ 🔅 🔵 [0001-任务 0/1] 做事',
@@ -155,18 +180,18 @@ describe('ReplyMonitorRuntime', () => {
         const { monitor, titles } = createMonitor();
 
         monitor.observeUserMessage();
-        await vi.advanceTimersByTimeAsync(45_000);
+        await vi.advanceTimersByTimeAsync(15_000);
         monitor.observeReceiveActivity('text');
         monitor.stopMonitoring('kill');
-        await vi.advanceTimersByTimeAsync(60_000);
+        await vi.advanceTimersByTimeAsync(20_000);
         expect(titles).toEqual(['🔵 [0001-任务 0/1] 做事']);
         monitor.dispose();
     });
 
     it('delivers one pending task message on the scanner poll', async () => {
         vi.useFakeTimers();
-        const deliver = vi.fn(() => 'ignored htask inject text');
-        const { monitor, taskMessages } = createMonitor({
+        const deliver = vi.fn(() => 'htask inject text');
+        const { monitor, taskMessages, enqueuedTaskMessages } = createMonitor({
             messages: () => [{
                 message_id: 'TM-1',
                 status: 'pending',
@@ -180,6 +205,7 @@ describe('ReplyMonitorRuntime', () => {
         await vi.advanceTimersByTimeAsync(2_000);
         expect(deliver).toHaveBeenCalledTimes(1);
         expect(deliver).toHaveBeenCalledWith('TM-1');
+        expect(enqueuedTaskMessages).toEqual(['htask inject text']);
         expect(taskMessages).toEqual([taskMessageOptions()]);
         expect(taskMessages[0]).not.toContain('message_id=');
         monitor.dispose();
@@ -190,9 +216,9 @@ describe('ReplyMonitorRuntime', () => {
         let status = 'pending';
         const deliver = vi.fn(() => {
             status = 'delivered';
-            return 'ignored htask inject text';
+            return 'htask inject text';
         });
-        const { monitor, taskMessages } = createMonitor({
+        const { monitor, taskMessages, enqueuedTaskMessages } = createMonitor({
             taskMessageReminderMs: 10_000,
             messages: () => [{
                 message_id: 'TM-1',
@@ -207,17 +233,19 @@ describe('ReplyMonitorRuntime', () => {
         await vi.advanceTimersByTimeAsync(2_000);
         await vi.advanceTimersByTimeAsync(2_000);
         expect(deliver).toHaveBeenCalledTimes(1);
+        expect(enqueuedTaskMessages).toEqual(['htask inject text']);
         expect(taskMessages).toEqual([taskMessageOptions()]);
         await vi.advanceTimersByTimeAsync(7_999);
         expect(taskMessages).toHaveLength(1);
         await vi.advanceTimersByTimeAsync(1);
         expect(taskMessages).toEqual([taskMessageOptions(), taskMessageOptions()]);
+        expect(enqueuedTaskMessages).toEqual(['htask inject text']);
         monitor.dispose();
     });
 
     it('repeats lightweight reminders for already delivered unacked messages until ack or dismiss', async () => {
         vi.useFakeTimers();
-        const { monitor, taskMessages } = createMonitor({
+        const { monitor, taskMessages, enqueuedTaskMessages } = createMonitor({
             taskMessageReminderMs: 10_000,
             messages: () => [{
                 message_id: 'TM-1',
@@ -230,6 +258,7 @@ describe('ReplyMonitorRuntime', () => {
 
         await vi.advanceTimersByTimeAsync(2_000);
         await vi.advanceTimersByTimeAsync(2_000);
+        expect(enqueuedTaskMessages).toEqual([]);
         expect(taskMessages).toEqual([taskMessageOptions()]);
         expect(taskMessages[0]).not.toContain('message_id=');
         await vi.advanceTimersByTimeAsync(7_999);
@@ -355,9 +384,9 @@ describe('ReplyMonitorRuntime', () => {
         ];
         const deliver = vi.fn(() => {
             messages = [];
-            return 'ignored htask inject text';
+            return 'htask inject text';
         });
-        const { monitor, taskMessages } = createMonitor({
+        const { monitor, taskMessages, enqueuedTaskMessages } = createMonitor({
             messages: () => messages,
             deliver,
         });
@@ -365,6 +394,7 @@ describe('ReplyMonitorRuntime', () => {
         await vi.advanceTimersByTimeAsync(2_000);
         await vi.advanceTimersByTimeAsync(2_000);
         expect(deliver).toHaveBeenCalledTimes(1);
+        expect(enqueuedTaskMessages).toEqual(['htask inject text']);
         expect(taskMessages).toEqual([taskMessageOptions()]);
         monitor.dispose();
     });

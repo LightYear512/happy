@@ -7,7 +7,7 @@ import type { BangCommandContext } from './types';
 import { renderOptionsBlock, type BangOptionSuggestion } from './types';
 import { findHtaskRoot, htaskCanonicalTitle, runHtask } from './htaskCommand';
 
-export const REPLY_MONITOR_ALERT_DELAY_MS = 60_000;
+export const REPLY_MONITOR_ALERT_DELAY_MS = 20_000;
 export const REPLY_MONITOR_POLL_INTERVAL_MS = 2_000;
 export const TASK_MESSAGE_REMINDER_INTERVAL_MS = 60_000;
 const REPLY_MONITOR_ALERT_MARKER = '⚠️';
@@ -24,6 +24,7 @@ export interface ReplyMonitorRuntimeOptions {
     taskMessageReminderMs?: number;
     currentTitle?: () => string | null;
     sendTitle: (title: string) => void;
+    enqueueTaskMessage?: (message: string) => void;
     sendTaskMessage?: (message: string, visibleFallback?: string, options?: BangOptionSuggestion[]) => void;
     now?: () => number;
     debug?: (message: string, error?: unknown) => void;
@@ -53,6 +54,7 @@ export class ReplyMonitorRuntime {
     private syncInFlight = false;
     private readonly taskMessageReminderSentAt = new Map<string, number>();
     private lastActivityAt: number | null = null;
+    private activeReply = false;
     private readonly idleMs: number;
     private readonly taskMessageReminderMs: number;
     private readonly isEnabled: ReplyMonitorRuntimeOptions['isEnabled'];
@@ -61,6 +63,7 @@ export class ReplyMonitorRuntime {
     private readonly deliverMessage: NonNullable<ReplyMonitorRuntimeOptions['deliverMessage']>;
     private readonly currentTitle: NonNullable<ReplyMonitorRuntimeOptions['currentTitle']>;
     private readonly sendTitle: ReplyMonitorRuntimeOptions['sendTitle'];
+    private readonly enqueueTaskMessage: NonNullable<ReplyMonitorRuntimeOptions['enqueueTaskMessage']>;
     private readonly sendTaskMessage: NonNullable<ReplyMonitorRuntimeOptions['sendTaskMessage']>;
     private readonly now: NonNullable<ReplyMonitorRuntimeOptions['now']>;
     private readonly debug: NonNullable<ReplyMonitorRuntimeOptions['debug']>;
@@ -74,6 +77,7 @@ export class ReplyMonitorRuntime {
         this.deliverMessage = options.deliverMessage ?? (async () => null);
         this.currentTitle = options.currentTitle ?? (() => null);
         this.sendTitle = options.sendTitle;
+        this.enqueueTaskMessage = options.enqueueTaskMessage ?? (() => undefined);
         this.sendTaskMessage = options.sendTaskMessage ?? (() => undefined);
         this.now = options.now ?? (() => Date.now());
         this.debug = options.debug ?? ((message, error) => logger.debug(message, error));
@@ -95,9 +99,22 @@ export class ReplyMonitorRuntime {
         this.observeReceiveActivity('assistant-reply');
     }
 
+    beginActiveReply(reason = 'active-reply-start'): void {
+        this.activeReply = true;
+        this.markActivity(reason);
+        void this.syncTitle(reason);
+    }
+
+    endActiveReply(reason = 'active-reply-end'): void {
+        this.activeReply = false;
+        this.markActivity(reason);
+        void this.syncTitle(reason);
+    }
+
     stopMonitoring(reason = 'stop'): void {
         this.debug(`[reply-monitor] stop requested reason=${reason}`);
         this.lastActivityAt = null;
+        this.activeReply = false;
         void this.syncTitle(reason);
     }
 
@@ -135,6 +152,7 @@ export class ReplyMonitorRuntime {
 
             const enabled = await this.isEnabled();
             const idle = enabled
+                && !this.activeReply
                 && this.lastActivityAt !== null
                 && this.now() - this.lastActivityAt >= this.idleMs;
             const expected = idle && !titleHasAlert(canonical)
@@ -142,11 +160,11 @@ export class ReplyMonitorRuntime {
                 : canonical;
             const current = this.currentTitle();
             if (current === expected) {
-                this.debug(`[reply-monitor] title unchanged reason=${reason} idle=${idle}`);
+                this.debug(`[reply-monitor] title unchanged reason=${reason} idle=${idle} active=${this.activeReply}`);
                 return;
             }
             this.sendTitle(expected);
-            this.debug(`[reply-monitor] title sent reason=${reason} idle=${idle}`);
+            this.debug(`[reply-monitor] title sent reason=${reason} idle=${idle} active=${this.activeReply}`);
         } catch (error) {
             this.debug('[reply-monitor] title sync skipped', error);
         }
@@ -165,6 +183,7 @@ export class ReplyMonitorRuntime {
                 if (message.status === 'pending') {
                     const text = await this.deliverMessage(message.message_id);
                     if (text !== null) {
+                        this.enqueueTaskMessage(text);
                         this.recordTaskMessageReminder(message.message_id);
                         this.sendTaskMessage(
                             formatTaskMessageNotification(message),
@@ -337,7 +356,8 @@ function readJsonObject(path: string, debugLabel: string): Record<string, unknow
 function readBindingFromHtaskHappy(root: string, happyId: string, expectedTaskId = ''): ReplyMonitorBinding | null {
     if (!isSafeHtaskRef(happyId)) return null;
     const cfg = readJsonObject(join(root, '.htask', 'cfg', `${happyId}.json`), `cfg ${happyId}`);
-    const taskId = cfg?.task_id;
+    if (!cfg) return null;
+    const taskId = cfg.task_id;
     if (!isSafeHtaskRef(taskId)) return null;
     if (expectedTaskId && taskId !== expectedTaskId) return null;
     const cfgLease = cfg.writer_lease;
@@ -413,6 +433,7 @@ export function createHtaskReplyMonitorRuntime(
     flavor: BangCommandContext['flavor'],
     idleMs = REPLY_MONITOR_ALERT_DELAY_MS,
     pollMs = REPLY_MONITOR_POLL_INTERVAL_MS,
+    enqueueTaskMessage?: (message: string) => void,
 ): ReplyMonitorRuntime {
     const titleSender = (summary: string) => {
         session.sendClaudeSessionMessage({
@@ -462,6 +483,7 @@ export function createHtaskReplyMonitorRuntime(
         },
         currentTitle: () => session.getSummaryText(),
         sendTitle: titleSender,
+        enqueueTaskMessage,
         sendTaskMessage: (message, visibleFallback, options) => {
             sendTaskMessageToSession(session, message, visibleFallback, options);
         },
