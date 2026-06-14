@@ -194,14 +194,8 @@ export class ReplyMonitorRuntime {
                     }
                     continue;
                 }
-                if (message.status === 'delivered' && this.shouldSendTaskMessageReminder(message.message_id)) {
-                    this.recordTaskMessageReminder(message.message_id);
-                    this.sendTaskMessage(
-                        formatTaskMessageNotification(message),
-                        formatTaskMessagePlainNotification(message),
-                        taskMessageActionOptions(message),
-                    );
-                    this.debug(`[reply-monitor] task message pending acknowledgement reason=${reason} message=${message.message_id}`);
+                if (message.status === 'delivered') {
+                    this.debug(`[reply-monitor] task message already delivered; ui reminder skipped reason=${reason} message=${message.message_id}`);
                 }
             }
         } catch (error) {
@@ -463,7 +457,7 @@ export function createHtaskReplyMonitorRuntime(
             if (!root) return [];
             const binding = readReplyMonitorBinding(root, session.sessionId);
             if (!binding) return [];
-            const result = await runHtask(root, ['message-list', '--task-id', binding.taskId]);
+            const result = await runHtask(root, ['message-list', '--task-id', binding.taskId, '--status', 'pending']);
             if (result.code !== 0) {
                 throw new Error(result.stderr || result.stdout || 'message-list failed');
             }

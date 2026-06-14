@@ -211,7 +211,7 @@ describe('ReplyMonitorRuntime', () => {
         monitor.dispose();
     });
 
-    it('throttles delivered-but-unacked task message reminders', async () => {
+    it('does not repeat UI reminders after a task message is delivered to the model', async () => {
         vi.useFakeTimers();
         let status = 'pending';
         const deliver = vi.fn(() => {
@@ -238,12 +238,12 @@ describe('ReplyMonitorRuntime', () => {
         await vi.advanceTimersByTimeAsync(7_999);
         expect(taskMessages).toHaveLength(1);
         await vi.advanceTimersByTimeAsync(1);
-        expect(taskMessages).toEqual([taskMessageOptions(), taskMessageOptions()]);
+        expect(taskMessages).toEqual([taskMessageOptions()]);
         expect(enqueuedTaskMessages).toEqual(['htask inject text']);
         monitor.dispose();
     });
 
-    it('repeats lightweight reminders for already delivered unacked messages until ack or dismiss', async () => {
+    it('ignores already delivered task messages in the background UI prompt path', async () => {
         vi.useFakeTimers();
         const { monitor, taskMessages, enqueuedTaskMessages } = createMonitor({
             taskMessageReminderMs: 10_000,
@@ -259,12 +259,11 @@ describe('ReplyMonitorRuntime', () => {
         await vi.advanceTimersByTimeAsync(2_000);
         await vi.advanceTimersByTimeAsync(2_000);
         expect(enqueuedTaskMessages).toEqual([]);
-        expect(taskMessages).toEqual([taskMessageOptions()]);
-        expect(taskMessages[0]).not.toContain('message_id=');
+        expect(taskMessages).toEqual([]);
         await vi.advanceTimersByTimeAsync(7_999);
-        expect(taskMessages).toHaveLength(1);
+        expect(taskMessages).toHaveLength(0);
         await vi.advanceTimersByTimeAsync(1);
-        expect(taskMessages).toEqual([taskMessageOptions(), taskMessageOptions()]);
+        expect(taskMessages).toEqual([]);
         monitor.dispose();
     });
 
@@ -311,11 +310,12 @@ describe('ReplyMonitorRuntime', () => {
             canonicalTitle: () => '🔵 [0001-任务 0/1] 做事',
             pendingMessages: () => [{
                 message_id: 'TM-1',
-                status: 'delivered',
+                status: 'pending',
                 from_task_id: 'HT-0282',
                 created_at: '2026-06-13T15:46:03',
                 body: 'hello',
             }],
+            deliverMessage: () => 'htask inject text',
             currentTitle: () => null,
             sendTitle: () => undefined,
             sendTaskMessage: (markdown, fallback, options) => calls.push({ markdown, fallback, options }),

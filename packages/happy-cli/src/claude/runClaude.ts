@@ -16,7 +16,7 @@ import { extractSDKMetadataAsync } from '@/claude/sdk/metadataExtractor';
 import { parseSpecialCommand } from '@/parsers/specialCommands';
 import { isBangCommand, executeBangCommand, hasActiveInteractiveSession, handleInteractiveInput, buildConsoleWelcome, buildSessionWelcome } from '@/commands/bang/dispatcher';
 import { renderOptionsBlock } from '@/commands/bang/types';
-import { findHtaskRoot, restoreHtaskSessionConfig } from '@/commands/bang/htaskCommand';
+import { findHtaskRoot, htaskCanonicalTitle, resolveHtaskHappyId, restoreHtaskSessionConfig } from '@/commands/bang/htaskCommand';
 import { getEnvironmentInfo } from '@/ui/doctor';
 import { configuration } from '@/configuration';
 import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
@@ -217,11 +217,40 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // a second session-scoped WebSocket that triggers stale-socket kicking
     const session = api.sessionSyncClient(response);
     const htaskRoot = findHtaskRoot();
-    const restoreHtaskProjection = (reason: string) => {
-        if (!htaskRoot || !session.sessionId) return;
-        void restoreHtaskSessionConfig(htaskRoot, session.sessionId, reason);
+    const restoreHtaskProjection = (reason: string): Promise<boolean> => {
+        if (!htaskRoot || !session.sessionId) return Promise.resolve(false);
+        return restoreHtaskSessionConfig(htaskRoot, session.sessionId, reason);
     };
-    restoreHtaskProjection(options.restoreSessionId ? 'claude-restore' : 'claude-start');
+    const startupHtaskProjection = restoreHtaskProjection(options.restoreSessionId ? 'claude-restore' : 'claude-start');
+
+    const readHtaskStartupTitle = async (): Promise<string | null> => {
+        await startupHtaskProjection.catch(error => {
+            logger.debug('[START] htask startup projection failed:', error);
+            return false;
+        });
+        if (!htaskRoot || !session.sessionId) return null;
+        const happyId = resolveHtaskHappyId(htaskRoot, session.sessionId);
+        return happyId ? htaskCanonicalTitle(htaskRoot, happyId, 'claude') : null;
+    };
+    let lastHtaskTitle = '';
+    const syncHtaskTitle = async (reason: string): Promise<void> => {
+        try {
+            const title = await readHtaskStartupTitle();
+            if (!title || title === lastHtaskTitle || title === session.getSummaryText()) return;
+            lastHtaskTitle = title;
+            session.sendClaudeSessionMessage({
+                type: 'summary',
+                summary: title,
+                leafUuid: randomUUID(),
+            });
+            logger.debug(`[START] Synced htask title reason=${reason}: ${title}`);
+        } catch (error) {
+            logger.debug(`[START] htask title sync skipped reason=${reason}:`, error);
+        }
+    };
+    const htaskTitleInterval = htaskRoot ? setInterval(() => {
+        void syncHtaskTitle('poll');
+    }, 2000) : null;
 
     // Extract SDK metadata in background and update session when ready
     // Skip for console sessions — they don't use Claude SDK and the SDK query
@@ -274,14 +303,18 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // Restore session title when resuming
     const resumeTitle = process.env.HAPPY_RESUME_TITLE;
     logger.debug(`[START] HAPPY_RESUME_TITLE=${resumeTitle || '(not set)'}`);
-    if (resumeTitle) {
-        session.waitForConnect().then(() => {
+    if (resumeTitle || htaskRoot) {
+        session.waitForConnect().then(async () => {
+            const htaskTitle = await readHtaskStartupTitle();
+            const startupTitle = htaskTitle || resumeTitle;
+            if (!startupTitle) return;
+            if (htaskTitle) lastHtaskTitle = htaskTitle;
             session.sendClaudeSessionMessage({
                 type: 'summary',
-                summary: resumeTitle,
+                summary: startupTitle,
                 leafUuid: randomUUID(),
             });
-            logger.debug(`[START] Restored resume title: ${resumeTitle}`);
+            logger.debug(`[START] Restored startup title source=${htaskTitle ? 'htask' : 'resume'}: ${startupTitle}`);
         }).catch(error => {
             logger.debug('[START] Failed to restore resume title:', error);
         });
@@ -636,6 +669,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 }));
                 
                 // Cleanup session resources (intervals, callbacks)
+                if (htaskTitleInterval) clearInterval(htaskTitleInterval);
                 currentSession?.cleanup();
 
                 // Send session death message
@@ -712,7 +746,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             // Store reference for hook server callback
             currentSession = sessionInstance;
             sessionInstance.addSessionFoundCallback(() => {
-                restoreHtaskProjection('claude-session-found');
+                void restoreHtaskProjection('claude-session-found').then(() => syncHtaskTitle('claude-session-found'));
             });
         },
         mcpServers: {
@@ -731,6 +765,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
     // Cleanup session resources (intervals, callbacks) - prevents memory leak
     // Note: currentSession is set by onSessionReady callback during loop()
+    if (htaskTitleInterval) clearInterval(htaskTitleInterval);
     (currentSession as Session | null)?.cleanup();
 
     // Send session death message
