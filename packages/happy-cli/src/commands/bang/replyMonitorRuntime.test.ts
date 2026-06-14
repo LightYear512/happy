@@ -9,6 +9,7 @@ import {
     TASK_MESSAGE_REMINDER_INTERVAL_MS,
     formatTaskMessagePlainNotification,
     readReplyMonitorBinding,
+    sendTaskMessageToSession,
     type TaskMessageRecord,
 } from './replyMonitorRuntime';
 import { buildHtaskPromptPayload, resolveHtaskHappyId } from './htaskCommand';
@@ -268,6 +269,7 @@ describe('ReplyMonitorRuntime', () => {
         expect(text).not.toContain('<options>');
         expect(text).not.toContain('<option');
         expect(text).not.toContain('TM-1');
+        expect(text).not.toContain('操作按钮');
     });
 
     it('passes a plain visible fallback alongside structured clickable options', async () => {
@@ -302,6 +304,38 @@ describe('ReplyMonitorRuntime', () => {
             expect.objectContaining({ label: '重复/不处理，忽略', value: '@task-dismiss TM-1' }),
         ]);
         monitor.dispose();
+    });
+
+    it('sends task message actions as structured event options instead of Codex markdown text', () => {
+        const events: unknown[] = [];
+        const codexMessages: unknown[] = [];
+        const session = {
+            sendSessionEvent: (event: unknown) => events.push(event),
+            sendCodexMessage: (message: unknown) => codexMessages.push(message),
+        };
+
+        sendTaskMessageToSession(
+            session,
+            taskMessageOptions(),
+            'plain fallback',
+            [
+                { label: '任务消息｜来源 HT-0282｜发送 2026-06-13 15:46｜hello', disabled: true },
+                { label: '已处理，确认', value: '@task-ack TM-1' },
+                { label: '重复/不处理，忽略', value: '@task-dismiss TM-1' },
+            ],
+        );
+
+        expect(codexMessages).toEqual([]);
+        expect(events).toEqual([
+            {
+                type: 'options',
+                options: [
+                    { label: '任务消息｜来源 HT-0282｜发送 2026-06-13 15:46｜hello', disabled: true },
+                    { label: '已处理，确认', value: '@task-ack TM-1' },
+                    { label: '重复/不处理，忽略', value: '@task-dismiss TM-1' },
+                ],
+            },
+        ]);
     });
 
     it('stops notifying after ack clears the pending message list', async () => {

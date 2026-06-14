@@ -295,8 +295,23 @@ export function formatTaskMessagePlainNotification(message: TaskMessageRecord): 
     return [
         `任务消息｜来源 ${source}｜发送 ${sentAt}`,
         preview,
-        '操作按钮已另行发送；如果按钮未出现，请刷新客户端。',
     ].join('\n');
+}
+
+export function sendTaskMessageToSession(
+    session: Pick<ApiSessionClient, 'sendSessionEvent'>,
+    message: string,
+    visibleFallback?: string,
+    options?: BangOptionSuggestion[],
+): void {
+    if (options && options.length > 0) {
+        session.sendSessionEvent({
+            type: 'options',
+            options: options.map(normalizeOptionSuggestion),
+        });
+        return;
+    }
+    session.sendSessionEvent({ type: 'message', message: visibleFallback ?? message });
 }
 
 function readJsonObject(path: string, debugLabel: string): Record<string, unknown> | null {
@@ -440,18 +455,7 @@ export function createHtaskReplyMonitorRuntime(
         currentTitle: () => session.getSummaryText(),
         sendTitle: titleSender,
         sendTaskMessage: (message, visibleFallback, options) => {
-            session.sendSessionEvent({ type: 'message', message: visibleFallback ?? message });
-            if (typeof session.sendCodexMessage === 'function') {
-                session.sendCodexMessage({ type: 'message', message, id: randomUUID() });
-                return;
-            }
-            if (options && options.length > 0) {
-                session.sendSessionEvent({
-                    type: 'options',
-                    options: options.map(normalizeOptionSuggestion),
-                });
-                return;
-            }
+            sendTaskMessageToSession(session, message, visibleFallback, options);
         },
     });
 }
