@@ -15,6 +15,7 @@ import { AgentInputAutocomplete } from './AgentInputAutocomplete';
 import { FloatingOverlay } from './FloatingOverlay';
 import { TextInputState, MultiTextInputHandle } from './MultiTextInput';
 import { applySuggestion } from './autocomplete/applySuggestion';
+import type { AutocompleteSuggestion } from './autocomplete/types';
 import { GitStatusBadge, useHasMeaningfulGitStatus } from './GitStatusBadge';
 import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 import { useSetting } from '@/sync/storage';
@@ -31,6 +32,7 @@ interface AgentInputProps {
     onChangeText: (text: string) => void;
     sessionId?: string;
     onSend: () => void;
+    onSendText?: (text: string, displayText?: string) => void;
     sendIcon?: React.ReactNode;
     onMicPress?: () => void;
     isMicActive?: boolean;
@@ -55,7 +57,7 @@ interface AgentInputProps {
         };
     };
     autocompletePrefixes: string[];
-    autocompleteSuggestions: (query: string) => Promise<{ key: string, text: string, component: React.ElementType }[]>;
+    autocompleteSuggestions: (query: string) => Promise<AutocompleteSuggestion[]>;
     usageData?: {
         inputTokens: number;
         outputTokens: number;
@@ -400,6 +402,14 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
         if (!suggestions[index] || !inputRef.current) return;
 
         const suggestion = suggestions[index];
+        if (suggestion.disabled) return;
+
+        if (suggestion.submit && props.onSendText) {
+            props.onSendText(suggestion.text, suggestion.displayText);
+            inputRef.current.setTextAndSelection('', { start: 0, end: 0 });
+            hapticsLight();
+            return;
+        }
 
         // Apply the suggestion
         const result = applySuggestion(
@@ -420,7 +430,7 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
 
         // Small haptic feedback
         hapticsLight();
-    }, [suggestions, inputState, props.autocompletePrefixes]);
+    }, [suggestions, inputState, props.autocompletePrefixes, props.onSendText]);
 
     // Settings modal state
     const [showSettings, setShowSettings] = React.useState(false);
@@ -476,7 +486,9 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
             } else if ((event.key === 'Enter' || (event.key === 'Tab' && !event.shiftKey))) {
                 // Both Enter and Tab select the current suggestion
                 // If none selected (selected === -1), select the first one
-                const indexToSelect = selected >= 0 ? selected : 0;
+                const firstEnabledIndex = suggestions.findIndex(suggestion => !suggestion.disabled);
+                const indexToSelect = selected >= 0 ? selected : firstEnabledIndex;
+                if (indexToSelect < 0) return true;
                 handleSuggestionSelect(indexToSelect);
                 return true;
             } else if (event.key === 'Escape') {
@@ -540,7 +552,10 @@ export const AgentInput = React.memo(React.forwardRef<MultiTextInputHandle, Agen
                         <AgentInputAutocomplete
                             suggestions={suggestions.map(s => {
                                 const Component = s.component;
-                                return <Component key={s.key} />;
+                                return {
+                                    element: <Component key={s.key} />,
+                                    disabled: s.disabled,
+                                };
                             })}
                             selectedIndex={selected}
                             onSelect={handleSuggestionSelect}

@@ -199,11 +199,19 @@ function SessionViewLoaded({ sessionId, session }: { sessionId: string, session:
     ), [availableModels, session.modelMode, session.metadata?.currentModelCode, flavor]);
     const sessionStatus = useSessionStatus(session);
     const sessionUsage = useSessionUsage(sessionId);
-    const alwaysShowContextSize = useSetting('alwaysShowContextSize');
-    const experiments = useSetting('experiments');
 
     // Use draft hook for auto-saving message drafts
     const { clearDraft } = useDraft(sessionId, message, setMessage);
+
+    const sendSessionText = React.useCallback((text: string, displayText?: string) => {
+        if (!text.trim()) return;
+        setMessage('');
+        clearDraft();
+        sync.sendMessage(sessionId, text, displayText);
+        trackMessageSent();
+    }, [clearDraft, sessionId]);
+    const alwaysShowContextSize = useSetting('alwaysShowContextSize');
+    const experiments = useSetting('experiments');
 
     // Handle dismissing CLI version warning
     const handleDismissCliWarning = React.useCallback(() => {
@@ -317,13 +325,9 @@ function SessionViewLoaded({ sessionId, session }: { sessionId: string, session:
                 isPulsing: sessionStatus.isPulsing
             }}
             onSend={() => {
-                if (message.trim()) {
-                    setMessage('');
-                    clearDraft();
-                    sync.sendMessage(sessionId, message);
-                    trackMessageSent();
-                }
+                sendSessionText(message);
             }}
+            onSendText={sendSessionText}
             onMicPress={micButtonState.onMicPress}
             isMicActive={micButtonState.isMicActive}
             onAbort={() => sessionAbort(sessionId)}

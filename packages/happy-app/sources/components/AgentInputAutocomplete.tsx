@@ -4,7 +4,10 @@ import { useUnistyles } from 'react-native-unistyles';
 import { FloatingOverlay } from './FloatingOverlay';
 
 interface AgentInputAutocompleteProps {
-    suggestions: React.ReactElement[];
+    suggestions: Array<{
+        element: React.ReactElement;
+        disabled?: boolean;
+    }>;
     selectedIndex?: number;
     onSelect: (index: number) => void;
     itemHeight: number;
@@ -23,17 +26,21 @@ export const AgentInputAutocomplete = React.memo((props: AgentInputAutocompleteP
             {suggestions.map((suggestion, index) => (
                 <Pressable
                     key={index}
-                    onPress={() => onSelect(index)}
+                    disabled={suggestion.disabled}
+                    onPress={() => {
+                        if (!suggestion.disabled) onSelect(index);
+                    }}
                     style={({ pressed }) => ({
                         height: itemHeight,
                         backgroundColor: pressed
                             ? theme.colors.surfacePressed
-                            : selectedIndex === index
+                            : selectedIndex === index && !suggestion.disabled
                                 ? theme.colors.surfaceSelected
                                 : 'transparent',
+                        opacity: suggestion.disabled ? 0.65 : 1,
                     })}
                 >
-                    {suggestion}
+                    {suggestion.element}
                 </Pressable>
             ))}
         </FloatingOverlay>

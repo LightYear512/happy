@@ -11,12 +11,13 @@ interface CommandSuggestionProps {
 }
 
 export const CommandSuggestion = React.memo(({ command, description }: CommandSuggestionProps) => {
+    const displayCommand = command.startsWith('@') ? command : `/${command}`;
     return (
         <View style={styles.suggestionContainer}>
-            <Text 
+            <Text
                 style={[styles.commandText, { marginRight: description ? 12 : 0 }]}
             >
-                /{command}
+                {displayCommand}
             </Text>
             {description && (
                 <Text
@@ -46,7 +47,7 @@ export const FileMentionSuggestion = React.memo(({ fileName, filePath, fileType 
                     color={styles.iconColor.color}
                 />
             </View>
-            <Text 
+            <Text
                 style={styles.fileNameText}
                 numberOfLines={1}
             >
@@ -55,6 +56,43 @@ export const FileMentionSuggestion = React.memo(({ fileName, filePath, fileType 
             <Text style={styles.labelText}>
                 {fileType === 'folder' ? t('agentInput.suggestion.folderLabel') : t('agentInput.suggestion.fileLabel')}
             </Text>
+        </View>
+    );
+});
+
+interface TaskMessageSuggestionProps {
+    title: string;
+    description?: string;
+    variant: 'info' | 'ack' | 'dismiss';
+}
+
+export const TaskMessageSuggestion = React.memo(({ title, description, variant }: TaskMessageSuggestionProps) => {
+    const iconName = variant === 'ack' ? 'checkmark-circle' : variant === 'dismiss' ? 'close-circle' : 'notifications';
+    return (
+        <View style={styles.suggestionContainer}>
+            <View style={styles.iconContainer}>
+                <Ionicons
+                    name={iconName}
+                    size={18}
+                    color={styles.iconColor.color}
+                />
+            </View>
+            <View style={styles.taskMessageTextContainer}>
+                <Text
+                    style={variant === 'info' ? styles.taskInfoText : styles.commandText}
+                    numberOfLines={1}
+                >
+                    {title}
+                </Text>
+                {description ? (
+                    <Text
+                        style={styles.descriptionText}
+                        numberOfLines={1}
+                    >
+                        {description}
+                    </Text>
+                ) : null}
+            </View>
         </View>
     );
 });
@@ -101,6 +139,15 @@ const styles = StyleSheet.create((theme) => ({
         fontSize: 12,
         color: theme.colors.textSecondary,
         marginLeft: 8,
+        ...Typography.default(),
+    },
+    taskMessageTextContainer: {
+        flex: 1,
+        minWidth: 0,
+    },
+    taskInfoText: {
+        fontSize: 13,
+        color: theme.colors.textSecondary,
         ...Typography.default(),
     },
 }));
