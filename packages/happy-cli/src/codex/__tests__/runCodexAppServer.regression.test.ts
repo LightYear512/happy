@@ -177,6 +177,56 @@ describe('runCodexAppServer — AST regression contracts', () => {
                 );
                 expect(keys).toContain('sandboxPolicy');
             });
+
+            it(`turn/start call at L${line} passes explicit model mode when selected`, () => {
+                const params = call.arguments[1] as ts.ObjectLiteralExpression;
+                const spreadTexts = params.properties
+                    .filter((p): p is ts.SpreadAssignment => ts.isSpreadAssignment(p))
+                    .map((p) => p.expression.getText(SF));
+                expect(spreadTexts.some((text) => text.includes('modelConfig.model'))).toBe(true);
+                expect(spreadTexts.some((text) => text.includes('modelConfig.reasoningEffort'))).toBe(true);
+            });
+        }
+    });
+
+    describe('thread/resume refreshes the resumed thread from the current Codex default model', () => {
+        const resumeCalls = findAllNodes(SF, (n): n is ts.CallExpression => {
+            if (!ts.isCallExpression(n)) return false;
+            if (!ts.isPropertyAccessExpression(n.expression)) return false;
+            if (n.expression.name.text !== 'request') return false;
+            const firstArg = n.arguments[0];
+            return (
+                !!firstArg &&
+                ts.isStringLiteral(firstArg) &&
+                firstArg.text === 'thread/resume'
+            );
+        });
+
+        it('at least one thread/resume call exists', () => {
+            expect(resumeCalls.length).toBeGreaterThan(0);
+        });
+
+        for (let i = 0; i < resumeCalls.length; i++) {
+            const call = resumeCalls[i];
+            const line = SF.getLineAndCharacterOfPosition(call.getStart(SF)).line + 1;
+
+            it(`thread/resume call at L${line} passes modelConfig.model`, () => {
+                const params = call.arguments[1];
+                expect(params, 'thread/resume must receive a params object').toBeDefined();
+                expect(ts.isObjectLiteralExpression(params!)).toBe(true);
+                const spreadTexts = (params as ts.ObjectLiteralExpression).properties
+                    .filter((p): p is ts.SpreadAssignment => ts.isSpreadAssignment(p))
+                    .map((p) => p.expression.getText(SF));
+                expect(spreadTexts.some((text) => text.includes('modelConfig.model'))).toBe(true);
+            });
+
+            it(`thread/resume call at L${line} passes modelConfig.reasoningEffort`, () => {
+                const params = call.arguments[1] as ts.ObjectLiteralExpression;
+                const spreadTexts = params.properties
+                    .filter((p): p is ts.SpreadAssignment => ts.isSpreadAssignment(p))
+                    .map((p) => p.expression.getText(SF));
+                expect(spreadTexts.some((text) => text.includes('modelConfig.reasoningEffort'))).toBe(true);
+            });
         }
     });
 

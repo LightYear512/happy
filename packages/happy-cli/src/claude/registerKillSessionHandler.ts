@@ -10,6 +10,11 @@ interface KillSessionResponse {
     message: string;
 }
 
+// Socket.IO must have a chance to serialize and flush the RPC acknowledgement
+// before killThisHappy can close the session socket or call process.exit().
+// The daemon machine RPC uses the same bounded acknowledgement grace period.
+const KILL_RPC_ACK_GRACE_MS = 100;
+
 
 export function registerKillSessionHandler(
     rpcHandlerManager: RpcHandlerManager,
@@ -18,11 +23,15 @@ export function registerKillSessionHandler(
     rpcHandlerManager.registerHandler<KillSessionRequest, KillSessionResponse>('killSession', async () => {
         logger.debug('Kill session request received');
 
-        // This will start the cleanup process
-        void killThisHappy();
+        // Starting cleanup here races RpcHandlerManager's encrypted response
+        // path: an idle runtime can reach process.exit() before Socket.IO sends
+        // its ACK. Defer cleanup until after that ACK returns to the event loop.
+        setTimeout(() => {
+            void killThisHappy().catch((error) => {
+                logger.debug('Kill session cleanup failed', error);
+            });
+        }, KILL_RPC_ACK_GRACE_MS);
 
-        // We should still be able to respond the the client, though they
-        // should optimistically assume the session is dead.
         return {
             success: true,
             message: 'Killing happy-cli process'

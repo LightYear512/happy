@@ -25,11 +25,14 @@ import { MessageBuffer } from "@/ui/ink/messageBuffer";
 import { CodexDisplay } from "@/ui/ink/CodexDisplay";
 import { trimIdent } from "@/utils/trimIdent";
 import type { CodexSessionConfig } from './types';
+import { withCodexModelModeMetadata } from './modelMode';
+import { resolveCodexModelModeOrDefault } from './defaultModelConfig';
 import { readCodexDefaultProfile, getCodexInstancePath, getCurrentCodexProfile } from '@/commands/bang/ccsProfiles';
 import { watchCodexProfileFile } from '@/commands/bang/authCommand';
 import type { FSWatcher } from 'node:fs';
 import { notifyDaemonSessionStarted } from "@/daemon/controlClient";
 import { registerKillSessionHandler } from "@/claude/registerKillSessionHandler";
+import { registerSessionTransportFatalHandler } from '@/api/registerSessionTransportFatalHandler';
 import { delay } from "@/utils/time";
 import { stopCaffeinate } from "@/utils/caffeinate";
 import { connectionState } from '@/utils/serverConnectionErrors';
@@ -196,6 +199,7 @@ export async function runCodex(opts: {
     // Permission handler declared here so it can be updated in onSessionSwap callback
     // (assigned later at line ~385 after client setup)
     let permissionHandler: CodexPermissionHandler;
+    let bindTransportFatalHandler: ((client: ApiSessionClient) => void) | null = null;
     const { session: initialSession, reconnectionHandle } = setupOfflineReconnection({
         api,
         sessionTag,
@@ -204,6 +208,8 @@ export async function runCodex(opts: {
         response,
         onSessionSwap: (newSession) => {
             session = newSession;
+            session.updateMetadata((metadata) => withCodexModelModeMetadata(metadata));
+            bindTransportFatalHandler?.(newSession);
             // Update permission handler with new session to avoid stale reference
             if (permissionHandler) {
                 permissionHandler.updateSession(newSession);
@@ -211,6 +217,7 @@ export async function runCodex(opts: {
         }
     });
     session = initialSession;
+    session.updateMetadata((metadata) => withCodexModelModeMetadata(metadata));
 
     // Always report to daemon if it exists (skip if offline)
     if (response) {
@@ -256,12 +263,13 @@ export async function runCodex(opts: {
             logger.debug(`[Codex] User message received with no permission mode override, using current: ${currentPermissionMode ?? 'default (effective)'}`);
         }
 
-        // Resolve model; explicit null resets to default (undefined)
         let messageModel = currentModel;
-        if (message.meta?.hasOwnProperty('model')) {
-            messageModel = message.meta.model || undefined;
+        if (message.meta && Object.prototype.hasOwnProperty.call(message.meta, 'model')) {
+            messageModel = typeof message.meta.model === 'string' && message.meta.model.length > 0
+                ? message.meta.model
+                : undefined;
             currentModel = messageModel;
-            logger.debug(`[Codex] Model updated from user message: ${messageModel || 'reset to default'}`);
+            logger.debug(`[Codex] Model mode updated from user message to: ${currentModel || 'Codex config'}`);
         } else {
             logger.debug(`[Codex] User message received with no model override, using current: ${currentModel || 'default'}`);
         }
@@ -475,6 +483,18 @@ export async function runCodex(opts: {
     session.rpcHandlerManager.registerHandler('abort', handleAbort);
 
     registerKillSessionHandler(session.rpcHandlerManager, handleKillSession);
+
+    let removeTransportFatalHandler = () => {};
+    bindTransportFatalHandler = (boundSession) => {
+        removeTransportFatalHandler();
+        removeTransportFatalHandler = registerSessionTransportFatalHandler(boundSession, async (snapshot) => {
+            logger.warn(`[Codex] Happy transport became terminal (${snapshot.state}); shutting down the unreachable runtime`);
+            shouldExit = true;
+            messageQueue.close();
+            await handleAbort();
+        });
+    };
+    bindTransportFatalHandler(session);
 
     //
     // Initialize Ink UI
@@ -883,16 +903,23 @@ export async function runCodex(opts: {
                 );
 
                 if (!wasCreated) {
+                    const modelConfig = resolveCodexModelModeOrDefault(message.mode.model);
                     const startConfig: CodexSessionConfig = {
                         prompt: message.message,
                         sandbox: executionPolicy.sandbox,
                         'approval-policy': executionPolicy.approvalPolicy,
                         config: { mcp_servers: mcpServers }
                     };
-                    if (message.mode.model) {
-                        startConfig.model = message.mode.model;
+                    if (modelConfig.model) {
+                        startConfig.model = modelConfig.model;
                     }
-                    
+                    if (modelConfig.reasoningEffort) {
+                        startConfig.config = {
+                            ...(startConfig.config ?? {}),
+                            model_reasoning_effort: modelConfig.reasoningEffort,
+                        };
+                    }
+
                     // Check for resume file from multiple sources
                     let resumeFile: string | null = null;
 
@@ -985,6 +1012,7 @@ export async function runCodex(opts: {
         logger.debug('[codex]: Final cleanup start');
         logActiveHandles('cleanup-start');
         replyMonitor.dispose();
+        removeTransportFatalHandler();
         removeShutdownHandlers();
         try { codexProfileWatcher?.close(); } catch { /* best effort */ }
 

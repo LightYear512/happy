@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtemp, mkdir, writeFile, readFile, rm, chmod } from 'node:fs/promises';
 import { tmpdir, platform } from 'node:os';
 import { join } from 'node:path';
+import { EventEmitter } from 'node:events';
 
 import { runCodexWithAppServer } from '../runCodexAppServer';
 import {
@@ -36,7 +37,7 @@ const DOC_MARKER = 'E2E_DOC_MARKER_九九八十一';
 const TRIGGER = '__TRIGGER_COMPACT_FAIL__';
 const TURN_DELIM = '@@TURN@@'; // plain-ASCII record separator (avoids escaping traps)
 
-class FakeSession {
+class FakeSession extends EventEmitter {
     readonly sessionId = 'fake-session-id';
     readonly sessionEvents: Array<{ type: string; message?: string }> = [];
     readonly rpcHandlers = new Map<string, (params: unknown) => unknown>();
@@ -47,6 +48,10 @@ class FakeSession {
     };
     private cb: ((message: UserMessage) => void) | null = null;
     private pending: UserMessage[] = [];
+
+    constructor() {
+        super();
+    }
 
     onUserMessage(callback: (data: UserMessage) => void): void {
         this.cb = callback;

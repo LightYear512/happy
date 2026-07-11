@@ -1,4 +1,5 @@
 import { logger } from '@/ui/logger'
+import axios from 'axios';
 import { EventEmitter } from 'node:events'
 import { io, Socket } from 'socket.io-client'
 import { AgentState, ClientToServerEvents, MessageContent, Metadata, ServerToClientEvents, Session, Update, UserMessage, UserMessageSchema, Usage } from './types'
@@ -18,6 +19,44 @@ import {
     mapClaudeLogMessageToSessionEnvelopes,
     type ClaudeSessionProtocolState,
 } from '@/claude/utils/sessionProtocolMapper';
+import {
+    MAX_RECOVERY_COLLECTION_BYTES,
+    MAX_RECOVERY_RESPONSE_BYTES,
+    mergeRecoveryMessages,
+    recoveryRowBytes,
+    sameRecoveryRow,
+    selectRecoveryMessages,
+    type SessionRecoveryAnchor,
+    type SessionRecoveryRow,
+} from './sessionMessageRecovery';
+import {
+    createSessionTransportHealthReporter,
+    type SessionTransportHealthReporter,
+    type SessionTransportHealthState,
+} from './sessionTransportHealth';
+
+const SERVER_EVICTION_RECOVERY_DELAY_MS = 6_000;
+const MAX_SERVER_EVICTION_RECOVERIES = 1;
+const MAX_OUTBOUND_QUEUE_MESSAGES = 256;
+const MAX_OUTBOUND_QUEUE_BYTES = 1_048_576;
+const MAX_SEEN_MESSAGE_IDS = 512;
+const MAX_RECOVERY_BUFFER_ROWS = 512;
+const RECOVERY_QUERY_TIMEOUT_MS = 10_000;
+const TRANSPORT_HEALTH_HEARTBEAT_MS = 10_000;
+
+export interface SessionTransportSnapshot {
+    state: SessionTransportHealthState;
+    reconnectCount: number;
+    queueMessages: number;
+    queueBytes: number;
+    reason: string | null;
+}
+
+interface QueuedPersistentMessage {
+    encrypted: string;
+    localId: string;
+    bytes: number;
+}
 
 /**
  * ACP (Agent Communication Protocol) message data types.
@@ -61,6 +100,23 @@ export class ApiSessionClient extends EventEmitter {
     private metadataLock = new AsyncLock();
     private encryptionKey: Uint8Array;
     private encryptionVariant: 'legacy' | 'dataKey';
+    private transportState: SessionTransportHealthState = 'connecting';
+    private transportReason: string | null = null;
+    private readonly transportHealth: SessionTransportHealthReporter | null;
+    private transportHealthHeartbeat: NodeJS.Timeout | null = null;
+    private hasConnected = false;
+    private closing = false;
+    private reconciling = false;
+    private serverEvictionRecoveries = 0;
+    private serverEvictionTimer: NodeJS.Timeout | null = null;
+    private lastObservedMessage: SessionRecoveryAnchor;
+    private recoveryBuffer: SessionRecoveryRow[] = [];
+    private recoveryBufferBytes = 0;
+    private seenMessagesById = new Map<string, SessionRecoveryRow>();
+    private seenMessageIdBySeq = new Map<number, string>();
+    private seenMessageOrder: string[] = [];
+    private outboundQueue: QueuedPersistentMessage[] = [];
+    private outboundQueueBytes = 0;
     private claudeSessionProtocolState: ClaudeSessionProtocolState = {
         currentTurnId: null,
         uuidToProviderSubagent: new Map<string, string>(),
@@ -83,6 +139,9 @@ export class ApiSessionClient extends EventEmitter {
         this.agentStateVersion = session.agentStateVersion;
         this.encryptionKey = session.encryptionKey;
         this.encryptionVariant = session.encryptionVariant;
+        this.lastObservedMessage = { id: null, seq: Number.isSafeInteger(session.seq) && session.seq >= 0 ? session.seq : 0 };
+        this.transportHealth = safeTransportHealthReporter(this.metadata.path, this.sessionId);
+        this.publishTransportState('connecting', null);
 
         // Initialize RPC handler manager
         this.rpcHandlerManager = new RpcHandlerManager({
@@ -117,10 +176,7 @@ export class ApiSessionClient extends EventEmitter {
         // Handlers
         //
 
-        this.socket.on('connect', () => {
-            logger.debug('Socket connected successfully');
-            this.rpcHandlerManager.onSocketConnect(this.socket);
-        })
+        this.socket.on('connect', () => this.handleSocketConnect())
 
         // Set up global RPC request handler
         this.socket.on('rpc-request', async (data: { method: string, params: string }, callback: (response: string) => void) => {
@@ -130,15 +186,20 @@ export class ApiSessionClient extends EventEmitter {
         this.socket.on('disconnect', (reason) => {
             logger.debug('[API] Socket disconnected:', reason);
             this.rpcHandlerManager.onSocketDisconnect();
+            this.handleSocketDisconnect(reason);
         })
 
         this.socket.on('connect_error', (error) => {
-            logger.debug('[API] Socket connection error:', error);
+            logger.debug('[API] Socket connection error:', boundedTransportReason(error));
             this.rpcHandlerManager.onSocketDisconnect();
+            if (!this.closing && this.transportState !== 'ownership_conflict' && this.transportState !== 'failed') {
+                this.publishTransportState('recovering', `connect_error: ${boundedTransportReason(error)}`);
+            }
         })
 
         // Server events
         this.socket.on('update', (data: Update) => {
+            const isPersistedMessageUpdate = data?.body?.t === 'new-message';
             try {
                 logger.debugLargeJson('[SOCKET] [UPDATE] Received update:', data);
 
@@ -147,23 +208,23 @@ export class ApiSessionClient extends EventEmitter {
                     return;
                 }
 
-                if (data.body.t === 'new-message' && data.body.message.content.t === 'encrypted') {
-                    const body = decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(data.body.message.content.c));
-
-                    logger.debugLargeJson('[SOCKET] [UPDATE] Received update:', body)
-
-                    // Try to parse as user message first
-                    const userResult = UserMessageSchema.safeParse(body);
-                    if (userResult.success) {
-                        // Server already filtered to only our session
-                        if (this.pendingMessageCallback) {
-                            this.pendingMessageCallback(userResult.data);
-                        } else {
-                            this.pendingMessages.push(userResult.data);
+                if (data.body.t === 'new-message') {
+                    if (data.body.sid !== this.sessionId) return;
+                    if (data.body.message?.content?.t !== 'encrypted') {
+                        throw new Error('recovery_incomplete: persisted update encryption envelope is invalid');
+                    }
+                    const [message] = mergeRecoveryMessages([], [data.body.message as SessionRecoveryRow]);
+                    if (this.reconciling) {
+                        const messageBytes = recoveryRowBytes(message);
+                        if (this.recoveryBuffer.length >= MAX_RECOVERY_BUFFER_ROWS ||
+                            this.recoveryBufferBytes + messageBytes > MAX_RECOVERY_COLLECTION_BYTES) {
+                            this.failTransport('recovery_incomplete: live recovery buffer exceeded budget');
+                            return;
                         }
+                        this.recoveryBuffer.push(message);
+                        this.recoveryBufferBytes += messageBytes;
                     } else {
-                        // If not a user message, it might be a permission response or other message type
-                        this.emit('message', body);
+                        this.deliverPersistedMessage(message);
                     }
                 } else if (data.body.t === 'update-session') {
                     if (data.body.metadata && data.body.metadata.version > this.metadataVersion) {
@@ -182,13 +243,16 @@ export class ApiSessionClient extends EventEmitter {
                     this.emit('message', data.body);
                 }
             } catch (error) {
-                logger.debug('[SOCKET] [UPDATE] [ERROR] Error handling update', { error });
+                logger.debug('[SOCKET] [UPDATE] [ERROR] Error handling update', boundedTransportReason(error));
+                if (isPersistedMessageUpdate) {
+                    this.failTransport(recoveryFailureReason(error));
+                }
             }
         });
 
         // DEATH
         this.socket.on('error', (error) => {
-            logger.debug('[API] Socket error:', error);
+            logger.debug('[API] Socket error:', boundedTransportReason(error));
         });
 
         //
@@ -200,18 +264,275 @@ export class ApiSessionClient extends EventEmitter {
 
     /** Wait for socket to connect. Resolves immediately if already connected. */
     waitForConnect(timeoutMs: number = 10_000): Promise<void> {
-        if (this.socket.connected) return Promise.resolve();
+        if (this.socket.connected && this.transportState === 'connected') return Promise.resolve();
         return new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
-                this.socket.off('connect', onConnect);
+                this.off('transport-state', onState);
                 reject(new Error('Socket connect timeout'));
             }, timeoutMs);
-            const onConnect = () => {
-                clearTimeout(timer);
-                resolve();
+            const onState = (snapshot: SessionTransportSnapshot) => {
+                if (snapshot.state === 'connected') {
+                    clearTimeout(timer);
+                    this.off('transport-state', onState);
+                    resolve();
+                } else if (snapshot.state === 'failed' || snapshot.state === 'ownership_conflict' || snapshot.state === 'closed') {
+                    clearTimeout(timer);
+                    this.off('transport-state', onState);
+                    reject(new Error(`Socket transport unavailable: ${snapshot.state}`));
+                }
             };
-            this.socket.once('connect', onConnect);
+            this.on('transport-state', onState);
         });
+    }
+
+    getTransportSnapshot(): SessionTransportSnapshot {
+        return {
+            state: this.transportState,
+            reconnectCount: this.serverEvictionRecoveries,
+            queueMessages: this.outboundQueue.length,
+            queueBytes: this.outboundQueueBytes,
+            reason: this.transportReason,
+        };
+    }
+
+    onTransportState(callback: (snapshot: SessionTransportSnapshot) => void): () => void {
+        this.on('transport-state', callback);
+        callback(this.getTransportSnapshot());
+        return () => this.off('transport-state', callback);
+    }
+
+    private handleSocketConnect(): void {
+        logger.debug('Socket connected successfully');
+        if (this.serverEvictionTimer) {
+            clearTimeout(this.serverEvictionTimer);
+            this.serverEvictionTimer = null;
+        }
+        if (this.closing) {
+            this.socket.disconnect();
+            return;
+        }
+        if (this.transportState === 'ownership_conflict' || this.transportState === 'failed') {
+            this.socket.disconnect();
+            return;
+        }
+        this.rpcHandlerManager.onSocketConnect(this.socket);
+        if (!this.hasConnected) {
+            this.hasConnected = true;
+            this.publishTransportState('connected', null);
+            this.flushOutboundQueue();
+            return;
+        }
+        void this.reconcileAfterReconnect();
+    }
+
+    private handleSocketDisconnect(reason: string): void {
+        if (this.closing) {
+            if (this.transportState !== 'closed') this.publishTransportState('closed', null);
+            return;
+        }
+        if (this.isTerminalTransport()) return;
+        if (reason !== 'io server disconnect') {
+            this.publishTransportState('recovering', reason);
+            return;
+        }
+        if (this.serverEvictionRecoveries >= MAX_SERVER_EVICTION_RECOVERIES) {
+            this.reconciling = false;
+            this.recoveryBuffer = [];
+            this.recoveryBufferBytes = 0;
+            this.publishTransportState('ownership_conflict', reason);
+            this.emit('transport-fatal', this.getTransportSnapshot());
+            return;
+        }
+        this.serverEvictionRecoveries += 1;
+        this.publishTransportState('recovering', reason);
+        this.serverEvictionTimer = setTimeout(() => {
+            this.serverEvictionTimer = null;
+            if (!this.closing && this.transportState === 'recovering') this.socket.connect();
+        }, SERVER_EVICTION_RECOVERY_DELAY_MS);
+    }
+
+    private async reconcileAfterReconnect(): Promise<void> {
+        if (this.reconciling || this.closing) return;
+        this.reconciling = true;
+        this.publishTransportState('reconciling', this.transportReason);
+        const anchor = { ...this.lastObservedMessage };
+        try {
+            const response = await axios.get(`${configuration.serverUrl}/v1/sessions/${this.sessionId}/messages`, {
+                headers: { Authorization: `Bearer ${this.token}` },
+                timeout: RECOVERY_QUERY_TIMEOUT_MS,
+                maxContentLength: MAX_RECOVERY_RESPONSE_BYTES,
+            });
+            if (this.isTerminalTransport()) return;
+            if (!Array.isArray(response.data?.messages)) throw new Error('recovery_incomplete: message collection is invalid');
+            const queried = selectRecoveryMessages(response.data.messages, anchor);
+            const buffered = this.recoveryBuffer.splice(0);
+            this.recoveryBufferBytes = 0;
+            const recovered = mergeRecoveryMessages(queried, buffered);
+            for (const message of recovered) this.deliverPersistedMessage(message);
+            if (this.isTerminalTransport()) return;
+            this.reconciling = false;
+            this.publishTransportState('connected', null);
+            this.flushOutboundQueue();
+        } catch (error) {
+            this.reconciling = false;
+            this.recoveryBuffer = [];
+            this.recoveryBufferBytes = 0;
+            this.failTransport(recoveryFailureReason(error));
+        }
+    }
+
+    private deliverPersistedMessage(message: SessionRecoveryRow): void {
+        if (this.isAlreadyObservedMessage(message)) return;
+        if (message.seq <= this.lastObservedMessage.seq) {
+            throw new Error('recovery_incomplete: persisted delivery does not advance the exact message anchor');
+        }
+        const body = this.decryptPersistedMessage(message);
+        logger.debugLargeJson('[SOCKET] [UPDATE] Received update:', body)
+        const userResult = UserMessageSchema.safeParse(body);
+        if (userResult.success) {
+            if (this.pendingMessageCallback) this.pendingMessageCallback(userResult.data);
+            else this.pendingMessages.push(userResult.data);
+        } else if ((body as Record<string, unknown>).role === 'user') {
+            throw new Error('recovery_incomplete: persisted user message body is invalid');
+        } else {
+            this.emit('message', body);
+        }
+        this.rememberPersistedMessage(message);
+        this.lastObservedMessage = { id: message.id, seq: message.seq };
+    }
+
+    private decryptPersistedMessage(message: SessionRecoveryRow): Record<string, unknown> {
+        let body: unknown;
+        try {
+            body = decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(message.content.c));
+        } catch {
+            throw new Error('recovery_incomplete: persisted message cannot be decrypted');
+        }
+        if (!body || typeof body !== 'object' || Array.isArray(body)) {
+            throw new Error('recovery_incomplete: persisted message body is invalid');
+        }
+        return body as Record<string, unknown>;
+    }
+
+    private isAlreadyObservedMessage(message: SessionRecoveryRow): boolean {
+        const existing = this.seenMessagesById.get(message.id);
+        if (existing) {
+            if (!sameRecoveryRow(existing, message)) {
+                throw new Error('recovery_incomplete: one delivered message id has conflicting persisted identity');
+            }
+            return true;
+        }
+        const seqOwner = this.seenMessageIdBySeq.get(message.seq);
+        if (seqOwner && seqOwner !== message.id) {
+            throw new Error('recovery_incomplete: one delivered message sequence has conflicting ids');
+        }
+        return false;
+    }
+
+    private rememberPersistedMessage(message: SessionRecoveryRow): void {
+        this.seenMessagesById.set(message.id, message);
+        this.seenMessageIdBySeq.set(message.seq, message.id);
+        this.seenMessageOrder.push(message.id);
+        if (this.seenMessageOrder.length > MAX_SEEN_MESSAGE_IDS) {
+            const removed = this.seenMessageOrder.shift();
+            if (removed) {
+                const removedMessage = this.seenMessagesById.get(removed);
+                this.seenMessagesById.delete(removed);
+                if (removedMessage) this.seenMessageIdBySeq.delete(removedMessage.seq);
+            }
+        }
+    }
+
+    private publishTransportState(state: SessionTransportHealthState, reason: string | null): void {
+        this.transportState = state;
+        this.transportReason = reason === null ? null : boundedTransportReason(reason);
+        const snapshot = this.getTransportSnapshot();
+        this.writeTransportHealth(state, snapshot);
+        if (state === 'connected') this.startTransportHealthHeartbeat();
+        else this.stopTransportHealthHeartbeat();
+        this.emit('transport-state', snapshot);
+    }
+
+    private writeTransportHealth(state: SessionTransportHealthState, snapshot: SessionTransportSnapshot): void {
+        try {
+            this.transportHealth?.write(state, {
+                reconnectCount: snapshot.reconnectCount,
+                queueMessages: snapshot.queueMessages,
+                queueBytes: snapshot.queueBytes,
+                reason: snapshot.reason,
+            });
+        } catch (error) {
+            logger.warn('[API] Failed to publish Happy transport health:', boundedTransportReason(error));
+        }
+    }
+
+    private startTransportHealthHeartbeat(): void {
+        if (!this.transportHealth || this.transportHealthHeartbeat) return;
+        this.transportHealthHeartbeat = setInterval(() => {
+            if (this.transportState === 'connected') {
+                this.writeTransportHealth('connected', this.getTransportSnapshot());
+            }
+        }, TRANSPORT_HEALTH_HEARTBEAT_MS);
+        this.transportHealthHeartbeat.unref();
+    }
+
+    private stopTransportHealthHeartbeat(): void {
+        if (!this.transportHealthHeartbeat) return;
+        clearInterval(this.transportHealthHeartbeat);
+        this.transportHealthHeartbeat = null;
+    }
+
+    private failTransport(reason: string): void {
+        if (this.isTerminalTransport()) return;
+        if (this.serverEvictionTimer) {
+            clearTimeout(this.serverEvictionTimer);
+            this.serverEvictionTimer = null;
+        }
+        this.reconciling = false;
+        this.recoveryBuffer = [];
+        this.recoveryBufferBytes = 0;
+        this.publishTransportState('failed', reason);
+        this.emit('transport-fatal', this.getTransportSnapshot());
+        this.socket.disconnect();
+    }
+
+    private isTerminalTransport(): boolean {
+        return this.transportState === 'failed' || this.transportState === 'ownership_conflict' ||
+            this.transportState === 'closed';
+    }
+
+    private sendPersistentMessage(encrypted: string): void {
+        if (this.socket.connected && this.transportState === 'connected') {
+            const localId = `happy-cli-v1-${randomUUID()}`;
+            this.socket.emit('message', { sid: this.sessionId, message: encrypted, localId });
+            return;
+        }
+        if (this.transportState === 'failed' || this.transportState === 'ownership_conflict' ||
+            this.transportState === 'closed') {
+            logger.warn('[API] Persistent message rejected by terminal Happy transport:', this.transportState);
+            this.emit('transport-fatal', this.getTransportSnapshot());
+            throw new Error(`Happy persistent message rejected: transport is ${this.transportState}`);
+        }
+        const bytes = Buffer.byteLength(encrypted, 'utf8');
+        if (this.outboundQueue.length >= MAX_OUTBOUND_QUEUE_MESSAGES ||
+            this.outboundQueueBytes + bytes > MAX_OUTBOUND_QUEUE_BYTES) {
+            this.failTransport('outbound_queue_overflow: persistent message recovery queue exceeded budget');
+            throw new Error('Happy persistent message rejected: outbound_queue_overflow');
+        }
+        const localId = `happy-cli-v1-${randomUUID()}`;
+        this.outboundQueue.push({ encrypted, localId, bytes });
+        this.outboundQueueBytes += bytes;
+        this.publishTransportState(this.transportState, this.transportReason);
+    }
+
+    private flushOutboundQueue(): void {
+        if (!this.socket.connected || this.transportState !== 'connected' || this.outboundQueue.length === 0) return;
+        const queued = this.outboundQueue.splice(0);
+        this.outboundQueueBytes = 0;
+        for (const message of queued) {
+            this.socket.emit('message', { sid: this.sessionId, message: message.encrypted, localId: message.localId });
+        }
+        this.publishTransportState('connected', null);
     }
 
     onUserMessage(callback: (data: UserMessage) => void) {
@@ -231,6 +552,25 @@ export class ApiSessionClient extends EventEmitter {
         } else {
             this.pendingMessages.push(message);
         }
+    }
+
+    /** Injects one persisted external user row exactly once across restore/query and live Socket races. */
+    injectPendingPersistedUserMessage(rawRow: unknown): boolean {
+        const [message] = mergeRecoveryMessages([], [rawRow as SessionRecoveryRow]);
+        if (this.isAlreadyObservedMessage(message)) return false;
+        const parsed = UserMessageSchema.safeParse(this.decryptPersistedMessage(message));
+        if (!parsed.success || parsed.data.meta?.sentFrom === 'cli') {
+            throw new Error('recovery_incomplete: pending persisted user message is invalid');
+        }
+        this.rememberPersistedMessage(message);
+        this.injectPendingMessage(parsed.data);
+        return true;
+    }
+
+    markRestoreRecoveryFailed(error: unknown): void {
+        if (this.closing || this.transportState === 'closed' || this.transportState === 'ownership_conflict') return;
+        const reason = boundedTransportReason(error);
+        this.failTransport(reason.includes('recovery_incomplete') ? reason : `recovery_incomplete: ${reason}`);
     }
 
     getSummaryText(): string | null {
@@ -270,17 +610,8 @@ export class ApiSessionClient extends EventEmitter {
             };
         }
 
-        // Check if socket is connected before sending
-        if (!this.socket.connected) {
-            logger.debug('[API] Socket not connected, cannot send Claude session message. Message will be lost:', { type: body.type });
-            return;
-        }
-
         const encrypted = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, content));
-        this.socket.emit('message', {
-            sid: this.sessionId,
-            message: encrypted
-        });
+        this.sendPersistentMessage(encrypted);
 
         // Track usage from assistant messages
         if (body.type === 'assistant' && body.message?.usage) {
@@ -309,7 +640,7 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     sendCodexMessage(body: any) {
-        let content = {
+        const content = {
             role: 'agent',
             content: {
                 type: 'codex',
@@ -321,20 +652,11 @@ export class ApiSessionClient extends EventEmitter {
         };
         const encrypted = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, content));
 
-        // Check if socket is connected before sending
-        if (!this.socket.connected) {
-            logger.debug('[API] Socket not connected, cannot send message. Message will be lost:', { type: body.type });
-            // TODO: Consider implementing message queue or HTTP fallback for reliability
-        }
-
-        this.socket.emit('message', {
-            sid: this.sessionId,
-            message: encrypted
-        });
+        this.sendPersistentMessage(encrypted);
     }
 
     sendSessionProtocolMessage(envelope: SessionEnvelope) {
-        let content = {
+        const content = {
             role: envelope.role,
             content: {
                 type: 'session',
@@ -347,14 +669,7 @@ export class ApiSessionClient extends EventEmitter {
 
         const encrypted = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, content));
 
-        if (!this.socket.connected) {
-            logger.debug('[API] Socket not connected, cannot send session protocol message. Message will be lost:', { eventType: envelope.ev.t });
-        }
-
-        this.socket.emit('message', {
-            sid: this.sessionId,
-            message: encrypted
-        });
+        this.sendPersistentMessage(encrypted);
     }
 
     /**
@@ -365,7 +680,7 @@ export class ApiSessionClient extends EventEmitter {
      * @param body - The message payload (type: 'message' | 'reasoning' | 'tool-call' | 'tool-result')
      */
     sendAgentMessage(provider: 'gemini' | 'codex' | 'claude' | 'opencode', body: ACPMessageData) {
-        let content = {
+        const content = {
             role: 'agent',
             content: {
                 type: 'acp',
@@ -380,10 +695,7 @@ export class ApiSessionClient extends EventEmitter {
         logger.debug(`[SOCKET] Sending ACP message from ${provider}:`, { type: body.type, hasMessage: 'message' in body });
 
         const encrypted = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, content));
-        this.socket.emit('message', {
-            sid: this.sessionId,
-            message: encrypted
-        });
+        this.sendPersistentMessage(encrypted);
     }
 
     sendSessionEvent(event: {
@@ -399,7 +711,7 @@ export class ApiSessionClient extends EventEmitter {
     } | {
         type: 'ready'
     }, id?: string) {
-        let content = {
+        const content = {
             role: 'agent',
             content: {
                 id: id ?? randomUUID(),
@@ -408,10 +720,7 @@ export class ApiSessionClient extends EventEmitter {
             }
         };
         const encrypted = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, content));
-        this.socket.emit('message', {
-            sid: this.sessionId,
-            message: encrypted
-        });
+        this.sendPersistentMessage(encrypted);
     }
 
     /**
@@ -433,7 +742,9 @@ export class ApiSessionClient extends EventEmitter {
      * Send session death message
      */
     sendSessionDeath() {
-        this.socket.emit('session-end', { sid: this.sessionId, time: Date.now() });
+        if (this.socket.connected && this.transportState === 'connected') {
+            this.socket.emit('session-end', { sid: this.sessionId, time: Date.now() });
+        }
     }
 
 
@@ -532,6 +843,7 @@ export class ApiSessionClient extends EventEmitter {
      * Wait for socket buffer to flush
      */
     async flush(): Promise<void> {
+        this.flushOutboundQueue();
         if (!this.socket.connected) {
             return;
         }
@@ -547,6 +859,44 @@ export class ApiSessionClient extends EventEmitter {
 
     async close() {
         logger.debug('[API] socket.close() called');
+        this.closing = true;
+        if (this.serverEvictionTimer) {
+            clearTimeout(this.serverEvictionTimer);
+            this.serverEvictionTimer = null;
+        }
+        this.stopTransportHealthHeartbeat();
+        const reason = this.outboundQueue.length > 0
+            ? `explicit close rejected ${this.outboundQueue.length} queued persistent messages`
+            : null;
+        this.publishTransportState('closed', reason);
+        this.outboundQueue = [];
+        this.outboundQueueBytes = 0;
         this.socket.close();
+    }
+}
+
+function boundedTransportReason(value: unknown): string {
+    const text = (value instanceof Error ? `${value.name}: ${value.message}` : String(value ?? 'unknown'))
+        .replace(/\bBearer\s+[^\s,;]+/gi, 'Bearer [redacted]')
+        .replace(/\b(authorization|token|secret|api[_-]?key)(\s*[:=]\s*)[^\s,;]+/gi, '$1$2[redacted]');
+    let bounded = '';
+    for (const character of text) {
+        if (Buffer.byteLength(bounded + character, 'utf8') > 512) break;
+        bounded += character;
+    }
+    return bounded;
+}
+
+function recoveryFailureReason(value: unknown): string {
+    const reason = boundedTransportReason(value);
+    return reason.includes('recovery_incomplete') ? reason : `recovery_incomplete: ${reason}`;
+}
+
+function safeTransportHealthReporter(workspace: string, sessionId: string): SessionTransportHealthReporter | null {
+    try {
+        return createSessionTransportHealthReporter(workspace, sessionId);
+    } catch (error) {
+        logger.warn('[API] Happy transport health reporting is unavailable:', boundedTransportReason(error));
+        return null;
     }
 }

@@ -38,7 +38,10 @@ export const UpdateBodySchema = z.object({
   message: z.object({
     id: z.string(),
     seq: z.number(),
-    content: SessionMessageContentSchema
+    localId: z.string().nullable(),
+    content: SessionMessageContentSchema,
+    createdAt: z.number(),
+    updatedAt: z.number()
   }),
   sid: z.string(), // Session ID
   t: z.literal('new-message')
@@ -114,7 +117,7 @@ export interface ServerToClientEvents {
  * Socket events from client to server
  */
 export interface ClientToServerEvents {
-  message: (data: { sid: string, message: any }) => void
+  message: (data: { sid: string, message: string, localId?: string }) => void
   'session-alive': (data: {
     sid: string;
     time: number;
@@ -334,6 +337,7 @@ export type Metadata = {
   startedFromDaemon?: boolean,
   hostPid?: number,
   startedBy?: 'daemon' | 'terminal',
+  consoleSession?: boolean,
   // Lifecycle state management
   lifecycleState?: 'running' | 'archiveRequested' | 'archived' | string,
   lifecycleStateSince?: number,

@@ -4,14 +4,17 @@ import axios from 'axios';
 import { connectionState } from '@/utils/serverConnectionErrors';
 
 // Use vi.hoisted to ensure mock functions are available when vi.mock factory runs
-const { mockPost, mockIsAxiosError } = vi.hoisted(() => ({
+const { mockPost, mockGet, mockIsAxiosError, loggerDebug } = vi.hoisted(() => ({
     mockPost: vi.fn(),
-    mockIsAxiosError: vi.fn(() => true)
+    mockGet: vi.fn(),
+    mockIsAxiosError: vi.fn(() => true),
+    loggerDebug: vi.fn()
 }));
 
 vi.mock('axios', () => ({
     default: {
         post: mockPost,
+        get: mockGet,
         isAxiosError: mockIsAxiosError
     },
     isAxiosError: mockIsAxiosError
@@ -19,7 +22,7 @@ vi.mock('axios', () => ({
 
 vi.mock('@/ui/logger', () => ({
     logger: {
-        debug: vi.fn()
+        debug: loggerDebug
     }
 }));
 
@@ -309,5 +312,42 @@ describe('Api server error handling', () => {
 
             consoleSpy.mockRestore();
         });
+    });
+});
+
+describe('session lookup log privacy', () => {
+    let api: ApiClient;
+
+    beforeEach(async () => {
+        vi.clearAllMocks();
+        api = await ApiClient.create({
+            token: 'fake-token',
+            encryption: { type: 'legacy' as const, secret: new Uint8Array(32) }
+        });
+    });
+
+    it('sanitizes getSessionById Axios errors', async () => {
+        mockGet.mockRejectedValue({
+            code: 'ERR_BAD_RESPONSE',
+            response: { status: 500, data: { payload: 'private-body' } },
+            config: { headers: { Authorization: 'Bearer secret-token' } }
+        });
+        await expect(api.getSessionById('session-1')).resolves.toBeNull();
+        const serialized = JSON.stringify(loggerDebug.mock.calls);
+        expect(serialized).toContain('ERR_BAD_RESPONSE');
+        expect(serialized).toContain('500');
+        expect(serialized).not.toContain('private-body');
+        expect(serialized).not.toContain('secret-token');
+    });
+
+    it('sanitizes getSessionMessages Axios errors', async () => {
+        mockGet.mockRejectedValue({
+            code: 'ECONNRESET',
+            request: { headers: { Authorization: 'Bearer another-secret' } }
+        });
+        await expect(api.getSessionMessages('session-1')).rejects.toThrow('session_message_lookup_failed');
+        const serialized = JSON.stringify(loggerDebug.mock.calls);
+        expect(serialized).toContain('ECONNRESET');
+        expect(serialized).not.toContain('another-secret');
     });
 });

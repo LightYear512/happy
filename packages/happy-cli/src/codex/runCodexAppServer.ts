@@ -20,6 +20,8 @@ import { registerShutdownHandlers } from '@/utils/shutdownHandlers';
 import { createCodexAppServerClient, type CodexAppServerClient } from './codexAppServerClient';
 import { buildCodexChildEnv } from './codexEnvBuilder';
 import { createAppServerStreamBridge, type AppServerStreamUpdate } from './appServerStreamBridge';
+import { withCodexModelModeMetadata } from './modelMode';
+import { resolveCodexModelModeOrDefault } from './defaultModelConfig';
 import { CodexPermissionHandler } from './utils/permissionHandler';
 import { ReasoningProcessor } from './utils/reasoningProcessor';
 import { DiffProcessor } from './utils/diffProcessor';
@@ -40,6 +42,7 @@ import { watchCodexProfileFile } from '@/commands/bang/authCommand';
 import type { FSWatcher } from 'node:fs';
 import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
 import { registerKillSessionHandler } from '@/claude/registerKillSessionHandler';
+import { registerSessionTransportFatalHandler } from '@/api/registerSessionTransportFatalHandler';
 import { stopCaffeinate } from '@/utils/caffeinate';
 import { connectionState } from '@/utils/serverConnectionErrors';
 import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
@@ -249,11 +252,13 @@ export async function runCodexWithAppServer(opts: {
     // block); `sandboxConfig` is hoisted because the turn loop reads it.
     let session: ApiSessionClient;
     let permissionHandler: CodexPermissionHandler;
+    let bindTransportFatalHandler: ((client: ApiSessionClient) => void) | null = null;
     let reconnectionHandle: ReturnType<typeof setupOfflineReconnection>['reconnectionHandle'] = null;
     let response: Awaited<ReturnType<typeof api.getOrCreateSession>> | undefined;
 
     if (opts.deps?.session) {
         session = opts.deps.session;
+        session.updateMetadata((metadata) => withCodexModelModeMetadata(metadata));
     } else {
         const machineId = settings?.machineId;
         if (!machineId) {
@@ -290,12 +295,15 @@ export async function runCodexWithAppServer(opts: {
             response,
             onSessionSwap: (newSession) => {
                 session = newSession;
+                session.updateMetadata((metadata) => withCodexModelModeMetadata(metadata));
+                bindTransportFatalHandler?.(newSession);
                 if (permissionHandler) {
                     permissionHandler.updateSession(newSession);
                 }
             },
         });
         session = reconnection.session;
+        session.updateMetadata((metadata) => withCodexModelModeMetadata(metadata));
         reconnectionHandle = reconnection.reconnectionHandle;
 
         if (response) {
@@ -347,10 +355,12 @@ export async function runCodexWithAppServer(opts: {
         }
 
         let messageModel = currentModel;
-        if (message.meta?.hasOwnProperty('model')) {
-            messageModel = message.meta.model || undefined;
+        if (message.meta && Object.prototype.hasOwnProperty.call(message.meta, 'model')) {
+            messageModel = typeof message.meta.model === 'string' && message.meta.model.length > 0
+                ? message.meta.model
+                : undefined;
             currentModel = messageModel;
-            logger.debug(`[CodexAppServer] Model updated: ${messageModel || 'reset to default'}`);
+            logger.debug(`[CodexAppServer] Model mode updated to: ${currentModel || 'Codex config'}`);
         }
 
         const enhancedMode: EnhancedMode = {
@@ -1050,6 +1060,18 @@ export async function runCodexWithAppServer(opts: {
     session.rpcHandlerManager.registerHandler('abort', handleAbort);
     registerKillSessionHandler(session.rpcHandlerManager, handleKillSession);
 
+    let removeTransportFatalHandler = () => {};
+    bindTransportFatalHandler = (boundSession) => {
+        removeTransportFatalHandler();
+        removeTransportFatalHandler = registerSessionTransportFatalHandler(boundSession, async (snapshot) => {
+            logger.warn(`[CodexAppServer] Happy transport became terminal (${snapshot.state}); shutting down the unreachable runtime`);
+            shouldExit = true;
+            messageQueue.close();
+            await handleAbort();
+        });
+    };
+    bindTransportFatalHandler(session);
+
     //
     // Main loop
     //
@@ -1429,6 +1451,7 @@ export async function runCodexWithAppServer(opts: {
                     message.mode.permissionMode,
                     sandboxManagedByHappy,
                 );
+                const modelConfig = resolveCodexModelModeOrDefault(message.mode.model);
 
                 // Start or resume thread if needed
                 if (!threadId) {
@@ -1439,6 +1462,8 @@ export async function runCodexWithAppServer(opts: {
                             threadId: opts.codexSessionId,
                             approvalPolicy: toApprovalPolicy(executionPolicy.approvalPolicy),
                             sandbox: executionPolicy.sandbox,
+                            ...(modelConfig.model ? { model: modelConfig.model } : {}),
+                            ...(modelConfig.reasoningEffort ? { config: { model_reasoning_effort: modelConfig.reasoningEffort } } : {}),
                             persistExtendedHistory: true,
                         });
                         threadId = readThreadId(threadResponse) ?? opts.codexSessionId;
@@ -1451,6 +1476,8 @@ export async function runCodexWithAppServer(opts: {
                             cwd: sessionCwd,
                             approvalPolicy: toApprovalPolicy(executionPolicy.approvalPolicy),
                             sandbox: executionPolicy.sandbox,
+                            ...(modelConfig.model ? { model: modelConfig.model } : {}),
+                            ...(modelConfig.reasoningEffort ? { config: { model_reasoning_effort: modelConfig.reasoningEffort } } : {}),
                             experimentalRawEvents: true,
                             persistExtendedHistory: true,
                         });
@@ -1491,7 +1518,8 @@ export async function runCodexWithAppServer(opts: {
                     input: [{ type: 'text', text: turnInputText }],
                     approvalPolicy: toApprovalPolicy(executionPolicy.approvalPolicy),
                     sandboxPolicy: toSandboxPolicy(executionPolicy.sandbox, sessionCwd),
-                    ...(message.mode.model ? { model: message.mode.model } : {}),
+                    ...(modelConfig.model ? { model: modelConfig.model } : {}),
+                    ...(modelConfig.reasoningEffort ? { effort: modelConfig.reasoningEffort } : {}),
                 });
                 if (injectSystemPrompt) {
                     needsSystemPromptInjection = false;
@@ -1550,6 +1578,7 @@ export async function runCodexWithAppServer(opts: {
         // Clean up resources
         logger.debug('[CodexAppServer] Final cleanup start');
         replyMonitor.dispose();
+        removeTransportFatalHandler();
 
         removeShutdownHandlers();
         try { codexProfileWatcher?.close(); } catch { /* best effort */ }

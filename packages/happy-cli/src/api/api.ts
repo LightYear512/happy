@@ -2,6 +2,9 @@ import axios from 'axios'
 import { logger } from '@/ui/logger'
 import type { AgentState, CreateSessionResponse, Metadata, Session, Machine, MachineMetadata, DaemonState } from '@/api/types'
 import { ApiSessionClient } from './apiSession';
+import { ApiSessionMetadataClient } from './apiSessionMetadata';
+import { ApiSessionMessageClient } from './apiSessionMessage';
+import { MAX_RECOVERY_RESPONSE_BYTES } from './sessionMessageRecovery';
 import { ApiMachineClient } from './apiMachine';
 import { decodeBase64, encodeBase64, getRandomBytes, encrypt, decrypt, libsodiumEncryptForPublicKey } from './encryption';
 import { PushNotificationClient } from './pushNotifications';
@@ -318,7 +321,7 @@ export class ApiClient {
         lastActiveAt: raw.lastActiveAt,
       };
     } catch (error) {
-      logger.debug('[API] [ERROR] Failed to get session by ID:', error);
+      logger.debug('[API] Session lookup failed', safeLookupFailure(error));
       return null;
     }
   }
@@ -327,24 +330,36 @@ export class ApiClient {
    * Get recent messages for a session. Used after restore to find pending user messages
    * that arrived while the CLI was offline (between session close and restore connect).
    */
-  async getSessionMessages(sessionId: string): Promise<Array<{ id: string, seq: number, content: any, createdAt: number }>> {
+  async getSessionMessages(sessionId: string): Promise<Array<{ id: string, seq: number, localId: string | null, content: any, createdAt: number }>> {
     try {
       const response = await axios.get(
         `${configuration.serverUrl}/v1/sessions/${sessionId}/messages`,
         {
           headers: { 'Authorization': `Bearer ${this.credential.token}` },
-          timeout: 10000
+          timeout: 10000,
+          maxContentLength: MAX_RECOVERY_RESPONSE_BYTES
         }
       );
-      return response.data.messages || [];
+      if (!Array.isArray(response.data?.messages)) {
+        throw new Error('session message response is malformed');
+      }
+      return response.data.messages;
     } catch (error) {
-      logger.debug('[API] [ERROR] Failed to get session messages:', error);
-      return [];
+      logger.debug('[API] Session messages lookup failed', safeLookupFailure(error));
+      throw new Error('session_message_lookup_failed');
     }
   }
 
   sessionSyncClient(session: Session): ApiSessionClient {
     return new ApiSessionClient(this.credential.token, session);
+  }
+
+  sessionMetadataClient(session: Session): ApiSessionMetadataClient {
+    return new ApiSessionMetadataClient(this.credential.token, session);
+  }
+
+  sessionMessageClient(session: Session): ApiSessionMessageClient {
+    return new ApiSessionMessageClient(this.credential.token, session);
   }
 
   machineSyncClient(machine: Machine): ApiMachineClient {
@@ -468,4 +483,15 @@ export class ApiClient {
       return null;
     }
   }
+}
+
+function safeLookupFailure(error: unknown): { kind: 'http' | 'network' | 'unknown'; status: number | null; code: string | null } {
+  if (axios.isAxiosError(error)) {
+    return {
+      kind: typeof error.response?.status === 'number' ? 'http' : 'network',
+      status: typeof error.response?.status === 'number' ? error.response.status : null,
+      code: typeof error.code === 'string' ? error.code : null,
+    };
+  }
+  return { kind: 'unknown', status: null, code: null };
 }
