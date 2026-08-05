@@ -450,13 +450,14 @@ export const it: TranslationStructure = {
         },
         codexModel: {
             title: 'MODELLO CODEX',
+            default: 'Impostazioni CLI',
             gpt5CodexLow: 'gpt-5-codex basso',
             gpt5CodexMedium: 'gpt-5-codex medio',
             gpt5CodexHigh: 'gpt-5-codex alto',
-            gpt5Minimal: 'GPT-5 Minimo',
-            gpt5Low: 'GPT-5 Basso',
-            gpt5Medium: 'GPT-5 Medio',
-            gpt5High: 'GPT-5 Alto',
+            gpt5Minimal: 'GPT-5.6 Minimo',
+            gpt5Low: 'GPT-5.6 Basso',
+            gpt5Medium: 'GPT-5.6 Medio',
+            gpt5High: 'GPT-5.6 Alto',
         },
         geminiPermissionMode: {
             title: 'MODALITÀ PERMESSI GEMINI',

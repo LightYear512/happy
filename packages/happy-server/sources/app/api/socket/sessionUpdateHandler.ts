@@ -1,6 +1,6 @@
 import { sessionAliveEventsCounter, websocketEventsCounter } from "@/app/monitoring/metrics2";
 import { activityCache } from "@/app/presence/sessionCache";
-import { buildNewMessageUpdate, buildSessionActivityEphemeral, buildUpdateSessionUpdate, ClientConnection, eventRouter } from "@/app/events/eventRouter";
+import { buildNewMessageUpdate, buildSessionActivityEphemeral, buildSessionSystemMessageEphemeral, buildUpdateSessionUpdate, ClientConnection, eventRouter } from "@/app/events/eventRouter";
 import { db } from "@/storage/db";
 import { allocateSessionSeq, allocateUserSeq } from "@/storage/seq";
 import { AsyncLock } from "@/utils/lock";
@@ -27,6 +27,31 @@ export async function tryRestoreSession(
     session: { id: string, active: boolean, lastActiveAt: Date, accountId: string, claudeSessionId: string | null, summary: string | null, plainMachineId: string | null },
     rpcListeners: Map<string, Socket>,
 ): Promise<boolean> {
+    const publishRestoreFailure = async (daemonSocket: Socket | null, error: unknown) => {
+        const detail = (error instanceof Error ? error.message : String(error))
+            .replace(/\s+/gu, ' ').trim().slice(0, 512) || 'Session restore failed';
+        const event = buildSessionSystemMessageEphemeral(session.id, `会话恢复失败：${detail}`);
+        if (daemonSocket) {
+            try {
+                const response: any = await daemonSocket.timeout(25000).emitWithAck('server-publish-session-error', {
+                    sessionId: session.id,
+                    eventId: event.eventId,
+                    source: 'happy.restore',
+                    code: 'happy.restore.failed',
+                    message: detail,
+                });
+                if (response?.ok === true && response.sessionId === session.id && response.eventId === event.eventId) {
+                    return;
+                }
+            } catch (publishError) {
+                log({ module: 'restore', level: 'error' }, `Unified restore error publication failed for session ${session.id}: ${publishError}`);
+            }
+        }
+        // No daemon means there is no encryption authority for a persistent
+        // agent event. Use the generic ephemeral adapter rather than dropping it.
+        eventRouter.emitEphemeral({ userId, payload: event,
+            recipientFilter: { type: 'user-scoped-only' } });
+    };
     const now = Date.now();
     const isInactive = !session.active;
     const isZombie = session.active && (now - session.lastActiveAt.getTime()) > ZOMBIE_THRESHOLD_MS;
@@ -48,78 +73,94 @@ export async function tryRestoreSession(
 
     // Set restoring lock
     restoringLocks.set(session.id, now);
-
-    // If zombie, mark as inactive first
-    if (isZombie) {
-        await db.session.update({
-            where: { id: session.id },
-            data: { active: false },
-        });
-    }
-
-    // Find the correct daemon socket via RPC listeners.
-    // RPC methods are registered with machineId prefix (e.g., "machineId:spawn-happy-session").
-    // If session has plainMachineId, match precisely. Otherwise fall back to first connected daemon.
     let daemonSocket: Socket | null = null;
-    if (session.plainMachineId) {
-        const machinePrefix = `${session.plainMachineId}:`;
-        for (const [method, sock] of rpcListeners.entries()) {
-            if (method.startsWith(machinePrefix) && sock.connected) {
-                daemonSocket = sock;
-                break;
-            }
-        }
-    } else {
-        // Fallback for sessions created before plainMachineId was added
-        for (const [_method, sock] of rpcListeners.entries()) {
-            if (sock.connected) {
-                daemonSocket = sock;
-                break;
-            }
-        }
-    }
-    if (!daemonSocket) {
-        log({ module: 'restore' }, `No connected daemon found for session ${session.id} (machineId=${session.plainMachineId || 'unknown'})`);
-        restoringLocks.delete(session.id);
-        return false;
-    }
-
-    // Send restore request directly to daemon socket (plaintext, bypasses RPC encryption layer).
-    // Server→Daemon socket is already authenticated (machine-scoped, token verified).
-    log({ module: 'restore' }, `Triggering restore for session ${session.id}`);
+    const daemonRestoredSessionIds = new Set<string>();
     try {
+        if (isZombie) {
+            await db.session.update({
+                where: { id: session.id },
+                data: { active: false },
+            });
+        }
+
+        // Find the correct daemon socket via RPC listeners.
+        if (session.plainMachineId) {
+            const machinePrefix = `${session.plainMachineId}:`;
+            for (const [method, sock] of rpcListeners.entries()) {
+                if (method.startsWith(machinePrefix) && sock.connected) {
+                    daemonSocket = sock;
+                    break;
+                }
+            }
+        } else {
+            for (const [_method, sock] of rpcListeners.entries()) {
+                if (sock.connected) {
+                    daemonSocket = sock;
+                    break;
+                }
+            }
+        }
+        if (!daemonSocket) {
+            throw new Error(`No connected daemon found (machineId=${session.plainMachineId || 'unknown'})`);
+        }
+
+        log({ module: 'restore' }, `Triggering restore for session ${session.id}`);
         const response: any = await daemonSocket.timeout(20000).emitWithAck('server-restore-session', {
             sessionId: session.id,
             claudeSessionId: session.claudeSessionId,
             summary: session.summary,
         });
-        if (!response.ok) {
-            throw new Error(response.error || 'Daemon returned error');
+        const result = response?.result;
+        if (result?.type === 'success' && typeof result.sessionId === 'string') {
+            daemonRestoredSessionIds.add(result.sessionId);
+            // A restoring child remains indexed by the requested identity until
+            // its exact webhook is admitted, so compensation checks both forms.
+            daemonRestoredSessionIds.add(session.id);
         }
+        if (!response || response.ok !== true) {
+            throw new Error(response?.error || 'Daemon returned error');
+        }
+        if (!result || result.type !== 'success' || result.sessionId !== session.id) {
+            throw new Error('Daemon did not restore the exact requested session');
+        }
+
+        const nowMs = Date.now();
+        await db.session.update({
+            where: { id: session.id },
+            data: {
+                active: true,
+                lastActiveAt: new Date(nowMs),
+            },
+        });
+        activityCache.invalidateSession(session.id);
+        eventRouter.emitEphemeral({
+            userId,
+            payload: buildSessionActivityEphemeral(session.id, true, nowMs, false),
+            recipientFilter: { type: 'user-scoped-only' },
+        });
+        return true;
     } catch (error) {
         log({ module: 'restore', level: 'error' }, `Restore failed for session ${session.id}: ${error}`);
-        restoringLocks.delete(session.id);
+        if (daemonSocket) {
+            for (const restoredSessionId of daemonRestoredSessionIds) {
+                try {
+                    const rollback: any = await daemonSocket.timeout(10000).emitWithAck(
+                        'server-rollback-restored-session',
+                        { sessionId: restoredSessionId },
+                    );
+                    if (!rollback || rollback.ok !== true || rollback.sessionId !== restoredSessionId) {
+                        log({ module: 'restore', level: 'error' }, `Restore rollback was not confirmed for session ${restoredSessionId}`);
+                    }
+                } catch (rollbackError) {
+                    log({ module: 'restore', level: 'error' }, `Restore rollback failed for session ${restoredSessionId}: ${rollbackError}`);
+                }
+            }
+        }
+        await publishRestoreFailure(daemonSocket, error);
         return false;
+    } finally {
+        restoringLocks.delete(session.id);
     }
-
-    // Explicit revival: the daemon acknowledged spawning a new child for this
-    // sessionId, so flip `active` back to true and drop the cache entry that
-    // still carries `dead: true` from a prior session-end. Without this step
-    // the next session-alive heartbeat from the restored child is rejected by
-    // isSessionValid and the UI never sees the session come back online.
-    const nowMs = Date.now();
-    await db.session.update({
-        where: { id: session.id },
-        data: { active: true, lastActiveAt: new Date(nowMs) },
-    });
-    activityCache.invalidateSession(session.id);
-    eventRouter.emitEphemeral({
-        userId,
-        payload: buildSessionActivityEphemeral(session.id, true, nowMs, false),
-        recipientFilter: { type: 'user-scoped-only' },
-    });
-
-    return true;
 }
 
 export function sessionUpdateHandler(userId: string, socket: Socket, connection: ClientConnection, rpcListeners: Map<string, Socket>) {

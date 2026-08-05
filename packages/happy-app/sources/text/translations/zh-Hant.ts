@@ -422,13 +422,14 @@ export const zhHant: TranslationStructure = {
         },
         codexModel: {
             title: 'CODEX 模型',
+            default: '使用 CLI 設定',
             gpt5CodexLow: 'gpt-5-codex low',
             gpt5CodexMedium: 'gpt-5-codex medium',
             gpt5CodexHigh: 'gpt-5-codex high',
-            gpt5Minimal: 'GPT-5 極簡',
-            gpt5Low: 'GPT-5 低',
-            gpt5Medium: 'GPT-5 中',
-            gpt5High: 'GPT-5 高',
+            gpt5Minimal: 'GPT-5.6 極簡',
+            gpt5Low: 'GPT-5.6 低',
+            gpt5Medium: 'GPT-5.6 中',
+            gpt5High: 'GPT-5.6 高',
         },
         geminiPermissionMode: {
             title: 'GEMINI 權限模式',

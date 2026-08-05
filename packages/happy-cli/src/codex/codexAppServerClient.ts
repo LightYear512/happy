@@ -29,7 +29,11 @@ type JsonRpcRequestHandler = (
 type JsonRpcNotificationHandler = (params: unknown) => Promise<void> | void;
 
 export type CodexAppServerClient = Readonly<{
-    request: (method: string, params?: unknown) => Promise<unknown>;
+    request: (
+        method: string,
+        params?: unknown,
+        options?: Readonly<{ timeoutMs?: number }>,
+    ) => Promise<unknown>;
     notify: (method: string, params?: unknown) => Promise<void>;
     registerRequestHandler: (
         method: string,
@@ -46,8 +50,10 @@ export type CodexAppServerClient = Readonly<{
 // Constants
 // ---------------------------------------------------------------------------
 
-/** 14 days – matches the existing MCP client timeout. */
-const DEFAULT_REQUEST_TIMEOUT_MS = 14 * 24 * 60 * 60 * 1000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_INITIALIZE_TIMEOUT_MS = 15_000;
+const DEFAULT_DISPOSE_TIMEOUT_MS = 3_000;
+const DEFAULT_FORCE_KILL_WAIT_MS = 1_000;
 
 const MAX_STDERR_CHARS = 8_000;
 
@@ -88,6 +94,13 @@ function toMessageKey(
 
 function createDisposedError(): Error {
     return new Error('Codex app-server client has been disposed');
+}
+
+function positiveTimeout(value: number | undefined, fallback: number): number {
+    if (value === undefined || !Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
+        return fallback;
+    }
+    return value;
 }
 
 // ---------------------------------------------------------------------------
@@ -182,6 +195,10 @@ function resolveCodexBinary(): string {
 export async function createCodexAppServerClient(opts?: {
     processEnv?: Record<string, string>;
     cwd?: string;
+    requestTimeoutMs?: number;
+    initializeTimeoutMs?: number;
+    disposeTimeoutMs?: number;
+    forceKillWaitMs?: number;
     /** TOML config overrides passed as `--config-override key=value` CLI args (e.g. MCP server injection). */
     configOverrides?: readonly string[];
 }): Promise<CodexAppServerClient> {
@@ -195,6 +212,17 @@ export async function createCodexAppServerClient(opts?: {
     }
     const env = sanitizeEnv(opts?.processEnv ?? process.env);
     const cwd = opts?.cwd ?? process.cwd();
+    const envRequestTimeout = Number(process.env.HAPPY_CODEX_APP_SERVER_RPC_TIMEOUT_MS);
+    const requestTimeoutMs = positiveTimeout(
+        opts?.requestTimeoutMs,
+        positiveTimeout(envRequestTimeout, DEFAULT_REQUEST_TIMEOUT_MS),
+    );
+    const initializeTimeoutMs = positiveTimeout(
+        opts?.initializeTimeoutMs,
+        Math.min(requestTimeoutMs, DEFAULT_INITIALIZE_TIMEOUT_MS),
+    );
+    const disposeTimeoutMs = positiveTimeout(opts?.disposeTimeoutMs, DEFAULT_DISPOSE_TIMEOUT_MS);
+    const forceKillWaitMs = positiveTimeout(opts?.forceKillWaitMs, DEFAULT_FORCE_KILL_WAIT_MS);
 
     // On Windows, npm-installed CLIs are `.cmd` shims that need cmd.exe wrapping
     // with proper argument escaping (same approach as happier's resolveWindowsCommandInvocation).
@@ -237,6 +265,7 @@ export async function createCodexAppServerClient(opts?: {
     let disposing = false;
     let disposePromise: Promise<void> | null = null;
     let resolveClosed: (() => void) | null = null;
+    let closed = false;
 
     const closedPromise = new Promise<void>((resolve) => {
         resolveClosed = resolve;
@@ -264,6 +293,7 @@ export async function createCodexAppServerClient(opts?: {
 
     const sendMessage = async (
         message: Record<string, unknown>,
+        writeTimeoutMs = requestTimeoutMs,
     ): Promise<void> => {
         if (state.fatalError) {
             throw state.fatalError;
@@ -290,8 +320,22 @@ export async function createCodexAppServerClient(opts?: {
                 throw state.fatalError ?? createDisposedError();
             }
             await new Promise<void>((resolve, reject) => {
+                let settled = false;
+                const timer = setTimeout(() => {
+                    if (settled) return;
+                    settled = true;
+                    const method = typeof message.method === 'string'
+                        ? message.method
+                        : 'notification';
+                    reject(new Error(
+                        `Codex app-server write ${method} timed out after ${writeTimeoutMs}ms`,
+                    ));
+                }, writeTimeoutMs);
                 try {
                     stdin.write(payload, 'utf8', (error) => {
+                        if (settled) return;
+                        settled = true;
+                        clearTimeout(timer);
                         if (error) {
                             reject(error);
                             return;
@@ -299,12 +343,20 @@ export async function createCodexAppServerClient(opts?: {
                         resolve();
                     });
                 } catch (err) {
+                    if (settled) return;
+                    settled = true;
+                    clearTimeout(timer);
                     reject(err);
                 }
             });
         });
         writeChain = nextWrite.catch(() => undefined);
-        await nextWrite;
+        try {
+            await nextWrite;
+        } catch (error) {
+            failWith(error);
+            throw error;
+        }
     };
 
     const handleServerRequest = async (
@@ -436,6 +488,7 @@ export async function createCodexAppServerClient(opts?: {
     });
 
     child.once('close', (code, signal) => {
+        closed = true;
         logger.debug(`[CodexAppServer] Child process closed: code=${code ?? 'null'} signal=${signal ?? 'null'} disposing=${disposing}`);
         resolveClosed?.();
         if (disposing) return;
@@ -456,6 +509,7 @@ export async function createCodexAppServerClient(opts?: {
     const request = async (
         method: string,
         requestParams?: unknown,
+        requestOptions?: Readonly<{ timeoutMs?: number }>,
     ): Promise<unknown> => {
         const id = ++nextId;
         const requestKey = toMessageKey(id);
@@ -465,15 +519,16 @@ export async function createCodexAppServerClient(opts?: {
             );
         }
 
+        const timeoutMs = positiveTimeout(requestOptions?.timeoutMs, requestTimeoutMs);
         const responsePromise = new Promise<unknown>((resolve, reject) => {
             const timer = setTimeout(() => {
                 pendingRequests.delete(requestKey);
                 reject(
                     new Error(
-                        `Codex app-server request ${method} timed out after ${DEFAULT_REQUEST_TIMEOUT_MS}ms`,
+                        `Codex app-server request ${method} timed out after ${timeoutMs}ms`,
                     ),
                 );
-            }, DEFAULT_REQUEST_TIMEOUT_MS);
+            }, timeoutMs);
 
             pendingRequests.set(requestKey, {
                 method,
@@ -489,12 +544,16 @@ export async function createCodexAppServerClient(opts?: {
         });
 
         try {
-            await sendMessage({
+            const sendPromise = sendMessage({
                 id,
                 method,
                 // Codex app-server rejects requests that omit the `params` field entirely.
                 params: requestParams === undefined ? {} : requestParams,
-            });
+            }, timeoutMs);
+            await Promise.race([
+                sendPromise,
+                responsePromise.then(() => undefined),
+            ]);
         } catch (error) {
             const failure =
                 error instanceof Error ? error : new Error(String(error));
@@ -569,7 +628,20 @@ export async function createCodexAppServerClient(opts?: {
             } catch {
                 // ignore
             }
-            await closedPromise;
+            const exitedGracefully = closed || await Promise.race([
+                closedPromise.then(() => true),
+                new Promise<boolean>((resolve) => setTimeout(() => resolve(false), disposeTimeoutMs)),
+            ]);
+            if (exitedGracefully) return;
+            try {
+                child.kill('SIGKILL');
+            } catch {
+                // ignore
+            }
+            await Promise.race([
+                closedPromise,
+                new Promise<void>((resolve) => setTimeout(resolve, forceKillWaitMs)),
+            ]);
         })();
 
         return await disposePromise;
@@ -589,7 +661,7 @@ export async function createCodexAppServerClient(opts?: {
             capabilities: {
                 experimentalApi: true,
             },
-        });
+        }, { timeoutMs: initializeTimeoutMs });
         await notify('initialized');
         logger.debug('[CodexAppServer] Initialization complete');
 

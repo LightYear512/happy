@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { resolveAbsolutePath, resolvePath } from './pathUtils';
+import { isConsoleSessionMetadata, resolveAbsolutePath, resolvePath } from './pathUtils';
 
 describe('pathUtils', () => {
     describe('resolveAbsolutePath', () => {
@@ -187,6 +187,45 @@ describe('pathUtils', () => {
                 .toBe('/home/user/app-v2/src/main.js');
             expect(resolvePath('/home/user/application/config.json', metadata))
                 .toBe('/home/user/application/config.json');
+        });
+    });
+
+    describe('isConsoleSessionMetadata', () => {
+        it('detects explicit console session metadata', () => {
+            expect(isConsoleSessionMetadata({
+                path: '/Users/steve',
+                consoleSession: true,
+            })).toBe(true);
+        });
+
+        it('detects legacy console paths', () => {
+            expect(isConsoleSessionMetadata({
+                path: '/Users/steve/.happy/console',
+            })).toBe(true);
+            expect(isConsoleSessionMetadata({
+                path: 'C:\\Users\\steve\\.happy-dev\\console',
+            })).toBe(true);
+        });
+
+        it('detects legacy console summary metadata when old clients reported the home path', () => {
+            expect(isConsoleSessionMetadata({
+                path: '/Users/steve',
+                summary: {
+                    text: '\u{1F5A5}\uFE0F \u63A7\u5236\u53F0 - steve.local',
+                    updatedAt: Date.now(),
+                },
+            })).toBe(true);
+        });
+
+        it('does not classify normal project sessions as console sessions', () => {
+            expect(isConsoleSessionMetadata({
+                path: '/Users/steve/project',
+                consoleSession: false,
+                summary: {
+                    text: 'Project work',
+                    updatedAt: Date.now(),
+                },
+            })).toBe(false);
         });
     });
 

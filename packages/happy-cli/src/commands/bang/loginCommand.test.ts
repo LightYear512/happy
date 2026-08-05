@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { analyzePtyOutput, analyzeCodexPtyOutput, stripAnsiOnly, parseLoginArgs, recoverInterruptedCodexLogin, acquireCodexLoginLock, updateCodexLoginLockToSpawned, type PtyAction } from './loginCommand';
+import { analyzePtyOutput, analyzeCodexPtyOutput, stripAnsiOnly, parseLoginArgs, recoverInterruptedCodexLogin, acquireCodexLoginLock, updateCodexLoginLockToSpawned, createClaudeLoginPreAuthDeadline, shouldAcceptClaudeLoginResult, type PtyAction } from './loginCommand';
 
 // Real OAuth URL from actual Claude Code login flow
 const REAL_OAUTH_URL = 'https://claude.ai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference+user%3Asessions%3Aclaude_code+user%3Amcp_servers+user%3Afile_upload&code_challenge=9wvqXasXp7FespyUXZRRUy7pzFl6NfFQR0bO-vCLBr4&code_challenge_method=S256&state=2ppMXLEutGbkjDlq3aZdYUJqF3-sU7RUX1xODTviPkE';
@@ -135,6 +135,33 @@ describe('analyzePtyOutput', () => {
             expect(result).toEqual({ action: 'already-authenticated' });
         });
 
+        it('detects an authenticated Claude main prompt without Welcome back', () => {
+            const buffer = '\x1B[1mClaude Code v2.1.170\x1B[0m\n'
+                + 'Account\n'
+                + '❯\u00A0Try "explain this project"\n'
+                + '? for shortcuts';
+            const result = analyzePtyOutput(buffer, PRE_LOGIN, false);
+            expect(result).toEqual({ action: 'already-authenticated' });
+        });
+
+        it('does not classify partial Claude main-screen markers as authenticated', () => {
+            const versionOnly = 'Claude Code v2.1.170\nAccount';
+            const promptOnly = 'Account\n❯\u00A0Try "explain this project"\n? for shortcuts';
+            const alreadySent = 'Claude Code v2.1.170\nAccount\n'
+                + '❯\u00A0Try "explain this project"\n? for shortcuts';
+
+            expect(analyzePtyOutput(versionOnly, PRE_LOGIN, false)).toEqual({ action: 'discard' });
+            expect(analyzePtyOutput(promptOnly, PRE_LOGIN, false)).toEqual({ action: 'discard' });
+            expect(analyzePtyOutput(alreadySent, PRE_LOGIN, true)).toEqual({ action: 'discard' });
+        });
+
+        it('keeps the login method selector ahead of authenticated main-screen detection', () => {
+            const buffer = 'Claude Code v2.1.170\nSelect login method:\n'
+                + '❯ 1. Claude account\n  2. Anthropic Console\n? for shortcuts';
+            const result = analyzePtyOutput(buffer, PRE_LOGIN, false);
+            expect(result).toEqual({ action: 'auto-respond', response: '\r' });
+        });
+
         it('does not detect "Welcome back" after /login already sent', () => {
             const buffer = 'Claude Code v2.1.87\nWelcome back! Run /init';
             const result = analyzePtyOutput(buffer, false, true);
@@ -172,6 +199,72 @@ describe('analyzePtyOutput', () => {
             expect(analyzePtyOutput('Login successful!', true, true)).toEqual({ action: 'forward' });
             expect(analyzePtyOutput('1. Option\n2. Option\n', true, true)).toEqual({ action: 'forward' });
         });
+    });
+});
+
+describe('createClaudeLoginPreAuthDeadline', () => {
+    it('fires a zero-delay pre-OAuth deadline exactly once', async () => {
+        let deliveries = 0;
+        const deadline = createClaudeLoginPreAuthDeadline(() => {
+            deliveries++;
+        }, 0);
+
+        await new Promise(resolve => setTimeout(resolve, 20));
+        deadline.clear();
+        deadline.clear();
+
+        expect(deliveries).toBe(1);
+    });
+
+    it('clearing after an OAuth URL prevents pre-OAuth timeout delivery', async () => {
+        let deliveries = 0;
+        const deadline = createClaudeLoginPreAuthDeadline(() => {
+            deliveries++;
+        }, 20);
+
+        deadline.clear();
+        deadline.clear();
+        await new Promise(resolve => setTimeout(resolve, 40));
+
+        expect(deliveries).toBe(0);
+    });
+
+    it('rejects unsafe pre-OAuth timeout budgets', () => {
+        for (const timeoutMs of [-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648]) {
+            expect(() => createClaudeLoginPreAuthDeadline(() => {}, timeoutMs)).toThrow(RangeError);
+        }
+    });
+});
+
+describe('shouldAcceptClaudeLoginResult', () => {
+    it('accepts only explicit success or credentials created by this login attempt', () => {
+        expect(shouldAcceptClaudeLoginResult({
+            loginSucceeded: true,
+            aborted: false,
+            credentialExistedBefore: true,
+            credentialExistsAfter: true,
+        })).toBe(true);
+        expect(shouldAcceptClaudeLoginResult({
+            loginSucceeded: false,
+            aborted: false,
+            credentialExistedBefore: false,
+            credentialExistsAfter: true,
+        })).toBe(true);
+        expect(shouldAcceptClaudeLoginResult({
+            loginSucceeded: false,
+            aborted: false,
+            credentialExistedBefore: true,
+            credentialExistsAfter: true,
+        })).toBe(false);
+    });
+
+    it('rejects aborted Claude login results even when credentials exist', () => {
+        expect(shouldAcceptClaudeLoginResult({
+            loginSucceeded: true,
+            aborted: true,
+            credentialExistedBefore: false,
+            credentialExistsAfter: true,
+        })).toBe(false);
     });
 });
 

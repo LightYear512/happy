@@ -1,7 +1,7 @@
 import { logger } from '@/ui/logger';
 import { handleAuthBangCommand, handleAuthAllBangCommand } from './authCommand';
 import { handleLoginBangCommand } from './loginCommand';
-import { handleRestartBangCommand, handleRestartAllBangCommand } from './restartCommand';
+import { handleRestartBangCommand } from './restartCommand';
 import { getCachedProfileUsageEntry, handleUsageBangCommand, type ProfileUsageEntry } from './usageCommand';
 import { handleTestBangCommand } from './testCommand';
 import { handleReminderBangCommand } from './reminderCommand';
@@ -22,9 +22,8 @@ const commands: Record<string, { handler: BangCommandHandler; desc: string; load
     'auth':        { handler: handleAuthBangCommand,        desc: '切换 CCS 账号', sessionOnly: true },
     'login':       { handler: handleLoginBangCommand,       desc: '登录账户' },
     'usage':       { handler: handleUsageBangCommand,       desc: '⏱️查看Claude 用量' },
-    'auth-all':    { handler: handleAuthAllBangCommand,     desc: '🔑切换Claude账号', consoleOnly: true },
+    'auth-all':    { handler: handleAuthAllBangCommand,     desc: '🔑设置Claude全局账号', consoleOnly: true },
     'restart':     { handler: handleRestartBangCommand,     desc: '重启会话', sessionOnly: true },
-    'restart-all': { handler: handleRestartAllBangCommand,  desc: '重启全部会话', consoleOnly: true },
     'reminder':    { handler: handleReminderBangCommand,    desc: '设置/取消提示', sessionOnly: true, hidden: true },
     'reply-monitor': { handler: handleReplyMonitorBangCommand, desc: '回复监控开关', sessionOnly: true, hidden: true },
     'task': { handler: handleTaskMessagesBangCommand, desc: '任务消息', sessionOnly: true, hidden: true },
@@ -45,7 +44,6 @@ const aliases: Record<string, string> = {
     'l-codex': 'login',
     // o: 'open', // TODO: 暂停使用
     r: 'restart',
-    ra: 'restart-all',
     u: 'usage',
     'u-codex': 'usage',
     reminder: 'reminder',
@@ -259,12 +257,12 @@ function parseBangCommand(text: string): { prefix: string; name: string; args: s
  * Build the !help output listing all available commands.
  */
 /** Commands hidden from help output (low-frequency commands not worth showing). */
-const helpHidden = new Set(['restart-all']);
+const helpHidden = new Set<string>();
 
 /** Commands that support --codex flag, with their codex-specific descriptions. */
 const codexVariants: Record<string, string> = {
     'auth':     '切换当前会话 Codex 账号',
-    'auth-all': '🔑切换codex账号',
+    'auth-all': '🔑设置Codex全局账号',
     'login':    '登录 Codex 账号',
     'usage':    '⏱️查看codex用量',
 };
@@ -291,7 +289,7 @@ function buildHelp(isConsole: boolean): BangCommandResult {
 }
 
 /** Commands hidden from console welcome (available via !help but not shown on launch). */
-const consoleWelcomeHidden = new Set(['restart-all', 'login']);
+const consoleWelcomeHidden = new Set(['login']);
 
 /**
  * Build the console welcome message listing key commands.

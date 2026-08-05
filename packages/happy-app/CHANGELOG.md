@@ -8,6 +8,7 @@ This release expands AI agent support and refines the voice experience, while im
 - Removed model configurations from agents. We were not able to keep up with the models so for now we are removing the configuration from the mobile app. You can still configure it through your CLIs, happy will simply use defaults.
 - Elevenlabs ... is epxensive. Voice conversations will soon require a subscription after 3 free trials - we'll soon allow connecting your own ElevenLabs agent if you want to manage your own spendings.
 - Improved markdown table rendering in chat - no more ASCII pipes `|--|`, actual formatted tables (layout still needs work, but much better!)
+- Fixed session-list close actions so an already-stopped session can be closed cleanly through its machine daemon.
 
 ## Version 4 - 2025-09-12
 

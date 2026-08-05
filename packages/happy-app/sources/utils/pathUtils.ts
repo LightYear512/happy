@@ -1,4 +1,4 @@
-import { Metadata } from '@/sync/storageTypes';
+import type { Metadata } from '@/sync/storageTypes';
 
 /**
  * Resolves a path relative to the root path from metadata.
@@ -79,3 +79,16 @@ export function resolveAbsolutePath(path: string, homeDir?: string): string {
  * Console sessions use this directory as their cwd and should be hidden from user-facing path lists.
  */
 export const isConsolePath = (path: string): boolean => /[/\\]\.happy[^/\\]*[/\\]console$/.test(path);
+
+const LEGACY_CONSOLE_SUMMARY_PREFIX = '\u{1F5A5}\uFE0F \u63A7\u5236\u53F0 - ';
+
+/**
+ * Check whether metadata belongs to the internal daemon console session.
+ *
+ * New CLIs report this explicitly. The path and summary fallbacks keep older console sessions hidden.
+ */
+export function isConsoleSessionMetadata(metadata: Pick<Metadata, 'path' | 'consoleSession' | 'summary'> | null | undefined): boolean {
+    return metadata?.consoleSession === true ||
+        (typeof metadata?.path === 'string' && isConsolePath(metadata.path)) ||
+        metadata?.summary?.text?.startsWith(LEGACY_CONSOLE_SUMMARY_PREFIX) === true;
+}

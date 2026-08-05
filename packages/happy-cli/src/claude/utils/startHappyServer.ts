@@ -15,6 +15,7 @@ import { appendFile } from "node:fs/promises";
 import { logger } from "@/ui/logger";
 import { ApiSessionClient } from "@/api/apiSession";
 import { randomUUID } from "node:crypto";
+import { modelMayChangeTitle } from "@/utils/titleAuthority";
 
 export interface HappyServerOptions {
     /** Returns the current JSONL session file path, or null if not yet available */
@@ -67,6 +68,9 @@ export async function startHappyServer(client: ApiSessionClient, options?: Happy
     logger.debug(`[happyMCP] server:start sessionId=${client.sessionId}`);
 
     const handler = async (title: string) => {
+        if (!modelMayChangeTitle()) {
+            return { success: false, error: 'Chat title is managed by its external session controller' };
+        }
         logger.debug('[happyMCP] Changing title to:', title);
         try {
             client.sendClaudeSessionMessage({

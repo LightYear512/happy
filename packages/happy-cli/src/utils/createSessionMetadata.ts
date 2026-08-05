@@ -10,11 +10,16 @@
 import os from 'node:os';
 import { resolve } from 'node:path';
 
-import type { AgentState, Metadata } from '@/api/types';
+import type { AgentState, Metadata, PermissionMode } from '@/api/types';
 import { configuration } from '@/configuration';
 import { projectPath } from '@/projectPath';
 import type { SandboxConfig } from '@/persistence';
 import packageJson from '../../package.json';
+import { withCodexModelModeMetadata } from '@/codex/modelMode';
+import { HAPPY_CONSOLE_NAME, stableHappySessionName } from '@/utils/happySessionName';
+import { sessionTitleAuthority, type SessionTitleAuthority } from '@/utils/titleAuthority';
+
+export const HAPPY_CONSOLE_TITLE = HAPPY_CONSOLE_NAME;
 
 /**
  * Backend flavor identifier for session metadata.
@@ -35,6 +40,11 @@ export interface CreateSessionMetadataOptions {
     sandbox?: SandboxConfig;
     /** Whether the backend runs with "dangerously skip permissions" behavior */
     dangerouslySkipPermissions?: boolean;
+    /** Initial backend permission mode persisted for exact restore. */
+    permissionMode?: PermissionMode;
+    /** Whether this is the daemon-owned internal console session */
+    consoleSession?: boolean;
+    titleAuthority?: SessionTitleAuthority;
 }
 
 /**
@@ -85,12 +95,21 @@ export function createSessionMetadata(opts: CreateSessionMetadataOptions): Sessi
         startedFromDaemon: opts.startedBy === 'daemon',
         hostPid: process.pid,
         startedBy: opts.startedBy || 'terminal',
+        consoleSession: opts.consoleSession === true || process.env.HAPPY_CONSOLE_SESSION === '1',
         lifecycleState: 'running',
         lifecycleStateSince: Date.now(),
         flavor: opts.flavor,
         sandbox: opts.sandbox?.enabled ? opts.sandbox : null,
         dangerouslySkipPermissions: opts.dangerouslySkipPermissions ?? null,
+        permissionMode: opts.permissionMode,
     };
+    metadata.name = stableHappySessionName(metadata);
+    if ((opts.titleAuthority ?? sessionTitleAuthority()) === 'external') metadata.titleAuthority = 'external';
 
-    return { state, metadata };
+    return {
+        state,
+        metadata: opts.flavor === 'codex'
+            ? withCodexModelModeMetadata(metadata)
+            : metadata,
+    };
 }

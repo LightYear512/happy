@@ -2,6 +2,7 @@ import type { CodexSessionConfig } from './types';
 
 type CodexApprovalPolicy = NonNullable<CodexSessionConfig['approval-policy']>;
 type CodexSandboxMode = NonNullable<CodexSessionConfig['sandbox']>;
+type PermissionMode = import('@/api/types').PermissionMode;
 
 /**
  * Single source of truth for the Codex protocol value sets accepted by
@@ -43,8 +44,16 @@ const _AssertExhaustiveSandbox: Equals<
 void _AssertExhaustiveApproval;
 void _AssertExhaustiveSandbox;
 
+export function resolveCodexSessionPermissionMode(
+    persisted: PermissionMode | undefined,
+    requested: PermissionMode | undefined,
+    dangerouslySkipPermissions: boolean,
+): PermissionMode {
+    return persisted ?? requested ?? (dangerouslySkipPermissions ? 'bypassPermissions' : 'default');
+}
+
 export function resolveCodexExecutionPolicy(
-    permissionMode: import('@/api/types').PermissionMode,
+    permissionMode: PermissionMode,
     sandboxManagedByHappy: boolean,
 ): { approvalPolicy: CodexApprovalPolicy; sandbox: CodexSandboxMode } {
     if (sandboxManagedByHappy) {
@@ -64,7 +73,7 @@ export function resolveCodexExecutionPolicy(
             case 'read-only': return 'never';
             case 'safe-yolo': return 'on-failure';
             case 'yolo': return 'on-failure';
-            case 'bypassPermissions': return 'on-failure';
+            case 'bypassPermissions': return 'never';
             case 'acceptEdits': return 'on-request';
             case 'plan': return 'on-request';
             default: return 'on-request';

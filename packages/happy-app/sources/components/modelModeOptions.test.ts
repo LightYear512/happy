@@ -27,18 +27,16 @@ describe('modelModeOptions', () => {
         expect(modes[0].name).toBe('tr:agentInput.permissionMode.default');
     });
 
-    it('builds codex model fallbacks with translated labels', () => {
+    it('builds codex model fallback from CLI settings plus GPT-5.6 test efforts', () => {
         const models = getCodexModelModes(translate);
         expect(models.map((model) => model.key)).toEqual([
-            'gpt-5-codex-high',
-            'gpt-5-codex-medium',
-            'gpt-5-codex-low',
-            'gpt-5-minimal',
-            'gpt-5-low',
-            'gpt-5-medium',
-            'gpt-5-high',
+            'default',
+            'gpt-5.6-sol:minimal',
+            'gpt-5.6-sol:low',
+            'gpt-5.6-sol:medium',
+            'gpt-5.6-sol:high',
         ]);
-        expect(models[0].name).toBe('tr:agentInput.codexModel.gpt5CodexHigh');
+        expect(models[0].name).toBe('tr:agentInput.codexModel.default');
     });
 
     it('prefers metadata models over hardcoded fallbacks', () => {
@@ -50,6 +48,22 @@ describe('modelModeOptions', () => {
 
         expect(models).toEqual([
             { key: 'custom-gemini', name: 'Gemini Custom', description: 'From metadata' },
+        ]);
+    });
+
+    it('ignores Codex metadata model cache and keeps the curated Codex choices', () => {
+        const models = getAvailableModels('codex', {
+            models: [
+                { code: 'gpt-5.6', value: 'GPT 5.6', description: 'Unsupported cache entry' },
+            ],
+        } as any, translate);
+
+        expect(models).toEqual([
+            { key: 'default', name: 'tr:agentInput.codexModel.default', description: 'Use Codex CLI config' },
+            { key: 'gpt-5.6-sol:minimal', name: 'tr:agentInput.codexModel.gpt5Minimal', description: 'gpt-5.6-sol / minimal reasoning' },
+            { key: 'gpt-5.6-sol:low', name: 'tr:agentInput.codexModel.gpt5Low', description: 'gpt-5.6-sol / low reasoning' },
+            { key: 'gpt-5.6-sol:medium', name: 'tr:agentInput.codexModel.gpt5Medium', description: 'gpt-5.6-sol / medium reasoning' },
+            { key: 'gpt-5.6-sol:high', name: 'tr:agentInput.codexModel.gpt5High', description: 'gpt-5.6-sol / high reasoning' },
         ]);
     });
 

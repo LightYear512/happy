@@ -13,7 +13,7 @@ import { io, type Socket } from 'socket.io-client';
 import { decodeBase64, decrypt, encodeBase64, encrypt } from './encryption';
 import { MAX_RECOVERY_RESPONSE_BYTES, RECENT_MESSAGE_WINDOW } from './sessionMessageRecovery';
 import { createUserScopedMessageObserver } from './apiSessionMessageObserver';
-import type { Session } from './types';
+import { MessageMetaSchema, type PermissionMode, type Session } from './types';
 
 const MAX_MESSAGE_BYTES = 12_000;
 const MAX_CODEX_BODY_BYTES = 64 * 1024;
@@ -23,15 +23,26 @@ const MAX_DATE_MS = 8_640_000_000_000_000;
 const MAX_CONFIRMATION_CIPHERTEXT_BYTES = 256 * 1024;
 const MAX_CODEX_BODY_DEPTH = 64;
 const MAX_CODEX_BODY_NODES = 100_000;
-const LOCAL_ID_PATTERN = /^xc-msg-v1-[a-f0-9]{64}$/;
-const REQUEST_KEYS = new Set(['messageRole', 'messageText', 'localId', 'timeoutMs']);
+const MESSAGE_LOCAL_ID_PATTERN = /^xc-msg-v1-[a-f0-9]{64}$/;
+const USER_LOCAL_ID_PATTERN = /^xc-(?:msg|soft)-v1-[a-f0-9]{64}$/;
+const USER_REQUEST_REQUIRED_KEYS = new Set(['messageRole', 'messageText', 'localId', 'timeoutMs']);
+const USER_REQUEST_KEYS = new Set([
+    ...USER_REQUEST_REQUIRED_KEYS, 'permissionMode', 'displayText', 'presentation',
+]);
 const CODEX_REQUEST_KEYS = new Set(['messageRole', 'messageType', 'body', 'localId', 'timeoutMs']);
+const AGENT_EVENT_REQUEST_REQUIRED_KEYS = new Set([
+    'messageRole', 'messageType', 'message', 'eventId', 'localId', 'timeoutMs',
+]);
+const AGENT_EVENT_REQUEST_KEYS = new Set([...AGENT_EVENT_REQUEST_REQUIRED_KEYS, 'presentation']);
 
 export interface UserMessageOnceRequest {
     messageRole: 'user';
     messageText: string;
     localId: string;
     timeoutMs: number;
+    permissionMode?: PermissionMode;
+    displayText?: string;
+    presentation?: 'compact' | 'mail';
 }
 
 export interface CodexMessageOnceRequest {
@@ -40,6 +51,16 @@ export interface CodexMessageOnceRequest {
     body: Record<string, unknown>;
     localId: string;
     timeoutMs: number;
+}
+
+export interface AgentEventOnceRequest {
+    messageRole: 'agent';
+    messageType: 'event';
+    message: string;
+    eventId: string;
+    localId: string;
+    timeoutMs: number;
+    presentation?: 'compact';
 }
 
 export interface PersistedMessageReceipt {
@@ -51,20 +72,54 @@ export interface PersistedMessageReceipt {
 }
 
 type ExpectedMessage =
-    | { kind: 'user'; text: string }
-    | { kind: 'codex'; body: Record<string, unknown> };
+    | { kind: 'user'; text: string; modelText?: string; permissionMode?: PermissionMode;
+        displayText?: string; presentation?: 'compact' | 'mail' }
+    | { kind: 'codex'; body: Record<string, unknown> }
+    | { kind: 'agent-event'; message: string; eventId: string; presentation?: 'compact' };
+
+export type MessagePersistenceOutcome = 'not-sent' | 'confirmation-unknown';
+
+export class HappyMessagePersistenceError extends Error {
+    readonly persistenceOutcome: MessagePersistenceOutcome;
+    readonly cause: unknown;
+
+    constructor(message: string, persistenceOutcome: MessagePersistenceOutcome, cause: unknown) {
+        super(message);
+        this.name = 'HappyMessagePersistenceError';
+        this.persistenceOutcome = persistenceOutcome;
+        this.cause = cause;
+    }
+}
 
 export function validateUserMessageOnceRequest(input: UserMessageOnceRequest): UserMessageOnceRequest {
-    requireExactKeys(input, REQUEST_KEYS, 'user message request');
+    requireKeys(input, USER_REQUEST_REQUIRED_KEYS, USER_REQUEST_KEYS, 'user message request');
     if (input.messageRole !== 'user') throw new Error('Invalid messageRole');
     const messageBytes = typeof input.messageText === 'string' ? Buffer.byteLength(input.messageText, 'utf8') : 0;
     if (messageBytes <= 0 || messageBytes > MAX_MESSAGE_BYTES) throw new Error('Invalid messageText size');
-    validateCommonRequest(input.localId, input.timeoutMs);
-    return input;
+    const permissionMode = MessageMetaSchema.shape.permissionMode.safeParse(input.permissionMode);
+    if (!permissionMode.success) throw new Error('Invalid permissionMode');
+    const displayText = MessageMetaSchema.shape.displayText.safeParse(input.displayText);
+    if (!displayText.success || (displayText.data !== undefined &&
+        (Buffer.byteLength(displayText.data, 'utf8') === 0 || Buffer.byteLength(displayText.data, 'utf8') > MAX_MESSAGE_BYTES))) {
+        throw new Error('Invalid displayText');
+    }
+    const presentation = MessageMetaSchema.shape.presentation.safeParse(input.presentation);
+    if (!presentation.success) throw new Error('Invalid presentation');
+    if (presentation.data === 'mail') {
+        const lines = displayText.data?.split('\n') ?? [];
+        if (lines.length !== 2 || lines.some((line) => line.length === 0)) throw new Error('Invalid Mail presentation');
+    }
+    validateCommonRequest(input.localId, input.timeoutMs, USER_LOCAL_ID_PATTERN);
+    return {
+        ...input,
+        ...(input.permissionMode === undefined ? {} : { permissionMode: permissionMode.data }),
+        ...(input.displayText === undefined ? {} : { displayText: displayText.data }),
+        ...(input.presentation === undefined ? {} : { presentation: presentation.data }),
+    };
 }
 
 export function validateCodexMessageOnceRequest(input: CodexMessageOnceRequest): CodexMessageOnceRequest {
-    requireExactKeys(input, CODEX_REQUEST_KEYS, 'Codex message request');
+    requireKeys(input, CODEX_REQUEST_KEYS, CODEX_REQUEST_KEYS, 'Codex message request');
     if (input.messageRole !== 'agent' || input.messageType !== 'codex') throw new Error('Invalid Codex message role or type');
     if (!input.body || typeof input.body !== 'object' || Array.isArray(input.body)) throw new Error('Invalid Codex message body');
     assertStrictJsonBody(input.body);
@@ -80,6 +135,18 @@ export function validateCodexMessageOnceRequest(input: CodexMessageOnceRequest):
     return { ...input, body: JSON.parse(serialized) as Record<string, unknown> };
 }
 
+export function validateAgentEventOnceRequest(input: AgentEventOnceRequest): AgentEventOnceRequest {
+    requireKeys(input, AGENT_EVENT_REQUEST_REQUIRED_KEYS, AGENT_EVENT_REQUEST_KEYS, 'agent event request');
+    if (input.messageRole !== 'agent' || input.messageType !== 'event') throw new Error('Invalid agent event role or type');
+    if (typeof input.message !== 'string' || Buffer.byteLength(input.message, 'utf8') <= 0 ||
+        Buffer.byteLength(input.message, 'utf8') > MAX_MESSAGE_BYTES) throw new Error('Invalid agent event message size');
+    if (typeof input.eventId !== 'string' || Buffer.byteLength(input.eventId, 'utf8') <= 0 ||
+        Buffer.byteLength(input.eventId, 'utf8') > MAX_MESSAGE_ID_BYTES) throw new Error('Invalid agent event id');
+    if (input.presentation !== undefined && input.presentation !== 'compact') throw new Error('Invalid presentation');
+    validateCommonRequest(input.localId, input.timeoutMs);
+    return { ...input };
+}
+
 /** User-scoped, one-shot writer confirmed through persisted server evidence. */
 export class ApiSessionMessageClient {
     private readonly session: Session;
@@ -87,6 +154,7 @@ export class ApiSessionMessageClient {
 
     static validateRequest = validateUserMessageOnceRequest;
     static validateCodexRequest = validateCodexMessageOnceRequest;
+    static validateAgentEventRequest = validateAgentEventOnceRequest;
 
     constructor(token: string, session: Session) {
         this.token = token;
@@ -95,11 +163,22 @@ export class ApiSessionMessageClient {
 
     async sendUserMessageOnce(raw: UserMessageOnceRequest): Promise<PersistedMessageReceipt> {
         const input = validateUserMessageOnceRequest(raw);
-        const expected: ExpectedMessage = { kind: 'user', text: input.messageText };
+        const split = input.displayText !== undefined;
+        const expected: ExpectedMessage = {
+            kind: 'user', text: input.displayText ?? input.messageText,
+            modelText: split ? input.messageText : undefined, permissionMode: input.permissionMode,
+            displayText: input.displayText, presentation: input.presentation,
+        };
         const content = {
             role: 'user',
-            content: { type: 'text', text: input.messageText },
-            meta: { sentFrom: 'cli' },
+            content: { type: 'text', text: input.displayText ?? input.messageText },
+            meta: {
+                sentFrom: 'cli',
+                ...(split ? { modelText: input.messageText } : {}),
+                ...(input.permissionMode === undefined ? {} : { permissionMode: input.permissionMode }),
+                ...(input.displayText === undefined ? {} : { displayText: input.displayText }),
+                ...(input.presentation === undefined ? {} : { presentation: input.presentation }),
+            },
         };
         return this.sendOnce(input.localId, input.timeoutMs, content, expected, false);
     }
@@ -111,6 +190,24 @@ export class ApiSessionMessageClient {
             role: 'agent',
             content: { type: 'codex', data: input.body },
             meta: { sentFrom: 'cli' },
+        };
+        return this.sendOnce(input.localId, input.timeoutMs, content, expected, true);
+    }
+
+    async sendAgentEventOnce(raw: AgentEventOnceRequest): Promise<PersistedMessageReceipt> {
+        const input = validateAgentEventOnceRequest(raw);
+        const expected: ExpectedMessage = {
+            kind: 'agent-event', message: input.message, eventId: input.eventId,
+            presentation: input.presentation,
+        };
+        const content = {
+            role: 'agent',
+            content: {
+                id: input.eventId,
+                type: 'event',
+                data: { type: input.presentation === 'compact' ? 'compact-message' : 'message',
+                    message: input.message },
+            },
         };
         return this.sendOnce(input.localId, input.timeoutMs, content, expected, true);
     }
@@ -127,6 +224,7 @@ export class ApiSessionMessageClient {
         let socket: Socket | null = null;
         let observedReceipt: PersistedMessageReceipt | null = null;
         let observedError: Error | null = null;
+        let emitted = false;
         try {
             const existing = await this.findPersistedMessage(localId, expected, deadline);
             if (existing) return existing;
@@ -148,6 +246,7 @@ export class ApiSessionMessageClient {
             await this.waitForConnect(socket, remaining(deadline));
             const message = encodeBase64(encrypt(this.session.encryptionKey, this.session.encryptionVariant, content));
             socket.emit('message', { sid: this.session.id, message, localId });
+            emitted = true;
 
             while (true) {
                 if (observedError) throw observedError;
@@ -156,6 +255,14 @@ export class ApiSessionMessageClient {
                 if (persisted) return persisted;
                 await delay(Math.min(100, remaining(deadline)));
             }
+        } catch (error) {
+            if (error instanceof HappyMessagePersistenceError) throw error;
+            const message = error instanceof Error ? error.message : 'Happy message persistence failed';
+            throw new HappyMessagePersistenceError(
+                message,
+                emitted ? 'confirmation-unknown' : 'not-sent',
+                error,
+            );
         } finally {
             socket?.close();
             observer?.close();
@@ -243,13 +350,29 @@ export async function sendCodexMessageOnce(
     return new ApiSessionMessageClient(token, session).sendCodexMessageOnce(input);
 }
 
-function requireExactKeys(value: unknown, expected: Set<string>, label: string): asserts value is Record<string, unknown> {
+/** Persists one exact gray agent event through the existing message pipeline. */
+export async function sendAgentEventOnce(
+    token: string,
+    session: Session,
+    raw: AgentEventOnceRequest,
+): Promise<PersistedMessageReceipt> {
+    const input = validateAgentEventOnceRequest(raw);
+    return new ApiSessionMessageClient(token, session).sendAgentEventOnce(input);
+}
+
+function requireKeys(
+    value: unknown,
+    required: Set<string>,
+    allowed: Set<string>,
+    label: string,
+): asserts value is Record<string, unknown> {
     if (!value || typeof value !== 'object' || Array.isArray(value) ||
         (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)) {
         throw new Error(`Invalid ${label}`);
     }
     const keys = Reflect.ownKeys(value);
-    if (keys.length !== expected.size || keys.some((key) => typeof key !== 'string' || !expected.has(key))) {
+    if (keys.some((key) => typeof key !== 'string' || !allowed.has(key)) ||
+        [...required].some((key) => !Object.prototype.hasOwnProperty.call(value, key))) {
         throw new Error(`Invalid ${label} fields`);
     }
     for (const key of keys) {
@@ -308,8 +431,12 @@ function assertStrictJsonBody(root: Record<string, unknown>): void {
     }
 }
 
-function validateCommonRequest(localId: unknown, timeoutMs: unknown): void {
-    if (typeof localId !== 'string' || !LOCAL_ID_PATTERN.test(localId)) throw new Error('Invalid localId');
+function validateCommonRequest(
+    localId: unknown,
+    timeoutMs: unknown,
+    pattern = MESSAGE_LOCAL_ID_PATTERN,
+): void {
+    if (typeof localId !== 'string' || !pattern.test(localId)) throw new Error('Invalid localId');
     if (!Number.isSafeInteger(timeoutMs) || Number(timeoutMs) <= 0 || Number(timeoutMs) > MAX_TIMEOUT_MS) {
         throw new Error('Invalid timeoutMs');
     }
@@ -374,10 +501,20 @@ function isExpectedMessage(content: unknown, expected: ExpectedMessage, session:
         if (!body || typeof body !== 'object') return false;
         const record = body as Record<string, any>;
         if (expected.kind === 'user') {
-            return record.role === 'user' && record.content?.type === 'text' && record.content.text === expected.text;
+            return record.role === 'user' && record.content?.type === 'text' && record.content.text === expected.text &&
+                record.meta?.sentFrom === 'cli' && record.meta?.modelText === expected.modelText &&
+                record.meta?.permissionMode === expected.permissionMode &&
+                record.meta?.displayText === expected.displayText &&
+                record.meta?.presentation === expected.presentation;
         }
-        return record.role === 'agent' && record.content?.type === 'codex' &&
-            deepEqual(record.content.data, expected.body) && record.meta?.sentFrom === 'cli';
+        if (expected.kind === 'codex') {
+            return record.role === 'agent' && record.content?.type === 'codex' &&
+                deepEqual(record.content.data, expected.body) && record.meta?.sentFrom === 'cli';
+        }
+        return record.role === 'agent' && record.content?.id === expected.eventId &&
+            record.content?.type === 'event' && record.content?.data?.type ===
+                (expected.presentation === 'compact' ? 'compact-message' : 'message') &&
+            record.content.data.message === expected.message;
     } catch {
         return false;
     }

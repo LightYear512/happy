@@ -20,6 +20,17 @@ interface ServerToDaemonEvents {
     'rpc-error': (data: { type: string, error: string }) => void;
     auth: (data: { success: boolean, user: string }) => void;
     error: (data: { message: string }) => void;
+    'server-rollback-restored-session': (data: { sessionId: string }, callback: (response: {
+        ok: boolean;
+        sessionId?: string;
+        error?: string;
+    }) => void) => void;
+    'server-publish-session-error': (data: PublishSessionErrorParams, callback: (response: {
+        ok: boolean;
+        sessionId?: string;
+        eventId?: string;
+        error?: string;
+    }) => void) => void;
 }
 
 interface DaemonToServerEvents {
@@ -75,9 +86,19 @@ export interface RestoreSessionParams {
     summary: string | null;
 }
 
+export interface PublishSessionErrorParams {
+    sessionId: string;
+    eventId: string;
+    source: string;
+    code: string;
+    message: string;
+}
+
 type MachineRpcHandlers = {
     spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
     stopSession: (sessionId: string) => Promise<boolean>;
+    rollbackRestoredSession: (sessionId: string) => Promise<boolean>;
+    publishSessionError: (params: PublishSessionErrorParams) => Promise<boolean>;
     requestShutdown: () => void;
     restoreSession: (params: RestoreSessionParams) => Promise<SpawnSessionResult>;
 }
@@ -87,6 +108,8 @@ export class ApiMachineClient {
     private keepAliveInterval: NodeJS.Timeout | null = null;
     private rpcHandlerManager: RpcHandlerManager;
     private restoreSessionHandler: ((params: RestoreSessionParams) => Promise<SpawnSessionResult>) | null = null;
+    private rollbackRestoredSessionHandler: ((sessionId: string) => Promise<boolean>) | null = null;
+    private publishSessionErrorHandler: ((params: PublishSessionErrorParams) => Promise<boolean>) | null = null;
 
     constructor(
         private token: string,
@@ -106,6 +129,8 @@ export class ApiMachineClient {
     setRPCHandlers({
         spawnSession,
         stopSession,
+        rollbackRestoredSession,
+        publishSessionError,
         requestShutdown,
         restoreSession
     }: MachineRpcHandlers) {
@@ -170,6 +195,8 @@ export class ApiMachineClient {
 
         // Store restore handler for direct socket event (not encrypted RPC)
         this.restoreSessionHandler = restoreSession;
+        this.rollbackRestoredSessionHandler = rollbackRestoredSession;
+        this.publishSessionErrorHandler = publishSessionError;
     }
 
     /**
@@ -291,11 +318,54 @@ export class ApiMachineClient {
             }
             try {
                 const result = await this.restoreSessionHandler(data);
+                if (result.type !== 'success') {
+                    const error = result.type === 'error'
+                        ? result.errorMessage
+                        : result.type === 'requestToApproveDirectoryCreation'
+                            ? 'Restore requires directory approval'
+                            : 'Restore was superseded';
+                    callback({ ok: false, error, result });
+                    return;
+                }
+                if (result.sessionId !== data.sessionId) {
+                    callback({ ok: false, error: 'Restored session identity mismatch', result });
+                    return;
+                }
                 callback({ ok: true, result });
             } catch (error) {
                 const msg = error instanceof Error ? error.message : 'Restore failed';
                 logger.debug(`[API MACHINE] Restore failed: ${msg}`);
                 callback({ ok: false, error: msg });
+            }
+        });
+
+        this.socket.on('server-rollback-restored-session', async (data, callback) => {
+            if (!data?.sessionId || !this.rollbackRestoredSessionHandler) {
+                callback({ ok: false, error: 'Restore rollback handler is unavailable' });
+                return;
+            }
+            try {
+                const stopped = await this.rollbackRestoredSessionHandler(data.sessionId);
+                callback(stopped
+                    ? { ok: true, sessionId: data.sessionId }
+                    : { ok: false, error: 'Restored session was not terminated' });
+            } catch (error) {
+                callback({ ok: false, error: error instanceof Error ? error.message : 'Rollback failed' });
+            }
+        });
+
+        this.socket.on('server-publish-session-error', async (data, callback) => {
+            if (!data?.sessionId || !data.eventId || !this.publishSessionErrorHandler) {
+                callback({ ok: false, error: 'Session error publisher is unavailable' });
+                return;
+            }
+            try {
+                const published = await this.publishSessionErrorHandler(data);
+                callback(published
+                    ? { ok: true, sessionId: data.sessionId, eventId: data.eventId }
+                    : { ok: false, error: 'Session error was not published' });
+            } catch (error) {
+                callback({ ok: false, error: error instanceof Error ? error.message : 'Session error publication failed' });
             }
         });
 

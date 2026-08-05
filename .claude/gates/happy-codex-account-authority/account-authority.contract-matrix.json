@@ -1,0 +1,122 @@
+{
+  "schemaVersion": "contract-first-module-gate/v2",
+  "contractProfile": "contract-first-module-lock/v1",
+  "module": "happy-cli.codex-account-authority",
+  "owner": "happy-cli.daemon",
+  "ownedPaths": [
+    "packages/happy-cli/src/daemon/run.ts",
+    "packages/happy-cli/src/daemon/run.test.ts",
+    "packages/happy-cli/src/commands/bang/ccsProfiles.ts",
+    "packages/happy-cli/src/codex/runCodex.ts",
+    "packages/happy-cli/src/codex/runCodexAppServer.ts",
+    ".claude/gates/happy-codex-account-authority/account-authority.design.md"
+  ],
+  "publicApis": [
+    {
+      "name": "buildDaemonChildEnvironment",
+      "inputs": [
+        "daemon process environment",
+        "explicit spawn environment",
+        "agent type",
+        "optional resume identifier"
+      ],
+      "acceptedStates": [
+        "explicit Codex account supplied by token or GUI profile",
+        "fresh Codex child without explicit account",
+        "restored Codex child without explicit account",
+        "non-Codex child"
+      ],
+      "rejectedStates": [
+        "daemon historical CODEX_HOME projected into a fresh Codex child",
+        "daemon historical CODEX_HOME projected into a restored Codex child",
+        "inherited CODEX_THREAD_ID projected into any Codex child"
+      ],
+      "provenanceFields": [
+        "agent type",
+        "explicit CODEX_HOME",
+        "resume identifier"
+      ],
+      "outputState": "One child environment in which explicit account input wins and daemon account history is absent.",
+      "enforcement": "buildDaemonChildEnvironment",
+      "negativeTests": [
+        {
+          "name": "explicit_codex_account_overrides_daemon_snapshot",
+          "file": "account-authority.hostile.test.mjs"
+        }
+      ]
+    }
+  ],
+  "budgets": {
+    "notApplicableReason": "The repair changes an existing environment projection condition and introduces no independently stored runtime budget."
+  },
+  "lifecycleTransitions": [
+    {
+      "from": "committed current Codex account and optional stopped conversation",
+      "to": "fresh or restored Codex child using the current account",
+      "creator": "account selection commit",
+      "advancer": "daemon child spawn",
+      "consumer": "Codex startup profile resolver",
+      "rejectTests": [
+        {
+          "name": "explicit_codex_account_overrides_daemon_snapshot",
+          "file": "account-authority.hostile.test.mjs"
+        }
+      ]
+    }
+  ],
+  "provenanceFields": [
+    {
+      "field": "CODEX_HOME",
+      "boundByDigest": "Explicit spawn environment or the current durable Codex profile configuration.",
+      "independentValidation": "The daemon projection test rejects inherited account history for both fresh and resumed Codex children.",
+      "tamperTests": [
+        {
+          "name": "explicit_codex_account_overrides_daemon_snapshot",
+          "file": "account-authority.hostile.test.mjs"
+        }
+      ]
+    }
+  ],
+  "hostileTests": [
+    {
+      "name": "restored_codex_uses_current_committed_account_not_daemon_snapshot",
+      "file": "account-authority.hostile.test.mjs",
+      "ownerBatch": "codex-account-authority",
+      "expectedFailureClass": "daemon-snapshot-leaked"
+    }
+  ],
+  "evidence": {
+    "mode": "approval",
+    "openFindingCount": 0,
+    "designSha256": "a1ed6a42f5d094768dd24813633fa2ba300f04e674197199cfe3b71b2d97a450",
+    "reviewFiles": [
+      {
+        "path": ".claude/designs/happy-codex-account-authority-review.md",
+        "sha256": "bc29c5699e039b2040c4d3320553eae1cde12658a15a645120115683f8e7bb00",
+        "reviewDigest": "sha256:bc29c5699e039b2040c4d3320553eae1cde12658a15a645120115683f8e7bb00",
+        "verdict": "PASS"
+      }
+    ],
+    "gateInvocation": {
+      "argv": [
+        "../xiework/jsbrowser/.agents/gates/contract-first/contract-first-module-gate.mjs",
+        "--matrix",
+        ".claude/gates/happy-codex-account-authority/account-authority.contract-matrix.json",
+        "--design",
+        ".claude/gates/happy-codex-account-authority/account-authority.design.md"
+      ]
+    },
+    "designSections": [
+      "Public Boundary Matrix",
+      "Budget Ledger",
+      "Lifecycle State Matrix",
+      "Digest And Provenance Matrix"
+    ],
+    "reviewTests": [
+      {
+        "name": "explicit_codex_account_overrides_daemon_snapshot",
+        "file": "account-authority.hostile.test.mjs"
+      }
+    ]
+  }
+}

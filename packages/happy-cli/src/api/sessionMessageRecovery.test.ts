@@ -9,6 +9,7 @@ import {
 const row = (id: string, seq: number): SessionRecoveryRow => ({
     id,
     seq,
+    localId: null,
     createdAt: 1_000 + seq,
     content: { t: 'encrypted', c: `cipher-${seq}` },
 });
@@ -48,6 +49,10 @@ describe('session message recovery', () => {
             .toThrow(/recovery_incomplete/);
         expect(() => mergeRecoveryMessages([row('same', 11)], [row('same', 12)]))
             .toThrow(/recovery_incomplete/);
+        expect(() => mergeRecoveryMessages(
+            [{ ...row('same-local', 11), localId: 'first' }],
+            [{ ...row('same-local', 11), localId: 'second' }],
+        )).toThrow(/recovery_incomplete/);
     });
 
     it('HSR rejects a query larger than the deployed recent-message window', () => {

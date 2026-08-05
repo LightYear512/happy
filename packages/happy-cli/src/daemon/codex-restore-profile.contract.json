@@ -1,0 +1,37 @@
+{
+  "schemaVersion": "contract-first-module-gate/v2",
+  "contractProfile": "contract-first-minimal-boundary/v1",
+  "riskTriggers": ["public-abi-or-persistent-format"],
+  "module": "happy.daemon.codex-restore-profile",
+  "owner": "happy-cli daemon and Codex app-server runtime",
+  "publicApis": [
+    {
+      "name": "persist_and_consume_codex_restore_profile",
+      "inputs": ["exact Happy session ID", "safe Codex profile name", "existing Codex restore authority"],
+      "acceptedStates": ["live exact session with initialized Codex profile", "legacy restore record without profile"],
+      "rejectedStates": ["unsafe profile", "non-Codex record carrying profile", "unknown or closed session authority"],
+      "provenanceFields": ["sessionId", "profileName", "restore.agent"],
+      "outputState": "restore record binds the next Codex process to the last successful CODEX_HOME",
+      "enforcement": "session-codex-profile endpoint plus parseRestoreFileData and buildRestoreProfileEnvironment",
+      "negativeTests": [
+        {
+          "name": "codex_restore_profile_boundary",
+          "file": "codex-restore-profile-boundary.test.mjs"
+        }
+      ]
+    }
+  ],
+  "budgets": {
+    "notApplicableReason": "the profile identity boundary adds no resource budget"
+  },
+  "lifecycleTransitions": {
+    "notApplicableReason": "the existing open and closed restore lifecycle remains unchanged"
+  },
+  "provenanceFields": {
+    "notApplicableReason": "the local hostile endpoint and strict restore parser validate the named fields directly"
+  },
+  "evidence": {
+    "mode": "approval",
+    "openFindingCount": 0
+  }
+}

@@ -6,7 +6,7 @@ import { CommandPalette } from './CommandPalette';
 import { Command } from './types';
 import { useGlobalKeyboard } from '@/hooks/useGlobalKeyboard';
 import { useAuth } from '@/auth/AuthContext';
-import { storage } from '@/sync/storage';
+import { isUserVisibleSession, storage } from '@/sync/storage';
 import { useShallow } from 'zustand/react/shallow';
 import { useNavigateToSession } from '@/hooks/useNavigateToSession';
 
@@ -77,6 +77,7 @@ export function CommandPaletteProvider({ children }: { children: React.ReactNode
 
         // Add session-specific commands
         const recentSessions = Object.values(sessions)
+            .filter(isUserVisibleSession)
             .sort((a, b) => b.updatedAt - a.updatedAt)
             .slice(0, 5);
 

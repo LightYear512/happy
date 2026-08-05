@@ -1,11 +1,16 @@
 import { trimIdent } from "@/utils/trimIdent";
 import { shouldIncludeCoAuthoredBy } from "./claudeSettings";
+import { sessionTitleAuthority } from "@/utils/titleAuthority";
 
 /**
  * Base system prompt shared across all configurations
  */
-const BASE_SYSTEM_PROMPT = (() => trimIdent(`
+const MODEL_TITLE_PROMPT = (() => trimIdent(`
     ALWAYS when you start a new chat - you must call a tool "mcp__happy__change_title" to set a chat title. When you think chat title is not relevant anymore - call the tool again to change it. When chat name is too generic and you have a change to make it more specific - call the tool again to change it. This title is needed to easily find the chat in the future. Help human.
+`))();
+
+const EXTERNAL_TITLE_PROMPT = (() => trimIdent(`
+    This chat title is managed by its external session controller. Do not call mcp__happy__change_title; only the controller may initialize or explicitly change this title.
 `))();
 
 /**
@@ -29,10 +34,10 @@ const CO_AUTHORED_CREDITS = (() => trimIdent(`
  */
 export const systemPrompt = (() => {
   const includeCoAuthored = shouldIncludeCoAuthoredBy();
-  
+  const titlePrompt = sessionTitleAuthority() === 'external' ? EXTERNAL_TITLE_PROMPT : MODEL_TITLE_PROMPT;
   if (includeCoAuthored) {
-    return BASE_SYSTEM_PROMPT + '\n\n' + CO_AUTHORED_CREDITS;
+    return titlePrompt + '\n\n' + CO_AUTHORED_CREDITS;
   } else {
-    return BASE_SYSTEM_PROMPT;
+    return titlePrompt;
   }
 })();

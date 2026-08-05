@@ -307,7 +307,7 @@ export class ApiClient {
 
       const raw = response.data.session;
       const metadata = decrypt(encryptionKey, encryptionVariant, decodeBase64(raw.metadata));
-      if (!metadata) return null; // Decryption failed — old key, caller should fallback
+      if (!metadata) return null; // Decryption failed; exact restore callers fail closed.
 
       return {
         id: raw.id,
@@ -324,6 +324,19 @@ export class ApiClient {
       logger.debug('[API] Session lookup failed', safeLookupFailure(error));
       return null;
     }
+  }
+
+  /**
+   * Rejoin exactly one existing Happy session. Restore is never allowed to
+   * create a replacement session because that would split one conversation
+   * across two identities.
+   */
+  async restoreSessionById(sessionId: string): Promise<Session> {
+    const session = await this.getSessionById(sessionId);
+    if (!session || session.id !== sessionId) {
+      throw new Error('happy_session_restore_failed');
+    }
+    return session;
   }
 
   /**

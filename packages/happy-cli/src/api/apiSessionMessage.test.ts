@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { ioMock, socket, makeSocket, getMock, isAxiosErrorMock, decryptMock } = vi.hoisted(() => {
+const { ioMock, socket, makeSocket, getMock, isAxiosErrorMock, decryptMock, encryptMock } = vi.hoisted(() => {
     const makeSocket = () => {
         const handlers = new Map<string, (...args: any[]) => void>();
         const listeners = new Map<string, (...args: any[]) => void>();
@@ -23,7 +23,10 @@ const { ioMock, socket, makeSocket, getMock, isAxiosErrorMock, decryptMock } = v
         makeSocket,
         getMock: vi.fn(),
         isAxiosErrorMock: vi.fn(() => false),
-        decryptMock: vi.fn(() => ({ role: 'user', content: { type: 'text', text: 'hello' } } as any)),
+        decryptMock: vi.fn(() => ({
+            role: 'user', content: { type: 'text', text: 'hello' }, meta: { sentFrom: 'cli' },
+        } as any)),
+        encryptMock: vi.fn(() => new Uint8Array([1, 2, 3])),
     };
 });
 
@@ -33,13 +36,13 @@ vi.mock('axios', () => ({
 }));
 vi.mock('@/configuration', () => ({ configuration: { serverUrl: 'https://happy.test' } }));
 vi.mock('./encryption', () => ({
-    encrypt: vi.fn(() => new Uint8Array([1, 2, 3])),
+    encrypt: encryptMock,
     encodeBase64: vi.fn(() => 'encrypted-user-message'),
     decodeBase64: vi.fn(() => new Uint8Array([1, 2, 3])),
     decrypt: decryptMock,
 }));
 
-import { ApiSessionMessageClient, sendCodexMessageOnce, sendUserMessageOnce } from './apiSessionMessage';
+import { ApiSessionMessageClient, sendAgentEventOnce, sendCodexMessageOnce, sendUserMessageOnce } from './apiSessionMessage';
 
 const session = {
     id: 'session-1',
@@ -62,7 +65,10 @@ describe('ApiSessionMessageClient', () => {
         socket.__listeners.clear();
         getMock.mockReset();
         isAxiosErrorMock.mockReset().mockReturnValue(false);
-        decryptMock.mockReset().mockReturnValue({ role: 'user', content: { type: 'text', text: 'hello' } });
+        decryptMock.mockReset().mockReturnValue({
+            role: 'user', content: { type: 'text', text: 'hello' }, meta: { sentFrom: 'cli' },
+        });
+        encryptMock.mockReset().mockReturnValue(new Uint8Array([1, 2, 3]));
     });
 
     it('does not create a socket before request admission and preflight', async () => {
@@ -85,6 +91,118 @@ describe('ApiSessionMessageClient', () => {
         expect(ioMock).not.toHaveBeenCalled();
     });
 
+    it('accepts the exact XC soft-notification localId namespace', () => {
+        const softLocalId = `xc-soft-v1-${'b'.repeat(64)}`;
+        expect(ApiSessionMessageClient.validateRequest({
+            messageRole: 'user', messageText: 'soft check', localId: softLocalId, timeoutMs: 10_000,
+        }).localId).toBe(softLocalId);
+        for (const invalid of [
+            `xc-soft-v2-${'b'.repeat(64)}`,
+            `xc-soft-v1-${'b'.repeat(63)}`,
+            `xc-soft-v1-${'B'.repeat(64)}`,
+        ]) expect(() => ApiSessionMessageClient.validateRequest({
+            messageRole: 'user', messageText: 'soft check', localId: invalid, timeoutMs: 10_000,
+        })).toThrow(/localId/);
+        expect(() => ApiSessionMessageClient.validateCodexRequest({
+            messageRole: 'agent', messageType: 'codex', body: { message: 'soft check' },
+            localId: softLocalId, timeoutMs: 10_000,
+        })).toThrow(/localId/);
+        expect(() => ApiSessionMessageClient.validateAgentEventRequest({
+            messageRole: 'agent', messageType: 'event', message: 'soft check', eventId: 'soft-check',
+            localId: softLocalId, timeoutMs: 10_000,
+        })).toThrow(/localId/);
+        expect(ioMock).not.toHaveBeenCalled();
+    });
+
+    it('persists a compact Mail event through the same bounded one-shot writer', async () => {
+        const observer = makeSocket();
+        const writer = makeSocket();
+        observer.connected = true;
+        writer.connected = true;
+        ioMock.mockReset().mockReturnValueOnce(observer).mockReturnValueOnce(writer);
+        const row = { id: 'agent-event-1', seq: 18, localId, createdAt: 12346,
+            content: { t: 'encrypted', c: 'ciphertext' } };
+        decryptMock.mockReturnValue({ role: 'agent', content: { id: 'restore-event-1', type: 'event',
+            data: { type: 'compact-message', message: '📤 x-000042 MixedCase 邮件标题' } } });
+        getMock.mockResolvedValue({ data: { messages: [] } });
+        writer.emit.mockImplementation((event: string) => {
+            if (event === 'message') {
+                observer.__listeners.get('update')?.({ body: { t: 'new-message', sid: session.id, message: row } });
+            }
+        });
+
+        await expect(sendAgentEventOnce('secret-token', session, {
+            messageRole: 'agent', messageType: 'event', message: '📤 x-000042 MixedCase 邮件标题',
+            eventId: 'restore-event-1', localId, timeoutMs: 10_000, presentation: 'compact',
+        })).resolves.toEqual({ result: 'success', id: row.id, seq: row.seq, localId, createdAt: row.createdAt });
+        expect(encryptMock).toHaveBeenCalledWith(session.encryptionKey, session.encryptionVariant,
+            { role: 'agent', content: { id: 'restore-event-1', type: 'event',
+                data: { type: 'compact-message', message: '📤 x-000042 MixedCase 邮件标题' } } });
+        expect(observer.close).toHaveBeenCalledOnce();
+        expect(writer.close).toHaveBeenCalledOnce();
+    });
+
+    it('auxiliary user message rejects invalid permission mode before socket creation', async () => {
+        const invalid = {
+            messageRole: 'user', messageText: 'hello', localId, timeoutMs: 10_000,
+            permissionMode: 'unsafe-unknown-mode',
+        } as any;
+        expect(() => ApiSessionMessageClient.validateRequest(invalid)).toThrow(/permissionMode/);
+        await expect(sendUserMessageOnce('secret-token', session, invalid)).rejects.toThrow(/permissionMode/);
+        expect(ioMock).not.toHaveBeenCalled();
+    });
+
+    it('auxiliary user message rejects an unknown presentation before socket creation', async () => {
+        const invalid = {
+            messageRole: 'user', messageText: 'hello', localId, timeoutMs: 10_000,
+            presentation: 'forged',
+        } as any;
+        expect(() => ApiSessionMessageClient.validateRequest(invalid)).toThrow(/presentation/);
+        await expect(sendUserMessageOnce('secret-token', session, invalid)).rejects.toThrow(/presentation/);
+        expect(ioMock).not.toHaveBeenCalled();
+    });
+
+    it.each(['one line', 'first\n\nthird'])(
+        'Mail presentation rejects a malformed two-line display before socket creation',
+        async (displayText) => {
+            const invalid = {
+                messageRole: 'user', messageText: 'full model context', displayText,
+                presentation: 'mail', localId, timeoutMs: 10_000,
+            } as const;
+            expect(() => ApiSessionMessageClient.validateRequest(invalid)).toThrow(/Mail presentation/);
+            await expect(sendUserMessageOnce('secret-token', session, invalid)).rejects.toThrow(/Mail presentation/);
+            expect(ioMock).not.toHaveBeenCalled();
+        },
+    );
+
+    it('agent event rejects an unknown presentation before socket creation', async () => {
+        const invalid = {
+            messageRole: 'agent', messageType: 'event', message: 'event', eventId: 'event-1',
+            presentation: 'mail', localId, timeoutMs: 10_000,
+        } as any;
+        expect(() => ApiSessionMessageClient.validateAgentEventRequest(invalid)).toThrow(/presentation/);
+        await expect(sendAgentEventOnce('secret-token', session, invalid)).rejects.toThrow(/presentation/);
+        expect(ioMock).not.toHaveBeenCalled();
+    });
+
+    it('auxiliary user message rejects oversized text before socket creation', async () => {
+        const invalid = {
+            messageRole: 'user', messageText: 'x'.repeat(12_001), localId, timeoutMs: 10_000,
+        } as const;
+        expect(() => ApiSessionMessageClient.validateRequest(invalid)).toThrow(/messageText size/);
+        await expect(sendUserMessageOnce('secret-token', session, invalid)).rejects.toThrow(/messageText size/);
+        expect(ioMock).not.toHaveBeenCalled();
+    });
+
+    it.each(['', 'x'.repeat(12_001)])('auxiliary user message rejects invalid display text before socket creation', async (displayText) => {
+        const invalid = {
+            messageRole: 'user', messageText: 'full model context', displayText, localId, timeoutMs: 10_000,
+        } as const;
+        expect(() => ApiSessionMessageClient.validateRequest(invalid)).toThrow(/displayText/);
+        await expect(sendUserMessageOnce('secret-token', session, invalid)).rejects.toThrow(/displayText/);
+        expect(ioMock).not.toHaveBeenCalled();
+    });
+
     it('returns the exact persisted row from the existing query API and closes its own socket', async () => {
         const row = { id: 'message-1', seq: 17, localId, createdAt: 12345, content: { t: 'encrypted', c: 'ciphertext' } };
         socket.connected = true;
@@ -100,6 +218,89 @@ describe('ApiSessionMessageClient', () => {
         }));
         expect(socket.emit).toHaveBeenCalledWith('message', expect.objectContaining({ sid: 'session-1', localId }));
         expect(socket.close).toHaveBeenCalledOnce();
+    });
+
+    it('encrypts and confirms the admitted permission mode on a user message', async () => {
+        const row = { id: 'message-mode', seq: 18, localId, createdAt: 12346, content: { t: 'encrypted', c: 'ciphertext' } };
+        socket.connected = true;
+        decryptMock.mockReturnValue({
+            role: 'user', content: { type: 'text', text: 'hello' },
+            meta: { sentFrom: 'cli', permissionMode: 'yolo' },
+        });
+        getMock
+            .mockResolvedValueOnce({ data: { messages: [] } })
+            .mockResolvedValueOnce({ data: { messages: [row] } });
+
+        const client = new ApiSessionMessageClient('secret-token', session);
+        await expect(client.sendUserMessageOnce({
+            messageRole: 'user', messageText: 'hello', localId, timeoutMs: 10_000, permissionMode: 'yolo',
+        })).resolves.toMatchObject({ result: 'success', id: row.id, localId });
+
+        expect(encryptMock).toHaveBeenCalledWith(
+            session.encryptionKey,
+            session.encryptionVariant,
+            expect.objectContaining({ meta: { sentFrom: 'cli', permissionMode: 'yolo' } }),
+        );
+    });
+
+    it('persists the compact legacy-client text while binding full model text in encrypted metadata', async () => {
+        const row = { id: 'message-compact', seq: 19, localId, createdAt: 12347, content: { t: 'encrypted', c: 'ciphertext' } };
+        socket.connected = true;
+        decryptMock.mockReturnValue({
+            role: 'user', content: { type: 'text', text: 'compact summary' },
+            meta: { sentFrom: 'cli', modelText: 'full model context',
+                displayText: 'compact summary', presentation: 'compact' },
+        });
+        getMock
+            .mockResolvedValueOnce({ data: { messages: [] } })
+            .mockResolvedValueOnce({ data: { messages: [row] } });
+
+        const client = new ApiSessionMessageClient('secret-token', session);
+        await expect(client.sendUserMessageOnce({
+            messageRole: 'user', messageText: 'full model context', displayText: 'compact summary',
+            localId, timeoutMs: 10_000, presentation: 'compact',
+        })).resolves.toMatchObject({ result: 'success', id: row.id, localId });
+
+        expect(encryptMock).toHaveBeenCalledWith(
+            session.encryptionKey,
+            session.encryptionVariant,
+            expect.objectContaining({
+                content: { type: 'text', text: 'compact summary' },
+                meta: { sentFrom: 'cli', modelText: 'full model context',
+                    displayText: 'compact summary', presentation: 'compact' },
+            }),
+        );
+    });
+
+    it('persists the received Mail card while binding full model text in encrypted metadata', async () => {
+        const row = { id: 'message-mail', seq: 20, localId, createdAt: 12348,
+            content: { t: 'encrypted', c: 'ciphertext' } };
+        socket.connected = true;
+        decryptMock.mockReturnValue({
+            role: 'user', content: { type: 'text', text: 'x-000028 01:19\nMixedCase 邮件标题' },
+            meta: { sentFrom: 'cli', modelText: 'full model context',
+                displayText: 'x-000028 01:19\nMixedCase 邮件标题', presentation: 'mail' },
+        });
+        getMock
+            .mockResolvedValueOnce({ data: { messages: [] } })
+            .mockResolvedValueOnce({ data: { messages: [row] } });
+
+        const client = new ApiSessionMessageClient('secret-token', session);
+        await expect(client.sendUserMessageOnce({
+            messageRole: 'user', messageText: 'full model context',
+            displayText: 'x-000028 01:19\nMixedCase 邮件标题',
+            localId, timeoutMs: 10_000, presentation: 'mail',
+        })).resolves.toMatchObject({ result: 'success', id: row.id, localId });
+
+        expect(encryptMock).toHaveBeenCalledWith(
+            session.encryptionKey,
+            session.encryptionVariant,
+            expect.objectContaining({
+                content: { type: 'text', text: 'x-000028 01:19\nMixedCase 邮件标题' },
+                meta: { sentFrom: 'cli', modelText: 'full model context',
+                    displayText: 'x-000028 01:19\nMixedCase 邮件标题', presentation: 'mail' },
+            }),
+        );
     });
 
     it('returns an existing localId without connecting or emitting again', async () => {
@@ -123,6 +324,21 @@ describe('ApiSessionMessageClient', () => {
         expect(socket.close).not.toHaveBeenCalled();
     });
 
+    it('persisted user message confirmation binds permission mode', async () => {
+        const row = { id: 'message-1', seq: 17, localId, createdAt: 12345, content: { t: 'encrypted', c: 'ciphertext' } };
+        decryptMock.mockReturnValue({
+            role: 'user', content: { type: 'text', text: 'hello' },
+            meta: { sentFrom: 'cli', permissionMode: 'default' },
+        });
+        getMock.mockResolvedValue({ data: { messages: [row] } });
+        const client = new ApiSessionMessageClient('secret-token', session);
+        await expect(client.sendUserMessageOnce({
+            messageRole: 'user', messageText: 'hello', localId, timeoutMs: 10_000, permissionMode: 'yolo',
+        })).rejects.toThrow(/payload mismatch/);
+        expect(socket.connect).not.toHaveBeenCalled();
+        expect(socket.emit).not.toHaveBeenCalled();
+    });
+
     it.each([
         [{ id: 'x'.repeat(129), seq: 17, createdAt: 12345 }, /id invalid/],
         [{ id: 'message-1', seq: 17, createdAt: 8_640_000_000_000_001 }, /createdAt invalid/],
@@ -134,6 +350,23 @@ describe('ApiSessionMessageClient', () => {
         expect(socket.connect).not.toHaveBeenCalled();
         expect(socket.emit).not.toHaveBeenCalled();
         expect(socket.close).not.toHaveBeenCalled();
+    });
+
+    it('persisted user message confirmation binds display text and compact presentation', async () => {
+        const row = { id: 'message-1', seq: 17, localId, createdAt: 12345, content: { t: 'encrypted', c: 'ciphertext' } };
+        decryptMock.mockReturnValue({
+            role: 'user', content: { type: 'text', text: 'compact summary' },
+            meta: { sentFrom: 'cli', modelText: 'hello',
+                displayText: 'different summary', presentation: 'compact' },
+        });
+        getMock.mockResolvedValue({ data: { messages: [row] } });
+        const client = new ApiSessionMessageClient('secret-token', session);
+        await expect(client.sendUserMessageOnce({
+            messageRole: 'user', messageText: 'hello', displayText: 'compact summary',
+            localId, timeoutMs: 10_000, presentation: 'compact',
+        })).rejects.toThrow(/payload mismatch/);
+        expect(socket.connect).not.toHaveBeenCalled();
+        expect(socket.emit).not.toHaveBeenCalled();
     });
 
     it('uses the same monotonic deadline for connect and read-back confirmation', async () => {

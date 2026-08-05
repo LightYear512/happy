@@ -205,10 +205,63 @@ export function analyzePtyOutput(buffer: string, loginUrlSent: boolean, loginCom
             return { action: 'already-authenticated' };
         }
 
+        // Recent Claude versions may render the authenticated main screen without
+        // "Welcome back". Require the version header, input prompt, and shortcut
+        // footer together so selection prompts cannot trigger a forced /login.
+        const hasClaudeVersionHeader = /\bClaude Code v\d+(?:\.\d+)+\b/.test(cleanBuffer);
+        const hasMainInputPrompt = /(?:^|\n)[^\S\r\n]*❯(?:[^\S\r\n]|$)/.test(cleanBuffer)
+            && cleanBuffer.includes('? for shortcuts');
+        if (!loginCommandSent && hasClaudeVersionHeader && hasMainInputPrompt) {
+            return { action: 'already-authenticated' };
+        }
+
         return { action: 'discard' };
     }
 
     return { action: 'forward' };
+}
+
+const CLAUDE_LOGIN_PRE_OAUTH_TIMEOUT_MS = 60_000;
+const MAX_NODE_TIMEOUT_MS = 2_147_483_647;
+
+export function createClaudeLoginPreAuthDeadline(
+    onTimeout: () => void,
+    timeoutMs = CLAUDE_LOGIN_PRE_OAUTH_TIMEOUT_MS,
+): { clear(): void } {
+    if (
+        !Number.isSafeInteger(timeoutMs)
+        || timeoutMs < 0
+        || timeoutMs > MAX_NODE_TIMEOUT_MS
+    ) {
+        throw new RangeError('Claude pre-OAuth timeout is outside the supported range');
+    }
+
+    let active = true;
+    const timer = setTimeout(() => {
+        if (!active) return;
+        active = false;
+        onTimeout();
+    }, timeoutMs);
+
+    return {
+        clear(): void {
+            if (!active) return;
+            active = false;
+            clearTimeout(timer);
+        },
+    };
+}
+
+export function shouldAcceptClaudeLoginResult(input: {
+    loginSucceeded: boolean;
+    aborted: boolean;
+    credentialExistedBefore: boolean;
+    credentialExistsAfter: boolean;
+}): boolean {
+    return !input.aborted && (
+        input.loginSucceeded
+        || (!input.credentialExistedBefore && input.credentialExistsAfter)
+    );
 }
 
 /**
@@ -858,6 +911,8 @@ export async function handleLoginBangCommand(
     // Create instance directory (track whether it existed for cleanup decisions)
     const instancePath = getInstancePath(profileName);
     const dirExistedBefore = existsSync(instancePath);
+    const credentialPath = join(instancePath, '.credentials.json');
+    const credentialExistedBefore = existsSync(credentialPath);
     try {
         mkdirSync(instancePath, { recursive: true });
     } catch (err) {
@@ -958,9 +1013,38 @@ export async function handleLoginBangCommand(
     let loginUrlSent = false;
     let loginCommandSent = false;
     let loginSucceeded = false;
+    let aborted = false;
+    let terminalNoticeSent = false;
+    let preAuthDeadline: { clear(): void } | null = null;
+
+    const clearPreAuthDeadline = (): void => {
+        preAuthDeadline?.clear();
+        preAuthDeadline = null;
+    };
+
+    const finishTerminalFailure = (message: string, flushBufferedOutput: boolean): void => {
+        if (terminalNoticeSent || exited) return;
+        aborted = true;
+        terminalNoticeSent = true;
+        clearPreAuthDeadline();
+        unregisterInteractiveSession();
+        if (flushBufferedOutput) {
+            flushOutput();
+        } else {
+            if (flushTimer) clearTimeout(flushTimer);
+            flushTimer = null;
+            outputBuffer = '';
+        }
+        try { ptyProcess.kill(); } catch (err) {
+            logger.debug('[!login] Failed to terminate Claude PTY:', err);
+        }
+        if (!dirExistedBefore) cleanupInstance(instancePath);
+        ctx.client.sendCodexMessage({ type: 'message', message });
+        ctx.client.sendSessionEvent({ type: 'ready' });
+    };
 
     ptyProcess.onData((data: string) => {
-        if (loginSucceeded) return; // Already finishing — ignore residual PTY output
+        if (loginSucceeded || aborted) return; // Already finishing — ignore residual PTY output
         outputBuffer += data;
 
         const result = analyzePtyOutput(outputBuffer, loginUrlSent, loginCommandSent);
@@ -977,6 +1061,7 @@ export async function handleLoginBangCommand(
 
             case 'forward-url':
                 loginUrlSent = true;
+                clearPreAuthDeadline();
                 logger.debug(`[!login] OAuth URL detected: ${result.url}`);
                 outputBuffer = '';
                 if (flushTimer) clearTimeout(flushTimer);
@@ -1008,6 +1093,7 @@ export async function handleLoginBangCommand(
                 if (forwardText.includes('Login successful')) {
                     logger.debug('[!login] Login successful detected, sending Enter and finishing');
                     loginSucceeded = true;
+                    clearPreAuthDeadline();
                     outputBuffer = '';
                     if (flushTimer) clearTimeout(flushTimer);
                     ptyProcess.write('\r');
@@ -1019,13 +1105,7 @@ export async function handleLoginBangCommand(
                 // Detect OAuth error (invalid code) → kill process and notify user
                 if (forwardText.includes('OAuth error') || forwardText.includes('Invalid code')) {
                     logger.debug('[!login] OAuth error detected, terminating login session');
-                    outputBuffer = '';
-                    if (flushTimer) clearTimeout(flushTimer);
-                    unregisterInteractiveSession();
-                    ptyProcess.kill();
-                    if (!dirExistedBefore) cleanupInstance(instancePath);
-                    ctx.client.sendCodexMessage({ type: 'message', message: '❌ 登录失败: 无效的 OAuth Code\n\n请重新使用 !login 登录' });
-                    ctx.client.sendSessionEvent({ type: 'ready' });
+                    finishTerminalFailure('❌ 登录失败: 无效的 OAuth Code\n\n请重新使用 !login 登录', false);
                     return;
                 }
 
@@ -1042,13 +1122,7 @@ export async function handleLoginBangCommand(
 
         if (trimmed === '!cancel' || trimmed === '!取消') {
             logger.debug('[!login] User cancelled login');
-            loginSucceeded = false; // Override any prior detection — user explicitly cancelled
-            unregisterInteractiveSession();
-            flushOutput();
-            ptyProcess.kill();
-            if (!dirExistedBefore) cleanupInstance(instancePath);
-            ctx.client.sendCodexMessage({ type: 'message', message: '❌ 登录已取消' });
-            ctx.client.sendSessionEvent({ type: 'ready' });
+            finishTerminalFailure('❌ 登录已取消', true);
             return;
         }
 
@@ -1078,13 +1152,19 @@ export async function handleLoginBangCommand(
     // Handle process exit
     ptyProcess.onExit(({ exitCode }) => {
         exited = true;
-        flushOutput();
+        clearPreAuthDeadline();
         unregisterInteractiveSession();
+        if (terminalNoticeSent) return;
+        flushOutput();
 
         // Only trust explicit PTY success signals or newly written credential files.
         // Do NOT check keychain here — it may contain old tokens from before this login attempt.
-        const hasCredentials = loginSucceeded
-            || existsSync(join(instancePath, '.credentials.json'));
+        const hasCredentials = shouldAcceptClaudeLoginResult({
+            loginSucceeded,
+            aborted,
+            credentialExistedBefore,
+            credentialExistsAfter: existsSync(credentialPath),
+        });
 
         if (hasCredentials) {
             try {
@@ -1105,6 +1185,13 @@ export async function handleLoginBangCommand(
         }
 
         ctx.client.sendSessionEvent({ type: 'ready' });
+    });
+
+    preAuthDeadline = createClaudeLoginPreAuthDeadline(() => {
+        finishTerminalFailure(
+            `❌ 登录启动超时\n\n重新尝试: !login ${profileName}`,
+            false,
+        );
     });
 
     // Return immediately — the interactive session runs asynchronously

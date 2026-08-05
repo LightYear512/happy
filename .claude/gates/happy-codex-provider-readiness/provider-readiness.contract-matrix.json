@@ -1,0 +1,122 @@
+{
+  "schemaVersion": "contract-first-module-gate/v2",
+  "contractProfile": "contract-first-module-lock/v1",
+  "module": "happy-cli.codex-provider-readiness",
+  "owner": "happy-cli.codex-app-server",
+  "ownedPaths": [
+    "packages/happy-cli/src/api/apiSession.ts",
+    "packages/happy-cli/src/codex/runCodexAppServer.ts",
+    "packages/happy-cli/src/daemon/run.ts",
+    "packages/happy-cli/src/codex/__tests__/runCodexAppServerE2E.test.ts",
+    "packages/happy-cli/src/daemon/run.test.ts",
+    ".claude/gates/happy-codex-provider-readiness/provider-readiness.design.md"
+  ],
+  "publicApis": [
+    {
+      "name": "daemon Codex spawn readiness",
+      "inputs": [
+        "one daemon-spawned fresh Happy Codex session",
+        "one real Codex app-server client",
+        "one daemon session-started webhook"
+      ],
+      "acceptedStates": [
+        "fresh Codex thread identifier durably stored before daemon acknowledgement",
+        "Claude daemon child using its existing registration behavior",
+        "terminal Codex session using its existing registration behavior"
+      ],
+      "rejectedStates": [
+        "daemon Codex webhook without provider identifier",
+        "malformed provider identifier",
+        "provider thread creation failure",
+        "metadata acknowledgement failure"
+      ],
+      "provenanceFields": [
+        "Happy session id",
+        "metadata flavor",
+        "startedBy",
+        "Codex thread id"
+      ],
+      "outputState": "One daemon spawn receipt whose Happy session can be restored before any user turn.",
+      "enforcement": "The app-server prepares and stores one fresh thread, while the daemon rejects premature Codex child webhooks.",
+      "negativeTests": [
+        {
+          "name": "existing_restore_identity_consumer_is_fail_closed",
+          "file": "provider-readiness.hostile.test.mjs"
+        }
+      ]
+    }
+  ],
+  "budgets": {
+    "notApplicableReason": "The single readiness transition is enforced by one hostile lifecycle test; it does not consume an independently stored runtime budget."
+  },
+  "lifecycleTransitions": [
+    {
+      "from": "Happy session created without provider identity",
+      "to": "daemon-acknowledged provider-ready session",
+      "creator": "Codex app-server thread/start",
+      "advancer": "acknowledged metadata update",
+      "consumer": "daemon session-started webhook",
+      "rejectTests": [
+        {
+          "name": "existing_restore_identity_consumer_is_fail_closed",
+          "file": "provider-readiness.hostile.test.mjs"
+        }
+      ]
+    }
+  ],
+  "provenanceFields": [
+    {
+      "field": "Codex thread id",
+      "boundByDigest": "The identifier is the exact thread/start response stored in encrypted Happy metadata.",
+      "independentValidation": "The daemon checks the provider identifier before resolving the spawn awaiter.",
+      "tamperTests": [
+        {
+          "name": "existing_restore_identity_consumer_is_fail_closed",
+          "file": "provider-readiness.hostile.test.mjs"
+        }
+      ]
+    }
+  ],
+  "hostileTests": [
+    {
+      "name": "daemon_codex_provider_identity_is_ready_before_spawn_receipt",
+      "file": "provider-readiness.hostile.test.mjs",
+      "ownerBatch": "codex-provider-readiness",
+      "expectedFailureClass": "provider-identity-not-ready"
+    }
+  ],
+  "evidence": {
+    "mode": "approval",
+    "openFindingCount": 0,
+    "designSha256": "d9d39e361cbf1f10e224ca1b7272602dc4b79d7cb6922bb3b89976b4d6c87d3c",
+    "reviewFiles": [
+      {
+        "path": ".claude/designs/happy-codex-provider-readiness-review.md",
+        "sha256": "5010ca77a7a476c6c540c24aaa613c1da85bc01809d1275c3541e1e23dae38db",
+        "reviewDigest": "sha256:5010ca77a7a476c6c540c24aaa613c1da85bc01809d1275c3541e1e23dae38db",
+        "verdict": "PASS"
+      }
+    ],
+    "gateInvocation": {
+      "argv": [
+        "../xiework/jsbrowser/.agents/gates/contract-first/contract-first-module-gate.mjs",
+        "--matrix",
+        ".claude/gates/happy-codex-provider-readiness/provider-readiness.contract-matrix.json",
+        "--design",
+        ".claude/gates/happy-codex-provider-readiness/provider-readiness.design.md"
+      ]
+    },
+    "designSections": [
+      "Public Boundary Matrix",
+      "Budget Ledger",
+      "Lifecycle State Matrix",
+      "Digest And Provenance Matrix"
+    ],
+    "reviewTests": [
+      {
+        "name": "existing_restore_identity_consumer_is_fail_closed",
+        "file": "provider-readiness.hostile.test.mjs"
+      }
+    ]
+  }
+}

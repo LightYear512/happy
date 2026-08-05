@@ -11,8 +11,9 @@ import {
 } from './testkit/fakeCodexAppServer';
 import type { ApiSessionClient } from '@/api/apiSession';
 import type { ApiClient } from '@/api/api';
-import type { UserMessage } from '@/api/types';
+import type { Metadata, UserMessage } from '@/api/types';
 import type { Credentials } from '@/persistence';
+import { publishAccountIntent, writeSessionAccountSelection } from '@/commands/bang/accountIntent';
 
 /**
  * True end-to-end test of the codex fallback-compact docs injection along the
@@ -35,12 +36,24 @@ const THREAD_UUID_2 = '00000000-0000-4000-8000-000000000002';
 const THREAD_UUID_3 = '00000000-0000-4000-8000-000000000003';
 const DOC_MARKER = 'E2E_DOC_MARKER_九九八十一';
 const TRIGGER = '__TRIGGER_COMPACT_FAIL__';
+const SUBAGENT_TRIGGER = '__SPAWN_SUBAGENT__';
 const TURN_DELIM = '@@TURN@@'; // plain-ASCII record separator (avoids escaping traps)
 
 class FakeSession extends EventEmitter {
     readonly sessionId = 'fake-session-id';
     readonly sessionEvents: Array<{ type: string; message?: string }> = [];
     readonly rpcHandlers = new Map<string, (params: unknown) => unknown>();
+    metadata: Metadata = {
+        path: '/workspace',
+        host: 'test-host',
+        homeDir: '/home/test',
+        happyHomeDir: '/home/test/.happy',
+        happyLibDir: '/happy/lib',
+        happyToolsDir: '/happy/tools',
+        flavor: 'codex',
+        startedBy: 'daemon',
+        hostPid: process.pid,
+    };
     readonly rpcHandlerManager = {
         registerHandler: (method: string, handler: (params: unknown) => unknown): void => {
             this.rpcHandlers.set(method, handler);
@@ -64,13 +77,19 @@ class FakeSession extends EventEmitter {
     sendUserText(text: string): void {
         this.injectPendingMessage({ role: 'user', content: { type: 'text', text } });
     }
+    sendSplitUserText(displayText: string, modelText: string): void {
+        this.injectPendingMessage({ role: 'user', content: { type: 'text', text: displayText },
+            meta: { sentFrom: 'cli', modelText, displayText, presentation: 'compact' } });
+    }
     sendSessionEvent(event: { type: string; message?: string }): void { this.sessionEvents.push(event); }
     sendCodexMessage(): void {}
     sendSessionProtocolMessage(): void {}
     sendClaudeSessionMessage(): void {}
     keepAlive(): void {}
     sendSessionDeath(): void {}
-    updateMetadata(): void {}
+    async updateMetadata(handler: (metadata: Metadata) => Metadata): Promise<void> {
+        this.metadata = handler(this.metadata);
+    }
     updateAgentState(): void {}
     async flush(): Promise<void> {}
     async close(): Promise<void> {}
@@ -85,6 +104,8 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
     let projectCwd: string;
     let binDir: string;
     let turnLog: string;
+    let threadTraceLog: string;
+    let resumeTraceLog: string;
 
     beforeEach(async () => {
         envScope.save();
@@ -92,10 +113,17 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
         projectCwd = await mkdtemp(join(tmpdir(), 'e2e-cwd-'));
         binDir = await mkdtemp(join(tmpdir(), 'e2e-bin-'));
         turnLog = join(binDir, 'turns.log');
+        threadTraceLog = join(binDir, 'thread-trace.jsonl');
+        resumeTraceLog = join(binDir, 'resume-trace.jsonl');
     });
     afterEach(async () => {
         envScope.restore();
         delete process.env.HAPPY_TEST_TURN_LOG;
+        delete process.env.HAPPY_TEST_THREAD_TRACE_LOG;
+        delete process.env.HAPPY_TEST_REJECT_FIRST_TURN;
+        delete process.env.HAPPY_TEST_RESUME_TRACE_LOG;
+        delete process.env.HAPPY_TEST_REJECT_RESUME;
+        delete process.env.HAPPY_TEST_RESUME_DELAY_MS;
         for (const d of [codexHome, projectCwd, binDir]) {
             await rm(d, { recursive: true, force: true });
         }
@@ -124,7 +152,12 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
                 'let nextThread = 0;',
                 `const threadIds = ${JSON.stringify([THREAD_UUID_1, THREAD_UUID_2, THREAD_UUID_3])};`,
                 'let nextTurn = 1;',
+                'let rejectTurnOnce = process.env.HAPPY_TEST_REJECT_FIRST_TURN === "1";',
+                'const rejectResume = process.env.HAPPY_TEST_REJECT_RESUME === "1";',
                 'const turnLog = process.env.HAPPY_TEST_TURN_LOG;',
+                'const threadTraceLog = process.env.HAPPY_TEST_THREAD_TRACE_LOG;',
+                'const resumeTraceLog = process.env.HAPPY_TEST_RESUME_TRACE_LOG;',
+                'const resumeDelayMs = Number(process.env.HAPPY_TEST_RESUME_DELAY_MS || 0);',
                 `const DELIM = ${JSON.stringify(TURN_DELIM)};`,
             ],
             bodyLines: [
@@ -137,16 +170,30 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
                 '  if (msg.method === "initialize") { reply(msg.id, { serverInfo: { name: "fake-codex", version: "0.0.0" } }); continue; }',
                 '  if (msg.method === "initialized") continue;',
                 '  if (msg.method === "thread/start") { reply(msg.id, { threadId: threadIds[Math.min(nextThread++, threadIds.length - 1)] }); continue; }',
-                '  if (msg.method === "thread/resume") { const tid = (msg.params && msg.params.threadId) || threadIds[0]; reply(msg.id, { threadId: tid }); continue; }',
+                '  if (msg.method === "thread/resume") {',
+                '    const tid = (msg.params && msg.params.threadId) || threadIds[0];',
+                '    if (resumeTraceLog) { try { fs.appendFileSync(resumeTraceLog, JSON.stringify({ threadId: tid }) + "\\n"); } catch {} }',
+                '    if (rejectResume) { send({ id: msg.id, error: { code: -32000, message: "no rollout found for thread id " + tid } }); continue; }',
+                '    if (resumeDelayMs > 0) { setTimeout(() => reply(msg.id, { threadId: tid }), resumeDelayMs); }',
+                '    else { reply(msg.id, { threadId: tid }); }',
+                '    continue;',
+                '  }',
                 '  if (msg.method === "turn/start") {',
                 '    const turnId = "turn-" + (nextTurn++);',
                 '    const threadId = msg.params && msg.params.threadId;',
                 '    const input = (msg.params && Array.isArray(msg.params.input)) ? msg.params.input : [];',
                 '    const text = input.map((p) => (p && typeof p.text === "string") ? p.text : "").join("");',
                 '    if (turnLog) { try { fs.appendFileSync(turnLog, text + DELIM); } catch {} }',
+                '    if (threadTraceLog) { try { fs.appendFileSync(threadTraceLog, JSON.stringify({ threadId, text, codexHome: process.env.CODEX_HOME }) + "\\n"); } catch {} }',
+                '    if (rejectTurnOnce) { rejectTurnOnce = false; send({ id: msg.id, error: { code: -32000, message: "injected first turn rejection" } }); continue; }',
+                '    if (threadId === "child-thread") { reply(msg.id, { error: { message: "direct app-server input is not allowed for multi-agent v2 sub-agents" } }); continue; }',
                 '    reply(msg.id, { turnId });',
                 '    notify("turn/started", { threadId, turn: { id: turnId } });',
-                '    if (text.includes("__TRIGGER_COMPACT_FAIL__")) {',
+                '    if (text.includes("__SPAWN_SUBAGENT__")) {',
+                '      setTimeout(() => notify("turn/started", { threadId: "child-thread", turn: { id: "child-turn" } }), 1);',
+                '      setTimeout(() => notify("turn/completed", { threadId: "child-thread", turn_id: "child-turn" }), 3);',
+                '      setTimeout(() => notify("turn/completed", { threadId, turn_id: turnId }), 8);',
+                '    } else if (text.includes("__TRIGGER_COMPACT_FAIL__")) {',
                 '      setTimeout(() => notify("error", {',
                 '        error: { message: "Error running remote compact task: stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses/compact)", codexErrorInfo: "other", additionalDetails: null },',
                 '        willRetry: false, threadId, turnId,',
@@ -178,6 +225,321 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
             return [];
         }
     }
+
+    async function readThreadTraces(): Promise<Array<{ threadId: string; text: string; codexHome?: string }>> {
+        try {
+            const raw = await readFile(threadTraceLog, 'utf-8');
+            return raw.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+        } catch {
+            return [];
+        }
+    }
+
+    async function readResumeTraces(): Promise<Array<{ threadId: string }>> {
+        try {
+            const raw = await readFile(resumeTraceLog, 'utf-8');
+            return raw.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+        } catch {
+            return [];
+        }
+    }
+
+    it('resumes the exact restored thread before runtime readiness or queued input', async () => {
+        const startupDirectory = join(projectCwd, 'xcoding-v2', 'dist');
+        await mkdir(startupDirectory, { recursive: true });
+        await writeFile(join(startupDirectory, 'cli.js'),
+            `process.stdout.write(JSON.stringify({ systemMessage: '旧版本已迁移:' + process.env.XC_CONVERSATION_ID }));\n`);
+        const fakeBin = await writeFakeBin();
+        process.env.HAPPY_CODEX_APP_SERVER_BIN = fakeBin;
+        process.env.HAPPY_CODEX_APP_SERVER_RPC_TIMEOUT_MS = '4000';
+        process.env.CODEX_HOME = codexHome;
+        process.env.HAPPY_TEST_RESUME_TRACE_LOG = resumeTraceLog;
+
+        const fakeSession = new FakeSession();
+        let requestExit: (() => void) | undefined;
+        let resolveReady: (() => void) | undefined;
+        const ready = new Promise<void>((resolve) => { resolveReady = resolve; });
+        const runtime = runCodexWithAppServer({
+            credentials: {} as Credentials,
+            startedBy: 'daemon',
+            restoreSessionId: fakeSession.sessionId,
+            codexSessionId: THREAD_UUID_1,
+            deps: {
+                apiClient: fakeApi,
+                session: fakeSession as unknown as ApiSessionClient,
+                cwd: projectCwd,
+                onRuntimeReady: ({ requestExit: close }) => {
+                    requestExit = close;
+                    resolveReady?.();
+                },
+            },
+        });
+
+        await ready;
+        expect(await readResumeTraces()).toEqual([{ threadId: THREAD_UUID_1 }]);
+        expect(await readTurnRecords()).toEqual([]);
+        requestExit?.();
+        await runtime;
+        expect(fakeSession.sessionEvents).not.toContainEqual(expect.objectContaining({
+            type: 'message', message: expect.stringContaining('旧版本已迁移'),
+        }));
+    });
+
+    it('rejects a missing restored rollout before exposing runtime readiness', async () => {
+        const fakeBin = await writeFakeBin();
+        process.env.HAPPY_CODEX_APP_SERVER_BIN = fakeBin;
+        process.env.HAPPY_CODEX_APP_SERVER_RPC_TIMEOUT_MS = '4000';
+        process.env.HAPPY_TEST_RESUME_TRACE_LOG = resumeTraceLog;
+        process.env.HAPPY_TEST_REJECT_RESUME = '1';
+        process.env.CODEX_HOME = codexHome;
+
+        const fakeSession = new FakeSession();
+        let becameReady = false;
+        await runCodexWithAppServer({
+            credentials: {} as Credentials,
+            startedBy: 'daemon',
+            restoreSessionId: fakeSession.sessionId,
+            codexSessionId: THREAD_UUID_1,
+            deps: {
+                apiClient: fakeApi,
+                session: fakeSession as unknown as ApiSessionClient,
+                cwd: projectCwd,
+                onRuntimeReady: () => { becameReady = true; },
+            },
+        });
+
+        expect(becameReady).toBe(false);
+        expect(await readResumeTraces()).toEqual([{ threadId: THREAD_UUID_1 }]);
+        expect(await readTurnRecords()).toEqual([]);
+        expect(fakeSession.sessionEvents).toContainEqual(expect.objectContaining({
+            type: 'message',
+            message: expect.stringContaining('no rollout found for thread id'),
+        }));
+    });
+
+    it('leaves restored-thread XC startup to the shared ApiSession boundary', async () => {
+        const startupDirectory = join(projectCwd, 'xcoding-v2', 'dist');
+        await mkdir(startupDirectory, { recursive: true });
+        await writeFile(join(startupDirectory, 'cli.js'),
+            `process.stdout.write(JSON.stringify({ systemMessage: '旧版本已迁移:' + process.env.XC_CONVERSATION_ID }));\n`);
+        const fakeBin = await writeFakeBin();
+        process.env.HAPPY_CODEX_APP_SERVER_BIN = fakeBin;
+        process.env.HAPPY_CODEX_APP_SERVER_RPC_TIMEOUT_MS = '4000';
+        process.env.CODEX_HOME = codexHome;
+
+        const fakeSession = new FakeSession();
+        let requestExit: (() => void) | undefined;
+        const ready = new Promise<void>((resolve) => {
+            void runCodexWithAppServer({
+                credentials: {} as Credentials,
+                codexSessionId: THREAD_UUID_1,
+                deps: {
+                    apiClient: fakeApi,
+                    session: fakeSession as unknown as ApiSessionClient,
+                    cwd: projectCwd,
+                    onRuntimeReady: ({ requestExit: close }) => { requestExit = close; resolve(); },
+                },
+            });
+        });
+
+        await ready;
+        requestExit?.();
+        expect(fakeSession.sessionEvents).not.toContainEqual(expect.objectContaining({
+            type: 'message', message: expect.stringContaining('旧版本已迁移'),
+        }));
+    });
+
+    // BUG-HAPPY-STARTUP diagnostic: reproduces the native-id/thread-id startup gap on the real turn loop.
+    it('leaves fresh-thread XC startup and admission to the shared ApiSession boundary', async () => {
+        const startupDirectory = join(projectCwd, 'xcoding-v2', 'dist');
+        await mkdir(startupDirectory, { recursive: true });
+        await writeFile(join(startupDirectory, 'cli.js'),
+            `process.stdout.write(process.argv[3] === 'startup'
+  ? JSON.stringify({ systemMessage: 'XC_READY:' + process.env.XC_CONVERSATION_ID })
+  : JSON.stringify({ hookSpecificOutput: { additionalContext: 'XC_FIRST_THREAD_CONTEXT' } }));\n`);
+        const fakeBin = await writeFakeBin();
+        process.env.HAPPY_CODEX_APP_SERVER_BIN = fakeBin;
+        process.env.HAPPY_CODEX_APP_SERVER_RPC_TIMEOUT_MS = '4000';
+        process.env.HAPPY_TEST_TURN_LOG = turnLog;
+        process.env.CODEX_HOME = codexHome;
+
+        const fakeSession = new FakeSession();
+        let requestExit: (() => void) | undefined;
+        const ready = new Promise<void>((resolve) => {
+            void runCodexWithAppServer({
+                credentials: {} as Credentials,
+                deps: {
+                    apiClient: fakeApi,
+                    session: fakeSession as unknown as ApiSessionClient,
+                    cwd: projectCwd,
+                    onRuntimeReady: ({ requestExit: close }) => { requestExit = close; resolve(); },
+                },
+            });
+        });
+
+        await ready;
+        fakeSession.sendUserText('FIRST_FRESH_PROMPT');
+        const deadline = Date.now() + 4_000;
+        let records: string[] = [];
+        while (Date.now() < deadline) {
+            records = await readTurnRecords();
+            if (records.length > 0) break;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        requestExit?.();
+        expect(fakeSession.sessionEvents).not.toContainEqual(expect.objectContaining({
+            type: 'message', message: expect.stringContaining('XC_READY'),
+        }));
+        expect(records).toHaveLength(1);
+        expect(records[0]).not.toContain('XC_FIRST_THREAD_CONTEXT');
+        expect(records[0]).toContain('FIRST_FRESH_PROMPT');
+    });
+
+    it('prepares a daemon Codex provider identity before the first turn', async () => {
+        const fakeBin = await writeFakeBin();
+        process.env.HAPPY_CODEX_APP_SERVER_BIN = fakeBin;
+        process.env.HAPPY_CODEX_APP_SERVER_RPC_TIMEOUT_MS = '4000';
+        process.env.HAPPY_TEST_TURN_LOG = turnLog;
+        process.env.CODEX_HOME = codexHome;
+
+        const fakeSession = new FakeSession();
+        let requestExit: (() => void) | undefined;
+        const ready = new Promise<void>((resolve) => {
+            void runCodexWithAppServer({
+                credentials: {} as Credentials,
+                startedBy: 'daemon',
+                deps: {
+                    apiClient: fakeApi,
+                    session: fakeSession as unknown as ApiSessionClient,
+                    cwd: projectCwd,
+                    onRuntimeReady: ({ requestExit: close }) => {
+                        requestExit = close;
+                        resolve();
+                    },
+                },
+            });
+        });
+
+        await ready;
+        expect(fakeSession.metadata.claudeSessionId).toBe(THREAD_UUID_1);
+        expect(await readTurnRecords()).toEqual([]);
+        requestExit?.();
+    });
+
+    it('does not duplicate shared ApiSession admission when a provider turn is retried', async () => {
+        const startupDirectory = join(projectCwd, 'xcoding-v2', 'dist');
+        const inputCalls = join(projectCwd, 'xc-input-calls.txt');
+        await mkdir(startupDirectory, { recursive: true });
+        await writeFile(join(startupDirectory, 'cli.js'),
+            `import { appendFileSync } from 'node:fs';
+if (process.argv[3] === 'input') appendFileSync(${JSON.stringify(inputCalls)}, 'input\\n');
+process.stdout.write(process.argv[3] === 'startup'
+  ? JSON.stringify({ systemMessage: 'XC_READY' })
+  : JSON.stringify({ hookSpecificOutput: { additionalContext: 'RETRY_CONTEXT' } }));\n`);
+        const fakeBin = await writeFakeBin();
+        process.env.HAPPY_CODEX_APP_SERVER_BIN = fakeBin;
+        process.env.HAPPY_CODEX_APP_SERVER_RPC_TIMEOUT_MS = '4000';
+        process.env.HAPPY_TEST_TURN_LOG = turnLog;
+        process.env.HAPPY_TEST_REJECT_FIRST_TURN = '1';
+        process.env.CODEX_HOME = codexHome;
+
+        const fakeSession = new FakeSession();
+        let requestExit: (() => void) | undefined;
+        const ready = new Promise<void>((resolve) => {
+            void runCodexWithAppServer({ credentials: {} as Credentials, deps: {
+                apiClient: fakeApi, session: fakeSession as unknown as ApiSessionClient, cwd: projectCwd,
+                onRuntimeReady: ({ requestExit: close }) => { requestExit = close; resolve(); },
+            } });
+        });
+        await ready;
+        fakeSession.sendUserText('REJECTED_PROMPT');
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        fakeSession.sendUserText('RETRIED_PROMPT');
+        const deadline = Date.now() + 4_000;
+        let records: string[] = [];
+        while (Date.now() < deadline) {
+            records = await readTurnRecords();
+            if (records.length >= 2) break;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        requestExit?.();
+
+        await expect(readFile(inputCalls, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+        expect(records).toHaveLength(2);
+        expect(records[1]).not.toContain('RETRY_CONTEXT');
+        expect(records[1]).toContain('RETRIED_PROMPT');
+    });
+
+    it('sends encrypted modelText to Codex while legacy clients retain the compact content text', async () => {
+        const fakeBin = await writeFakeBin();
+        process.env.HAPPY_CODEX_APP_SERVER_BIN = fakeBin;
+        process.env.HAPPY_CODEX_APP_SERVER_RPC_TIMEOUT_MS = '4000';
+        process.env.HAPPY_TEST_TURN_LOG = turnLog;
+        process.env.CODEX_HOME = codexHome;
+
+        const fakeSession = new FakeSession();
+        let requestExit: (() => void) | undefined;
+        const ready = new Promise<void>((resolve) => {
+            void runCodexWithAppServer({
+                credentials: {} as Credentials,
+                deps: {
+                    apiClient: fakeApi,
+                    session: fakeSession as unknown as ApiSessionClient,
+                    cwd: projectCwd,
+                    onRuntimeReady: ({ requestExit: close }) => { requestExit = close; resolve(); },
+                },
+            });
+        });
+
+        await ready;
+        fakeSession.sendSplitUserText('VISIBLE_COMPACT_SUMMARY', 'MODEL_ONLY_COMPLETE_MAIL_BODY');
+        const deadline = Date.now() + 4_000;
+        let records: string[] = [];
+        while (Date.now() < deadline) {
+            records = await readTurnRecords();
+            if (records.length > 0) break;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        requestExit?.();
+
+        expect(records).toHaveLength(1);
+        expect(records[0]).toContain('MODEL_ONLY_COMPLETE_MAIL_BODY');
+        expect(records[0]).not.toContain('VISIBLE_COMPACT_SUMMARY');
+    }, 10_000);
+
+    it('routes a raw @ command locally even when XC supplied model context', async () => {
+        const fakeBin = await writeFakeBin();
+        process.env.HAPPY_CODEX_APP_SERVER_BIN = fakeBin;
+        process.env.HAPPY_CODEX_APP_SERVER_RPC_TIMEOUT_MS = '4000';
+        process.env.HAPPY_TEST_TURN_LOG = turnLog;
+        process.env.CODEX_HOME = codexHome;
+
+        const fakeSession = new FakeSession();
+        let requestExit: (() => void) | undefined;
+        const ready = new Promise<void>((resolve) => {
+            void runCodexWithAppServer({
+                credentials: {} as Credentials,
+                deps: {
+                    apiClient: fakeApi,
+                    session: fakeSession as unknown as ApiSessionClient,
+                    cwd: projectCwd,
+                    onRuntimeReady: ({ requestExit: close }) => { requestExit = close; resolve(); },
+                },
+            });
+        });
+
+        await ready;
+        const eventFloor = fakeSession.sessionEvents.length;
+        fakeSession.sendSplitUserText('@', '[XC required context]\n\n@');
+        const deadline = Date.now() + 4_000;
+        while (Date.now() < deadline && fakeSession.sessionEvents.length === eventFloor) {
+            await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        requestExit?.();
+
+        expect(fakeSession.sessionEvents.length).toBeGreaterThan(eventFloor);
+        expect(await readTurnRecords()).toEqual([]);
+    }, 10_000);
 
     it('emits a compact-failure error → auto-rescue injects .happy docs into the next turn/start', async () => {
         await writeRollout(THREAD_UUID_1);
@@ -223,4 +585,384 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
         expect(records[records.length - 1]).toContain(DOC_MARKER);
         expect(records[records.length - 1]).toContain('<!--HAPPY-PROJECT-DOCS-v1-->');
     }, 30_000);
+
+    it('keeps direct input and lifecycle on the root thread after a sub-agent turn', async () => {
+        const fakeBin = await writeFakeBin();
+        process.env.HAPPY_CODEX_APP_SERVER_BIN = fakeBin;
+        process.env.HAPPY_CODEX_APP_SERVER_RPC_TIMEOUT_MS = '4000';
+        process.env.HAPPY_TEST_TURN_LOG = turnLog;
+        process.env.HAPPY_TEST_THREAD_TRACE_LOG = threadTraceLog;
+        process.env.CODEX_HOME = codexHome;
+
+        const fakeSession = new FakeSession();
+        let requestExit: (() => void) | undefined;
+        let resolveReady: (() => void) | undefined;
+        const runtimeReady = new Promise<void>((resolve) => { resolveReady = resolve; });
+        const runtime = runCodexWithAppServer({
+            credentials: {} as Credentials,
+            deps: {
+                apiClient: fakeApi,
+                session: fakeSession as unknown as ApiSessionClient,
+                cwd: projectCwd,
+                onRuntimeReady: ({ requestExit: re }) => {
+                    requestExit = re;
+                    resolveReady?.();
+                },
+            },
+        });
+
+        await runtimeReady;
+        fakeSession.sendUserText(SUBAGENT_TRIGGER);
+        const firstDeadline = Date.now() + 4_000;
+        while (Date.now() < firstDeadline) {
+            if ((await readThreadTraces()).length >= 1) break;
+            await new Promise((r) => setTimeout(r, 20));
+        }
+        await new Promise((r) => setTimeout(r, 40));
+        fakeSession.sendUserText('second-root-prompt');
+
+        const secondDeadline = Date.now() + 4_000;
+        let traces: Array<{ threadId: string; text: string }> = [];
+        while (Date.now() < secondDeadline) {
+            traces = await readThreadTraces();
+            if (traces.length >= 2) break;
+            await new Promise((r) => setTimeout(r, 20));
+        }
+
+        requestExit?.();
+        await runtime;
+
+        expect(traces).toHaveLength(2);
+        expect(traces[0].text).toContain(SUBAGENT_TRIGGER);
+        expect(traces[1].text).toContain('second-root-prompt');
+        expect(traces[1].threadId).toBe(traces[0].threadId);
+        expect(traces[1].threadId).not.toBe('child-thread');
+    }, 15_000);
+
+    it('switches the app-server account only after resuming the exact root thread', async () => {
+        const happyHome = join(binDir, 'happy-home');
+        const instances = join(happyHome, 'auth', 'codex', 'instances');
+        const workHome = join(instances, 'work');
+        const personalHome = join(instances, 'personal');
+        await mkdir(workHome, { recursive: true });
+        await mkdir(personalHome, { recursive: true });
+        await writeFile(join(workHome, 'auth.json'), JSON.stringify({ tokens: { access_token: 'work-test-token' } }));
+        await writeFile(join(personalHome, 'auth.json'), JSON.stringify({ tokens: { access_token: 'personal-test-token' } }));
+        await writeFile(join(instances, 'config.yaml'), 'default: work\n');
+
+        const fakeBin = await writeFakeBin();
+        process.env.HAPPY_CODEX_APP_SERVER_BIN = fakeBin;
+        process.env.HAPPY_CODEX_APP_SERVER_RPC_TIMEOUT_MS = '4000';
+        process.env.HAPPY_TEST_THREAD_TRACE_LOG = threadTraceLog;
+        process.env.HAPPY_HOME_DIR = happyHome;
+        process.env.CODEX_HOME = workHome;
+
+        const fakeSession = new FakeSession();
+        let requestExit: (() => void) | undefined;
+        let resolveReady: (() => void) | undefined;
+        const runtimeReady = new Promise<void>((resolve) => { resolveReady = resolve; });
+        const runtime = runCodexWithAppServer({
+            credentials: {} as Credentials,
+            deps: {
+                apiClient: fakeApi,
+                session: fakeSession as unknown as ApiSessionClient,
+                cwd: projectCwd,
+                onRuntimeReady: ({ requestExit: re }) => {
+                    requestExit = re;
+                    resolveReady?.();
+                },
+            },
+        });
+
+        await runtimeReady;
+        fakeSession.sendUserText('first-account-prompt');
+        const firstDeadline = Date.now() + 4_000;
+        while (Date.now() < firstDeadline) {
+            if ((await readThreadTraces()).length >= 1) break;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+
+        fakeSession.sendUserText('!auth personal');
+        const swapDeadline = Date.now() + 8_000;
+        while (Date.now() < swapDeadline) {
+            if (fakeSession.sessionEvents.some((event) => event.message?.includes('Switched to "personal"'))) break;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+
+        fakeSession.sendUserText('second-account-prompt');
+        const secondDeadline = Date.now() + 4_000;
+        let traces: Array<{ threadId: string; text: string; codexHome?: string }> = [];
+        while (Date.now() < secondDeadline) {
+            traces = await readThreadTraces();
+            if (traces.length >= 2) break;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+
+        requestExit?.();
+        await runtime;
+
+        expect(fakeSession.sessionEvents.some((event) => event.message?.includes('Switched to "personal"'))).toBe(true);
+        expect(traces).toHaveLength(2);
+        expect(traces[0].threadId).toBe(traces[1].threadId);
+        expect(traces[0].codexHome).toBe(workHome);
+        expect(traces[1].codexHome).toBe(personalHome);
+    }, 20_000);
+
+    it('does not wake an idle session for a global account target and switches before the next input', async () => {
+        const happyHome = join(binDir, 'happy-home');
+        const instances = join(happyHome, 'auth', 'codex', 'instances');
+        const workHome = join(instances, 'work');
+        const personalHome = join(instances, 'personal');
+        await mkdir(workHome, { recursive: true });
+        await mkdir(personalHome, { recursive: true });
+        await writeFile(join(workHome, 'auth.json'), JSON.stringify({ tokens: { access_token: 'work-test-token' } }));
+        await writeFile(join(personalHome, 'auth.json'), JSON.stringify({ tokens: { access_token: 'personal-test-token' } }));
+        await writeFile(join(instances, 'config.yaml'), 'default: work\n');
+
+        const fakeBin = await writeFakeBin();
+        process.env.HAPPY_CODEX_APP_SERVER_BIN = fakeBin;
+        process.env.HAPPY_CODEX_APP_SERVER_RPC_TIMEOUT_MS = '4000';
+        process.env.HAPPY_TEST_THREAD_TRACE_LOG = threadTraceLog;
+        process.env.HAPPY_TEST_RESUME_TRACE_LOG = resumeTraceLog;
+        process.env.HAPPY_HOME_DIR = happyHome;
+        process.env.CODEX_HOME = workHome;
+
+        const fakeSession = new FakeSession();
+        let requestExit: (() => void) | undefined;
+        let resolveReady: (() => void) | undefined;
+        const runtimeReady = new Promise<void>((resolve) => { resolveReady = resolve; });
+        const runtime = runCodexWithAppServer({
+            credentials: {} as Credentials,
+            deps: {
+                apiClient: fakeApi,
+                session: fakeSession as unknown as ApiSessionClient,
+                cwd: projectCwd,
+                onRuntimeReady: ({ requestExit: re }) => {
+                    requestExit = re;
+                    resolveReady?.();
+                },
+            },
+        });
+
+        await runtimeReady;
+        fakeSession.sendUserText('first-account-prompt');
+        const firstDeadline = Date.now() + 4_000;
+        while (Date.now() < firstDeadline) {
+            if ((await readThreadTraces()).length >= 1) break;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+
+        publishAccountIntent('codex', 'personal', Date.now(), happyHome);
+        await new Promise((resolve) => setTimeout(resolve, 350));
+        expect(await readResumeTraces()).toEqual([]);
+        expect(fakeSession.sessionEvents.some((event) => event.message?.includes('Switched to "personal"'))).toBe(false);
+
+        fakeSession.sendUserText('second-account-prompt');
+        const secondDeadline = Date.now() + 8_000;
+        let traces: Array<{ threadId: string; text: string; codexHome?: string }> = [];
+        while (Date.now() < secondDeadline) {
+            traces = await readThreadTraces();
+            if (traces.length >= 2) break;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+
+        requestExit?.();
+        await runtime;
+
+        expect(await readResumeTraces()).toEqual([{ threadId: traces[0]?.threadId }]);
+        expect(traces).toHaveLength(2);
+        expect(traces[0].threadId).toBe(traces[1].threadId);
+        expect(traces[0].codexHome).toBe(workHome);
+        expect(traces[1].codexHome).toBe(personalHome);
+    }, 20_000);
+
+    it('uses a newer global account at startup instead of an unavailable saved account', async () => {
+        const happyHome = join(binDir, 'happy-home');
+        const instances = join(happyHome, 'auth', 'codex', 'instances');
+        const unavailableHome = join(instances, 'deleted-manual');
+        const personalHome = join(instances, 'personal');
+        await mkdir(personalHome, { recursive: true });
+        await writeFile(join(personalHome, 'auth.json'), JSON.stringify({ tokens: { access_token: 'personal-test-token' } }));
+        await mkdir(instances, { recursive: true });
+        await writeFile(join(instances, 'config.yaml'), 'default: deleted-manual\n');
+        writeSessionAccountSelection('fake-session-id', 'codex', 'deleted-manual', 100, happyHome);
+        publishAccountIntent('codex', 'personal', 101, happyHome);
+
+        const fakeBin = await writeFakeBin();
+        process.env.HAPPY_CODEX_APP_SERVER_BIN = fakeBin;
+        process.env.HAPPY_CODEX_APP_SERVER_RPC_TIMEOUT_MS = '4000';
+        process.env.HAPPY_TEST_THREAD_TRACE_LOG = threadTraceLog;
+        process.env.HAPPY_HOME_DIR = happyHome;
+        process.env.CODEX_HOME = unavailableHome;
+
+        const fakeSession = new FakeSession();
+        let requestExit: (() => void) | undefined;
+        let resolveReady: (() => void) | undefined;
+        const runtimeReady = new Promise<void>((resolve) => { resolveReady = resolve; });
+        const runtime = runCodexWithAppServer({
+            credentials: {} as Credentials,
+            deps: {
+                apiClient: fakeApi,
+                session: fakeSession as unknown as ApiSessionClient,
+                cwd: projectCwd,
+                onRuntimeReady: ({ requestExit: re }) => {
+                    requestExit = re;
+                    resolveReady?.();
+                },
+            },
+        });
+
+        await runtimeReady;
+        fakeSession.sendUserText('startup-global-account');
+        const deadline = Date.now() + 4_000;
+        let traces: Array<{ threadId: string; text: string; codexHome?: string }> = [];
+        while (Date.now() < deadline) {
+            traces = await readThreadTraces();
+            if (traces.length >= 1) break;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+
+        requestExit?.();
+        await runtime;
+
+        expect(traces).toHaveLength(1);
+        expect(traces[0].codexHome).toBe(personalHome);
+        expect(traces[0].text).toContain('startup-global-account');
+    }, 15_000);
+
+    it('uses the canonical RPC timeout for account swap and keeps the old account usable on timeout', async () => {
+        const happyHome = join(binDir, 'happy-home');
+        const instances = join(happyHome, 'auth', 'codex', 'instances');
+        const workHome = join(instances, 'work');
+        const personalHome = join(instances, 'personal');
+        await mkdir(workHome, { recursive: true });
+        await mkdir(personalHome, { recursive: true });
+        await writeFile(join(workHome, 'auth.json'), JSON.stringify({ tokens: { access_token: 'work-test-token' } }));
+        await writeFile(join(personalHome, 'auth.json'), JSON.stringify({ tokens: { access_token: 'personal-test-token' } }));
+        await writeFile(join(instances, 'config.yaml'), 'default: work\n');
+
+        const fakeBin = await writeFakeBin();
+        process.env.HAPPY_CODEX_APP_SERVER_BIN = fakeBin;
+        process.env.HAPPY_CODEX_APP_SERVER_RPC_TIMEOUT_MS = '1000';
+        process.env.HAPPY_TEST_RESUME_DELAY_MS = '1500';
+        process.env.HAPPY_TEST_THREAD_TRACE_LOG = threadTraceLog;
+        process.env.HAPPY_HOME_DIR = happyHome;
+        process.env.CODEX_HOME = workHome;
+
+        const fakeSession = new FakeSession();
+        let requestExit: (() => void) | undefined;
+        let resolveReady: (() => void) | undefined;
+        const runtimeReady = new Promise<void>((resolve) => { resolveReady = resolve; });
+        const runtime = runCodexWithAppServer({
+            credentials: {} as Credentials,
+            deps: {
+                apiClient: fakeApi,
+                session: fakeSession as unknown as ApiSessionClient,
+                cwd: projectCwd,
+                onRuntimeReady: ({ requestExit: re }) => {
+                    requestExit = re;
+                    resolveReady?.();
+                },
+            },
+        });
+
+        await runtimeReady;
+        fakeSession.sendUserText('first-account-prompt');
+        const firstDeadline = Date.now() + 2_000;
+        while (Date.now() < firstDeadline) {
+            if ((await readThreadTraces()).length >= 1) break;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+
+        fakeSession.sendUserText('!auth personal');
+        const failureDeadline = Date.now() + 2_000;
+        while (Date.now() < failureDeadline) {
+            if (fakeSession.sessionEvents.some((event) => event.message?.includes('timed out after 1000ms'))) break;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+
+        fakeSession.sendUserText('old-account-still-usable');
+        const secondDeadline = Date.now() + 2_000;
+        let traces: Array<{ threadId: string; text: string; codexHome?: string }> = [];
+        while (Date.now() < secondDeadline) {
+            traces = await readThreadTraces();
+            if (traces.length >= 2) break;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+
+        requestExit?.();
+        await runtime;
+
+        expect(fakeSession.sessionEvents.some((event) => event.message?.includes('timed out after 1000ms'))).toBe(true);
+        expect(fakeSession.sessionEvents.some((event) => event.message?.includes('Switched to "personal"'))).toBe(false);
+        expect(traces).toHaveLength(2);
+        expect(traces[0].threadId).toBe(traces[1].threadId);
+        expect(traces[0].codexHome).toBe(workHome);
+        expect(traces[1].codexHome).toBe(workHome);
+    }, 15_000);
+
+    it('attempts a failed global account target once per input without using the old account', async () => {
+        const happyHome = join(binDir, 'happy-home');
+        const instances = join(happyHome, 'auth', 'codex', 'instances');
+        const workHome = join(instances, 'work');
+        const personalHome = join(instances, 'personal');
+        await mkdir(workHome, { recursive: true });
+        await mkdir(personalHome, { recursive: true });
+        await writeFile(join(workHome, 'auth.json'), JSON.stringify({ tokens: { access_token: 'work-test-token' } }));
+        await writeFile(join(personalHome, 'auth.json'), JSON.stringify({ tokens: { access_token: 'personal-test-token' } }));
+        await writeFile(join(instances, 'config.yaml'), 'default: work\n');
+
+        const fakeBin = await writeFakeBin();
+        process.env.HAPPY_CODEX_APP_SERVER_BIN = fakeBin;
+        process.env.HAPPY_CODEX_APP_SERVER_RPC_TIMEOUT_MS = '1000';
+        process.env.HAPPY_TEST_REJECT_RESUME = '1';
+        process.env.HAPPY_TEST_THREAD_TRACE_LOG = threadTraceLog;
+        process.env.HAPPY_TEST_RESUME_TRACE_LOG = resumeTraceLog;
+        process.env.HAPPY_HOME_DIR = happyHome;
+        process.env.CODEX_HOME = workHome;
+
+        const fakeSession = new FakeSession();
+        let requestExit: (() => void) | undefined;
+        let resolveReady: (() => void) | undefined;
+        const runtimeReady = new Promise<void>((resolve) => { resolveReady = resolve; });
+        const runtime = runCodexWithAppServer({
+            credentials: {} as Credentials,
+            deps: {
+                apiClient: fakeApi,
+                session: fakeSession as unknown as ApiSessionClient,
+                cwd: projectCwd,
+                onRuntimeReady: ({ requestExit: re }) => {
+                    requestExit = re;
+                    resolveReady?.();
+                },
+            },
+        });
+
+        await runtimeReady;
+        fakeSession.sendUserText('first-account-prompt');
+        const firstDeadline = Date.now() + 2_000;
+        while (Date.now() < firstDeadline) {
+            if ((await readThreadTraces()).length >= 1) break;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+
+        publishAccountIntent('codex', 'personal', Date.now(), happyHome);
+        fakeSession.sendUserText('must-not-run-on-old-account');
+        const failureDeadline = Date.now() + 2_000;
+        while (Date.now() < failureDeadline) {
+            if (fakeSession.sessionEvents.some((event) => event.message?.includes('本次输入未提交'))) break;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        await new Promise((resolve) => setTimeout(resolve, 300));
+
+        const traces = await readThreadTraces();
+        const resumes = await readResumeTraces();
+        requestExit?.();
+        await runtime;
+
+        expect(fakeSession.sessionEvents.some((event) => event.message?.includes('本次输入未提交'))).toBe(true);
+        expect(resumes).toHaveLength(1);
+        expect(traces).toHaveLength(1);
+        expect(traces[0].text).toContain('first-account-prompt');
+    }, 15_000);
 });

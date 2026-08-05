@@ -254,7 +254,10 @@ export const MessageMetaSchema = z.object({
   customSystemPrompt: z.string().nullable().optional(), // Custom system prompt for this message (null = reset)
   appendSystemPrompt: z.string().nullable().optional(), // Append to system prompt for this message (null = reset)
   allowedTools: z.array(z.string()).nullable().optional(), // Allowed tools for this message (null = reset)
-  disallowedTools: z.array(z.string()).nullable().optional() // Disallowed tools for this message (null = reset)
+  disallowedTools: z.array(z.string()).nullable().optional(), // Disallowed tools for this message (null = reset)
+  modelText: z.string().optional(), // Optional model-facing text when content.text is a compact legacy-client summary
+  displayText: z.string().optional(), // Optional UI text replacing the model-facing message text
+  presentation: z.enum(['compact', 'mail']).optional()
 })
 
 export type MessageMeta = z.infer<typeof MessageMetaSchema>
@@ -289,6 +292,16 @@ export const UserMessageSchema = z.object({
 })
 
 export type UserMessage = z.infer<typeof UserMessageSchema>
+
+export const localCommandUserText = (message: UserMessage): string => message.content.text
+
+export function modelFacingUserText(message: UserMessage): string {
+  const modelText = message.meta?.modelText
+  if (message.meta?.presentation && !modelText) {
+    throw new Error('Presented user message is missing modelText')
+  }
+  return modelText ?? message.content.text
+}
 
 export const AgentMessageSchema = z.object({
   role: z.literal('agent'),
@@ -338,6 +351,7 @@ export type Metadata = {
   hostPid?: number,
   startedBy?: 'daemon' | 'terminal',
   consoleSession?: boolean,
+  titleAuthority?: 'external',
   // Lifecycle state management
   lifecycleState?: 'running' | 'archiveRequested' | 'archived' | string,
   lifecycleStateSince?: number,
@@ -346,6 +360,7 @@ export type Metadata = {
   flavor?: string
   sandbox?: SandboxConfig | null
   dangerouslySkipPermissions?: boolean | null
+  permissionMode?: PermissionMode
 };
 
 export type AgentState = {

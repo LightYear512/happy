@@ -31,6 +31,7 @@ import { spawnHappyCLI } from './utils/spawnHappyCLI'
 import { claudeCliPath } from './claude/claudeLocal'
 import { execFileSync } from 'node:child_process'
 import { extractNoSandboxFlag } from './utils/sandboxFlags'
+import { MessageMetaSchema, type PermissionMode } from './api/types'
 
 
 (async () => {
@@ -111,6 +112,7 @@ import { extractNoSandboxFlag } from './utils/sandboxFlags'
       let startedBy: 'daemon' | 'terminal' | undefined = undefined;
       let restoreSessionId: string | undefined = undefined;
       let codexSessionId: string | undefined = undefined;
+      let permissionMode: PermissionMode | undefined = undefined;
       const codexArgs = extractNoSandboxFlag(args.slice(1));
       for (let i = 0; i < codexArgs.args.length; i++) {
         if (codexArgs.args[i] === '--started-by') {
@@ -119,13 +121,18 @@ import { extractNoSandboxFlag } from './utils/sandboxFlags'
           restoreSessionId = codexArgs.args[++i];
         } else if (codexArgs.args[i] === '--resume') {
           codexSessionId = codexArgs.args[++i];
+        } else if (codexArgs.args[i] === '--permission-mode') {
+          const parsed = MessageMetaSchema.shape.permissionMode.safeParse(codexArgs.args[++i]);
+          if (!parsed.success || parsed.data === undefined) throw new Error('Invalid Codex permission mode');
+          permissionMode = parsed.data;
         }
       }
 
       const {
         credentials
       } = await authAndSetupMachineIfNeeded();
-      await runCodex({credentials, startedBy, noSandbox: codexArgs.noSandbox, restoreSessionId, codexSessionId});
+      await runCodex({ credentials, startedBy, noSandbox: codexArgs.noSandbox,
+        restoreSessionId, codexSessionId, permissionMode });
       // Do not force exit here; allow instrumentation to show lingering handles
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
@@ -321,9 +328,12 @@ import { extractNoSandboxFlag } from './utils/sandboxFlags'
       
       // Parse startedBy argument
       let startedBy: 'daemon' | 'terminal' | undefined = undefined;
+      let restoreSessionId: string | undefined = undefined;
       for (let i = 1; i < args.length; i++) {
         if (args[i] === '--started-by') {
           startedBy = args[++i] as 'daemon' | 'terminal';
+        } else if (args[i] === '--happy-restore-session') {
+          restoreSessionId = args[++i];
         }
       }
       
@@ -344,7 +354,7 @@ import { extractNoSandboxFlag } from './utils/sandboxFlags'
         await new Promise(resolve => setTimeout(resolve, 200));
       }
 
-      await runGemini({credentials, startedBy});
+      await runGemini({ credentials, startedBy, restoreSessionId });
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
       if (process.env.DEBUG) {
@@ -497,8 +507,11 @@ import { extractNoSandboxFlag } from './utils/sandboxFlags'
       process.exit(0)
     } else if (daemonSubcommand === 'stop') {
       const killSessions = args.includes('--kill-sessions');
-      await stopDaemon(killSessions ? { stopSessions: true } : undefined)
-      process.exit(0)
+      const stopped = await stopDaemon(killSessions ? { stopSessions: true } : undefined)
+      if (!stopped) {
+        console.error('Daemon shutdown was blocked while user sessions remain active or could not be stopped safely')
+      }
+      process.exit(stopped ? 0 : 1)
     } else if (daemonSubcommand === 'status') {
       // Show daemon-specific doctor output
       await runDoctorCommand('daemon')

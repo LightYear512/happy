@@ -1,0 +1,37 @@
+{
+  "schemaVersion": "contract-first-module-gate/v2",
+  "contractProfile": "contract-first-minimal-boundary/v1",
+  "riskTriggers": ["public-abi-or-persistent-format"],
+  "module": "happy.account-intent",
+  "owner": "happy-cli account command and provider input boundary",
+  "publicApis": [
+    {
+      "name": "publish_and_consume_account_intent",
+      "inputs": ["validated provider flavor", "validated profile name", "Happy session ID"],
+      "acceptedStates": ["missing global intent or session selection", "strict v1 global intent and session selection", "clock rollback normalized to the next monotonic timestamp"],
+      "rejectedStates": ["malformed schema or unknown field", "invalid or exhausted timestamp"],
+      "provenanceFields": ["flavor", "profileName", "setAt", "Happy session ID"],
+      "outputState": "one monotonic global intent and one per-session current profile plus last-seen global timestamp",
+      "enforcement": "strict parser plus atomic writers",
+      "negativeTests": [
+        {
+          "name": "account_intent_boundary",
+          "file": "account-intent-boundary.test.mjs"
+        }
+      ]
+    }
+  ],
+  "budgets": {
+    "notApplicableReason": "two bounded local JSON documents add no resource budget"
+  },
+  "lifecycleTransitions": {
+    "notApplicableReason": "input-boundary switching uses monotonic scalar comparison, not a persisted lifecycle"
+  },
+  "provenanceFields": {
+    "notApplicableReason": "the hostile boundary test validates flavor, profile, timestamp and session isolation directly"
+  },
+  "evidence": {
+    "mode": "approval",
+    "openFindingCount": 0
+  }
+}

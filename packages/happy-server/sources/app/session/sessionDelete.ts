@@ -16,10 +16,17 @@ import { log } from "@/utils/log";
  * 
  * @param ctx - Context with user information
  * @param sessionId - ID of the session to delete
- * @returns true if deletion was successful, false if session not found or not owned by user
+ * @returns the deletion result; conditional preconditions are checked in the same transaction
  */
-export async function sessionDelete(ctx: Context, sessionId: string): Promise<boolean> {
+export type SessionDeleteResult = 'deleted' | 'not-found' | 'precondition-failed';
+export interface SessionDeleteCondition { expectedAccountId: string; before: Date }
+
+export async function sessionDelete(ctx: Context, sessionId: string,
+    condition?: SessionDeleteCondition): Promise<SessionDeleteResult> {
     return await inTx(async (tx) => {
+        if (condition && condition.expectedAccountId !== ctx.uid) {
+            return 'precondition-failed';
+        }
         // Verify session exists and belongs to the user
         const session = await tx.session.findFirst({
             where: {
@@ -34,7 +41,10 @@ export async function sessionDelete(ctx: Context, sessionId: string): Promise<bo
                 userId: ctx.uid, 
                 sessionId 
             }, `Session not found or not owned by user`);
-            return false;
+            return 'not-found';
+        }
+        if (condition && (session.active || session.lastActiveAt >= condition.before)) {
+            return 'precondition-failed';
         }
 
         // Delete all related data
@@ -103,6 +113,6 @@ export async function sessionDelete(ctx: Context, sessionId: string): Promise<bo
             });
         });
 
-        return true;
+        return 'deleted';
     });
 }

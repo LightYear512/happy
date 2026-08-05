@@ -5,7 +5,7 @@ import { ApiClient } from '@/api/api';
 import { fetchAndInjectPendingMessages } from '@/utils/fetchPendingMessages';
 import { logger } from '@/ui/logger';
 import { loop } from '@/claude/loop';
-import { AgentState, Metadata } from '@/api/types';
+import { AgentState, localCommandUserText, Metadata, modelFacingUserText } from '@/api/types';
 import packageJson from '../../package.json';
 import { Credentials, readSettings } from '@/persistence';
 import { EnhancedMode, PermissionMode } from './loop';
@@ -16,7 +16,7 @@ import { extractSDKMetadataAsync } from '@/claude/sdk/metadataExtractor';
 import { parseSpecialCommand } from '@/parsers/specialCommands';
 import { isBangCommand, executeBangCommand, hasActiveInteractiveSession, handleInteractiveInput, buildConsoleWelcome, buildSessionWelcome } from '@/commands/bang/dispatcher';
 import { renderOptionsBlock } from '@/commands/bang/types';
-import { findHtaskRoot, htaskCanonicalTitle, resolveHtaskHappyId, restoreHtaskSessionConfig } from '@/commands/bang/htaskCommand';
+import { buildHtaskClaudeEnvironment, findHtaskRoot, htaskCanonicalTitle, resolveHtaskHappyId, restoreHtaskSessionConfig } from '@/commands/bang/htaskCommand';
 import { getEnvironmentInfo } from '@/ui/doctor';
 import { configuration } from '@/configuration';
 import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
@@ -37,6 +37,8 @@ import { createSessionScanner, readSessionLog } from '@/claude/utils/sessionScan
 import { getProjectPath } from '@/claude/utils/path';
 import { Session } from './session';
 import { applySandboxPermissionPolicy, resolveInitialClaudePermissionMode } from './utils/permissionMode';
+import { HAPPY_CONSOLE_TITLE } from '@/utils/createSessionMetadata';
+import { installHappySessionEnvironment } from '@/utils/projectSessionStartup';
 
 /** JavaScript runtime to use for spawning Claude Code */
 export type JsRuntime = 'node' | 'bun'
@@ -132,6 +134,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         startedFromDaemon: options.startedBy === 'daemon',
         hostPid: process.pid,
         startedBy: options.startedBy || 'terminal',
+        consoleSession: isConsoleSession,
         // Initialize lifecycle state
         lifecycleState: 'running',
         lifecycleStateSince: Date.now(),
@@ -139,16 +142,12 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         sandbox: sandboxConfig?.enabled ? sandboxConfig : null,
         dangerouslySkipPermissions,
     };
-    // Restore path: rejoin existing session by ID, fallback to creating new session
+    // Restore must rejoin the exact Happy session. A failed lookup must not
+    // silently create a second conversation identity.
     let response;
     if (options.restoreSessionId) {
-        response = await api.getSessionById(options.restoreSessionId);
-        if (response) {
-            logger.debug(`[CLAUDE] Restored session ${options.restoreSessionId}`);
-        } else {
-            logger.debug(`[CLAUDE] Failed to restore session ${options.restoreSessionId}, creating new session`);
-            response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
-        }
+        response = await api.restoreSessionById(options.restoreSessionId);
+        logger.debug(`[CLAUDE] Restored session ${options.restoreSessionId}`);
     } else {
         response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
     }
@@ -216,7 +215,9 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // Create realtime session BEFORE extractSDKMetadataAsync to avoid creating
     // a second session-scoped WebSocket that triggers stale-socket kicking
     const session = api.sessionSyncClient(response);
-    const htaskRoot = findHtaskRoot();
+    installHappySessionEnvironment(session.sessionId);
+    const claudeHtaskEnv = buildHtaskClaudeEnvironment(session.sessionId, options.claudeEnvVars);
+    const htaskRoot = isConsoleSession ? null : findHtaskRoot();
     const restoreHtaskProjection = (reason: string): Promise<boolean> => {
         if (!htaskRoot || !session.sessionId) return Promise.resolve(false);
         return restoreHtaskSessionConfig(htaskRoot, session.sessionId, reason);
@@ -270,7 +271,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             } catch (error) {
                 logger.debug('[start] Failed to update session metadata:', error);
             }
-        });
+        }, claudeHtaskEnv);
     }
 
     // Console session: set title, send welcome message
@@ -282,7 +283,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             // Set session title via summary message (same mechanism as change_title MCP tool)
             session.sendClaudeSessionMessage({
                 type: 'summary',
-                summary: `🖥️ 控制台 - ${os.hostname()}`,
+                summary: HAPPY_CONSOLE_TITLE,
                 leafUuid: randomUUID(),
             });
             // Welcome message derived from command registry (SSoT: dispatcher.ts)
@@ -303,7 +304,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // Restore session title when resuming
     const resumeTitle = process.env.HAPPY_RESUME_TITLE;
     logger.debug(`[START] HAPPY_RESUME_TITLE=${resumeTitle || '(not set)'}`);
-    if (resumeTitle || htaskRoot) {
+    if (!isConsoleSession && (resumeTitle || htaskRoot)) {
         session.waitForConnect().then(async () => {
             const htaskTitle = await readHtaskStartupTitle();
             const startupTitle = htaskTitle || resumeTitle;
@@ -462,6 +463,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     let currentAllowedTools: string[] | undefined = undefined; // Track current allowed tools
     let currentDisallowedTools: string[] | undefined = undefined; // Track current disallowed tools
     session.onUserMessage((message) => {
+        const rawText = localCommandUserText(message);
 
         // Resolve permission mode from meta - pass through as-is, mapping happens at SDK boundary
         let messagePermissionMode: PermissionMode | undefined = currentPermissionMode;
@@ -535,12 +537,12 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
         // Route input to active interactive session (e.g., !auth create login flow)
         if (hasActiveInteractiveSession()) {
-            handleInteractiveInput(message.content.text);
+            handleInteractiveInput(rawText);
             return;
         }
 
         // Check for bang commands (! full commands or @ short aliases) - handle without LLM
-        if (isBangCommand(message.content.text)) {
+        if (isBangCommand(rawText)) {
             const enhancedMode: EnhancedMode = {
                 permissionMode: messagePermissionMode || 'default',
                 model: messageModel,
@@ -550,7 +552,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 allowedTools: messageAllowedTools,
                 disallowedTools: messageDisallowedTools
             };
-            executeBangCommand(message.content.text, {
+            executeBangCommand(rawText, {
                 client: session,
                 session: currentSession,
                 messageQueue,
@@ -605,7 +607,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         }
 
         // Check for special commands before processing
-        const specialCommand = parseSpecialCommand(message.content.text);
+        const specialCommand = parseSpecialCommand(rawText);
 
         if (specialCommand.type === 'compact') {
             logger.debug('[start] Detected /compact command');
@@ -618,7 +620,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 allowedTools: messageAllowedTools,
                 disallowedTools: messageDisallowedTools
             };
-            messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, enhancedMode);
+            messageQueue.pushIsolateAndClear(specialCommand.originalMessage || rawText, enhancedMode);
             logger.debugLargeJson('[start] /compact command pushed to queue:', message);
             return;
         }
@@ -634,12 +636,13 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 allowedTools: messageAllowedTools,
                 disallowedTools: messageDisallowedTools
             };
-            messageQueue.pushIsolateAndClear(specialCommand.originalMessage || message.content.text, enhancedMode);
+            messageQueue.pushIsolateAndClear(specialCommand.originalMessage || rawText, enhancedMode);
             logger.debugLargeJson('[start] /compact command pushed to queue:', message);
             return;
         }
 
         // Push with resolved permission mode, model, system prompts, and tools
+        const text = modelFacingUserText(message);
         const enhancedMode: EnhancedMode = {
             permissionMode: messagePermissionMode || 'default',
             model: messageModel,
@@ -649,7 +652,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             allowedTools: messageAllowedTools,
             disallowedTools: messageDisallowedTools
         };
-        messageQueue.push(message.content.text, enhancedMode);
+        messageQueue.push(text, enhancedMode);
         logger.debugLargeJson('User message pushed to queue:', message)
     });
 
@@ -756,7 +759,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             }
         },
         session,
-        claudeEnvVars: options.claudeEnvVars,
+        claudeEnvVars: claudeHtaskEnv,
         claudeArgs: options.claudeArgs,
         sandboxConfig,
         hookSettingsPath,

@@ -15,13 +15,20 @@ import {
     unlinkSync,
     writeFileSync,
 } from 'node:fs';
+import { lstat, readFile, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { deterministicStringify } from '@/utils/deterministicJson';
 
-const SCHEMA = 'xc.happy-session-transport-health.v1';
+export const SESSION_TRANSPORT_HEALTH_SCHEMA = 'xc.happy-session-transport-health.v1';
+export const SESSION_TRANSPORT_HEALTH_HEARTBEAT_MS = 10_000;
+export const SESSION_TRANSPORT_HEALTH_FRESH_MS = 30_000;
+export const SESSION_TRANSPORT_HEALTH_CLOCK_SKEW_MS = 5_000;
 const SESSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const MAX_RECEIPT_BYTES = 16 * 1024;
 const MAX_REASON_BYTES = 512;
+const STATES = new Set<SessionTransportHealthState>([
+    'connecting', 'connected', 'recovering', 'reconciling', 'ownership_conflict', 'failed', 'closed',
+]);
 
 export type SessionTransportHealthState =
     | 'connecting'
@@ -37,6 +44,19 @@ export interface SessionTransportHealthDetail {
     queueMessages: number;
     queueBytes: number;
     reason: string | null;
+}
+
+export interface SessionTransportHealthRecord extends SessionTransportHealthDetail {
+    schema: typeof SESSION_TRANSPORT_HEALTH_SCHEMA;
+    nativeSessionId: string;
+    processId: number;
+    processStartedAt: string;
+    generation: number;
+    state: SessionTransportHealthState;
+    connectedAt: string | null;
+    disconnectedAt: string | null;
+    updatedAt: string;
+    recordDigest: string;
 }
 
 export class SessionTransportHealthReporter {
@@ -56,7 +76,7 @@ export class SessionTransportHealthReporter {
         this.processStartedAt = new Date(Date.now() - Math.floor(process.uptime() * 1_000)).toISOString();
     }
 
-    write(state: SessionTransportHealthState, detail: SessionTransportHealthDetail): void {
+    write(state: SessionTransportHealthState, detail: SessionTransportHealthDetail): SessionTransportHealthRecord {
         validateDetail(detail);
         const updatedAt = new Date().toISOString();
         if (state === 'connected' && this.lastState !== 'connected') this.connectedAt = updatedAt;
@@ -67,7 +87,7 @@ export class SessionTransportHealthReporter {
         this.lastState = state;
         this.generation += 1;
         const base = {
-            schema: SCHEMA,
+            schema: SESSION_TRANSPORT_HEALTH_SCHEMA as typeof SESSION_TRANSPORT_HEALTH_SCHEMA,
             nativeSessionId: this.nativeSessionId,
             processId: process.pid,
             processStartedAt: this.processStartedAt,
@@ -81,7 +101,7 @@ export class SessionTransportHealthReporter {
             disconnectedAt: this.disconnectedAt,
             updatedAt,
         };
-        const record = { ...base, recordDigest: digest(base) };
+        const record: SessionTransportHealthRecord = { ...base, recordDigest: digest(base) };
         const serialized = `${deterministicStringify(record)}\n`;
         if (Buffer.byteLength(serialized, 'utf8') > MAX_RECEIPT_BYTES) throw new Error('Happy transport health receipt exceeds budget');
         const temporary = `${this.path}.tmp-${process.pid}-${randomUUID()}`;
@@ -101,6 +121,7 @@ export class SessionTransportHealthReporter {
             try { unlinkSync(temporary); } catch { /* already renamed or absent */ }
             throw error;
         }
+        return record;
     }
 }
 
@@ -121,6 +142,65 @@ export function createSessionTransportHealthReporter(
     return new SessionTransportHealthReporter(happy, nativeSessionId);
 }
 
+export function parseSessionTransportHealthRecord(value: unknown): SessionTransportHealthRecord {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new Error('Happy transport health receipt is invalid');
+    }
+    const row = value as Record<string, unknown>;
+    const allowed = new Set([
+        'schema', 'nativeSessionId', 'processId', 'processStartedAt', 'generation', 'state',
+        'reconnectCount', 'queueMessages', 'queueBytes', 'reason', 'connectedAt', 'disconnectedAt',
+        'updatedAt', 'recordDigest',
+    ]);
+    if (Object.keys(row).length !== allowed.size || Object.keys(row).some((key) => !allowed.has(key))
+        || row.schema !== SESSION_TRANSPORT_HEALTH_SCHEMA
+        || typeof row.nativeSessionId !== 'string' || !SESSION_ID_RE.test(row.nativeSessionId)
+        || !positiveInteger(row.processId) || !positiveInteger(row.generation)
+        || typeof row.state !== 'string' || !STATES.has(row.state as SessionTransportHealthState)
+        || !nonNegativeInteger(row.reconnectCount) || !nonNegativeInteger(row.queueMessages)
+        || !nonNegativeInteger(row.queueBytes)
+        || (row.reason !== null && (typeof row.reason !== 'string'
+            || Buffer.byteLength(row.reason, 'utf8') > MAX_REASON_BYTES))
+        || !isoTime(row.processStartedAt) || !nullableIsoTime(row.connectedAt)
+        || !nullableIsoTime(row.disconnectedAt) || !isoTime(row.updatedAt)
+        || Date.parse(row.processStartedAt as string) > Date.parse(row.updatedAt as string)
+        || typeof row.recordDigest !== 'string' || !/^sha256:[a-f0-9]{64}$/u.test(row.recordDigest)) {
+        throw new Error('Happy transport health receipt is invalid');
+    }
+    const { recordDigest, ...base } = row;
+    if (recordDigest !== digest(base)) throw new Error('Happy transport health receipt digest is invalid');
+    return row as unknown as SessionTransportHealthRecord;
+}
+
+export async function readSessionTransportHealthRecord(
+    workspace: string,
+    nativeSessionId: string,
+): Promise<SessionTransportHealthRecord | null> {
+    if (typeof workspace !== 'string' || workspace.length === 0 || !SESSION_ID_RE.test(nativeSessionId)) return null;
+    try {
+        let directory = await safeExistingDirectory(join(workspace, '.virtual-session'));
+        for (const segment of ['runtime', 'provider-health', 'happy']) {
+            const child = join(directory, segment);
+            const resolved = await safeExistingDirectory(child);
+            if (resolved !== child) throw new Error('Happy transport health path escapes its workspace');
+            directory = resolved;
+        }
+        const receiptPath = join(directory, `${nativeSessionId}.json`);
+        const stat = await lstat(receiptPath);
+        if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_RECEIPT_BYTES) {
+            throw new Error('Happy transport health receipt path is unsafe');
+        }
+        const resolved = await realpath(receiptPath);
+        if (resolved !== receiptPath) throw new Error('Happy transport health receipt path escapes its directory');
+        const bytes = await readFile(resolved);
+        if (bytes.byteLength > MAX_RECEIPT_BYTES) throw new Error('Happy transport health receipt exceeds budget');
+        return parseSessionTransportHealthRecord(JSON.parse(bytes.toString('utf8')));
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw error;
+    }
+}
+
 function ensureDirectory(path: string, privateDirectory = false): string {
     if (!existsSync(path)) mkdirSync(path, { recursive: false, mode: 0o700 });
     const stat = lstatSync(path);
@@ -136,6 +216,31 @@ function validateDetail(detail: SessionTransportHealthDetail): void {
         (detail.reason !== null && typeof detail.reason !== 'string')) {
         throw new Error('Happy transport health detail is invalid');
     }
+}
+
+async function safeExistingDirectory(path: string): Promise<string> {
+    const stat = await lstat(path);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) {
+        throw new Error('Happy transport health path is not a safe directory');
+    }
+    return realpath(path);
+}
+
+function positiveInteger(value: unknown): value is number {
+    return Number.isSafeInteger(value) && Number(value) > 0;
+}
+
+function nonNegativeInteger(value: unknown): value is number {
+    return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+function isoTime(value: unknown): value is string {
+    return typeof value === 'string' && Number.isFinite(Date.parse(value))
+        && new Date(value).toISOString() === value;
+}
+
+function nullableIsoTime(value: unknown): value is string | null {
+    return value === null || isoTime(value);
 }
 
 function digest(value: unknown): string {

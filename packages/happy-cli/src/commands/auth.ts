@@ -64,14 +64,11 @@ async function handleAuthLogin(args: string[]): Promise<void> {
     console.log(chalk.gray('  • Stop daemon if running'));
     console.log(chalk.gray('  • Re-authenticate and register machine\n'));
 
-    // Stop daemon if running
-    try {
-      logger.debug('Stopping daemon for force auth...');
-      await stopDaemon();
-      console.log(chalk.gray('✓ Stopped daemon'));
-    } catch (error) {
-      logger.debug('Daemon was not running or failed to stop:', error);
+    logger.debug('Stopping daemon and its sessions for force auth...');
+    if (!await stopDaemon({ stopSessions: true })) {
+      throw new Error('Force authentication was cancelled because active sessions could not be stopped safely');
     }
+    console.log(chalk.gray('✓ Stopped daemon'));
 
     // Clear credentials
     await clearCredentials();
@@ -142,11 +139,10 @@ async function handleAuthLogout(): Promise<void> {
 
   if (answer.toLowerCase() === 'y' || answer.toLowerCase() === 'yes') {
     try {
-      // Stop daemon if running
-      try {
-        await stopDaemon();
-        console.log(chalk.gray('Stopped daemon'));
-      } catch { }
+      if (!await stopDaemon({ stopSessions: true })) {
+        throw new Error('Active sessions could not be stopped safely');
+      }
+      console.log(chalk.gray('Stopped daemon'));
 
       // Remove entire happy directory (as current logout does)
       if (existsSync(happyDir)) {

@@ -11,7 +11,7 @@ import { StyleSheet, useUnistyles } from 'react-native-unistyles';
 import { layout } from '@/components/layout';
 import { t } from '@/text';
 import { MultiTextInput, MultiTextInputHandle } from '@/components/MultiTextInput';
-import { isConsolePath } from '@/utils/pathUtils';
+import { isConsolePath, isConsoleSessionMetadata } from '@/utils/pathUtils';
 
 const stylesheet = StyleSheet.create((theme) => ({
     container: {
@@ -102,19 +102,23 @@ export default function PathPickerScreen() {
                 if (typeof item === 'string') return; // Skip section headers
 
                 const session = item as any;
-                if (session.metadata?.machineId === params.machineId && session.metadata?.path) {
-                    const filtered = isConsolePath(session.metadata.path);
-                    if (filtered) console.log('[pick/path] FILTERED session path:', session.metadata.path);
-                    if (filtered) return;
+                if (session.metadata?.machineId !== params.machineId || !session.metadata?.path) {
+                    return;
                 }
-                    const path = session.metadata.path;
-                    if (!pathSet.has(path)) {
-                        pathSet.add(path);
-                        pathsWithTimestamps.push({
-                            path,
-                            timestamp: session.updatedAt || session.createdAt
-                        });
-                    }
+
+                const filtered = isConsoleSessionMetadata(session.metadata);
+                if (filtered) {
+                    console.log('[pick/path] FILTERED session path:', session.metadata.path);
+                    return;
+                }
+
+                const path = session.metadata.path;
+                if (!pathSet.has(path)) {
+                    pathSet.add(path);
+                    pathsWithTimestamps.push({
+                        path,
+                        timestamp: session.updatedAt || session.createdAt
+                    });
                 }
             });
 

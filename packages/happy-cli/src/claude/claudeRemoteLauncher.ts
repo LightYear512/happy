@@ -1,5 +1,5 @@
 import { render } from "ink";
-import { readFileSync, watch, type FSWatcher } from "node:fs";
+import { existsSync } from "node:fs";
 import { Session } from "./session";
 import { MessageBuffer } from "@/ui/ink/messageBuffer";
 import { RemoteModeDisplay } from "@/ui/ink/RemoteModeDisplay";
@@ -16,10 +16,19 @@ import { EnhancedMode } from "./loop";
 import { RawJSONLines } from "@/claude/types";
 import { OutgoingMessageQueue } from "./utils/OutgoingMessageQueue";
 import { getToolName } from "./utils/getToolName";
-import { configuration } from "@/configuration";
-import { tryGlobalProfileSwitch } from "@/commands/bang/authCommand";
 import { formatErrorForUser } from "@/claude/utils/errorFormatter";
-import { getCurrentCcsProfile } from "@/commands/bang/ccsProfiles";
+import {
+    applyProfileSwitch,
+    getCurrentCcsProfile,
+    readCcsProfiles,
+} from "@/commands/bang/ccsProfiles";
+import {
+    accountIntentIsNewer,
+    readAccountIntent,
+    readSessionAccountSelection,
+    resolveStartupAccountSelection,
+    writeSessionAccountSelection,
+} from "@/commands/bang/accountIntent";
 import { queryRateLimitContext } from "@/commands/bang/usageCommand";
 
 interface PermissionsField {
@@ -295,58 +304,35 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
         }
     }
 
-    // Set up fs.watch for global signals (!auth-all, !restart-all)
-    // Watches the happyHomeDir directory for changes to signal files.
-    // When another session writes a signal file, we detect the change and act accordingly.
-    let signalWatcher: FSWatcher | null = null;
-    let profileDebounceTimer: NodeJS.Timeout | null = null;
-    let restartDebounceTimer: NodeJS.Timeout | null = null;
-    let lastRestartSignal = '';
-
-    try {
-        signalWatcher = watch(configuration.happyHomeDir, (event, filename) => {
-            if (filename === 'active-ccs-profile') {
-                if (profileDebounceTimer) clearTimeout(profileDebounceTimer);
-                profileDebounceTimer = setTimeout(() => {
-                    const switched = tryGlobalProfileSwitch();
-                    if (switched) {
-                        const newProfile = getCurrentCcsProfile() || 'unknown';
-                        logger.debug(`[remote]: Global profile change detected → "${newProfile}", interrupting session`);
-                        session.client.sendSessionEvent({ type: 'message', message: `🔄 Switched to "${newProfile}" (via !auth-all)` });
-                        session.queue.interrupt();
-                    }
-                }, 200);
-            } else if (filename === 'restart-signal') {
-                if (restartDebounceTimer) clearTimeout(restartDebounceTimer);
-                restartDebounceTimer = setTimeout(() => {
-                    try {
-                        const signal = readFileSync(configuration.restartSignalFile, 'utf-8').trim();
-                        if (signal && signal !== lastRestartSignal) {
-                            lastRestartSignal = signal;
-                            const currentProfile = getCurrentCcsProfile() || 'unknown';
-                            logger.debug(`[remote]: Restart signal detected (${currentProfile}), interrupting session`);
-                            session.client.sendSessionEvent({ type: 'message', message: `🔄 正在重启会话 (${currentProfile})` });
-                            session.pendingRestartConfirmation = true;
-                            session.queue.interrupt();
-                        }
-                    } catch {
-                        // Signal file may have been deleted between watch and read
-                    }
-                }, 200);
-            }
-        });
-        signalWatcher.on('error', (err) => {
-            logger.debug('[remote]: Signal watcher error:', err);
-        });
-    } catch (err) {
-        logger.debug('[remote]: Failed to set up signal watcher:', err);
-    }
-
     try {
         let pending: {
             message: string;
             mode: EnhancedMode;
+            isolate: boolean;
+            hash: string;
         } | null = null;
+        const savedAccount = readSessionAccountSelection(session.client.sessionId, 'claude');
+        const startupAccount = resolveStartupAccountSelection(savedAccount, readAccountIntent('claude'));
+        if (startupAccount && startupAccount.profileName !== getCurrentCcsProfile()) {
+            const target = readCcsProfiles().profiles.find(profile => profile.name === startupAccount.profileName);
+            if (!target || !existsSync(target.instancePath)) {
+                throw new Error(`Selected Claude profile "${startupAccount.profileName}" is unavailable`);
+            }
+            applyProfileSwitch(startupAccount.profileName, 'claude', target.instancePath);
+        }
+        if (startupAccount?.source === 'global') {
+            try {
+                writeSessionAccountSelection(
+                    session.client.sessionId,
+                    'claude',
+                    startupAccount.profileName,
+                    startupAccount.seenGlobalSetAt,
+                );
+            } catch (error) {
+                logger.warn('[remote]: Failed to persist startup account selection:', error);
+            }
+        }
+        let lastSeenAccountIntent = startupAccount?.seenGlobalSetAt ?? 0;
 
         // Track session ID to detect when it actually changes
         // This prevents context loss when mode changes (permission mode, model, etc.)
@@ -398,17 +384,42 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         return permissionHandler.isAborted(toolCallId);
                     },
                     nextMessage: async () => {
-                        if (pending) {
-                            let p = pending;
+                        let msg = pending;
+                        if (msg) {
                             pending = null;
-                            permissionHandler.handleModeChange(p.mode.permissionMode);
-                            return p;
+                        } else {
+                            msg = await session.queue.waitForMessagesAndGetAsString(controller.signal);
                         }
-
-                        let msg = await session.queue.waitForMessagesAndGetAsString(controller.signal);
 
                         // Check if mode has changed
                         if (msg) {
+                            const intent = readAccountIntent('claude');
+                            if (accountIntentIsNewer(intent, lastSeenAccountIntent)) {
+                                if (intent.profileName !== getCurrentCcsProfile()) {
+                                    const target = readCcsProfiles().profiles.find(profile => profile.name === intent.profileName);
+                                    if (!target || !existsSync(target.instancePath)) {
+                                        throw new Error(`Global Claude profile "${intent.profileName}" is unavailable`);
+                                    }
+                                    applyProfileSwitch(intent.profileName, 'claude', target.instancePath);
+                                    pending = msg;
+                                    session.client.sendSessionEvent({
+                                        type: 'message',
+                                        message: `🔄 Switched to "${intent.profileName}" (via !auth-all)`,
+                                    });
+                                }
+                                lastSeenAccountIntent = intent.setAt;
+                                try {
+                                    writeSessionAccountSelection(
+                                        session.client.sessionId,
+                                        'claude',
+                                        intent.profileName,
+                                        intent.setAt,
+                                    );
+                                } catch (error) {
+                                    logger.warn('[remote]: Failed to persist session account selection:', error);
+                                }
+                                if (pending) return null;
+                            }
                             if ((modeHash && msg.hash !== modeHash) || msg.isolate) {
                                 logger.debug('[remote]: mode has changed, pending message');
                                 pending = msg;
@@ -432,7 +443,12 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                         session.onSessionFound(sessionId);
                     },
                     onThinkingChange: session.onThinkingChange,
-                    claudeEnvVars: session.claudeEnvVars,
+                    claudeEnvVars: {
+                        ...session.claudeEnvVars,
+                        ...(process.env.CLAUDE_CONFIG_DIR
+                            ? { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR }
+                            : {}),
+                    },
                     claudeArgs: session.claudeArgs,
                     onMessage,
                     onCompletionEvent: (message: string) => {
@@ -583,21 +599,6 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             }
         }
     } finally {
-
-        // Clean up signal watcher
-        if (signalWatcher) {
-            signalWatcher.close();
-            signalWatcher = null;
-        }
-        if (profileDebounceTimer) {
-            clearTimeout(profileDebounceTimer);
-            profileDebounceTimer = null;
-        }
-        if (restartDebounceTimer) {
-            clearTimeout(restartDebounceTimer);
-            restartDebounceTimer = null;
-        }
-
         // Clean up permission handler
         permissionHandler.reset();
 

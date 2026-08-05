@@ -2,7 +2,7 @@ import { decrypt, decodeBase64 } from '@/api/encryption';
 import { logger } from '@/ui/logger';
 import type { ApiClient } from '@/api/api';
 import type { ApiSessionClient } from '@/api/apiSession';
-import { UserMessageSchema, type UserMessage } from '@/api/types';
+import { UserMessageSchema, modelFacingUserText, type UserMessage } from '@/api/types';
 import {
     RECENT_MESSAGE_WINDOW,
     SessionRecoveryError,
@@ -65,9 +65,7 @@ export async function fetchAndInjectPendingMessages(
             if (!parsed.success) {
                 throw new SessionRecoveryError('persisted user restore message is invalid');
             }
-            if (parsed.data.meta?.sentFrom !== 'cli') {
-                pendingMessages.push({ message: parsed.data, seq: row.seq, row });
-            }
+            pendingMessages.push({ message: parsed.data, seq: row.seq, row });
         }
 
         if (fullWindow && !processedResponseBoundaryFound) {
@@ -77,7 +75,7 @@ export async function fetchAndInjectPendingMessages(
         pendingMessages.sort((left, right) => left.seq - right.seq);
         let injectedCount = 0;
         for (const pending of pendingMessages) {
-            logger.debug(`${logPrefix} Injecting pending message from restore: "${pending.message.content.text.substring(0, 50)}"`);
+            logger.debug(`${logPrefix} Injecting pending message from restore: "${modelFacingUserText(pending.message).substring(0, 50)}"`);
             if (session.injectPendingPersistedUserMessage(pending.row)) injectedCount += 1;
         }
         if (injectedCount > 0) {

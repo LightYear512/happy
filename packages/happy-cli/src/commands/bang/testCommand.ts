@@ -22,9 +22,8 @@ function testHelp(): string[] {
         label('!help 输出'),
         '📖 快捷命令',
         SEPARATOR,
-        '@aa (!auth-all) → 切换全部会话账号',
+        '@aa (!auth-all) → 设置全局账号（会话下次输入前应用）',
         '!login (@l) → 登录账户',
-        '!restart-all (@ra) → 重启全部会话',
         '@u (!usage) → 查看 API 用量',
         '!session (@s) → 浏览项目目录和会话',
         '!open (@o) → 打开会话',
@@ -123,7 +122,7 @@ function testAuth(): string[] {
         'hassel',
         'chulai',
         SEPARATOR,
-        '!auth-all <名称> → 切换全部会话',
+        '!auth-all <名称> → 设置全局账号（会话下次输入前应用）',
 
         label('!auth 列表（无配置）'),
         '📋 当前无 CCS 配置。',
@@ -144,8 +143,8 @@ function testAuth(): string[] {
         '使用 !auth 查看可用账号。',
 
         label('!auth-all 成功'),
-        '✅ 已广播切换到 "chulai"',
-        '组 "default" 中的所有会话',
+        '✅ 全局账号已设置为 "chulai"',
+        '现有会话不会被打断，将在下一次实际输入前核对并切换',
     ];
 }
 
@@ -153,9 +152,6 @@ function testRestart(): string[] {
     return [
         label('!restart 当前'),
         '🔄 正在重启会话 (hassel)',
-
-        label('!restart-all'),
-        '🔄 已广播重启信号到全部会话 (hassel)',
     ];
 }
 

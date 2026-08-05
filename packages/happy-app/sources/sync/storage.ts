@@ -20,6 +20,7 @@ import { isMutableTool } from "@/components/tools/knownTools";
 import { projectManager } from "./projectManager";
 import { DecryptedArtifact } from "./artifactTypes";
 import { FeedItem } from "./feedTypes";
+import { isConsoleSessionMetadata } from '@/utils/pathUtils';
 
 // Debounce timer for realtimeMode changes
 let realtimeModeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -45,6 +46,10 @@ function isSessionActive(session: { active: boolean; activeAt: number }): boolea
 function isSandboxEnabled(metadata: Session['metadata'] | null | undefined): boolean {
     const sandbox = metadata?.sandbox;
     return !!sandbox && typeof sandbox === 'object' && (sandbox as { enabled?: unknown }).enabled === true;
+}
+
+export function isUserVisibleSession(session: Pick<Session, 'metadata'>): boolean {
+    return !isConsoleSessionMetadata(session.metadata);
 }
 
 // Known entitlement IDs
@@ -157,6 +162,7 @@ function buildSessionListViewData(
     const inactiveSessions: Session[] = [];
 
     Object.values(sessions).forEach(session => {
+        if (isConsoleSessionMetadata(session.metadata)) return;
         if (isSessionActive(session)) {
             activeSessions.push(session);
         } else {
@@ -296,7 +302,7 @@ export const storage = create<StorageState>()((set, get) => {
         },
         getActiveSessions: () => {
             const state = get();
-            return Object.values(state.sessions).filter(s => s.active);
+            return Object.values(state.sessions).filter(s => s.active && isUserVisibleSession(s));
         },
         applySessions: (sessions: (Omit<Session, 'presence'> & { presence?: "online" | number })[]) => set((state) => {
             // Load drafts and permission modes if sessions are empty (initial load)
@@ -345,6 +351,7 @@ export const storage = create<StorageState>()((set, get) => {
 
             // Process all sessions from merged set
             Object.values(mergedSessions).forEach(session => {
+                if (isConsoleSessionMetadata(session.metadata)) return;
                 if (activeSet.has(session.id)) {
                     activeSessions.push(session);
                 } else {
@@ -459,7 +466,10 @@ export const storage = create<StorageState>()((set, get) => {
                     machineMetadataMap.set(machine.id, machine.metadata);
                 }
             });
-            projectManager.updateSessions(Object.values(mergedSessions), machineMetadataMap);
+            projectManager.updateSessions(
+                Object.values(mergedSessions).filter(session => !isConsoleSessionMetadata(session.metadata)),
+                machineMetadataMap
+            );
 
             return {
                 ...state,
@@ -1140,7 +1150,9 @@ export function useSessionListViewData(): SessionListViewItem[] | null {
 export function useAllSessions(): Session[] {
     return storage(useShallow((state) => {
         if (!state.isDataReady) return [];
-        return Object.values(state.sessions).sort((a, b) => b.updatedAt - a.updatedAt);
+        return Object.values(state.sessions)
+            .filter(isUserVisibleSession)
+            .sort((a, b) => b.updatedAt - a.updatedAt);
     }));
 }
 

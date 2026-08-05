@@ -12,12 +12,20 @@
 
 import { render } from 'ink';
 import React from 'react';
+import { homedir } from 'node:os';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { ApiClient } from '@/api/api';
+import { localCommandUserText, modelFacingUserText } from '@/api/types';
 import { projectPath } from '@/projectPath';
 import { fetchAndInjectPendingMessages } from '@/utils/fetchPendingMessages';
 import { registerShutdownHandlers } from '@/utils/shutdownHandlers';
 import { createCodexAppServerClient, type CodexAppServerClient } from './codexAppServerClient';
+import {
+    performCodexAccountSwap,
+    requireExactCodexThreadResume,
+    type AccountSwapResult,
+} from './codexAccountSwap';
 import { buildCodexChildEnv } from './codexEnvBuilder';
 import { createAppServerStreamBridge, type AppServerStreamUpdate } from './appServerStreamBridge';
 import { withCodexModelModeMetadata } from './modelMode';
@@ -38,15 +46,21 @@ import { systemPrompt } from '@/claude/utils/systemPrompt';
 import { MessageBuffer } from '@/ui/ink/messageBuffer';
 import { CodexDisplay } from '@/ui/ink/CodexDisplay';
 import { readCodexDefaultProfile, getCodexInstancePath, getCurrentCodexProfile } from '@/commands/bang/ccsProfiles';
-import { watchCodexProfileFile } from '@/commands/bang/authCommand';
-import type { FSWatcher } from 'node:fs';
-import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
+import {
+    accountIntentIsNewer,
+    readAccountIntent,
+    readSessionAccountSelection,
+    resolveStartupAccountSelection,
+    writeSessionAccountSelection,
+} from '@/commands/bang/accountIntent';
+import { notifyDaemonCodexProfile, notifyDaemonSessionStarted } from '@/daemon/controlClient';
+import { installHappySessionEnvironment } from '@/utils/projectSessionStartup';
 import { registerKillSessionHandler } from '@/claude/registerKillSessionHandler';
 import { registerSessionTransportFatalHandler } from '@/api/registerSessionTransportFatalHandler';
 import { stopCaffeinate } from '@/utils/caffeinate';
 import { connectionState } from '@/utils/serverConnectionErrors';
 import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
-import { resolveCodexExecutionPolicy } from './executionPolicy';
+import { resolveCodexExecutionPolicy, resolveCodexSessionPermissionMode } from './executionPolicy';
 import { emitReadyIfIdle } from './runCodex';
 import type { PermissionResult } from './utils/permissionHandler';
 import type { ApiSessionClient } from '@/api/apiSession';
@@ -142,11 +156,11 @@ export function readTurnId(value: unknown): string | null {
  * internally-tagged-enum `SandboxPolicy` object required by the app-server
  * `turn/start` RPC. See happier's `resolveCodexAppServerPolicyForPermissionMode`.
  */
-function toSandboxPolicy(sandbox: string, directory: string): Record<string, unknown> {
+export function toSandboxPolicy(sandbox: string, directory: string): Record<string, unknown> {
     if (sandbox === 'workspace-write') {
         return {
             type: 'workspaceWrite',
-            writableRoots: [directory],
+            writableRoots: [directory, join(homedir(), '.xcoding-v2')],
             readOnlyAccess: { type: 'fullAccess' },
             networkAccess: true,
             excludeTmpdirEnvVar: false,
@@ -204,6 +218,7 @@ export async function runCodexWithAppServer(opts: {
     noSandbox?: boolean;
     restoreSessionId?: string;
     codexSessionId?: string;
+    permissionMode?: PermissionMode;
     /**
      * Test-only injection seam. Production callers pass nothing → the original
      * server-backed init path runs verbatim. `session` lets a test drive the
@@ -231,6 +246,7 @@ export async function runCodexWithAppServer(opts: {
             logger.debug(`[CodexAppServer] Applied default codex profile "${defaultProfile}": ${process.env.CODEX_HOME}`);
         }
     }
+    let activeCodexProfile = getCurrentCodexProfile();
 
     //
     // Session setup (mirrors runCodex)
@@ -273,16 +289,13 @@ export async function runCodexWithAppServer(opts: {
             machineId,
             startedBy: opts.startedBy,
             sandbox: sandboxConfig,
+            permissionMode: opts.permissionMode,
+            dangerouslySkipPermissions: opts.permissionMode === 'bypassPermissions' || opts.permissionMode === 'yolo',
         });
 
         if (opts.restoreSessionId) {
-            response = await api.getSessionById(opts.restoreSessionId);
-            if (response) {
-                logger.debug(`[CodexAppServer] Restored session ${opts.restoreSessionId}`);
-            } else {
-                logger.debug(`[CodexAppServer] Failed to restore session ${opts.restoreSessionId}, creating new session`);
-                response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
-            }
+            response = await api.restoreSessionById(opts.restoreSessionId);
+            logger.debug(`[CodexAppServer] Restored session ${opts.restoreSessionId}`);
         } else {
             response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
         }
@@ -295,6 +308,7 @@ export async function runCodexWithAppServer(opts: {
             response,
             onSessionSwap: (newSession) => {
                 session = newSession;
+                installHappySessionEnvironment(newSession.sessionId);
                 session.updateMetadata((metadata) => withCodexModelModeMetadata(metadata));
                 bindTransportFatalHandler?.(newSession);
                 if (permissionHandler) {
@@ -303,22 +317,10 @@ export async function runCodexWithAppServer(opts: {
             },
         });
         session = reconnection.session;
+        installHappySessionEnvironment(session.sessionId);
         session.updateMetadata((metadata) => withCodexModelModeMetadata(metadata));
         reconnectionHandle = reconnection.reconnectionHandle;
 
-        if (response) {
-            try {
-                logger.debug(`[START] Reporting session ${response.id} to daemon`);
-                const result = await notifyDaemonSessionStarted(response.id, metadata);
-                if (result.error) {
-                    logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
-                } else {
-                    logger.debug(`[START] Reported session ${response.id} to daemon`);
-                }
-            } catch (error) {
-                logger.debug('[START] Failed to report to daemon (may not be running):', error);
-            }
-        }
     }
 
     //
@@ -335,11 +337,22 @@ export async function runCodexWithAppServer(opts: {
     // rollout.jsonl. See `utils/recentUserBuffer.ts` for the full rationale.
     const recentUserBuffer = createRecentUserBuffer();
 
-    let currentPermissionMode: PermissionMode | undefined = undefined;
+    let currentPermissionMode = resolveCodexSessionPermissionMode(
+        response?.metadata.permissionMode,
+        opts.permissionMode,
+        response?.metadata.dangerouslySkipPermissions === true,
+    );
+    if (response && response.metadata.permissionMode === undefined && opts.permissionMode) {
+        session.updateMetadata((metadata) => ({
+            ...metadata,
+            permissionMode: currentPermissionMode,
+            dangerouslySkipPermissions: currentPermissionMode === 'bypassPermissions' || currentPermissionMode === 'yolo',
+        }));
+    }
     let currentModel: string | undefined = undefined;
     const replyMonitor = createHtaskReplyMonitorRuntime(session, 'codex', undefined, undefined, (text) => {
         const enhancedMode: EnhancedMode = {
-            permissionMode: currentPermissionMode || 'default',
+            permissionMode: currentPermissionMode,
             model: currentModel,
         };
         logger.debug(`[CodexAppServer] Enqueueing delivered task message: "${text.substring(0, 80)}"`);
@@ -347,10 +360,13 @@ export async function runCodexWithAppServer(opts: {
     });
 
     session.onUserMessage((message) => {
-        let messagePermissionMode = currentPermissionMode;
         if (message.meta?.permissionMode) {
-            messagePermissionMode = message.meta.permissionMode as PermissionMode;
-            currentPermissionMode = messagePermissionMode;
+            currentPermissionMode = message.meta.permissionMode as PermissionMode;
+            session.updateMetadata((metadata) => ({
+                ...metadata,
+                permissionMode: currentPermissionMode,
+                dangerouslySkipPermissions: currentPermissionMode === 'bypassPermissions' || currentPermissionMode === 'yolo',
+            }));
             logger.debug(`[CodexAppServer] Permission mode updated to: ${currentPermissionMode}`);
         }
 
@@ -364,14 +380,14 @@ export async function runCodexWithAppServer(opts: {
         }
 
         const enhancedMode: EnhancedMode = {
-            permissionMode: messagePermissionMode || 'default',
+            permissionMode: currentPermissionMode,
             model: messageModel,
         };
 
-        const text = message.content.text;
+        const rawText = localCommandUserText(message);
 
         if (hasActiveInteractiveSession()) {
-            handleInteractiveInput(text);
+            handleInteractiveInput(rawText);
             return;
         }
 
@@ -412,7 +428,7 @@ export async function runCodexWithAppServer(opts: {
         // /clear: no truncation RPC exists — the closest analog is a fresh
         // thread with no seed. We expose this as the same orchestrator path
         // but skip the seed.
-        const specialCommand = parseSpecialCommand(text);
+        const specialCommand = parseSpecialCommand(rawText);
         if (specialCommand.type === 'compact' || specialCommand.type === 'clear') {
             const verb = specialCommand.type;
             void runManualCompact(verb).catch((err) => {
@@ -426,18 +442,19 @@ export async function runCodexWithAppServer(opts: {
             return;
         }
 
-        if (isBangCommand(text)) {
+        if (isBangCommand(rawText)) {
             const claudeShapedMode: ClaudeEnhancedMode = {
                 permissionMode: enhancedMode.permissionMode,
                 model: enhancedMode.model,
             };
-            executeBangCommand(text, {
+            executeBangCommand(rawText, {
                 client: session,
                 session: { mode: 'remote' },
                 messageQueue: messageQueue as unknown as MessageQueue2<ClaudeEnhancedMode>,
                 currentEnhancedMode: claudeShapedMode,
                 isConsoleSession: false,
                 flavor: 'codex',
+                deferCodexProfileSwitch: true,
             }).then(async result => {
                 await new Promise(resolve => setTimeout(resolve, 200));
                 const messages = Array.isArray(result.message) ? result.message : [result.message];
@@ -457,17 +474,21 @@ export async function runCodexWithAppServer(opts: {
                     }
                 }
                 // Route a bang-requested session restart through the same
-                // pendingAccountSwap path used by !auth-all --codex (broadcast
-                // file watcher). Without this, !auth --codex only updates
+                // pendingAccountSwap path used by the input-boundary global
+                // account check. Without this, !auth --codex only updates
                 // process.env.CODEX_HOME in the parent — the running codex
                 // app-server child still has the old auth in its frozen env,
                 // so the success message ("✅ 已切换到 X") is a lie. The swap
                 // path disposes the child and respawns it with the new env;
                 // the savedThreadId hand-off keeps the conversation intact.
                 if (result.action === 'restart-session') {
-                    const target = getCurrentCodexProfile() || 'unknown';
+                    const target = result.restartProfile || activeCodexProfile || 'unknown';
                     logger.debug(`[CodexAppServer] Single-session swap requested → ${target}`);
-                    pendingAccountSwap = { target, source: 'single-session' };
+                    pendingAccountSwap = {
+                        target,
+                        source: 'single-session',
+                        seenSetAt: result.restartSeenGlobalSetAt,
+                    };
                     messageQueue.interrupt();
                 }
                 session.sendSessionEvent({ type: 'ready' });
@@ -485,6 +506,7 @@ export async function runCodexWithAppServer(opts: {
         // Must precede messageQueue.push: a synchronous push failure would
         // otherwise skip the record, leaving the prompt unrecoverable by the
         // seed builder. All non-prompt traffic has been early-returned above.
+        const text = modelFacingUserText(message);
         replyMonitor.observeUserMessage();
         recentUserBuffer.record(text);
         messageQueue.push(text, enhancedMode);
@@ -514,6 +536,27 @@ export async function runCodexWithAppServer(opts: {
     // sandbox writableRoots and the turn-message cwd. Project-level fallback
     // docs (.happy/on-fallback-compact.md) are resolved relative to it.
     const sessionCwd = opts.deps?.cwd ?? process.cwd();
+    const startFreshThread = async (
+        requestClient: CodexAppServerClient,
+        permissionMode: PermissionMode,
+        model: string | undefined,
+    ): Promise<string> => {
+        const executionPolicy = resolveCodexExecutionPolicy(permissionMode, !!sandboxConfig);
+        const modelConfig = resolveCodexModelModeOrDefault(model);
+        const threadResponse = await requestClient.request('thread/start', {
+            cwd: sessionCwd,
+            approvalPolicy: toApprovalPolicy(executionPolicy.approvalPolicy),
+            sandbox: executionPolicy.sandbox,
+            ...(modelConfig.model ? { model: modelConfig.model } : {}),
+            ...(modelConfig.reasoningEffort ? { config: { model_reasoning_effort: modelConfig.reasoningEffort } } : {}),
+            experimentalRawEvents: true,
+            persistExtendedHistory: true,
+        });
+        const freshThreadId = readThreadId(threadResponse);
+        if (!freshThreadId) throw new Error('Codex app-server thread/start returned no thread id');
+        logger.debug(`[CodexAppServer] Started thread: ${freshThreadId}`);
+        return freshThreadId;
+    };
 
     // Auto-rescue gate: when codex's auto pre-sampling compaction fails
     // (`willRetry: false`, message contains "Error running remote compact task")
@@ -730,7 +773,7 @@ export async function runCodexWithAppServer(opts: {
             if (mode === 'compact' && autoTriggered) {
                 const replayText = '继续';
                 const replayMode: EnhancedMode = {
-                    permissionMode: currentPermissionMode || 'default',
+                    permissionMode: currentPermissionMode,
                     model: currentModel,
                 };
                 recentUserBuffer.record(replayText);
@@ -1067,6 +1110,8 @@ export async function runCodexWithAppServer(opts: {
             logger.warn(`[CodexAppServer] Happy transport became terminal (${snapshot.state}); shutting down the unreachable runtime`);
             shouldExit = true;
             messageQueue.close();
+            const hardExit = setTimeout(() => process.exit(1), 5_000);
+            hardExit.unref();
             await handleAbort();
         });
     };
@@ -1083,46 +1128,53 @@ export async function runCodexWithAppServer(opts: {
     // a swap is transparent — the new client's events route through the same
     // happy-session state as the old one.
     const registerClientHandlers = (c: CodexAppServerClient) => {
+        const isRootThreadNotification = (method: string, params: unknown): boolean => {
+            const notificationThreadId = readThreadId(params);
+            if (threadId && notificationThreadId && notificationThreadId !== threadId) {
+                logger.debug(
+                    `[CodexAppServer] Ignoring child-thread ${method} threadId=${notificationThreadId} (root=${threadId})`,
+                );
+                return false;
+            }
+            return true;
+        };
+
         c.registerNotificationHandler('turn/started', (params) => {
+            if (!isRootThreadNotification('turn/started', params)) return;
             const updates = bridge.onNotification('turn/started', params);
             // Extract turnId from notification
             const notifTurnId = readTurnId(params);
             if (notifTurnId) {
                 activeTurnId = notifTurnId;
             }
-            // Extract threadId if present
-            const notifThreadId = readThreadId(params);
-            if (notifThreadId && notifThreadId !== threadId) {
-                threadId = notifThreadId;
-            }
             processBridgeUpdates(updates);
         });
 
         c.registerNotificationHandler('turn/completed', (params) => {
-            const updates = bridge.onNotification('turn/completed', params);
-            processBridgeUpdates(updates);
+            if (!isRootThreadNotification('turn/completed', params)) return;
             // Stale notification guard: a delayed turn/completed for a turn we
             // already moved past (e.g. after /compact swap or auto-rescue
-            // re-thread) must not settle the NEW turn's promise. The bridge
-            // still gets the update for protocol bookkeeping; only the
-            // lifecycle and activeTurnId are guarded.
+            // re-thread) must not settle the NEW turn's promise.
             const notifTurnId = readTurnId(params);
             if (notifTurnId && activeTurnId && notifTurnId !== activeTurnId) {
                 logger.debug(`[CodexAppServer] Ignoring stale turn/completed turnId=${notifTurnId} (active=${activeTurnId})`);
                 return;
             }
+            const updates = bridge.onNotification('turn/completed', params);
+            processBridgeUpdates(updates);
             activeTurnId = null;
             turnLifecycle.finish();
         });
 
         c.registerNotificationHandler('turn/interrupted', (params) => {
-            const updates = bridge.onNotification('turn/interrupted', params);
-            processBridgeUpdates(updates);
+            if (!isRootThreadNotification('turn/interrupted', params)) return;
             const notifTurnId = readTurnId(params);
             if (notifTurnId && activeTurnId && notifTurnId !== activeTurnId) {
                 logger.debug(`[CodexAppServer] Ignoring stale turn/interrupted turnId=${notifTurnId} (active=${activeTurnId})`);
                 return;
             }
+            const updates = bridge.onNotification('turn/interrupted', params);
+            processBridgeUpdates(updates);
             activeTurnId = null;
             turnLifecycle.finish();
         });
@@ -1162,6 +1214,7 @@ export async function runCodexWithAppServer(opts: {
         c.registerNotificationHandler('error', (params) => {
             const record = params as Record<string, unknown> | null;
             if (record && record.willRetry === true) return; // transient, codex will retry
+            if (!isRootThreadNotification('error', params)) return;
 
             // Turn state-machine exit: a non-retryable error notification means
             // the current turn is dead. Settle the pending promise (resolve,
@@ -1272,34 +1325,48 @@ export async function runCodexWithAppServer(opts: {
         });
     };
 
-    // Set by both swap entry points: the codex profile watcher (broadcast from
-    // !auth-all --codex) and the bang dispatcher (single-session !auth).
-    // Consumed at top-of-loop: tears down the current app-server subprocess and
-    // rebuilds with the new CODEX_HOME. The next iteration's thread/resume picks
-    // up savedThreadId so the conversation continues transparently. `source`
+    // Set by both swap entry points: a global target discovered immediately
+    // before real model input and the bang dispatcher (single-session !auth).
+    // Consumed at top-of-loop: builds a candidate with the target CODEX_HOME,
+    // resumes the exact current thread, then replaces the old client. `source`
     // drives the user-visible status message so the wording matches the path
-    // that triggered it (mirrors claude-side `(via !auth-all)` for broadcast vs
+    // that triggered it (mirrors claude-side `(via !auth-all)` for global vs
     // a bare `(via !auth)` for the single-session swap).
-    type AccountSwapSource = 'broadcast' | 'single-session';
-    let pendingAccountSwap: { target: string; source: AccountSwapSource } | null = null;
-
-    // Watch for !auth-all --codex. On a valid switch, tryGlobalProfileSwitch has
-    // already updated process.env.CODEX_HOME — we just flag the loop. The current
-    // turn (if any) finishes naturally; the swap is consumed at the next top-of-loop
-    // check, mirroring the claude-side "wait for turn boundary" behavior. Forcibly
-    // aborting an in-flight turn here would drop the model's partial work and
-    // surprise the user — the broadcast is a "switch when convenient" intent, not
-    // an emergency stop.
-    const codexProfileWatcher: FSWatcher | null = watchCodexProfileFile(() => {
-        const target = getCurrentCodexProfile() || 'unknown';
-        logger.debug(`[CodexAppServer] Account swap signaled (broadcast): ${target}`);
-        pendingAccountSwap = { target, source: 'broadcast' };
-        // Wake the message-queue waiter so an idle session doesn't sit on the
-        // swap until the next user message arrives. The loop handles a null
-        // batch + non-null pendingAccountSwap as "consume the swap and keep
-        // looping" (see below) rather than "exit the runtime".
-        messageQueue.interrupt();
-    });
+    type AccountSwapSource = 'global' | 'single-session';
+    let pendingAccountSwap: { target: string; source: AccountSwapSource; seenSetAt?: number } | null = null;
+    const savedAccount = readSessionAccountSelection(session.sessionId, 'codex');
+    const startupAccount = resolveStartupAccountSelection(savedAccount, readAccountIntent('codex'));
+    if (startupAccount && startupAccount.profileName !== activeCodexProfile) {
+        const savedHome = getCodexInstancePath(startupAccount.profileName);
+        if (!existsSync(join(savedHome, 'auth.json'))) {
+            throw new Error(`Selected Codex profile "${startupAccount.profileName}" is unavailable`);
+        }
+        process.env.CODEX_HOME = savedHome;
+        activeCodexProfile = startupAccount.profileName;
+    }
+    if (startupAccount?.source === 'global') {
+        try {
+            writeSessionAccountSelection(
+                session.sessionId,
+                'codex',
+                startupAccount.profileName,
+                startupAccount.seenGlobalSetAt,
+            );
+        } catch (error) {
+            logger.warn('[CodexAppServer] Failed to persist startup account selection:', error);
+        }
+    }
+    let lastSeenAccountIntent = startupAccount?.seenGlobalSetAt ?? 0;
+    const rememberAccountIntent = (profileName: string, setAt: number): void => {
+        lastSeenAccountIntent = setAt;
+        try {
+            writeSessionAccountSelection(session.sessionId, 'codex', profileName, setAt);
+        } catch (error) {
+            // The in-process scalar is sufficient until restart. On restart the
+            // same global target is sampled again and the marker write retries.
+            logger.warn('[CodexAppServer] Failed to persist session account selection:', error);
+        }
+    };
 
     try {
         // Create app-server client. Build the child env via the shared helper so
@@ -1318,6 +1385,81 @@ export async function runCodexWithAppServer(opts: {
 
         // Register notification + request handlers BEFORE starting any thread
         registerClientHandlers(client);
+
+        // Prove an existing provider thread is usable before the daemon can
+        // report the restored Happy session as online or deliver queued input.
+        // turn/start still applies the incoming message's model and permission
+        // mode, so this does not change account or per-turn selection.
+        if (opts.codexSessionId) {
+            const expectedThreadId = opts.codexSessionId;
+            const executionPolicy = resolveCodexExecutionPolicy(
+                currentPermissionMode,
+                !!sandboxConfig,
+            );
+            logger.debug(`[CodexAppServer] Resuming thread ${expectedThreadId} before runtime readiness`);
+            const threadResponse = await client.request('thread/resume', {
+                threadId: expectedThreadId,
+                approvalPolicy: toApprovalPolicy(executionPolicy.approvalPolicy),
+                sandbox: executionPolicy.sandbox,
+                persistExtendedHistory: true,
+            });
+            threadId = requireExactCodexThreadResume(
+                readThreadId(threadResponse),
+                expectedThreadId,
+            );
+            await session.updateMetadata((currentMetadata) => ({
+                ...currentMetadata,
+                claudeSessionId: threadId!,
+            }), { rejectOnServerError: true });
+            threadIdStored = true;
+            opts.codexSessionId = undefined;
+            logger.debug(`[CodexAppServer] Provider thread ready: ${threadId}`);
+
+            if (opts.startedBy === 'daemon' && response) {
+                const registration = await notifyDaemonSessionStarted(
+                    response.id,
+                    { ...response.metadata, claudeSessionId: threadId, hostPid: process.pid },
+                    opts.restoreSessionId ? threadId : undefined,
+                );
+                if (registration.error) {
+                    throw new Error(`Daemon provider readiness registration failed: ${registration.error}`);
+                }
+                if (activeCodexProfile) {
+                    const profileRegistration = await notifyDaemonCodexProfile(response.id, activeCodexProfile);
+                    if (profileRegistration.error) {
+                        throw new Error(`Daemon Codex profile registration failed: ${profileRegistration.error}`);
+                    }
+                }
+            }
+        }
+
+        // A daemon spawn is not ready until it owns a restorable provider
+        // identity. Allocate the Codex thread without starting a model turn,
+        // persist it, then publish the daemon webhook that resolves spawnSession.
+        if (!threadId && opts.startedBy === 'daemon' && !opts.restoreSessionId && !opts.codexSessionId) {
+            threadId = await startFreshThread(client, currentPermissionMode, currentModel);
+            await session.updateMetadata((currentMetadata) => ({
+                ...currentMetadata,
+                claudeSessionId: threadId!,
+            }), { rejectOnServerError: true });
+            threadIdStored = true;
+            if (response) {
+                const registration = await notifyDaemonSessionStarted(response.id, {
+                    ...response.metadata,
+                    claudeSessionId: threadId,
+                    hostPid: process.pid,
+                });
+                if (registration.error) {
+                    throw new Error(`Daemon provider readiness registration failed: ${registration.error}`);
+                }
+                if (activeCodexProfile) {
+                    const profileRegistration = await notifyDaemonCodexProfile(response.id, activeCodexProfile);
+                    if (profileRegistration.error) {
+                        throw new Error(`Daemon Codex profile registration failed: ${profileRegistration.error}`);
+                    }
+                }
+            }
+        }
 
         // After restore, fetch pending user messages
         if (opts.restoreSessionId && response) {
@@ -1344,62 +1486,119 @@ export async function runCodexWithAppServer(opts: {
 
         while (!shouldExit) {
             // Consume pending !auth-all --codex account swap before anything else.
-            // tryGlobalProfileSwitch already updated process.env.CODEX_HOME; we now
-            // dispose the current app-server subprocess and spawn a new one that
-            // inherits the new env. savedThreadId → opts.codexSessionId makes the
-            // next iteration's thread/resume pick up the conversation via the
-            // shared symlinked sessions/ directory.
+            // Build and resume the candidate against the exact current thread first.
+            // Only a ready candidate may replace and dispose the current client.
             if (pendingAccountSwap) {
-                const { target, source } = pendingAccountSwap;
+                const { target, source, seenSetAt } = pendingAccountSwap;
                 pendingAccountSwap = null;
-                const savedThreadId = threadId;
+                const savedThreadId: string | null = threadId;
+                let swapCommitted = false;
                 try {
-                    if (client) {
-                        await client.dispose();
-                        client = null;
+                    const currentClient: CodexAppServerClient | null = client;
+                    if (!currentClient) {
+                        throw new Error('Codex app-server client is not initialized');
                     }
-                    // Account swap: rebuild env so the new spawn picks up the just-
-                    // updated process.env.CODEX_HOME (set by tryGlobalProfileSwitch).
-                    const swapEnvBuild = buildCodexChildEnv({ logTag: 'CodexAppServer:swap' });
-                    client = await createCodexAppServerClient({
-                        configOverrides: mcpServerConfigOverrides,
-                        processEnv: swapEnvBuild.env,
+                    const targetHome = getCodexInstancePath(target);
+                    const modelConfig = resolveCodexModelModeOrDefault(currentModel);
+                    const executionPolicy = resolveCodexExecutionPolicy(
+                        currentPermissionMode,
+                        !!sandboxConfig,
+                    );
+                    const result: AccountSwapResult<CodexAppServerClient> = await performCodexAccountSwap({
+                        currentClient,
+                        threadId: savedThreadId,
+                        createCandidate: async () => {
+                            const swapEnvBuild = buildCodexChildEnv({
+                                baseEnv: { ...process.env, CODEX_HOME: targetHome },
+                                logTag: 'CodexAppServer:swap',
+                            });
+                            return await createCodexAppServerClient({
+                                configOverrides: mcpServerConfigOverrides,
+                                processEnv: swapEnvBuild.env,
+                            });
+                        },
+                        prepareCandidate: registerClientHandlers,
+                        resumeCandidate: async (candidate, exactThreadId) => {
+                            const response = await candidate.request('thread/resume', {
+                                threadId: exactThreadId,
+                                approvalPolicy: toApprovalPolicy(executionPolicy.approvalPolicy),
+                                sandbox: executionPolicy.sandbox,
+                                ...(modelConfig.model ? { model: modelConfig.model } : {}),
+                                ...(modelConfig.reasoningEffort ? { config: { model_reasoning_effort: modelConfig.reasoningEffort } } : {}),
+                                persistExtendedHistory: true,
+                            });
+                            return requireExactCodexThreadResume(
+                                readThreadId(response),
+                                exactThreadId,
+                            );
+                        },
                     });
-                    registerClientHandlers(client);
-                    threadId = null;
-                    threadIdStored = false;
-                    activeTurnId = null;
-                    currentModeHash = null;
-                    if (savedThreadId) {
-                        opts.codexSessionId = savedThreadId;
+                    if (!result.ok) throw result.error;
+                    // performCodexAccountSwap has now disposed the old client.
+                    // From here onward this is committed and must never be
+                    // reported as a rollback-capable switch failure.
+                    swapCommitted = true;
+                    client = result.client;
+                    threadId = result.threadId;
+                    process.env.CODEX_HOME = targetHome;
+                    activeCodexProfile = target;
+                    if (opts.startedBy === 'daemon' && response) {
+                        const profileRegistration = await notifyDaemonCodexProfile(response.id, target);
+                        if (profileRegistration.error) {
+                            logger.warn(`[CodexAppServer] Failed to report account to daemon: ${profileRegistration.error}`);
+                        }
                     }
+                    if (seenSetAt !== undefined) {
+                        rememberAccountIntent(target, seenSetAt);
+                    }
+                    activeTurnId = null;
                     permissionHandler.reset();
                     reasoningProcessor.abort();
                     diffProcessor.reset();
                     thinking = false;
                     session.keepAlive(thinking, 'remote');
                     // Mirror the claude-side wording: `(via !auth-all)` is the
-                    // broadcast path; the single-session path triggered locally
+                    // global path; the single-session path triggered locally
                     // by `!auth <profile>` reads as a bare `(via !auth)`.
-                    const sourceTag = source === 'broadcast' ? '!auth-all --codex' : '!auth';
+                    const sourceTag = source === 'global' ? '!auth-all --codex' : '!auth';
                     const msg = `🔄 Switched to "${target}" (via ${sourceTag})`;
                     messageBuffer.addMessage(msg, 'status');
                     session.sendSessionEvent({ type: 'message', message: msg });
                     logger.debug(`[CodexAppServer] Account swap complete → ${target} (source=${source})`);
-                    // The watcher's messageQueue.interrupt() was meant to wake an idle
-                    // waiter so the swap is consumed promptly. If the broadcast arrived
-                    // mid-turn there was no live waiter, so the flag is still pending.
-                    // We've now consumed the swap — drop the deferred flag so the next
-                    // wait blocks for real input instead of returning null and breaking
-                    // the loop into Final cleanup (which closes the socket → offline).
+                    // A single-session command may wake the idle queue so the explicit
+                    // request is consumed promptly. Global account targets never wake or
+                    // interrupt a session; they are discovered only with real input.
                     messageQueue.clearInterrupt();
                 } catch (err) {
-                    logger.warn('[CodexAppServer] Account swap failed:', err);
-                    const errMsg = `⚠ 切换账号失败: ${(err as Error).message || 'unknown error'}`;
-                    messageBuffer.addMessage(errMsg, 'status');
-                    session.sendSessionEvent({ type: 'message', message: errMsg });
-                    shouldExit = true;
-                    break;
+                    const detail = (err as Error).message || 'unknown error';
+                    const errMsg = swapCommitted
+                        ? `⚠ 账号已切换，但会话状态刷新失败: ${detail}`
+                        : `⚠ 切换账号失败，本次输入未提交，请重试: ${detail}`;
+                    if (!swapCommitted) {
+                        // Do not process this input under the old account and do
+                        // not immediately retry the same failed global target.
+                        // The intent remains unacknowledged, so a later real input
+                        // gets one fresh attempt without adding persisted state.
+                        pending = null;
+                    }
+                    logger.warn(
+                        swapCommitted
+                            ? '[CodexAppServer] Account swap post-commit finalization failed:'
+                            : '[CodexAppServer] Account swap failed:',
+                        err,
+                    );
+                    try {
+                        messageBuffer.addMessage(errMsg, 'status');
+                    } catch (statusError) {
+                        logger.warn('[CodexAppServer] Failed to buffer account swap status:', statusError);
+                    }
+                    try {
+                        session.sendSessionEvent({ type: 'message', message: errMsg });
+                    } catch (statusError) {
+                        logger.warn('[CodexAppServer] Failed to publish account swap status:', statusError);
+                    }
+                } finally {
+                    messageQueue.clearInterrupt();
                 }
                 continue;
             }
@@ -1409,13 +1608,9 @@ export async function runCodexWithAppServer(opts: {
             if (!message) {
                 const batch = await messageQueue.waitForMessagesAndGetAsString();
                 if (!batch) {
-                    // A null batch can mean three things: queue closed (shutdown),
-                    // signal-driven interrupt (e.g. account-swap watcher woke us
-                    // up while idle), or a regular interrupt with nothing pending.
-                    // Only the swap case wants to keep looping — the swap is
-                    // consumed at the top of the next iteration.
+                    // A null batch means shutdown or an explicit local interrupt.
                     if (pendingAccountSwap && !shouldExit && !messageQueue.isClosed()) {
-                        logger.debug('[CodexAppServer] Wait interrupted by account swap signal — re-entering loop');
+                        logger.debug('[CodexAppServer] Wait interrupted by local account switch — re-entering loop');
                         continue;
                     }
                     logger.debug(`[CodexAppServer] batch=${!!batch}, shouldExit=${shouldExit}`);
@@ -1425,6 +1620,31 @@ export async function runCodexWithAppServer(opts: {
             }
 
             if (!message) break;
+
+            // The global target is sampled only after real input exists and before
+            // that input reaches Codex. Keep the batch pending while the existing
+            // transactional swap resumes the exact thread. An idle session therefore
+            // performs no work, and an active turn is never interrupted by a file event.
+            const currentIntent = readAccountIntent('codex');
+            if (accountIntentIsNewer(currentIntent, lastSeenAccountIntent)) {
+                if (currentIntent.profileName === activeCodexProfile) {
+                    if (opts.startedBy === 'daemon' && response) {
+                        const registration = await notifyDaemonCodexProfile(response.id, currentIntent.profileName);
+                        if (registration.error) {
+                            logger.warn(`[CodexAppServer] Failed to report account to daemon: ${registration.error}`);
+                        }
+                    }
+                    rememberAccountIntent(currentIntent.profileName, currentIntent.setAt);
+                } else {
+                    pending = message;
+                    pendingAccountSwap = {
+                        target: currentIntent.profileName,
+                        source: 'global',
+                        seenSetAt: currentIntent.setAt,
+                    };
+                    continue;
+                }
+            }
 
             // Mode change: keep the same Codex thread.
             //
@@ -1446,6 +1666,10 @@ export async function runCodexWithAppServer(opts: {
             currentModeHash = message.hash;
 
             try {
+                const requestClient = client;
+                if (!requestClient) {
+                    throw new Error('Codex app-server client is not initialized');
+                }
                 const sandboxManagedByHappy = !!sandboxConfig;
                 const executionPolicy = resolveCodexExecutionPolicy(
                     message.mode.permissionMode,
@@ -1453,42 +1677,16 @@ export async function runCodexWithAppServer(opts: {
                 );
                 const modelConfig = resolveCodexModelModeOrDefault(message.mode.model);
 
-                // Start or resume thread if needed
+                // Start a new thread if needed. Existing threads were resumed
+                // before runtime readiness, so queued input cannot be the
+                // operation that discovers a missing rollout.
                 if (!threadId) {
-                    if (opts.codexSessionId) {
-                        // Resume existing thread
-                        logger.debug(`[CodexAppServer] Resuming thread ${opts.codexSessionId}`);
-                        const threadResponse = await client.request('thread/resume', {
-                            threadId: opts.codexSessionId,
-                            approvalPolicy: toApprovalPolicy(executionPolicy.approvalPolicy),
-                            sandbox: executionPolicy.sandbox,
-                            ...(modelConfig.model ? { model: modelConfig.model } : {}),
-                            ...(modelConfig.reasoningEffort ? { config: { model_reasoning_effort: modelConfig.reasoningEffort } } : {}),
-                            persistExtendedHistory: true,
-                        });
-                        threadId = readThreadId(threadResponse) ?? opts.codexSessionId;
-                        logger.debug(`[CodexAppServer] Resumed thread: ${threadId}`);
-                        messageBuffer.addMessage('Resuming previous conversation...', 'status');
-                    } else {
-                        // Start new thread
-                        logger.debug('[CodexAppServer] Starting new thread');
-                        const threadResponse = await client.request('thread/start', {
-                            cwd: sessionCwd,
-                            approvalPolicy: toApprovalPolicy(executionPolicy.approvalPolicy),
-                            sandbox: executionPolicy.sandbox,
-                            ...(modelConfig.model ? { model: modelConfig.model } : {}),
-                            ...(modelConfig.reasoningEffort ? { config: { model_reasoning_effort: modelConfig.reasoningEffort } } : {}),
-                            experimentalRawEvents: true,
-                            persistExtendedHistory: true,
-                        });
-                        threadId = readThreadId(threadResponse);
-                        if (!threadId) {
-                            throw new Error('Codex app-server thread/start returned no thread id');
-                        }
-                        logger.debug(`[CodexAppServer] Started thread: ${threadId}`);
-                    }
-                    // Clear resume ID after first use so subsequent turns don't try to resume again
-                    opts.codexSessionId = undefined;
+                    logger.debug('[CodexAppServer] Starting new thread');
+                    threadId = await startFreshThread(
+                        requestClient,
+                        message.mode.permissionMode,
+                        message.mode.model,
+                    );
                 }
 
                 logger.debug(`[CodexAppServer] Starting turn on thread ${threadId}`);
@@ -1513,7 +1711,7 @@ export async function runCodexWithAppServer(opts: {
                     compactState.pendingSeedText = null;
                     logger.debug(`[CodexAppServer] Injecting compact seed (${seed.length} chars) into next turn`);
                 }
-                const turnResponse = await client.request('turn/start', {
+                const turnResponse = await requestClient.request('turn/start', {
                     threadId,
                     input: [{ type: 'text', text: turnInputText }],
                     approvalPolicy: toApprovalPolicy(executionPolicy.approvalPolicy),
@@ -1521,6 +1719,10 @@ export async function runCodexWithAppServer(opts: {
                     ...(modelConfig.model ? { model: modelConfig.model } : {}),
                     ...(modelConfig.reasoningEffort ? { effort: modelConfig.reasoningEffort } : {}),
                 });
+                const responseTurnId = readTurnId(turnResponse);
+                if (responseTurnId) {
+                    activeTurnId = responseTurnId;
+                }
                 if (injectSystemPrompt) {
                     needsSystemPromptInjection = false;
                 }
@@ -1543,7 +1745,9 @@ export async function runCodexWithAppServer(opts: {
                 // Settle the pending promise on RPC failure (the only path that
                 // legitimately rejects). Idempotent if it was already settled
                 // by an error notification handler that beat us here.
+                const unsettledTurn = turnLifecycle.current;
                 turnLifecycle.finish(error instanceof Error ? error : new Error(String(error)));
+                await unsettledTurn?.catch(() => {});
                 const errorMessage = error instanceof Error ? error.message : String(error);
 
                 if (errorMessage.includes('disposed') || errorMessage.includes('exited')) {
@@ -1581,8 +1785,6 @@ export async function runCodexWithAppServer(opts: {
         removeTransportFatalHandler();
 
         removeShutdownHandlers();
-        try { codexProfileWatcher?.close(); } catch { /* best effort */ }
-
         if (reconnectionHandle) {
             logger.debug('[CodexAppServer] Cancelling offline reconnection');
             reconnectionHandle.cancel();

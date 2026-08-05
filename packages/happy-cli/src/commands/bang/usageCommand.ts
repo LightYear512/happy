@@ -11,11 +11,11 @@ import { SEPARATOR, codeBlock, parseCodexFlag, rejectCodexFlagInSession, type Ba
 import { formatRelativeTime } from './relativeTime';
 
 const USAGE_API_URL = 'https://api.anthropic.com/api/oauth/usage';
-/** Fresh TTL: cache is considered authoritative within this window (no revalidate). */
+/** Fresh TTL: profile menus hide cache age within this window. Active usage queries still fetch first. */
 const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 const CACHE_AGE_DISPLAY_MIN_MS = 5 * 60 * 1000; // Hide cache age while it is effectively fresh.
 const USAGE_UNAVAILABLE_PERCENT = 95;
-/** Stale TTL: beyond fresh but within stale — cached value is still shown with ⏳ marker, and a background revalidate fires. */
+/** Stale TTL: failed active usage queries may fall back to cache within this window. */
 const STALE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 export interface UsageData {
@@ -335,10 +335,14 @@ export interface ProfileUsageEntry {
     fiveHourPercent: number | null;
     /** 5h reset timestamp, ISO string, for compact account menus. */
     fiveHourResetAt: string | null;
+    /** Unix ms when the 5h window itself was fetched. */
+    fiveHourCachedAt: number | null;
     /** 7d utilization percentage for compact account menus. */
     sevenDayPercent: number | null;
     /** 7d reset timestamp, ISO string, for compact account menus. */
     sevenDayResetAt: string | null;
+    /** Unix ms when the 7d window itself was fetched. */
+    sevenDayCachedAt: number | null;
     /** True when the 5h window is at or above 100%. */
     full: boolean;
     /** True when the 7d window is at or above 100%. */
@@ -356,8 +360,10 @@ function makeClaudeEntry(data: UsageData, cachedAt: number, stale = false, authE
         summary: formatClaudeUsageSummary(data),
         fiveHourPercent: data.five_hour?.utilization ?? null,
         fiveHourResetAt: data.five_hour?.resets_at ?? null,
+        fiveHourCachedAt: data.five_hour ? cachedAt : null,
         sevenDayPercent: data.seven_day?.utilization ?? null,
         sevenDayResetAt: data.seven_day?.resets_at ?? null,
+        sevenDayCachedAt: data.seven_day ? cachedAt : null,
         full: isClaudeFiveHourFull(data),
         sevenDayFull: isClaudeSevenDayFull(data),
         authExpired,
@@ -373,8 +379,10 @@ function makeCodexEntry(data: CodexUsageData, cachedAt: number, stale = false, a
         summary: formatCodexUsageSummary(data),
         fiveHourPercent: data.primaryWindow?.usedPercent ?? null,
         fiveHourResetAt: resetAt,
+        fiveHourCachedAt: data.primaryWindow?.fetchedAt ?? (data.primaryWindow ? cachedAt : null),
         sevenDayPercent: data.secondaryWindow?.usedPercent ?? null,
         sevenDayResetAt,
+        sevenDayCachedAt: data.secondaryWindow?.fetchedAt ?? (data.secondaryWindow ? cachedAt : null),
         full: isCodexFiveHourFull(data),
         sevenDayFull: isCodexSevenDayFull(data),
         authExpired,
@@ -389,67 +397,15 @@ function isAuthExpiredError(err: unknown): boolean {
     return err.message.includes('令牌已过期') || err.message.includes('令牌已过期或无效');
 }
 
-/** In-flight background revalidations (dedupe by cache key). */
-const inflightRevalidate = new Set<string>();
-
-/** Fire-and-forget background refresh for a Claude profile whose cache is stale. */
-function backgroundRevalidateClaude(instancePath: string, profileName: string): void {
-    if (inflightRevalidate.has(`claude:${instancePath}`)) return;
-    inflightRevalidate.add(`claude:${instancePath}`);
-    void (async () => {
-        try {
-            const token = readOAuthToken(instancePath);
-            if (!token) return;
-            const data = await Promise.race([
-                fetchUsage(token, profileName),
-                new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000)),
-            ]);
-            setClaudeCache(instancePath, { data, fetchedAt: Date.now() });
-            logger.debug(`[!usage] background revalidate succeeded for ${profileName}`);
-        } catch (err) {
-            logger.debug(`[!usage] background revalidate failed for ${profileName}:`, err);
-        } finally {
-            inflightRevalidate.delete(`claude:${instancePath}`);
-        }
-    })();
-}
-
-/** Fire-and-forget background refresh for a Codex profile whose cache is stale. */
-function backgroundRevalidateCodex(codexHome: string, profileName: string): void {
-    if (inflightRevalidate.has(`codex:${codexHome}`)) return;
-    inflightRevalidate.add(`codex:${codexHome}`);
-    void (async () => {
-        try {
-            const token = readCodexAccessToken(codexHome);
-            if (!token) return;
-            const data = await Promise.race([
-                fetchCodexUsage(token, profileName),
-                new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000)),
-            ]);
-            setCodexCache(codexHome, { data, fetchedAt: Date.now() });
-            logger.debug(`[!usage] codex background revalidate succeeded for ${profileName}`);
-        } catch (err) {
-            logger.debug(`[!usage] codex background revalidate failed for ${profileName}:`, err);
-        } finally {
-            inflightRevalidate.delete(`codex:${codexHome}`);
-        }
-    })();
-}
-
 /**
- * Fetch a one-line usage summary for a profile, respecting cache.
+ * Fetch a one-line usage summary for a profile.
  *
- * Cache strategy (stale-while-revalidate):
- *   - Fresh hit (age < CACHE_TTL_MS): return cached summary with `stale=false`.
- *   - Stale hit (CACHE_TTL_MS ≤ age < STALE_TTL_MS): return cached summary with
- *     `stale=true`, trigger a fire-and-forget background revalidate so the next
- *     call sees fresh data. If revalidate fails (e.g. token expired), the same
- *     stale value keeps serving until STALE_TTL_MS elapses.
- *   - Miss / expired beyond stale: synchronous network fetch (5s timeout).
+ * Active usage checks are fetch-first. The file-backed cache is written after a
+ * successful fetch and is read only when the fresh fetch fails.
  *
  * Returns `{ summary, authExpired, stale, cachedAt }` so callers can distinguish
  * "no data yet" from "token expired and needs refresh via any cc message", and
- * render a "⏳ N 分钟前" marker when the data is stale.
+ * render a stale marker when the data came from the failure fallback.
  */
 export async function fetchProfileUsageSummary(profileName: string, flavor: AuthFlavor): Promise<ProfileUsageEntry> {
     ensureHydrated();
@@ -457,38 +413,20 @@ export async function fetchProfileUsageSummary(profileName: string, flavor: Auth
     const cacheKey = isCodex ? getCodexInstancePath(profileName) : getInstancePath(profileName);
     try {
         if (isCodex) {
-            const cached = codexCache.get(cacheKey);
-            const age = cached ? Date.now() - cached.fetchedAt : Infinity;
-            if (cached && age < CACHE_TTL_MS) {
-                return makeCodexEntry(cached.data, cached.fetchedAt);
-            }
-            if (cached && age < STALE_TTL_MS) {
-                backgroundRevalidateCodex(cacheKey, profileName);
-                return makeCodexEntry(cached.data, cached.fetchedAt, true);
-            }
             const token = readCodexAccessToken(cacheKey);
-            if (!token) return { summary: null, fiveHourPercent: null, fiveHourResetAt: null, sevenDayPercent: null, sevenDayResetAt: null, full: false, sevenDayFull: false, authExpired: false, stale: false, cachedAt: null };
+            if (!token) return { summary: null, fiveHourPercent: null, fiveHourResetAt: null, fiveHourCachedAt: null, sevenDayPercent: null, sevenDayResetAt: null, sevenDayCachedAt: null, full: false, sevenDayFull: false, authExpired: false, stale: false, cachedAt: null };
             const data = await Promise.race([
                 fetchCodexUsage(token, profileName),
                 new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000)),
             ]);
             const now = Date.now();
-            setCodexCache(cacheKey, { data, fetchedAt: now });
-            return makeCodexEntry(data, now);
+            const stored = setCodexCache(cacheKey, { data, fetchedAt: now });
+            return makeCodexEntry(stored.data, stored.fetchedAt);
         }
 
         // Claude
-        const cached = cache.get(cacheKey);
-        const age = cached ? Date.now() - cached.fetchedAt : Infinity;
-        if (cached && age < CACHE_TTL_MS) {
-            return makeClaudeEntry(cached.data, cached.fetchedAt);
-        }
-        if (cached && age < STALE_TTL_MS) {
-            backgroundRevalidateClaude(cacheKey, profileName);
-            return makeClaudeEntry(cached.data, cached.fetchedAt, true);
-        }
         const token = readOAuthToken(cacheKey);
-        if (!token) return { summary: null, fiveHourPercent: null, fiveHourResetAt: null, sevenDayPercent: null, sevenDayResetAt: null, full: false, sevenDayFull: false, authExpired: false, stale: false, cachedAt: null };
+        if (!token) return { summary: null, fiveHourPercent: null, fiveHourResetAt: null, fiveHourCachedAt: null, sevenDayPercent: null, sevenDayResetAt: null, sevenDayCachedAt: null, full: false, sevenDayFull: false, authExpired: false, stale: false, cachedAt: null };
         const data = await Promise.race([
             fetchUsage(token, profileName),
             new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000)),
@@ -507,7 +445,7 @@ export async function fetchProfileUsageSummary(profileName: string, flavor: Auth
                 ? makeCodexEntry((cached as CachedCodexUsage).data, cached.fetchedAt, true, authExpired)
                 : makeClaudeEntry((cached as CachedUsage).data, cached.fetchedAt, true, authExpired);
         }
-        return { summary: null, fiveHourPercent: null, fiveHourResetAt: null, sevenDayPercent: null, sevenDayResetAt: null, full: false, sevenDayFull: false, authExpired, stale: false, cachedAt: null };
+        return { summary: null, fiveHourPercent: null, fiveHourResetAt: null, fiveHourCachedAt: null, sevenDayPercent: null, sevenDayResetAt: null, sevenDayCachedAt: null, full: false, sevenDayFull: false, authExpired, stale: false, cachedAt: null };
     }
 }
 
@@ -519,7 +457,7 @@ function formatDetailedDataAge(cachedAt: number): string | null {
     if (ageMs < CACHE_AGE_DISPLAY_MIN_MS) return null;
     if (ageMs < CACHE_TTL_MS) {
         const remainMin = Math.ceil((CACHE_TTL_MS - ageMs) / 60000);
-        return `ℹ️ 数据获取于 ${formatRelativeTime(cachedAt)}（${remainMin} 分钟内复用缓存）`;
+        return `ℹ️ 数据获取于 ${formatRelativeTime(cachedAt)}（缓存仍在 ${remainMin} 分钟内）`;
     }
     return `ℹ️ 旧缓存获取于 ${formatRelativeTime(cachedAt)}（已超过 15 分钟）`;
 }
@@ -592,15 +530,26 @@ function resolveOAuthTokenForProfile(profileName: string): { token: string; prof
 // ---------------------------------------------------------------------------
 
 const CODEX_USAGE_API_URL = 'https://chatgpt.com/backend-api/wham/usage';
+const CODEX_FIVE_HOUR_WINDOW_SECONDS = 5 * 60 * 60;
+const CODEX_SEVEN_DAY_WINDOW_SECONDS = 7 * 24 * 60 * 60;
+
+interface CodexUsageWindow {
+    usedPercent: number;
+    resetAt: number;
+    /** Provider-declared semantic duration; required for new rate-limit records. */
+    limitWindowSeconds?: number;
+    /** Additive v1 cache provenance; absent in old cache files and API records. */
+    fetchedAt?: number;
+}
 
 interface CodexUsageData {
     planType?: string;
-    /** 5-hour primary window */
-    primaryWindow?: { usedPercent: number; resetAt: number };
-    /** 7-day secondary window */
-    secondaryWindow?: { usedPercent: number; resetAt: number };
+    /** Canonical internal slot for the provider-declared 5-hour window. */
+    primaryWindow?: CodexUsageWindow;
+    /** Canonical internal slot for the provider-declared 7-day window. */
+    secondaryWindow?: CodexUsageWindow;
     /** Code review rate limit (null when not available) */
-    codeReviewWindow?: { usedPercent: number; resetAt: number };
+    codeReviewWindow?: CodexUsageWindow;
 }
 
 interface CachedCodexUsage {
@@ -609,6 +558,74 @@ interface CachedCodexUsage {
 }
 
 const codexCache = new Map<string, CachedCodexUsage>();
+
+function normalizeCodexUsageData(data: CodexUsageData): CodexUsageData {
+    const normalized: CodexUsageData = {};
+    if (data.planType !== undefined) normalized.planType = data.planType;
+    if (data.codeReviewWindow !== undefined) normalized.codeReviewWindow = data.codeReviewWindow;
+
+    const legacyDualWindow = data.primaryWindow?.limitWindowSeconds == null &&
+        data.secondaryWindow?.limitWindowSeconds == null &&
+        data.primaryWindow !== undefined && data.secondaryWindow !== undefined;
+    const candidates = [
+        { position: 'primary' as const, window: data.primaryWindow },
+        { position: 'secondary' as const, window: data.secondaryWindow },
+    ];
+    for (const candidate of candidates) {
+        if (!candidate.window) continue;
+        const duration = candidate.window.limitWindowSeconds ??
+            (legacyDualWindow
+                ? candidate.position === 'primary' ? CODEX_FIVE_HOUR_WINDOW_SECONDS : CODEX_SEVEN_DAY_WINDOW_SECONDS
+                : candidate.position === 'secondary' ? CODEX_SEVEN_DAY_WINDOW_SECONDS : null);
+        if (duration === CODEX_FIVE_HOUR_WINDOW_SECONDS) {
+            normalized.primaryWindow = { ...candidate.window, limitWindowSeconds: duration };
+        } else if (duration === CODEX_SEVEN_DAY_WINDOW_SECONDS) {
+            normalized.secondaryWindow = { ...candidate.window, limitWindowSeconds: duration };
+        }
+    }
+    return normalized;
+}
+
+function mergeCodexWindow(
+    previous: CodexUsageWindow | undefined,
+    previousEntryFetchedAt: number | undefined,
+    incoming: CodexUsageWindow | undefined,
+    incomingEntryFetchedAt: number,
+    now: number,
+): CodexUsageWindow | undefined {
+    const candidates = [
+        previous ? { ...previous, fetchedAt: previous.fetchedAt ?? previousEntryFetchedAt } : undefined,
+        incoming ? { ...incoming, fetchedAt: incoming.fetchedAt ?? incomingEntryFetchedAt } : undefined,
+    ].filter((window): window is CodexUsageWindow & { fetchedAt: number } =>
+        window?.fetchedAt != null && Number.isFinite(window.fetchedAt) && now - window.fetchedAt < STALE_TTL_MS);
+    candidates.sort((left, right) => right.fetchedAt - left.fetchedAt);
+    return candidates[0];
+}
+
+function mergeCodexCacheEntries(
+    previous: CachedCodexUsage | undefined,
+    incoming: CachedCodexUsage,
+    now = Date.now(),
+): CachedCodexUsage {
+    previous = previous ? { ...previous, data: normalizeCodexUsageData(previous.data) } : undefined;
+    incoming = { ...incoming, data: normalizeCodexUsageData(incoming.data) };
+    const incomingIsNewest = !previous || incoming.fetchedAt >= previous.fetchedAt;
+    const data: CodexUsageData = {};
+    const planType = incomingIsNewest
+        ? incoming.data.planType ?? previous?.data.planType
+        : previous?.data.planType ?? incoming.data.planType;
+    if (planType !== undefined) data.planType = planType;
+    const primaryWindow = mergeCodexWindow(previous?.data.primaryWindow, previous?.fetchedAt,
+        incoming.data.primaryWindow, incoming.fetchedAt, now);
+    const secondaryWindow = mergeCodexWindow(previous?.data.secondaryWindow, previous?.fetchedAt,
+        incoming.data.secondaryWindow, incoming.fetchedAt, now);
+    const codeReviewWindow = mergeCodexWindow(previous?.data.codeReviewWindow, previous?.fetchedAt,
+        incoming.data.codeReviewWindow, incoming.fetchedAt, now);
+    if (primaryWindow) data.primaryWindow = primaryWindow;
+    if (secondaryWindow) data.secondaryWindow = secondaryWindow;
+    if (codeReviewWindow) data.codeReviewWindow = codeReviewWindow;
+    return { data, fetchedAt: Math.max(previous?.fetchedAt ?? 0, incoming.fetchedAt) };
+}
 
 // ---------------------------------------------------------------------------
 // Disk persistence (file-backed cache for cross-session consistency)
@@ -682,7 +699,10 @@ function loadUsageCacheIntoMemory(payload: UsageCachePayload): void {
     for (const [key, entry] of Object.entries(payload.codex)) {
         if (!entry || typeof entry.fetchedAt !== 'number') continue;
         if ((now - entry.fetchedAt) >= STALE_TTL_MS) continue;
-        codexCache.set(key, entry);
+        const normalized = { ...entry, data: normalizeCodexUsageData(entry.data) };
+        if (!normalized.data.primaryWindow && !normalized.data.secondaryWindow &&
+            (entry.data.primaryWindow || entry.data.secondaryWindow)) continue;
+        codexCache.set(key, normalized);
     }
 }
 
@@ -724,8 +744,7 @@ function withUsageCacheLock<T>(operation: () => T): T {
             sleepSync(50);
         }
     }
-    logger.debug('[!usage] usage-cache lock timeout, writing without lock');
-    return operation();
+    throw new Error('usage-cache lock timeout');
 }
 
 function writeUsageEntry(section: 'claude' | 'codex', key: string, entry: CachedUsage | CachedCodexUsage): void {
@@ -734,7 +753,7 @@ function writeUsageEntry(section: 'claude' | 'codex', key: string, entry: Cached
         if (section === 'claude') {
             payload.claude[key] = entry as CachedUsage;
         } else {
-            payload.codex[key] = entry as CachedCodexUsage;
+            payload.codex[key] = mergeCodexCacheEntries(payload.codex[key], entry as CachedCodexUsage);
         }
         const now = Date.now();
         for (const [cacheKey, cached] of Object.entries(payload.claude)) {
@@ -759,9 +778,10 @@ function setClaudeCache(key: string, entry: CachedUsage): void {
 }
 
 /** Write to the Codex usage cache and immediately merge it to disk. */
-function setCodexCache(key: string, entry: CachedCodexUsage): void {
-    codexCache.set(key, entry);
-    writeUsageEntry('codex', key, entry);
+function setCodexCache(key: string, entry: CachedCodexUsage): CachedCodexUsage {
+    const merged = mergeCodexCacheEntries(codexCache.get(key), entry);
+    writeUsageEntry('codex', key, merged);
+    return codexCache.get(key) ?? merged;
 }
 
 /** Read access_token from a codex auth.json file. */
@@ -827,18 +847,26 @@ async function fetchCodexUsage(token: string, debugLabel: string): Promise<Codex
     // Parse wham/usage response — actual shape:
     // { plan_type, rate_limit: { primary_window: { used_percent, reset_at }, secondary_window: {...} }, code_review_rate_limit, ... }
     const result: CodexUsageData = { planType: raw.plan_type as string | undefined };
-    const rateLimit = raw.rate_limit as Record<string, { used_percent?: number; reset_at?: number }> | undefined;
-    if (rateLimit?.primary_window) {
-        result.primaryWindow = {
-            usedPercent: rateLimit.primary_window.used_percent ?? 0,
-            resetAt: rateLimit.primary_window.reset_at ?? 0,
+    const rateLimit = raw.rate_limit as Record<string, {
+        used_percent?: number;
+        reset_at?: number;
+        limit_window_seconds?: number;
+    } | null> | undefined;
+    for (const rawWindow of [rateLimit?.primary_window, rateLimit?.secondary_window]) {
+        if (!rawWindow) continue;
+        const duration = rawWindow.limit_window_seconds;
+        const window: CodexUsageWindow = {
+            usedPercent: rawWindow.used_percent ?? 0,
+            resetAt: rawWindow.reset_at ?? 0,
+            ...(duration !== undefined ? { limitWindowSeconds: duration } : {}),
         };
-    }
-    if (rateLimit?.secondary_window) {
-        result.secondaryWindow = {
-            usedPercent: rateLimit.secondary_window.used_percent ?? 0,
-            resetAt: rateLimit.secondary_window.reset_at ?? 0,
-        };
+        if (duration === CODEX_FIVE_HOUR_WINDOW_SECONDS) {
+            result.primaryWindow = window;
+        } else if (duration === CODEX_SEVEN_DAY_WINDOW_SECONDS) {
+            result.secondaryWindow = window;
+        } else {
+            logger.debug(`[!usage:codex] Ignoring rate-limit window with unsupported duration=${String(duration)}`);
+        }
     }
     const codeReview = raw.code_review_rate_limit as { used_percent?: number; reset_at?: number } | null;
     if (codeReview) {
@@ -1107,9 +1135,6 @@ async function handleCodexUsage(profileArg: string, ctx: BangCommandContext): Pr
     const { token, profileLabel, cacheKey } = resolved;
     ensureHydrated();
     const cached = codexCache.get(cacheKey);
-    if (cached && (Date.now() - cached.fetchedAt) < CACHE_TTL_MS) {
-        return { message: formatCodexUsage(cached.data, profileLabel, cached.fetchedAt), action: 'none' };
-    }
 
     try {
         const data = await fetchCodexUsage(token, profileLabel);
@@ -1191,16 +1216,9 @@ export async function handleUsageBangCommand(args: string, ctx: BangCommandConte
 
     const { token, profileLabel, cacheKey } = resolved;
 
-    // Check cache
+    // Hydrate cache for failure fallback only. Active usage queries always fetch first.
     ensureHydrated();
     const cached = cache.get(cacheKey);
-    if (cached && (Date.now() - cached.fetchedAt) < CACHE_TTL_MS) {
-        logger.debug(`[!usage] Returning cached usage for profile: ${profileLabel}`);
-        return {
-            message: formatUsage(cached.data, profileLabel, cached.fetchedAt),
-            action: 'none',
-        };
-    }
 
     // Fetch fresh data (retry once with re-read token on auth failures)
     try {

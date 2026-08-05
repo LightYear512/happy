@@ -82,13 +82,6 @@ export async function claudeRemote(opts: {
         }
     }
 
-    // Set environment variables for Claude Code SDK
-    if (opts.claudeEnvVars) {
-        Object.entries(opts.claudeEnvVars).forEach(([key, value]) => {
-            process.env[key] = value;
-        });
-    }
-
     // Get initial message
     const initial = await opts.nextMessage();
     if (!initial) { // No initial message - exit
@@ -139,6 +132,7 @@ export async function claudeRemote(opts: {
             return resolve(join(projectPath(), 'scripts', 'claude_remote_launcher.cjs'));
         })(),
         settingsPath: opts.hookSettingsPath,
+        environment: opts.claudeEnvVars,
     }
 
     // Track thinking state

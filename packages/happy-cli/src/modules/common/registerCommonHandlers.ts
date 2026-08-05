@@ -1,15 +1,34 @@
 import { logger } from '@/ui/logger';
 import { exec, ExecOptions } from 'child_process';
 import { promisify } from 'util';
+import { existsSync } from 'fs';
 import { readFile, writeFile, readdir, stat } from 'fs/promises';
 import { createHash } from 'crypto';
+import { homedir } from 'os';
 import { join } from 'path';
 import { run as runRipgrep } from '@/modules/ripgrep/index';
 import { run as runDifftastic } from '@/modules/difftastic/index';
 import { RpcHandlerManager } from '../../api/rpc/RpcHandlerManager';
 import { validatePath } from './pathSecurity';
+import type { PermissionMode } from '@/api/types';
 
 const execAsync = promisify(exec);
+
+const gitStatusSyncDisableFile = join(homedir(), '.happy', 'disable-git-status-sync');
+const automaticGitStatusCommands = new Set([
+    'git rev-parse --is-inside-work-tree',
+    'git status --porcelain=v2 --branch --show-stash --untracked-files=all',
+    'git status --porcelain=v2 --branch --untracked-files=all',
+    'git diff --numstat',
+    'git diff --cached --numstat',
+]);
+
+function isAutomaticGitStatusSyncDisabled(command: string): boolean {
+    if (!automaticGitStatusCommands.has(command)) {
+        return false;
+    }
+    return process.env.HAPPY_DISABLE_GIT_STATUS_SYNC === '1' || existsSync(gitStatusSyncDisableFile);
+}
 
 interface BashRequest {
     command: string;
@@ -123,14 +142,18 @@ export interface SpawnSessionOptions {
     resume?: string;
     /** Title to restore when resuming a session */
     title?: string;
+    /** Marks titles whose write authority belongs to an external session controller. */
+    titleAuthority?: 'external';
     /** Happy session ID to restore (rejoin existing session instead of creating new) */
     restoreSessionId?: string;
     /** Mark this session as the daemon console session (lightweight, bang-command-only) */
     consoleSession?: boolean;
     approvedNewDirectoryCreation?: boolean;
     agent?: 'claude' | 'codex' | 'gemini';
+    permissionMode?: PermissionMode;
     token?: string;
     environmentVariables?: {
+        CODEX_HOME?: string;                // Exact persisted Codex profile for session restore
         // Anthropic Claude API configuration
         ANTHROPIC_BASE_URL?: string;        // Custom API endpoint (overrides default)
         ANTHROPIC_AUTH_TOKEN?: string;      // API authentication token
@@ -143,6 +166,8 @@ export interface SpawnSessionOptions {
         // Note: TMUX_TMPDIR is used by tmux to store socket files when default /tmp is not suitable
         // Common use case: When /tmp has limited space or different permissions
     };
+    /** Explicit XC child-provider replacement provenance, used only by the local daemon boundary. */
+    xcReplacement?: { sessionId: string; previousOpener: string; providerBinding: string };
 }
 
 export type SpawnSessionResult =
@@ -159,6 +184,15 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
     // Shell command handler - executes commands in the default shell
     rpcHandlerManager.registerHandler<BashRequest, BashResponse>('bash', async (data) => {
         logger.debug('Shell command request:', data.command);
+
+        if (isAutomaticGitStatusSyncDisabled(data.command)) {
+            logger.debug('Automatic git status sync is disabled:', data.command);
+            return {
+                success: false,
+                exitCode: 1,
+                error: `Automatic git status sync disabled by ${gitStatusSyncDisableFile}`,
+            };
+        }
 
         // Validate cwd if provided
         // Special case: "/" means "use shell's default cwd" (used by CLI detection)

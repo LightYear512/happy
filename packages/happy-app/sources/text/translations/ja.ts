@@ -453,13 +453,14 @@ export const ja: TranslationStructure = {
         },
         codexModel: {
             title: 'CODEXモデル',
+            default: 'CLI設定',
             gpt5CodexLow: 'gpt-5-codex 低',
             gpt5CodexMedium: 'gpt-5-codex 中',
             gpt5CodexHigh: 'gpt-5-codex 高',
-            gpt5Minimal: 'GPT-5 最小',
-            gpt5Low: 'GPT-5 低',
-            gpt5Medium: 'GPT-5 中',
-            gpt5High: 'GPT-5 高',
+            gpt5Minimal: 'GPT-5.6 最小',
+            gpt5Low: 'GPT-5.6 低',
+            gpt5Medium: 'GPT-5.6 中',
+            gpt5High: 'GPT-5.6 高',
         },
         geminiPermissionMode: {
             title: 'GEMINI権限モード',

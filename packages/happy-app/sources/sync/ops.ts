@@ -475,18 +475,45 @@ export async function sessionRipgrep(
 /**
  * Kill the session process immediately
  */
-export async function sessionKill(sessionId: string): Promise<SessionKillResponse> {
+export async function sessionKill(sessionId: string, machineId?: string): Promise<SessionKillResponse> {
+    let sessionFailure: SessionKillResponse = {
+        success: false,
+        message: 'Session RPC failed'
+    };
     try {
         const response = await apiSocket.sessionRPC<SessionKillResponse, {}>(
             sessionId,
             'killSession',
             {}
         );
-        return response;
+        if (response.success || !machineId) {
+            return response;
+        }
+        sessionFailure = response;
+    } catch (error) {
+        sessionFailure = {
+            success: false,
+            message: error instanceof Error ? error.message : 'Unknown error'
+        };
+        if (!machineId) {
+            return sessionFailure;
+        }
+    }
+
+    try {
+        const response = await apiSocket.machineRPC<{ message: string }, { sessionId: string }>(
+            machineId,
+            'stop-session',
+            { sessionId }
+        );
+        return {
+            success: true,
+            message: response.message
+        };
     } catch (error) {
         return {
             success: false,
-            message: error instanceof Error ? error.message : 'Unknown error'
+            message: error instanceof Error ? error.message : sessionFailure.message
         };
     }
 }

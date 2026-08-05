@@ -1,0 +1,129 @@
+{
+  "schemaVersion": "contract-first-module-gate/v1",
+  "module": "happy-server.sessionUpdateHandler",
+  "owner": "AT-0057",
+  "implementationPhase": "session-close-pending-input-recovery",
+  "publicApis": [
+    {
+      "name": "sessionUpdateHandler message/session-end lifecycle",
+      "inputs": ["user-scoped persisted message", "session-scoped persisted message", "session-end event", "daemon RPC listeners"],
+      "acceptedStates": ["active session with acknowledged input", "active session with unacknowledged input", "inactive session"],
+      "rejectedStates": ["expired wake trigger", "acknowledged wake trigger", "duplicate restore in progress", "missing daemon"],
+      "provenanceFields": ["session id", "user id", "authoritative session message sequence", "observed-at time"],
+      "outputState": "unchanged active session, closed session, or one acknowledged restored session",
+      "enforcement": "pending restore trigger registry plus sessionUpdateHandler message and session-end handlers",
+      "negativeTests": [
+        {
+          "name": "session-scoped response acknowledgement prevents close-time restore",
+          "file": "sources/app/api/socket/sessionUpdateHandler.spec.ts"
+        },
+        {
+          "name": "expired pending input cannot revive a later closed session",
+          "file": "sources/app/api/socket/sessionUpdateHandler.spec.ts"
+        }
+      ]
+    },
+    {
+      "name": "tryRestoreSession",
+      "inputs": ["session lifecycle record", "user id", "daemon RPC listener map"],
+      "acceptedStates": ["inactive", "zombie without live heartbeat"],
+      "rejectedStates": ["active and recent", "live heartbeat", "restore already in progress", "missing daemon"],
+      "provenanceFields": ["session id", "account id", "plain machine id", "agent resume id", "summary"],
+      "outputState": "daemon-acknowledged active restored session or false",
+      "enforcement": "tryRestoreSession",
+      "negativeTests": [
+        {
+          "name": "active recent session does not restore",
+          "file": "sources/app/api/socket/sessionUpdateHandler.spec.ts"
+        },
+        {
+          "name": "missing daemon does not claim restore",
+          "file": "sources/app/api/socket/sessionUpdateHandler.spec.ts"
+        }
+      ]
+    }
+  ],
+  "budgets": [
+    {
+      "field": "pending restore trigger TTL and maximum entry count",
+      "enforcement": "recordPendingRestoreTrigger and consumePendingRestoreTrigger",
+      "phase": "admission and cleanup",
+      "zeroTest": {
+        "name": "expired pending input cannot revive a later closed session",
+        "file": "sources/app/api/socket/sessionUpdateHandler.spec.ts"
+      },
+      "overflowTest": {
+        "name": "pending restore trigger registry evicts the oldest entry at capacity",
+        "file": "sources/app/api/socket/sessionUpdateHandler.spec.ts"
+      },
+      "errorKind": "expired or capacity-evicted wake trigger"
+    }
+  ],
+  "lifecycleTransitions": [
+    {
+      "from": "active session plus unacknowledged user message",
+      "to": "inactive then daemon-acknowledged restored session",
+      "creator": "user-scoped message handler",
+      "advancer": "session-end handler",
+      "consumer": "tryRestoreSession",
+      "rejectTests": [
+        {
+          "name": "pending user input restores when session-end wins the race",
+          "file": "sources/app/api/socket/sessionUpdateHandler.spec.ts"
+        }
+      ]
+    },
+    {
+      "from": "active session plus unacknowledged user message",
+      "to": "active session with acknowledged input",
+      "creator": "user-scoped message handler",
+      "advancer": "later session-scoped persisted message",
+      "consumer": "session-end handler",
+      "rejectTests": [
+        {
+          "name": "session-scoped response acknowledgement prevents close-time restore",
+          "file": "sources/app/api/socket/sessionUpdateHandler.spec.ts"
+        }
+      ]
+    }
+  ],
+  "provenanceFields": [
+    {
+      "field": "session id, user id, authoritative message sequence, observed-at time",
+      "boundByDigest": "notApplicable: in-process lifecycle registry consumes server-authoritative database sequence",
+      "independentValidation": "session id and user id equality plus monotonic message sequence comparison and TTL check",
+      "tamperTests": [
+        {
+          "name": "session-scoped response acknowledgement prevents close-time restore",
+          "file": "sources/app/api/socket/sessionUpdateHandler.spec.ts"
+        },
+        {
+          "name": "expired pending input cannot revive a later closed session",
+          "file": "sources/app/api/socket/sessionUpdateHandler.spec.ts"
+        }
+      ]
+    }
+  ],
+  "evidence": {
+    "designSections": ["## Module lock", "## Contract", "## Event ordering", "## Validation", "## Non-goals"],
+    "reviewTests": [
+      {
+        "name": "pending user input restores when session-end wins the race",
+        "file": "sources/app/api/socket/sessionUpdateHandler.spec.ts"
+      },
+      {
+        "name": "session-scoped response acknowledgement prevents close-time restore",
+        "file": "sources/app/api/socket/sessionUpdateHandler.spec.ts"
+      },
+      {
+        "name": "expired pending input cannot revive a later closed session",
+        "file": "sources/app/api/socket/sessionUpdateHandler.spec.ts"
+      }
+    ],
+    "commands": [
+      "yarn --cwd packages/happy-server vitest run sources/app/api/socket/sessionUpdateHandler.spec.ts",
+      "yarn --cwd packages/happy-server build",
+      "node /Users/layaboxniu/xiework/jsbrowser/.agents/htask/gates/contract-first-module-gate.mjs --matrix packages/happy-server/sessionUpdateHandler.contract-matrix.AT-0057.json --design .claude/designs/AT-0057-happy-server-session-restore-race.md"
+    ]
+  }
+}

@@ -40,6 +40,7 @@ yarn-error.*
 
 # typescript
 *.tsbuildinfo
+/packages/happy-cli/src/**/*.js
 
 .claude/settings.local.json
 .plan

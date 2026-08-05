@@ -74,10 +74,13 @@ const sandboxConfig: SandboxConfig = {
 
 describe('CodexMcpClient sandbox integration', () => {
     const originalRustLog = process.env.RUST_LOG;
+    const originalCodexHome = process.env.CODEX_HOME;
 
     beforeEach(() => {
         vi.clearAllMocks();
         process.env.RUST_LOG = originalRustLog;
+        if (originalCodexHome === undefined) delete process.env.CODEX_HOME;
+        else process.env.CODEX_HOME = originalCodexHome;
         mockExecSync.mockReturnValue('codex-cli 0.43.0');
         mockClientConnect.mockResolvedValue(undefined);
         mockClientClose.mockResolvedValue(undefined);
@@ -87,6 +90,8 @@ describe('CodexMcpClient sandbox integration', () => {
 
     afterAll(() => {
         process.env.RUST_LOG = originalRustLog;
+        if (originalCodexHome === undefined) delete process.env.CODEX_HOME;
+        else process.env.CODEX_HOME = originalCodexHome;
     });
 
     it.skipIf(process.platform === 'win32')('wraps MCP transport when sandbox is enabled', async () => {
@@ -151,5 +156,19 @@ describe('CodexMcpClient sandbox integration', () => {
                 }),
             }),
         );
+    });
+
+    it('reconnects with the newly selected Codex account environment', async () => {
+        process.env.CODEX_HOME = '/accounts/old';
+        const client = new CodexMcpClient();
+        await client.connect();
+
+        process.env.CODEX_HOME = '/accounts/new';
+        await client.reconnect();
+
+        expect(mockClientConnect).toHaveBeenCalledTimes(2);
+        expect(mockClientClose).toHaveBeenCalledTimes(1);
+        expect(mockStdioCtor.mock.calls.map(([options]) => options.env.CODEX_HOME))
+            .toEqual(['/accounts/old', '/accounts/new']);
     });
 });

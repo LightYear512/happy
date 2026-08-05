@@ -13,6 +13,7 @@ import os from 'node:os';
 import { join, resolve } from 'node:path';
 
 import { ApiClient } from '@/api/api';
+import { modelFacingUserText } from '@/api/types';
 import { logger } from '@/ui/logger';
 import { Credentials, readSettings } from '@/persistence';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
@@ -51,6 +52,7 @@ import {
   formatOptionsXml,
 } from '@/gemini/utils/optionsParser';
 import { ConversationHistory } from '@/gemini/utils/conversationHistory';
+import { rejectUnsupportedGeminiRestore } from './restorePolicy';
 
 
 /**
@@ -59,7 +61,9 @@ import { ConversationHistory } from '@/gemini/utils/conversationHistory';
 export async function runGemini(opts: {
   credentials: Credentials;
   startedBy?: 'daemon' | 'terminal';
+  restoreSessionId?: string;
 }): Promise<void> {
+  rejectUnsupportedGeminiRestore(opts.restoreSessionId);
   //
   // Define session
   //
@@ -262,7 +266,7 @@ export async function runGemini(opts: {
 
     // Build the full prompt with appendSystemPrompt if provided
     // Only include system prompt for the first message to avoid forcing tool usage on every message
-    const originalUserMessage = message.content.text;
+    const originalUserMessage = modelFacingUserText(message);
     let fullPrompt = originalUserMessage;
     if (isFirstMessage && message.meta?.appendSystemPrompt) {
       // Prepend system prompt to user message only for first message

@@ -139,9 +139,9 @@ describe('buildConsoleWelcome', () => {
     it('includes commands available in console (not sessionOnly)', () => {
         const joined = buildConsoleWelcome().suggestions!.join('\n');
         // These are consoleOnly or shared commands
-        expect(joined).toContain('@aa｜🔑切换Claude账号');
+        expect(joined).toContain('@aa｜🔑设置Claude全局账号');
         expect(joined).toContain('@u｜⏱️查看Claude 用量');
-        expect(joined).toContain('@aa-codex｜🔑切换codex账号');
+        expect(joined).toContain('@aa-codex｜🔑设置Codex全局账号');
         expect(joined).toContain('@u-codex｜⏱️查看codex用量');
         expect(joined).toContain('❇️ @ 主菜单');
         expect(joined).not.toContain('!usage (!u)');
@@ -172,14 +172,14 @@ describe('buildConsoleWelcome', () => {
 
     it('shows auth-all in the welcome listing (not hidden)', () => {
         const joined = buildConsoleWelcome().suggestions!.join('\n');
-        expect(joined).toContain('@aa｜🔑切换Claude账号');
-        expect(joined).toContain('@aa-codex｜🔑切换codex账号');
+        expect(joined).toContain('@aa｜🔑设置Claude全局账号');
+        expect(joined).toContain('@aa-codex｜🔑设置Codex全局账号');
     });
 
     it('suggestions list console-available commands', () => {
         const suggestions = buildConsoleWelcome().suggestions!;
-        expect(suggestions).toContain('@aa｜🔑切换Claude账号');
-        expect(suggestions).toContain('@aa-codex｜🔑切换codex账号');
+        expect(suggestions).toContain('@aa｜🔑设置Claude全局账号');
+        expect(suggestions).toContain('@aa-codex｜🔑设置Codex全局账号');
         expect(suggestions).not.toContain('@l');
         expect(suggestions).not.toContain('@l-codex');
         expect(suggestions).toContain('@u｜⏱️查看Claude 用量');

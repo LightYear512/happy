@@ -8,21 +8,23 @@ import {
     ReplyMonitorRuntime,
     TASK_MESSAGE_REMINDER_INTERVAL_MS,
     formatTaskMessagePlainNotification,
+    isXcTitleOwnedSession,
     readReplyMonitorBinding,
     sendTaskMessageToSession,
     type TaskMessageRecord,
 } from './replyMonitorRuntime';
-import { buildHtaskPromptPayload, resolveHtaskHappyId } from './htaskCommand';
+import { buildHtaskClaudeEnvironment, buildHtaskPromptPayload, resolveHtaskHappyId } from './htaskCommand';
 
 function createMonitor(options?: {
     enabled?: () => boolean;
     canonical?: () => string | null;
     messages?: () => TaskMessageRecord[] | Promise<TaskMessageRecord[]>;
-    deliver?: (messageId: string) => string | null | Promise<string | null>;
+    deliver?: (messageId: string) => { queueText: string | null } | null | Promise<{ queueText: string | null } | null>;
     initialTitle?: string | null;
     now?: () => number;
     pollMs?: number;
     taskMessageReminderMs?: number;
+    ownsTitle?: () => boolean;
 }) {
     const titles: string[] = [];
     const taskMessages: string[] = [];
@@ -36,6 +38,7 @@ function createMonitor(options?: {
         pendingMessages: options?.messages,
         deliverMessage: options?.deliver,
         taskMessageReminderMs: options?.taskMessageReminderMs,
+        ownsCanonicalTitle: options?.ownsTitle,
         currentTitle: () => current,
         now: options?.now,
         sendTitle: title => {
@@ -190,7 +193,7 @@ describe('ReplyMonitorRuntime', () => {
 
     it('delivers one pending task message on the scanner poll', async () => {
         vi.useFakeTimers();
-        const deliver = vi.fn(() => 'htask inject text');
+        const deliver = vi.fn(() => ({ queueText: null }));
         const { monitor, taskMessages, enqueuedTaskMessages } = createMonitor({
             messages: () => [{
                 message_id: 'TM-1',
@@ -205,18 +208,18 @@ describe('ReplyMonitorRuntime', () => {
         await vi.advanceTimersByTimeAsync(2_000);
         expect(deliver).toHaveBeenCalledTimes(1);
         expect(deliver).toHaveBeenCalledWith('TM-1');
-        expect(enqueuedTaskMessages).toEqual(['htask inject text']);
+        expect(enqueuedTaskMessages).toEqual([]);
         expect(taskMessages).toEqual([taskMessageOptions()]);
         expect(taskMessages[0]).not.toContain('message_id=');
         monitor.dispose();
     });
 
-    it('does not repeat UI reminders after a task message is delivered to the model', async () => {
+    it('does not duplicate a freshly transported task message into the local model queue', async () => {
         vi.useFakeTimers();
         let status = 'pending';
         const deliver = vi.fn(() => {
             status = 'delivered';
-            return 'htask inject text';
+            return { queueText: null };
         });
         const { monitor, taskMessages, enqueuedTaskMessages } = createMonitor({
             taskMessageReminderMs: 10_000,
@@ -233,18 +236,19 @@ describe('ReplyMonitorRuntime', () => {
         await vi.advanceTimersByTimeAsync(2_000);
         await vi.advanceTimersByTimeAsync(2_000);
         expect(deliver).toHaveBeenCalledTimes(1);
-        expect(enqueuedTaskMessages).toEqual(['htask inject text']);
+        expect(enqueuedTaskMessages).toEqual([]);
         expect(taskMessages).toEqual([taskMessageOptions()]);
         await vi.advanceTimersByTimeAsync(7_999);
         expect(taskMessages).toHaveLength(1);
         await vi.advanceTimersByTimeAsync(1);
-        expect(taskMessages).toEqual([taskMessageOptions()]);
-        expect(enqueuedTaskMessages).toEqual(['htask inject text']);
+        expect(taskMessages).toEqual([taskMessageOptions(), taskMessageOptions()]);
+        expect(enqueuedTaskMessages).toEqual([]);
         monitor.dispose();
     });
 
-    it('ignores already delivered task messages in the background UI prompt path', async () => {
+    it('recovers an unhandled delivered task message into the model queue once per runtime', async () => {
         vi.useFakeTimers();
+        const deliver = vi.fn(() => ({ queueText: 'recovered htask inject text' }));
         const { monitor, taskMessages, enqueuedTaskMessages } = createMonitor({
             taskMessageReminderMs: 10_000,
             messages: () => [{
@@ -254,16 +258,19 @@ describe('ReplyMonitorRuntime', () => {
                 created_at: '2026-06-13T15:46:03',
                 body: 'hello',
             }],
+            deliver,
         });
 
         await vi.advanceTimersByTimeAsync(2_000);
         await vi.advanceTimersByTimeAsync(2_000);
-        expect(enqueuedTaskMessages).toEqual([]);
-        expect(taskMessages).toEqual([]);
+        expect(deliver).toHaveBeenCalledTimes(1);
+        expect(enqueuedTaskMessages).toEqual(['recovered htask inject text']);
+        expect(taskMessages).toEqual([taskMessageOptions()]);
         await vi.advanceTimersByTimeAsync(7_999);
-        expect(taskMessages).toHaveLength(0);
+        expect(taskMessages).toHaveLength(1);
         await vi.advanceTimersByTimeAsync(1);
-        expect(taskMessages).toEqual([]);
+        expect(taskMessages).toEqual([taskMessageOptions(), taskMessageOptions()]);
+        expect(enqueuedTaskMessages).toEqual(['recovered htask inject text']);
         monitor.dispose();
     });
 
@@ -315,7 +322,7 @@ describe('ReplyMonitorRuntime', () => {
                 created_at: '2026-06-13T15:46:03',
                 body: 'hello',
             }],
-            deliverMessage: () => 'htask inject text',
+            deliverMessage: () => ({ queueText: null }),
             currentTitle: () => null,
             sendTitle: () => undefined,
             sendTaskMessage: (markdown, fallback, options) => calls.push({ markdown, fallback, options }),
@@ -384,7 +391,7 @@ describe('ReplyMonitorRuntime', () => {
         ];
         const deliver = vi.fn(() => {
             messages = [];
-            return 'htask inject text';
+            return { queueText: 'htask inject text' };
         });
         const { monitor, taskMessages, enqueuedTaskMessages } = createMonitor({
             messages: () => messages,
@@ -411,6 +418,66 @@ describe('ReplyMonitorRuntime', () => {
         expect(titles).toEqual(['🔵 [0001-任务 0/1] 做事']);
         expect(taskMessages).toEqual([]);
         monitor.dispose();
+    });
+
+    it('leaves an XC-owned title untouched while continuing task message delivery', async () => {
+        vi.useFakeTimers();
+        const canonical = vi.fn(() => '🔵 [0001-任务 0/1] 做事');
+        const deliver = vi.fn(() => ({ queueText: 'htask inject text' }));
+        const { monitor, titles, enqueuedTaskMessages } = createMonitor({
+            ownsTitle: () => false,
+            canonical,
+            messages: () => [{ message_id: 'TM-1', status: 'pending' }],
+            deliver,
+        });
+
+        await vi.advanceTimersByTimeAsync(2_000);
+        expect(canonical).not.toHaveBeenCalled();
+        expect(titles).toEqual([]);
+        expect(deliver).toHaveBeenCalledTimes(1);
+        expect(enqueuedTaskMessages).toEqual(['htask inject text']);
+        monitor.dispose();
+    });
+
+    it('recognizes XC title ownership only from a matching durable real and virtual binding', () => {
+        const root = mkdtempSync(join(tmpdir(), 'reply-monitor-xc-owner-'));
+        try {
+            mkdirSync(join(root, '.virtual-session', 'runtime', 'real-sessions', 'happy'), { recursive: true });
+            mkdirSync(join(root, '.virtual-session', 'sessions', 'VS-NATIVE-1'), { recursive: true });
+            writeFileSync(
+                join(root, '.virtual-session', 'runtime', 'real-sessions', 'happy', 'NATIVE-1.json'),
+                JSON.stringify({
+                    schema: 'virtual-session.real-session-binding.v1',
+                    provider: 'happy',
+                    nativeSessionId: 'NATIVE-1',
+                    virtualSessionId: 'VS-NATIVE-1',
+                    active: true,
+                }),
+            );
+            writeFileSync(
+                join(root, '.virtual-session', 'sessions', 'VS-NATIVE-1', 'session.json'),
+                JSON.stringify({
+                    schema: 'virtual-session.session.v1',
+                    id: 'VS-NATIVE-1',
+                    taskBinding: { taskId: 'AT-0045', generation: 3 },
+                }),
+            );
+
+            expect(isXcTitleOwnedSession(root, 'NATIVE-1')).toBe(true);
+            expect(isXcTitleOwnedSession(root, 'NATIVE-2')).toBe(false);
+
+            writeFileSync(
+                join(root, '.virtual-session', 'sessions', 'VS-NATIVE-1', 'session.json'),
+                JSON.stringify({
+                    schema: 'virtual-session.session.v1',
+                    id: 'VS-FOREIGN',
+                    taskBinding: { taskId: 'AT-0045', generation: 3 },
+                }),
+            );
+            expect(isXcTitleOwnedSession(root, 'NATIVE-1')).toBe(false);
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
     });
 
     it('resolves native session ids to stable htask happy ids through session-config', () => {
@@ -521,5 +588,17 @@ describe('ReplyMonitorRuntime', () => {
             native_session_id: 'NATIVE-OLD',
             prompt: '@reply-monitor',
         });
+    });
+
+    it('builds a child-only htask identity environment from the Happy native session', () => {
+        const base = { EXISTING: 'kept', HTASK_SESSION_CONFIG_ID: 'stale' };
+        const originalProcessValue = process.env.HTASK_SESSION_CONFIG_ID;
+
+        expect(buildHtaskClaudeEnvironment('NATIVE-CURRENT', base)).toEqual({
+            EXISTING: 'kept',
+            HTASK_SESSION_CONFIG_ID: 'NATIVE-CURRENT',
+        });
+        expect(base.HTASK_SESSION_CONFIG_ID).toBe('stale');
+        expect(process.env.HTASK_SESSION_CONFIG_ID).toBe(originalProcessValue);
     });
 });

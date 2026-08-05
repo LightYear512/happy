@@ -3,10 +3,11 @@ import { encodeBase64, encrypt } from '@/api/encryption';
 import { fetchAndInjectPendingMessages } from './fetchPendingMessages';
 
 const key = new Uint8Array(32);
-const encrypted = (id: string, seq: number, body: unknown, createdAt = Date.now() - 10_000) => ({
+const encrypted = (id: string, seq: number, body: unknown, createdAt = Date.now() - 10_000,
+    localId: string | null = null) => ({
     id,
     seq,
-    localId: null,
+    localId,
     createdAt,
     content: { t: 'encrypted', c: encodeBase64(encrypt(key, 'legacy', body)) },
 });
@@ -29,6 +30,27 @@ describe('fetchAndInjectPendingMessages', () => {
         await expect(fetchAndInjectPendingMessages(api, session, 'session-1', key, 'legacy', '[test]'))
             .resolves.toBe(2);
         expect(injected).toEqual([11, 12]);
+    });
+
+    it('HSR restores a persisted CLI Mail command with its verified local identity', async () => {
+        const localId = `xc-msg-v1-${'a'.repeat(64)}`;
+        const rows = [
+            encrypted('u-11', 11, { role: 'user', content: { type: 'text', text: 'Mail command' },
+                meta: { sentFrom: 'cli', presentation: 'compact', modelText: 'verified command' } },
+            Date.now() - 10_000, localId),
+            encrypted('a-10', 10, { role: 'agent', content: { type: 'codex', data: { type: 'message', message: 'old' } } }),
+        ];
+        const injected: string[] = [];
+        const api = { getSessionMessages: vi.fn().mockResolvedValue(rows) } as any;
+        const session = {
+            waitForConnect: vi.fn().mockResolvedValue(undefined),
+            injectPendingPersistedUserMessage: vi.fn((row) => { injected.push(row.localId); return true; }),
+            markRestoreRecoveryFailed: vi.fn(),
+        } as any;
+
+        await expect(fetchAndInjectPendingMessages(api, session, 'session-1', key, 'legacy', '[test]'))
+            .resolves.toBe(1);
+        expect(injected).toEqual([localId]);
     });
 
     it('HSR fails closed when a full recent window contains no processed-response boundary', async () => {

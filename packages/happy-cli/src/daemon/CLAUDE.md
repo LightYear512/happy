@@ -15,7 +15,7 @@ Control Flow:
 4. `startDaemon()` performs startup:
    - Sets up shutdown promise and handlers (SIGINT, SIGTERM, uncaughtException, unhandledRejection)
    - Version check: `isDaemonRunningSameVersion()` reads daemon.state.json, compares `startedWithCliVersion` with `configuration.currentCliVersion`
-   - If version mismatch: calls `stopDaemon()` to kill old daemon before proceeding
+   - If version mismatch: calls `stopDaemon()` to drain the old daemon before proceeding
    - If same version running: exits with "Daemon already running"
    - Lock acquisition: `acquireDaemonLock()` creates exclusive lock file to prevent multiple daemons
    - Authentication: `authAndSetupMachineIfNeeded()` ensures credentials exist
@@ -44,10 +44,10 @@ The daemon detects when `npm upgrade happy-coder` occurs:
 1. Heartbeat reads package.json from disk
 2. Compares `JSON.parse(package.json).version` with compiled `configuration.currentCliVersion`
 3. If mismatch detected:
-   - Spawns new daemon via `spawnHappyCLI(['daemon', 'start'])`
-   - Hangs and waits to be killed
+   - Defers the upgrade while any user child remains active
+   - Spawns new daemon via `spawnHappyCLI(['daemon', 'start'])` only after the user-child census is empty
 4. New daemon starts, sees old daemon.state.json version != its compiled version
-5. New daemon calls `stopDaemon()` which tries HTTP `/stop`, falls back to SIGKILL
+5. New daemon calls `stopDaemon()`; shutdown fails closed if a user child appeared during the handoff
 6. New daemon takes over
 
 ### Stopping the Daemon
@@ -57,13 +57,16 @@ Command: `happy daemon stop`
 Control Flow:
 1. `stopDaemon()` in `controlClient.ts` reads daemon.state.json
 2. Attempts graceful shutdown via HTTP POST to `/stop`
+   - Plain stop is deferred while user sessions remain active
+   - `--kill-sessions` preflights that every target is owned by the current daemon
+   - A failed target blocks shutdown and never falls back to killing only the daemon
 3. Daemon receives request, calls `cleanupAndShutdown()`:
    - Updates backend status to "shutting-down"
    - Closes WebSocket connection
    - Stops HTTP server
    - Deletes daemon.state.json
    - Releases lock file
-4. If HTTP fails, falls back to `process.kill(pid, 'SIGKILL')`
+4. If HTTP fails while the daemon PID is still alive, shutdown fails closed; a dead PID is treated as stopped and startup later reclaims stale state
 
 ## 2. Session Management
 
@@ -171,7 +174,9 @@ I do not like how
 - posts helpers for daemon do not return typed results
 - I don't like that daemonPost returns either response from daemon or { error: ... }. We should have consistent envelope type
 
-- we loose track of children processes when daemon exits / restarts - we should write them to the same state file? At least the pids should be there for doctor & cleanup
+- restored daemon-spawned processes are rediscovered after daemon restart from
+  their unique exact restore argument and open restore authority; fresh sessions
+  without that durable argument still self-report through the input path
 
 - caffeinate process is not tracked in state at all & might become runaway
 - caffeinate is also started by individual sesions - we should not do that for simpler cleanup 
@@ -449,7 +454,3 @@ Authorization: Bearer <token>
    - Clients only receive updates for fields that changed
 
 5. **RPC Pattern**: Machine-scoped RPC methods prefixed with machineId (like sessions)
-
-
-
-

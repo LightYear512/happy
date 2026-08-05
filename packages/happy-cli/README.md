@@ -116,6 +116,15 @@ happy acp opencode --verbose         # Include raw backend/envelope logs
 happy acp -- custom-agent --flag     # Run any ACP-compatible command directly
 ```
 
+### Project XC v2 startup
+
+When the current workspace contains `xcoding-v2/dist/cli.js`, a Happy Codex
+session starts that project's XC v2 virtual session before the model thread
+exists, using the verified Happy session ID. The first real Codex thread then
+runs the project's canonical `host input` path and upgrades the same virtual
+session in place. Projects without XC v2 are unchanged, and startup/input
+failures are shown in the Happy session instead of being silently skipped.
+
 ### Sandbox Subcommands
 
 ```bash
@@ -160,8 +169,8 @@ When inside a Happy session, you can use bang commands to manage sessions and pr
 
 These commands are only available in the console (multi-session) mode:
 
-- `!auth-all <name>` – Switch all sessions on this machine to a CCS profile
-- `!restart-all` – Restart all sessions
+- `!auth-all <name>` – Record the global CCS profile. Existing sessions are not interrupted; each applies a newer setting immediately before its next real input.
+- `!auth-all --codex <name>` – Apply the same input-boundary behavior to Codex sessions.
 
 ## MCP Server
 

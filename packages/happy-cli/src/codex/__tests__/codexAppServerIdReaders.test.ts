@@ -1,8 +1,27 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { isCuid } from '@paralleldrive/cuid2';
-import { readThreadId, readTurnId } from '../runCodexAppServer';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { readThreadId, readTurnId, toSandboxPolicy } from '../runCodexAppServer';
 import { createAppServerStreamBridge, type AppServerStreamUpdate } from '../appServerStreamBridge';
 import { logger } from '@/ui/logger';
+
+describe('toSandboxPolicy', () => {
+    it('workspace-write admits only the workspace and XC global state', () => {
+        expect(toSandboxPolicy('workspace-write', '/workspace')).toEqual({
+            type: 'workspaceWrite',
+            writableRoots: ['/workspace', join(homedir(), '.xcoding-v2')],
+            readOnlyAccess: { type: 'fullAccess' },
+            networkAccess: true,
+            excludeTmpdirEnvVar: false,
+            excludeSlashTmp: false,
+        });
+        expect(toSandboxPolicy('read-only', '/workspace')).toEqual({
+            type: 'readOnly', access: { type: 'fullAccess' }, networkAccess: true,
+        });
+        expect(toSandboxPolicy('danger-full-access', '/workspace')).toEqual({ type: 'dangerFullAccess' });
+    });
+});
 
 // Regression suite for codex 0.130.0 protocol drift: notifications switched
 // from camelCase `turnId` / `threadId` to snake_case `turn_id` / `thread_id`.

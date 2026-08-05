@@ -45,6 +45,16 @@ export function currentHappyId(ctx: BangCommandContext): string {
     return (clientSessionId || process.env.HTASK_SESSION_CONFIG_ID || process.env.HAPPY_SESSION_ID || '').trim();
 }
 
+export function buildHtaskClaudeEnvironment(
+    nativeSessionId: string,
+    base: Record<string, string> = {},
+): Record<string, string> {
+    const sessionId = nativeSessionId.trim();
+    return sessionId
+        ? { ...base, HTASK_SESSION_CONFIG_ID: sessionId }
+        : { ...base };
+}
+
 function isSafeHtaskRef(value: unknown): value is string {
     return typeof value === 'string' && HTASK_SAFE_REF.test(value);
 }

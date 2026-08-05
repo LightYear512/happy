@@ -1,7 +1,5 @@
-import { writeFileSync } from 'node:fs';
 import { logger } from '@/ui/logger';
 import { getCurrentCcsProfile, getCurrentCodexProfile } from './ccsProfiles';
-import { configuration } from '@/configuration';
 import type { BangCommandContext, BangCommandResult } from './types';
 
 /**
@@ -15,9 +13,8 @@ export async function handleRestartBangCommand(args: string, ctx: BangCommandCon
 
     if (ctx.isConsoleSession) {
         return {
-            message: ['ℹ️ 控制台中请使用 !restart-all 重启全部会话'],
+            message: ['ℹ️ 控制台不批量重启会话；请在目标会话中使用 !restart'],
             action: 'none',
-            suggestions: ['!restart-all'],
         };
     }
 
@@ -40,15 +37,6 @@ export async function handleRestartBangCommand(args: string, ctx: BangCommandCon
 }
 
 /**
- * Handle the `!restart-all` bang command (console only).
- *
- * Broadcast restart to all sessions on this machine.
- */
-export async function handleRestartAllBangCommand(_args: string, _ctx: BangCommandContext): Promise<BangCommandResult> {
-    return restartAll();
-}
-
-/**
  * Restart the current session only.
  */
 function restartCurrent(flavor?: 'claude' | 'codex' | 'gemini'): BangCommandResult {
@@ -58,29 +46,4 @@ function restartCurrent(flavor?: 'claude' | 'codex' | 'gemini'): BangCommandResu
     logger.debug(`[!restart] Restarting current session${profileLabel} [flavor=${flavor ?? 'claude'}]`);
 
     return { message: `🔄 正在重启会话${profileLabel}`, action: 'restart-session' };
-}
-
-/**
- * Restart all sessions on this machine by writing a timestamp to the
- * restart-signal file. Other sessions detect this via fs.watch and restart.
- * Console doesn't need restart-session since it has no Claude SDK.
- */
-function restartAll(): BangCommandResult {
-    const currentProfile = getCurrentCcsProfile();
-    const profileLabel = currentProfile ? ` (${currentProfile})` : '';
-
-    logger.debug(`[!restart] Broadcasting restart to all sessions${profileLabel}`);
-
-    try {
-        writeFileSync(configuration.restartSignalFile, Date.now().toString(), 'utf-8');
-        logger.debug(`[!restart] Wrote restart signal: ${configuration.restartSignalFile}`);
-    } catch (err) {
-        logger.debug('[!restart] Failed to write restart signal file:', err);
-        return {
-            message: ['❌ 广播重启信号失败'],
-            action: 'none',
-        };
-    }
-
-    return { message: `🔄 已广播重启信号到全部会话${profileLabel}`, action: 'none' };
 }

@@ -402,16 +402,30 @@ export function sessionRoutes(app: Fastify) {
         schema: {
             params: z.object({
                 sessionId: z.string()
-            })
+            }),
+            querystring: z.object({
+                expectedAccountId: z.string().min(1),
+                before: z.coerce.number().int().nonnegative()
+            }).optional()
         },
         preHandler: app.authenticate
     }, async (request, reply) => {
         const userId = request.userId;
         const { sessionId } = request.params;
+        const condition = request.query;
+        if (condition && condition.before >= Date.now()) {
+            return reply.code(400).send({ error: 'Session deletion cutoff must be in the past' });
+        }
 
-        const deleted = await sessionDelete({ uid: userId }, sessionId);
+        const result = await sessionDelete({ uid: userId }, sessionId, condition ? {
+            expectedAccountId: condition.expectedAccountId,
+            before: new Date(condition.before)
+        } : undefined);
 
-        if (!deleted) {
+        if (result === 'precondition-failed') {
+            return reply.code(409).send({ error: 'Session deletion precondition failed' });
+        }
+        if (result === 'not-found' && !condition) {
             return reply.code(404).send({ error: 'Session not found or not owned by user' });
         }
 

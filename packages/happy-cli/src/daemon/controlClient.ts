@@ -5,11 +5,12 @@
 
 import { logger } from '@/ui/logger';
 import { clearDaemonState, readDaemonState } from '@/persistence';
-import { Metadata } from '@/api/types';
+import type { Metadata, PermissionMode } from '@/api/types';
 import { projectPath } from '@/projectPath';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import { configuration } from '@/configuration';
+import type { SessionTransportHealthRecord } from '@/api/sessionTransportHealth';
 
 async function daemonPost(path: string, body?: any): Promise<{ error?: string } | any> {
   const state = await readDaemonState();
@@ -61,16 +62,28 @@ async function daemonPost(path: string, body?: any): Promise<{ error?: string } 
 
 export async function notifyDaemonSessionStarted(
   sessionId: string,
-  metadata: Metadata
+  metadata: Metadata,
+  readyProviderSessionId?: string,
+  transportHealth?: SessionTransportHealthRecord | null,
 ): Promise<{ error?: string } | any> {
   return await daemonPost('/session-started', {
     sessionId,
-    metadata
+    metadata,
+    ...(readyProviderSessionId ? { readyProviderSessionId } : {}),
+    ...(transportHealth !== undefined ? { transportHealth } : {}),
   });
+}
+
+export async function notifyDaemonCodexProfile(
+  sessionId: string,
+  profileName: string,
+): Promise<{ error?: string } | any> {
+  return await daemonPost('/session-codex-profile', { sessionId, profileName });
 }
 
 export async function listDaemonSessions(): Promise<any[]> {
   const result = await daemonPost('/list');
+  if (result.error) throw new Error(result.error);
   return result.children || [];
 }
 
@@ -79,42 +92,40 @@ export async function stopDaemonSession(sessionId: string): Promise<boolean> {
   return result.success || false;
 }
 
-export async function spawnDaemonSession(directory: string, sessionId?: string, resume?: string, title?: string): Promise<any> {
-  const result = await daemonPost('/spawn-session', { directory, sessionId, resume, title });
+export async function restoreDaemonSession(
+  sessionId: string,
+  permissionMode?: PermissionMode,
+): Promise<any> {
+  return await daemonPost('/restore-session', { sessionId, permissionMode });
+}
+
+export async function spawnDaemonSession(
+  directory: string,
+  restoreSessionId?: string,
+  resume?: string,
+  title?: string,
+  agent?: 'claude' | 'codex' | 'gemini'
+): Promise<any> {
+  const result = await daemonPost('/spawn-session', {
+    directory,
+    sessionId: restoreSessionId,
+    resume,
+    title,
+    agent,
+  });
   return result;
 }
 
-export async function stopDaemonHttp(options?: { stopSessions?: boolean }): Promise<void> {
-  await daemonPost('/stop', options?.stopSessions ? { stopSessions: true } : undefined);
+export async function stopDaemonHttp(options?: { stopSessions?: boolean }): Promise<'stopping' | 'blocked'> {
+  const result = await daemonPost('/stop', options?.stopSessions ? { stopSessions: true } : undefined);
+  if (result.error) throw new Error(result.error);
+  if (result.status !== 'stopping' && result.status !== 'blocked') {
+    throw new Error('Daemon returned an invalid shutdown result');
+  }
+  return result.status;
 }
 
-/**
- * The version check is still quite naive.
- * For instance we are not handling the case where we upgraded happy,
- * the daemon is still running, and it recieves a new message to spawn a new session.
- * This is a tough case - we need to somehow figure out to restart ourselves,
- * yet still handle the original request.
- * 
- * Options:
- * 1. Periodically check during the health checks whether our version is the same as CLIs version. If not - restart.
- * 2. Wait for a command from the machine session, or any other signal to
- * check for version & restart.
- *   a. Handle the request first
- *   b. Let the request fail, restart and rely on the client retrying the request
- * 
- * I like option 1 a little better.
- * Maybe we can ... wait for it ... have another daemon to make sure 
- * our daemon is always alive and running the latest version.
- * 
- * That seems like an overkill and yet another process to manage - lets not do this :D
- * 
- * TODO: This function should return a state object with
- * clear state - if it is running / or errored out or something else.
- * Not just a boolean.
- * 
- * We can destructure the response on the caller for richer output.
- * For instance when running `happy daemon status` we can show more information.
- */
+/** Check whether daemon state currently points at a live process. */
 export async function checkIfDaemonRunningAndCleanupStaleState(): Promise<boolean> {
   const state = await readDaemonState();
   if (!state) {
@@ -161,23 +172,6 @@ export async function isDaemonRunningCurrentlyInstalledHappyVersion(): Promise<b
     
     logger.debug(`[DAEMON CONTROL] Current CLI version: ${currentCliVersion}, Daemon started with version: ${state.startedWithCliVersion}`);
     return currentCliVersion === state.startedWithCliVersion;
-    
-    // PREVIOUS IMPLEMENTATION - Keeping this commented in case we need it
-    // Kirill does not understand how the upgrade of npm packages happen and whether 
-    // we will get a new path or not when happy-coder is upgraded globally.
-    // If reading package.json doesn't work correctly after npm upgrades, 
-    // we can revert to spawning a process (but should add timeout and cleanup!)
-    /*
-    const { spawnHappyCLI } = await import('@/utils/spawnHappyCLI');
-    const happyProcess = spawnHappyCLI(['--version'], { stdio: 'pipe' });
-    let version: string | null = null;
-    happyProcess.stdout?.on('data', (data) => {
-      version = data.toString().trim();
-    });
-    await new Promise(resolve => happyProcess.stdout?.on('close', resolve));
-    logger.debug(`[DAEMON CONTROL] Current CLI version: ${version}, Daemon started with version: ${state.startedWithCliVersion}`);
-    return version === state.startedWithCliVersion;
-    */
   } catch (error) {
     logger.debug('[DAEMON CONTROL] Error checking daemon version', error);
     return false;
@@ -193,37 +187,41 @@ export async function cleanupDaemonState(): Promise<void> {
   }
 }
 
-export async function stopDaemon(options?: { stopSessions?: boolean }) {
+export async function stopDaemon(options?: { stopSessions?: boolean }): Promise<boolean> {
   try {
     const state = await readDaemonState();
     if (!state) {
       logger.debug('No daemon state found');
-      return;
+      return true;
     }
 
     logger.debug(`Stopping daemon with PID ${state.pid}`, { stopSessions: options?.stopSessions });
 
     // Try HTTP graceful stop
     try {
-      await stopDaemonHttp(options);
+      const status = await stopDaemonHttp(options);
+      if (status === 'blocked') {
+        logger.debug('Daemon refused an unsafe shutdown request');
+        return false;
+      }
 
       // Wait for daemon to die (allow more time when stopping sessions)
       await waitForProcessDeath(state.pid, options?.stopSessions ? 10000 : 2000);
       logger.debug('Daemon stopped gracefully via HTTP');
-      return;
+      return true;
     } catch (error) {
-      logger.debug('HTTP stop failed, will force kill', error);
-    }
-
-    // Force kill
-    try {
-      process.kill(state.pid, 'SIGKILL');
-      logger.debug('Force killed daemon');
-    } catch (error) {
-      logger.debug('Daemon already dead');
+      try {
+        process.kill(state.pid, 0);
+      } catch {
+        logger.debug('Daemon was already dead; stale state can be reclaimed by startup');
+        return true;
+      }
+      logger.debug('Refusing to kill a live daemon after graceful shutdown failed', error);
+      return false;
     }
   } catch (error) {
     logger.debug('Error stopping daemon', error);
+    return false;
   }
 }
 

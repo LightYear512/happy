@@ -8,8 +8,11 @@
 // These exports allow me to use this package a library in dev-environment cli helper programs
 export { ApiClient } from '@/api/api'
 export { ApiSessionClient } from '@/api/apiSession'
+export { ApiSessionMetadataClient } from '@/api/apiSessionMetadata'
+export type { ExtensibleMetadata, MetadataUpdater } from '@/api/apiSessionMetadata'
 export {
   ApiSessionMessageClient,
+  HappyMessagePersistenceError,
   sendCodexMessageOnce,
   sendUserMessageOnce,
   validateCodexMessageOnceRequest,
@@ -17,6 +20,7 @@ export {
 } from '@/api/apiSessionMessage'
 export type {
   CodexMessageOnceRequest,
+  MessagePersistenceOutcome,
   PersistedMessageReceipt,
   UserMessageOnceRequest
 } from '@/api/apiSessionMessage'

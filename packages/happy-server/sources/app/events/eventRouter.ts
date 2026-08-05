@@ -3,6 +3,7 @@ import { log } from "@/utils/log";
 import { GitHubProfile } from "@/app/api/types";
 import { AccountProfile } from "@/types";
 import { getPublicUrl } from "@/storage/files";
+import { randomKeyNaked } from "@/utils/randomKeyNaked";
 
 // === CONNECTION TYPES ===
 
@@ -178,6 +179,12 @@ export type EphemeralEvent = {
     type: 'machine-status';
     machineId: string;
     online: boolean;
+    timestamp: number;
+} | {
+    type: 'session-message';
+    id: string;
+    eventId: string;
+    message: string;
     timestamp: number;
 };
 
@@ -393,7 +400,13 @@ export function buildNewMessageUpdate(message: {
     };
 }
 
-export function buildUpdateSessionUpdate(sessionId: string, updateSeq: number, updateId: string, metadata?: { value: string; version: number }, agentState?: { value: string; version: number }): UpdatePayload {
+export function buildUpdateSessionUpdate(
+    sessionId: string,
+    updateSeq: number,
+    updateId: string,
+    metadata?: { value: string; version: number },
+    agentState?: { value: string; version: number },
+): UpdatePayload {
     return {
         id: updateId,
         seq: updateSeq,
@@ -401,7 +414,7 @@ export function buildUpdateSessionUpdate(sessionId: string, updateSeq: number, u
             t: 'update-session',
             id: sessionId,
             metadata,
-            agentState
+            agentState,
         },
         createdAt: Date.now()
     };
@@ -488,6 +501,16 @@ export function buildSessionActivityEphemeral(sessionId: string, active: boolean
         active,
         activeAt,
         thinking: thinking || false
+    };
+}
+
+export function buildSessionSystemMessageEphemeral(sessionId: string, message: string): EphemeralPayload {
+    return {
+        type: 'session-message',
+        id: sessionId,
+        eventId: randomKeyNaked(12),
+        message,
+        timestamp: Date.now(),
     };
 }
 

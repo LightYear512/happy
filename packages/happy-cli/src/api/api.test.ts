@@ -350,4 +350,54 @@ describe('session lookup log privacy', () => {
         expect(serialized).toContain('ECONNRESET');
         expect(serialized).not.toContain('another-secret');
     });
+
+    it('fails closed when an exact restore lookup fails', async () => {
+        mockGet.mockRejectedValue({ code: 'ECONNRESET' });
+
+        await expect(api.restoreSessionById('session-1'))
+            .rejects.toThrow('happy_session_restore_failed');
+        expect(mockPost).not.toHaveBeenCalled();
+    });
+
+    it('rejects a restore response carrying a replacement session id', async () => {
+        mockGet.mockResolvedValue({
+            data: {
+                session: {
+                    id: 'replacement-session',
+                    seq: 1,
+                    metadata: 'metadata',
+                    metadataVersion: 1,
+                    agentState: null,
+                    agentStateVersion: 0,
+                    dataEncryptionKey: null,
+                    lastActiveAt: Date.now(),
+                },
+            },
+        });
+
+        await expect(api.restoreSessionById('session-1'))
+            .rejects.toThrow('happy_session_restore_failed');
+        expect(mockPost).not.toHaveBeenCalled();
+    });
+
+    it('returns the original record when the restore id matches exactly', async () => {
+        mockGet.mockResolvedValue({
+            data: {
+                session: {
+                    id: 'session-1',
+                    seq: 1,
+                    metadata: 'metadata',
+                    metadataVersion: 1,
+                    agentState: null,
+                    agentStateVersion: 0,
+                    dataEncryptionKey: null,
+                    lastActiveAt: Date.now(),
+                },
+            },
+        });
+
+        await expect(api.restoreSessionById('session-1'))
+            .resolves.toMatchObject({ id: 'session-1' });
+        expect(mockPost).not.toHaveBeenCalled();
+    });
 });

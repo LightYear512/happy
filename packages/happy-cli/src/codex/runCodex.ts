@@ -1,6 +1,7 @@
 import { render } from "ink";
 import React from "react";
 import { ApiClient } from '@/api/api';
+import { localCommandUserText, modelFacingUserText } from '@/api/types';
 import { fetchAndInjectPendingMessages } from '@/utils/fetchPendingMessages';
 import { CodexMcpClient } from './codexMcpClient';
 import { CodexPermissionHandler } from './utils/permissionHandler';
@@ -28,9 +29,15 @@ import type { CodexSessionConfig } from './types';
 import { withCodexModelModeMetadata } from './modelMode';
 import { resolveCodexModelModeOrDefault } from './defaultModelConfig';
 import { readCodexDefaultProfile, getCodexInstancePath, getCurrentCodexProfile } from '@/commands/bang/ccsProfiles';
-import { watchCodexProfileFile } from '@/commands/bang/authCommand';
-import type { FSWatcher } from 'node:fs';
-import { notifyDaemonSessionStarted } from "@/daemon/controlClient";
+import {
+    accountIntentIsNewer,
+    readAccountIntent,
+    readSessionAccountSelection,
+    resolveStartupAccountSelection,
+    writeSessionAccountSelection,
+} from '@/commands/bang/accountIntent';
+import { notifyDaemonCodexProfile, notifyDaemonSessionStarted } from "@/daemon/controlClient";
+import { installHappySessionEnvironment } from '@/utils/projectSessionStartup';
 import { registerKillSessionHandler } from "@/claude/registerKillSessionHandler";
 import { registerSessionTransportFatalHandler } from '@/api/registerSessionTransportFatalHandler';
 import { delay } from "@/utils/time";
@@ -39,7 +46,7 @@ import { connectionState } from '@/utils/serverConnectionErrors';
 import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
 import { registerShutdownHandlers } from '@/utils/shutdownHandlers';
 import type { ApiSessionClient } from '@/api/apiSession';
-import { resolveCodexExecutionPolicy } from './executionPolicy';
+import { resolveCodexExecutionPolicy, resolveCodexSessionPermissionMode } from './executionPolicy';
 import { mapCodexMcpMessageToSessionEnvelopes, mapCodexProcessorMessageToSessionEnvelopes } from './utils/sessionProtocolMapper';
 import {
     isBangCommand,
@@ -51,6 +58,7 @@ import {
 import { createHtaskReplyMonitorRuntime } from '@/commands/bang/replyMonitorRuntime';
 import { renderOptionsBlock } from '@/commands/bang/types';
 import type { EnhancedMode as ClaudeEnhancedMode } from '@/claude/loop';
+import { performCodexMcpAccountRestart } from './codexAccountSwap';
 
 // ---------------------------------------------------------------------------
 // App-server mode detection
@@ -107,6 +115,7 @@ export async function runCodex(opts: {
     startedBy?: 'daemon' | 'terminal';
     noSandbox?: boolean;
     restoreSessionId?: string;
+    permissionMode?: import('@/api/types').PermissionMode;
     /** Codex session ID from previous run — used to find transcript file for experimental_resume */
     codexSessionId?: string;
 }): Promise<void> {
@@ -137,6 +146,8 @@ export async function runCodex(opts: {
             logger.debug(`[codex] Applied default codex profile "${defaultProfile}": ${process.env.CODEX_HOME}`);
         }
     }
+    let activeCodexProfile = getCurrentCodexProfile();
+    let lastSeenAccountIntent = 0;
 
     //
     // Define session
@@ -178,18 +189,16 @@ export async function runCodex(opts: {
         machineId,
         startedBy: opts.startedBy,
         sandbox: sandboxConfig,
+        permissionMode: opts.permissionMode,
+        dangerouslySkipPermissions: opts.permissionMode === 'bypassPermissions' || opts.permissionMode === 'yolo',
     });
 
-    // Restore path: rejoin existing session by ID, fallback to creating new session
+    // Restore must rejoin the exact Happy session. Creating a replacement here
+    // would split the conversation identity from its history and pending input.
     let response;
     if (opts.restoreSessionId) {
-        response = await api.getSessionById(opts.restoreSessionId);
-        if (response) {
-            logger.debug(`[Codex] Restored session ${opts.restoreSessionId}`);
-        } else {
-            logger.debug(`[Codex] Failed to restore session ${opts.restoreSessionId}, creating new session`);
-            response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
-        }
+        response = await api.restoreSessionById(opts.restoreSessionId);
+        logger.debug(`[Codex] Restored session ${opts.restoreSessionId}`);
     } else {
         response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
     }
@@ -208,6 +217,7 @@ export async function runCodex(opts: {
         response,
         onSessionSwap: (newSession) => {
             session = newSession;
+            installHappySessionEnvironment(newSession.sessionId);
             session.updateMetadata((metadata) => withCodexModelModeMetadata(metadata));
             bindTransportFatalHandler?.(newSession);
             // Update permission handler with new session to avoid stale reference
@@ -217,6 +227,44 @@ export async function runCodex(opts: {
         }
     });
     session = initialSession;
+    installHappySessionEnvironment(session.sessionId);
+    const savedAccount = readSessionAccountSelection(session.sessionId, 'codex');
+    const startupAccount = resolveStartupAccountSelection(savedAccount, readAccountIntent('codex'));
+    if (startupAccount && startupAccount.profileName !== activeCodexProfile) {
+        const savedHome = getCodexInstancePath(startupAccount.profileName);
+        if (!fs.existsSync(join(savedHome, 'auth.json'))) {
+            throw new Error(`Selected Codex profile "${startupAccount.profileName}" is unavailable`);
+        }
+        process.env.CODEX_HOME = savedHome;
+        activeCodexProfile = startupAccount.profileName;
+    }
+    if (startupAccount?.source === 'global') {
+        try {
+            writeSessionAccountSelection(
+                session.sessionId,
+                'codex',
+                startupAccount.profileName,
+                startupAccount.seenGlobalSetAt,
+            );
+        } catch (error) {
+            logger.warn('[Codex] Failed to persist startup account selection:', error);
+        }
+    }
+    lastSeenAccountIntent = startupAccount?.seenGlobalSetAt ?? 0;
+    const rememberAccountIntent = (profileName: string, setAt: number): void => {
+        lastSeenAccountIntent = setAt;
+        try {
+            writeSessionAccountSelection(session.sessionId, 'codex', profileName, setAt);
+        } catch (error) {
+            logger.warn('[Codex] Failed to persist session account selection:', error);
+        }
+    };
+    if (startupAccount && opts.startedBy === 'daemon' && response) {
+        const profileRegistration = await notifyDaemonCodexProfile(response.id, startupAccount.profileName);
+        if (profileRegistration.error) {
+            logger.warn(`[Codex] Failed to report saved account to daemon: ${profileRegistration.error}`);
+        }
+    }
     session.updateMetadata((metadata) => withCodexModelModeMetadata(metadata));
 
     // Always report to daemon if it exists (skip if offline)
@@ -241,11 +289,25 @@ export async function runCodex(opts: {
 
     // Track current overrides to apply per message
     // Use shared PermissionMode type from api/types for cross-agent compatibility
-    let currentPermissionMode: import('@/api/types').PermissionMode | undefined = undefined;
+    let currentPermissionMode = resolveCodexSessionPermissionMode(
+        response?.metadata.permissionMode,
+        opts.permissionMode,
+        response?.metadata.dangerouslySkipPermissions === true,
+    );
+    if (response && response.metadata.permissionMode === undefined && opts.permissionMode) {
+        session.updateMetadata((metadata) => ({
+            ...metadata,
+            permissionMode: currentPermissionMode,
+            dangerouslySkipPermissions: currentPermissionMode === 'bypassPermissions' || currentPermissionMode === 'yolo',
+        }));
+    }
     let currentModel: string | undefined = undefined;
+    const pendingMcpRestart: { current: {
+        profile: string | null; seenSetAt?: number;
+    } | null } = { current: null };
     const replyMonitor = createHtaskReplyMonitorRuntime(session, 'codex', undefined, undefined, (text) => {
         const enhancedMode: EnhancedMode = {
-            permissionMode: currentPermissionMode || 'default',
+            permissionMode: currentPermissionMode,
             model: currentModel,
         };
         logger.debug(`[Codex] Enqueueing delivered task message: "${text.substring(0, 80)}"`);
@@ -254,13 +316,16 @@ export async function runCodex(opts: {
 
     session.onUserMessage((message) => {
         // Resolve permission mode (accept all modes, will be mapped in switch statement)
-        let messagePermissionMode = currentPermissionMode;
         if (message.meta?.permissionMode) {
-            messagePermissionMode = message.meta.permissionMode as import('@/api/types').PermissionMode;
-            currentPermissionMode = messagePermissionMode;
+            currentPermissionMode = message.meta.permissionMode as import('@/api/types').PermissionMode;
+            session.updateMetadata((metadata) => ({
+                ...metadata,
+                permissionMode: currentPermissionMode,
+                dangerouslySkipPermissions: currentPermissionMode === 'bypassPermissions' || currentPermissionMode === 'yolo',
+            }));
             logger.debug(`[Codex] Permission mode updated from user message to: ${currentPermissionMode}`);
         } else {
-            logger.debug(`[Codex] User message received with no permission mode override, using current: ${currentPermissionMode ?? 'default (effective)'}`);
+            logger.debug(`[Codex] User message received with no permission mode override, using current: ${currentPermissionMode}`);
         }
 
         let messageModel = currentModel;
@@ -275,25 +340,25 @@ export async function runCodex(opts: {
         }
 
         const enhancedMode: EnhancedMode = {
-            permissionMode: messagePermissionMode || 'default',
+            permissionMode: currentPermissionMode,
             model: messageModel,
         };
 
-        const text = message.content.text;
+        const rawText = localCommandUserText(message);
 
         // Route input to active interactive session (e.g., !login OAuth flow)
         if (hasActiveInteractiveSession()) {
-            handleInteractiveInput(text);
+            handleInteractiveInput(rawText);
             return;
         }
 
         // Check for bang commands (! full commands or @ short aliases) - handle without invoking Codex model
-        if (isBangCommand(text)) {
+        if (isBangCommand(rawText)) {
             const claudeShapedMode: ClaudeEnhancedMode = {
                 permissionMode: enhancedMode.permissionMode,
                 model: enhancedMode.model,
             };
-            executeBangCommand(text, {
+            executeBangCommand(rawText, {
                 client: session,
                 // Codex has no Claude Session wrapper; pass a minimal shape so handlers
                 // that read `mode` (e.g., !restart) still work — codex is always remote.
@@ -302,6 +367,7 @@ export async function runCodex(opts: {
                 currentEnhancedMode: claudeShapedMode,
                 isConsoleSession: false,
                 flavor: 'codex',
+                deferCodexProfileSwitch: true,
             }).then(async result => {
                 // Delay ensures mobile client receives messages in correct order —
                 // it sorts by createdAt timestamp, so rapid events can arrive out of order.
@@ -325,13 +391,11 @@ export async function runCodex(opts: {
                 session.sendSessionEvent({ type: 'ready' });
 
                 if (result.action === 'restart-session') {
-                    // P1 work item: align with codex abort+resume restart semantics.
-                    // For now, surface a clear hint instead of silently dropping the action.
-                    logger.debug('[Codex] Bang command requested session restart — not yet supported on codex backend');
-                    session.sendSessionEvent({
-                        type: 'message',
-                        message: 'ℹ️ Codex 后端暂不支持 !restart，请手动结束当前会话后重新启动 happy codex',
-                    });
+                    pendingMcpRestart.current = {
+                        profile: result.restartProfile ?? getCurrentCodexProfile(),
+                        seenSetAt: result.restartSeenGlobalSetAt,
+                    };
+                    messageQueue.interrupt();
                 }
             }).catch(error => {
                 logger.warn('[Codex] Bang command failed:', error);
@@ -344,6 +408,7 @@ export async function runCodex(opts: {
             return;
         }
 
+        const text = modelFacingUserText(message);
         replyMonitor.observeUserMessage();
         messageQueue.push(text, enhancedMode);
     });
@@ -400,9 +465,6 @@ export async function runCodex(opts: {
     let abortController = new AbortController();
     let shouldExit = false;
     let storedSessionIdForResume: string | null = null;
-    // Set by the codex profile watcher when !auth-all --codex broadcasts a switch.
-    // Consumed at top-of-loop: triggers subprocess reconnect with new CODEX_HOME.
-    let pendingAccountSwap: string | null = null;
 
     /**
      * Handles aborting the current task/inference without exiting the process.
@@ -491,6 +553,8 @@ export async function runCodex(opts: {
             logger.warn(`[Codex] Happy transport became terminal (${snapshot.state}); shutting down the unreachable runtime`);
             shouldExit = true;
             messageQueue.close();
+            const hardExit = setTimeout(() => process.exit(1), 5_000);
+            hardExit.unref();
             await handleAbort();
         });
     };
@@ -549,17 +613,6 @@ export async function runCodex(opts: {
             session.sendSessionDeath();
             await session.flush();
         } catch {}
-    });
-
-    // Watch for !auth-all --codex broadcasts. On switch we flag pendingAccountSwap
-    // and interrupt any active turn via handleAbort(). The loop top consumes the
-    // flag and triggers the actual subprocess reconnect.
-    const codexProfileWatcher: FSWatcher | null = watchCodexProfileFile(() => {
-        const target = getCurrentCodexProfile() || 'unknown';
-        logger.debug(`[codex] Account swap signaled: ${target}`);
-        pendingAccountSwap = target;
-        // Fire-and-forget; handleAbort's internal try/catch handles errors.
-        void handleAbort();
     });
 
     // Helper: find Codex session transcript for a given sessionId
@@ -799,38 +852,53 @@ export async function runCodex(opts: {
 
         while (!shouldExit) {
             logActiveHandles('loop-top');
-
-            // Consume pending !auth-all --codex account swap before handling any message.
-            // The watcher already updated process.env.CODEX_HOME via tryGlobalProfileSwitch
-            // and called handleAbort() (which stored sessionId for resume). We now rebuild
-            // the MCP subprocess with the new env; the next iteration's startSession will
-            // pick up storedSessionIdForResume and resume the conversation via symlinked
-            // shared sessions/ directory.
-            if (pendingAccountSwap) {
-                const target = pendingAccountSwap;
-                pendingAccountSwap = null;
-                try {
-                    await client.reconnect();
+            if (pendingMcpRestart.current) {
+                const restart = pendingMcpRestart.current;
+                pendingMcpRestart.current = null;
+                const previousSessionId = client.getSessionId();
+                const resumeFile = findCodexResumeFile(previousSessionId);
+                if (wasCreated && (!previousSessionId || !resumeFile)) {
+                    pending = null;
+                    const status = '⚠ 无法安全定位当前 Codex 会话记录，账号和会话均未改变；本次输入未提交，请重试';
+                    session.sendSessionEvent({ type: 'message', message: status });
+                    messageQueue.clearInterrupt();
+                    continue;
+                }
+                const restarted = await performCodexMcpAccountRestart(client,
+                    restart.profile ? getCodexInstancePath(restart.profile) : process.env.CODEX_HOME);
+                if (restarted.ok) {
                     client.clearSession();
                     wasCreated = false;
                     currentModeHash = null;
-                    permissionHandler.reset();
-                    reasoningProcessor.abort();
-                    diffProcessor.reset();
-                    thinking = false;
-                    session.keepAlive(thinking, 'remote');
-                    const msg = `🔄 Switched to "${target}" (via !auth-all --codex)`;
-                    messageBuffer.addMessage(msg, 'status');
-                    session.sendSessionEvent({ type: 'message', message: msg });
-                    logger.debug(`[codex] Account swap complete → ${target}`);
-                } catch (err) {
-                    logger.warn('[codex] Account swap failed:', err);
-                    const errMsg = `⚠ 切换账号失败: ${(err as Error).message || 'unknown error'}`;
-                    messageBuffer.addMessage(errMsg, 'status');
-                    session.sendSessionEvent({ type: 'message', message: errMsg });
-                    shouldExit = true;
-                    break;
+                    codexSessionIdStored = false;
+                    nextExperimentalResume = resumeFile;
+                    opts.codexSessionId = undefined;
+                    activeCodexProfile = restart.profile ?? getCurrentCodexProfile();
+                    if (activeCodexProfile && opts.startedBy === 'daemon' && response) {
+                        const registration = await notifyDaemonCodexProfile(response.id, activeCodexProfile);
+                        if (registration.error) {
+                            logger.warn(`[Codex] Failed to persist MCP profile: ${registration.error}`);
+                        }
+                    }
+                    if (restart.seenSetAt !== undefined) {
+                        rememberAccountIntent(activeCodexProfile ?? restart.profile ?? '', restart.seenSetAt);
+                    }
+                    const target = restart.profile ? `"${restart.profile}"` : '当前账号';
+                    session.sendSessionEvent({ type: 'message',
+                        message: `🔄 已重启 Codex MCP 会话并切换到 ${target}` });
+                } else {
+                    // One failed target attempt must not spin on the same input
+                    // or silently submit it under the restored old account.
+                    // A later real input retries because the global timestamp
+                    // remains unacknowledged.
+                    pending = null;
+                    const rollbackDetail = restarted.rollbackError
+                        ? `；原账号恢复失败: ${restarted.rollbackError.message}`
+                        : '；已恢复原账号';
+                    session.sendSessionEvent({ type: 'message',
+                        message: `⚠ Codex MCP 重启失败，本次输入未提交，请重试: ${restarted.error.message}${rollbackDetail}` });
                 }
+                messageQueue.clearInterrupt();
                 continue;
             }
 
@@ -842,6 +910,7 @@ export async function runCodex(opts: {
                 const waitSignal = abortController.signal;
                 const batch = await messageQueue.waitForMessagesAndGetAsString(waitSignal);
                 if (!batch) {
+                    if (pendingMcpRestart.current && !shouldExit) continue;
                     // If wait was aborted (e.g., remote abort with no active inference), ignore and continue
                     if (waitSignal.aborted && !shouldExit) {
                         logger.debug('[codex]: Wait aborted while idle; ignoring and continuing');
@@ -856,6 +925,29 @@ export async function runCodex(opts: {
             // Defensive check for TS narrowing
             if (!message) {
                 break;
+            }
+
+            // Global account changes are sampled only when a real model input is
+            // ready. The input remains pending while the existing restart path
+            // reconnects, so no file watcher can wake, interrupt, or stop this process.
+            const currentIntent = readAccountIntent('codex');
+            if (accountIntentIsNewer(currentIntent, lastSeenAccountIntent)) {
+                if (currentIntent.profileName === activeCodexProfile) {
+                    if (opts.startedBy === 'daemon' && response) {
+                        const registration = await notifyDaemonCodexProfile(response.id, currentIntent.profileName);
+                        if (registration.error) {
+                            logger.warn(`[Codex] Failed to report account to daemon: ${registration.error}`);
+                        }
+                    }
+                    rememberAccountIntent(currentIntent.profileName, currentIntent.setAt);
+                } else {
+                    pending = message;
+                    pendingMcpRestart.current = {
+                        profile: currentIntent.profileName,
+                        seenSetAt: currentIntent.setAt,
+                    };
+                    continue;
+                }
             }
 
             // If a session exists and mode changed, restart on next iteration
@@ -1014,8 +1106,6 @@ export async function runCodex(opts: {
         replyMonitor.dispose();
         removeTransportFatalHandler();
         removeShutdownHandlers();
-        try { codexProfileWatcher?.close(); } catch { /* best effort */ }
-
         // Cancel offline reconnection if still running
         if (reconnectionHandle) {
             logger.debug('[codex]: Cancelling offline reconnection');

@@ -35,7 +35,7 @@ import { randomUUID } from 'expo-crypto';
 import { useCLIDetection } from '@/hooks/useCLIDetection';
 import { useEnvironmentVariables, resolveEnvVarSubstitution, extractEnvVarReferences } from '@/hooks/useEnvironmentVariables';
 import { formatPathRelativeToHome } from '@/utils/sessionUtils';
-import { resolveAbsolutePath, isConsolePath } from '@/utils/pathUtils';
+import { resolveAbsolutePath, isConsolePath, isConsoleSessionMetadata } from '@/utils/pathUtils';
 import { MultiTextInput } from '@/components/MultiTextInput';
 import { isMachineOnline } from '@/utils/machineUtils';
 import { StatusDot } from '@/components/StatusDot';
@@ -84,7 +84,7 @@ const getRecentPathForMachine = (machineId: string | null, recentPaths: Array<{ 
     const pathsWithTimestamps: Array<{ path: string; timestamp: number }> = [];
 
     sessions.forEach(session => {
-        if (session.metadata?.machineId === machineId && session.metadata?.path && !isConsolePath(session.metadata.path)) {
+        if (session.metadata?.machineId === machineId && session.metadata?.path && !isConsoleSessionMetadata(session.metadata)) {
             pathsWithTimestamps.push({
                 path: session.metadata.path,
                 timestamp: session.createdAt // Use createdAt, not updatedAt
@@ -636,7 +636,7 @@ function NewSessionWizard() {
                 if (typeof item === 'string') return; // Skip section headers
 
                 const session = item as any;
-                if (session.metadata?.machineId === selectedMachineId && session.metadata?.path && !isConsolePath(session.metadata.path)) {
+                if (session.metadata?.machineId === selectedMachineId && session.metadata?.path && !isConsoleSessionMetadata(session.metadata)) {
                     const path = session.metadata.path;
                     if (!pathSet.has(path)) {
                         pathSet.add(path);
@@ -1056,11 +1056,7 @@ function NewSessionWizard() {
                     await sync.sendMessage(result.sessionId, sessionPrompt);
                 }
 
-                router.replace(`/session/${result.sessionId}`, {
-                    dangerouslySingular() {
-                        return 'session'
-                    },
-                });
+                router.replace(`/session/${result.sessionId}`);
             } else {
                 throw new Error('Session spawning failed - no session ID returned.');
             }

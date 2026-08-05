@@ -13,14 +13,16 @@ export const TASK_MESSAGE_REMINDER_INTERVAL_MS = 60_000;
 const REPLY_MONITOR_ALERT_MARKER = '⚠️';
 const HTASK_CONTROL_CENTER_TITLE_MARKER = '❇️';
 const HTASK_SAFE_REF = /^[A-Za-z0-9_.-]+$/;
+const XC_TASK_REF = /^AT-[0-9]+$/;
 
 export interface ReplyMonitorRuntimeOptions {
     idleMs?: number;
     pollMs?: number;
     isEnabled: () => boolean | Promise<boolean>;
+    ownsCanonicalTitle?: () => boolean | Promise<boolean>;
     canonicalTitle: () => string | null | Promise<string | null>;
     pendingMessages?: () => TaskMessageRecord[] | Promise<TaskMessageRecord[]>;
-    deliverMessage?: (messageId: string) => string | null | Promise<string | null>;
+    deliverMessage?: (messageId: string) => TaskMessageDelivery | null | Promise<TaskMessageDelivery | null>;
     taskMessageReminderMs?: number;
     currentTitle?: () => string | null;
     sendTitle: (title: string) => void;
@@ -30,9 +32,13 @@ export interface ReplyMonitorRuntimeOptions {
     debug?: (message: string, error?: unknown) => void;
 }
 
+export interface TaskMessageDelivery {
+    queueText: string | null;
+}
+
 export interface TaskMessageRecord {
     message_id: string;
-    status: 'pending' | 'delivered' | 'acked' | 'dismissed' | string;
+    status: 'pending' | 'presented' | 'delivered' | 'acked' | 'dismissed' | string;
     from_task_id?: string;
     to_task_id?: string;
     kind?: string;
@@ -53,11 +59,13 @@ export class ReplyMonitorRuntime {
     private disposed = false;
     private syncInFlight = false;
     private readonly taskMessageReminderSentAt = new Map<string, number>();
+    private readonly modelQueuedMessageIds = new Set<string>();
     private lastActivityAt: number | null = null;
     private activeReply = false;
     private readonly idleMs: number;
     private readonly taskMessageReminderMs: number;
     private readonly isEnabled: ReplyMonitorRuntimeOptions['isEnabled'];
+    private readonly ownsCanonicalTitle: NonNullable<ReplyMonitorRuntimeOptions['ownsCanonicalTitle']>;
     private readonly canonicalTitle: ReplyMonitorRuntimeOptions['canonicalTitle'];
     private readonly pendingMessages: NonNullable<ReplyMonitorRuntimeOptions['pendingMessages']>;
     private readonly deliverMessage: NonNullable<ReplyMonitorRuntimeOptions['deliverMessage']>;
@@ -72,6 +80,7 @@ export class ReplyMonitorRuntime {
         this.idleMs = options.idleMs ?? REPLY_MONITOR_ALERT_DELAY_MS;
         this.taskMessageReminderMs = options.taskMessageReminderMs ?? TASK_MESSAGE_REMINDER_INTERVAL_MS;
         this.isEnabled = options.isEnabled;
+        this.ownsCanonicalTitle = options.ownsCanonicalTitle ?? (() => true);
         this.canonicalTitle = options.canonicalTitle;
         this.pendingMessages = options.pendingMessages ?? (async () => []);
         this.deliverMessage = options.deliverMessage ?? (async () => null);
@@ -144,6 +153,10 @@ export class ReplyMonitorRuntime {
 
     private async syncCanonicalTitle(reason: string): Promise<void> {
         try {
+            if (!await this.ownsCanonicalTitle()) {
+                this.debug(`[reply-monitor] title sync skipped external-owner reason=${reason}`);
+                return;
+            }
             const canonical = await this.canonicalTitle();
             if (!canonical) {
                 this.debug(`[reply-monitor] title sync skipped missing-title reason=${reason}`);
@@ -179,23 +192,29 @@ export class ReplyMonitorRuntime {
                     this.taskMessageReminderSentAt.delete(messageId);
                 }
             }
-            for (const message of messages) {
-                if (message.status === 'pending') {
-                    const text = await this.deliverMessage(message.message_id);
-                    if (text !== null) {
-                        this.enqueueTaskMessage(text);
-                        this.recordTaskMessageReminder(message.message_id);
-                        this.sendTaskMessage(
-                            formatTaskMessageNotification(message),
-                            formatTaskMessagePlainNotification(message),
-                            taskMessageActionOptions(message),
-                        );
-                        this.debug(`[reply-monitor] task message delivered reason=${reason} message=${message.message_id}`);
-                    }
-                    continue;
+            for (const messageId of this.modelQueuedMessageIds) {
+                if (!visibleIds.has(messageId)) {
+                    this.modelQueuedMessageIds.delete(messageId);
                 }
-                if (message.status === 'delivered') {
-                    this.debug(`[reply-monitor] task message already delivered; ui reminder skipped reason=${reason} message=${message.message_id}`);
+            }
+            for (const message of messages) {
+                if (!['pending', 'presented', 'delivered'].includes(message.status)) continue;
+                if (!this.modelQueuedMessageIds.has(message.message_id)) {
+                    const delivery = await this.deliverMessage(message.message_id);
+                    if (delivery === null) continue;
+                    if (delivery.queueText !== null) {
+                        this.enqueueTaskMessage(delivery.queueText);
+                    }
+                    this.modelQueuedMessageIds.add(message.message_id);
+                    this.debug(`[reply-monitor] task message queued reason=${reason} status=${message.status} message=${message.message_id}`);
+                }
+                if (this.shouldSendTaskMessageReminder(message.message_id)) {
+                    this.sendTaskMessage(
+                        formatTaskMessageNotification(message),
+                        formatTaskMessagePlainNotification(message),
+                        taskMessageActionOptions(message),
+                    );
+                    this.recordTaskMessageReminder(message.message_id);
                 }
             }
         } catch (error) {
@@ -408,6 +427,32 @@ export function readReplyMonitorBinding(root: string, sessionId: string): ReplyM
     return readBindingFromHtaskHappy(root, sessionId);
 }
 
+export function isXcTitleOwnedSession(root: string, sessionId: string): boolean {
+    if (!isSafeHtaskRef(sessionId)) return false;
+    const real = readJsonObject(
+        join(root, '.virtual-session', 'runtime', 'real-sessions', 'happy', `${sessionId}.json`),
+        `XC real-session ${sessionId}`,
+    );
+    if (real?.schema !== 'virtual-session.real-session-binding.v1'
+        || real.provider !== 'happy'
+        || real.nativeSessionId !== sessionId
+        || real.active !== true
+        || !isSafeHtaskRef(real.virtualSessionId)) return false;
+
+    const virtualSessionId = real.virtualSessionId;
+    const virtualSession = readJsonObject(
+        join(root, '.virtual-session', 'sessions', virtualSessionId, 'session.json'),
+        `XC virtual-session ${virtualSessionId}`,
+    );
+    const taskBinding = virtualSession?.taskBinding;
+    return virtualSession?.schema === 'virtual-session.session.v1'
+        && virtualSession.id === virtualSessionId
+        && !!taskBinding
+        && typeof taskBinding === 'object'
+        && !Array.isArray(taskBinding)
+        && XC_TASK_REF.test(String((taskBinding as { taskId?: unknown }).taskId ?? ''));
+}
+
 function readReplyMonitorTask(root: string, happyId: string): Record<string, unknown> | null {
     return readReplyMonitorBinding(root, happyId)?.task ?? null;
 }
@@ -440,6 +485,10 @@ export function createHtaskReplyMonitorRuntime(
     return new ReplyMonitorRuntime({
         idleMs,
         pollMs,
+        ownsCanonicalTitle: () => {
+            const root = findHtaskRoot();
+            return !root || !isXcTitleOwnedSession(root, session.sessionId);
+        },
         isEnabled: async () => {
             const root = findHtaskRoot();
             if (!root) return false;
@@ -457,7 +506,7 @@ export function createHtaskReplyMonitorRuntime(
             if (!root) return [];
             const binding = readReplyMonitorBinding(root, session.sessionId);
             if (!binding) return [];
-            const result = await runHtask(root, ['message-list', '--task-id', binding.taskId, '--status', 'pending']);
+            const result = await runHtask(root, ['message-list', '--task-id', binding.taskId, '--status', 'active']);
             if (result.code !== 0) {
                 throw new Error(result.stderr || result.stdout || 'message-list failed');
             }
@@ -472,8 +521,21 @@ export function createHtaskReplyMonitorRuntime(
             if (result.code !== 0) {
                 throw new Error(result.stderr || result.stdout || 'message-deliver failed');
             }
-            const parsed = JSON.parse(result.stdout) as { inject_text?: unknown };
-            return typeof parsed.inject_text === 'string' ? parsed.inject_text : null;
+            const parsed = JSON.parse(result.stdout) as {
+                delivered?: unknown;
+                already_delivered?: unknown;
+                inject_text?: unknown;
+            };
+            if (parsed.already_delivered === true && typeof parsed.inject_text === 'string') {
+                return { queueText: parsed.inject_text };
+            }
+            if (parsed.delivered === true) {
+                // Live transport triggers session.onUserMessage, which owns the
+                // queue insertion. Only a historical delivered message needs
+                // local recovery.
+                return { queueText: null };
+            }
+            return null;
         },
         currentTitle: () => session.getSummaryText(),
         sendTitle: titleSender,

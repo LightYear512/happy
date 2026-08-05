@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { deterministicStringify } from '@/utils/deterministicJson';
-import { createSessionTransportHealthReporter } from './sessionTransportHealth';
+import { createSessionTransportHealthReporter, parseSessionTransportHealthRecord,
+    readSessionTransportHealthRecord } from './sessionTransportHealth';
 
 const roots: string[] = [];
 
@@ -32,7 +33,9 @@ describe('session transport health receipt', () => {
         const reporter = createSessionTransportHealthReporter(workspace, 'native-session-1');
         expect(reporter).not.toBeNull();
 
-        reporter!.write('connected', { reconnectCount: 1, queueMessages: 2, queueBytes: 64, reason: null });
+        const published = reporter!.write('connected', {
+            reconnectCount: 1, queueMessages: 2, queueBytes: 64, reason: null,
+        });
         const path = join(workspace, '.virtual-session', 'runtime', 'provider-health', 'happy', 'native-session-1.json');
         const receipt = JSON.parse(readFileSync(path, 'utf8'));
         const { recordDigest, ...base } = receipt;
@@ -41,6 +44,8 @@ describe('session transport health receipt', () => {
         expect(receipt.state).toBe('connected');
         expect(receipt.nativeSessionId).toBe('native-session-1');
         expect(receipt.queueMessages).toBe(2);
+        expect(published).toEqual(receipt);
+        await expect(readSessionTransportHealthRecord(workspace, 'native-session-1')).resolves.toEqual(receipt);
         expect(existsSync(`${path}.tmp`)).toBe(false);
         expect(statSync(join(workspace, '.virtual-session', 'runtime', 'provider-health', 'happy')).mode & 0o077).toBe(0);
     });
@@ -77,5 +82,21 @@ describe('session transport health receipt', () => {
         const second = JSON.parse(readFileSync(path, 'utf8'));
         expect(second.connectedAt).toBe(first.connectedAt);
         expect(second.generation).toBe(first.generation + 1);
+    });
+
+    it('HSR rejects altered and path-escaping current-process evidence', async () => {
+        const workspace = await mkdtemp(join(tmpdir(), 'happy-health-hostile-'));
+        roots.push(workspace);
+        mkdirSync(join(workspace, '.virtual-session'), { recursive: true });
+        const reporter = createSessionTransportHealthReporter(workspace, 'native-session-4');
+        const record = reporter!.write('connected', {
+            reconnectCount: 0, queueMessages: 0, queueBytes: 0, reason: null,
+        });
+        expect(parseSessionTransportHealthRecord(record)).toEqual(record);
+        expect(() => parseSessionTransportHealthRecord({ ...record, generation: record.generation + 1 }))
+            .toThrow(/digest/u);
+        expect(() => parseSessionTransportHealthRecord({ ...record, extra: true }))
+            .toThrow(/invalid/u);
+        await expect(readSessionTransportHealthRecord(workspace, '../native-session-4')).resolves.toBeNull();
     });
 });

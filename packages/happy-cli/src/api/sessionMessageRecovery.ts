@@ -16,6 +16,7 @@ export interface SessionRecoveryAnchor {
 export interface SessionRecoveryRow {
     id: string;
     seq: number;
+    localId: string | null;
     createdAt: number;
     content: { t: 'encrypted'; c: string };
 }
@@ -90,6 +91,8 @@ function validateRow(value: unknown): SessionRecoveryRow {
     if (typeof row.id !== 'string' || row.id.length === 0 || Buffer.byteLength(row.id, 'utf8') > MAX_MESSAGE_ID_BYTES ||
         !Number.isSafeInteger(row.seq) || Number(row.seq) <= 0 ||
         !Number.isSafeInteger(row.createdAt) || Number(row.createdAt) <= 0 || Number(row.createdAt) > MAX_DATE_MS ||
+        (row.localId !== undefined && row.localId !== null &&
+            (typeof row.localId !== 'string' || !/^[^\u0000-\u001f]{1,256}$/u.test(row.localId))) ||
         !row.content || typeof row.content !== 'object' || Array.isArray(row.content)) {
         throw new SessionRecoveryError('message row identity is invalid');
     }
@@ -101,6 +104,7 @@ function validateRow(value: unknown): SessionRecoveryRow {
     return {
         id: row.id,
         seq: Number(row.seq),
+        localId: typeof row.localId === 'string' ? row.localId : null,
         createdAt: Number(row.createdAt),
         content: { t: 'encrypted', c: content.c },
     };
@@ -115,10 +119,12 @@ function validateAnchor(anchor: SessionRecoveryAnchor): void {
 }
 
 export function recoveryRowBytes(row: SessionRecoveryRow): number {
-    return Buffer.byteLength(row.id, 'utf8') + Buffer.byteLength(row.content.c, 'utf8') + 32;
+    return Buffer.byteLength(row.id, 'utf8') + Buffer.byteLength(row.localId ?? '', 'utf8')
+        + Buffer.byteLength(row.content.c, 'utf8') + 32;
 }
 
 export function sameRecoveryRow(left: SessionRecoveryRow, right: SessionRecoveryRow): boolean {
-    return left.id === right.id && left.seq === right.seq && left.createdAt === right.createdAt &&
+    return left.id === right.id && left.seq === right.seq && left.localId === right.localId
+        && left.createdAt === right.createdAt &&
         left.content.t === right.content.t && left.content.c === right.content.c;
 }

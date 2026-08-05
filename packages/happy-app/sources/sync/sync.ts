@@ -28,6 +28,7 @@ import { log } from '@/log';
 import { gitStatusSync } from './gitStatusSync';
 import { projectManager } from './projectManager';
 import { voiceHooks } from '@/realtime/hooks/voiceHooks';
+import { createSystemMessage } from './systemMessage';
 import { Message } from './typesMessage';
 import { EncryptionCache } from './encryption/encryptionCache';
 import { systemPrompt } from './prompt/systemPrompt';
@@ -1901,6 +1902,12 @@ class Sync {
                 };
                 storage.getState().applyMachines([updatedMachine]);
             }
+        }
+
+        if (updateData.type === 'session-message') {
+            this.applyMessages(updateData.id, [
+                createSystemMessage(updateData),
+            ]);
         }
 
         // daemon-status ephemeral updates are deprecated, machine status is handled via machine-activity

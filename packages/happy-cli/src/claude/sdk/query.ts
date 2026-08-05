@@ -27,6 +27,21 @@ import { ensureLocalProxyBypass } from '@/claude/utils/proxyBypass'
 import type { Writable } from 'node:stream'
 import { logger } from '@/ui/logger'
 
+export function applyQueryEnvironment(
+    baseEnvironment: NodeJS.ProcessEnv,
+    overrides?: NodeJS.ProcessEnv
+): NodeJS.ProcessEnv {
+    const environment = { ...baseEnvironment }
+    for (const [key, value] of Object.entries(overrides ?? {})) {
+        if (value === undefined) {
+            delete environment[key]
+        } else {
+            environment[key] = value
+        }
+    }
+    return environment
+}
+
 /**
  * Query class manages Claude Code process interaction
  */
@@ -341,7 +356,10 @@ export function query(config: {
 
     // Spawn Claude Code process
     // Use clean env for global claude to avoid local node_modules/.bin taking precedence
-    const spawnEnv = isCommandOnly ? getCleanEnv() : { ...process.env }
+    const spawnEnv = applyQueryEnvironment(
+        isCommandOnly ? getCleanEnv() : process.env,
+        config.options?.environment
+    )
 
     if (mcpServers && Object.keys(mcpServers).length > 0) {
         ensureLocalProxyBypass(spawnEnv)

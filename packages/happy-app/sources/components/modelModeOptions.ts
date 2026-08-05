@@ -77,15 +77,13 @@ export function getClaudeModelModes(): ModelMode[] {
     ];
 }
 
-export function getCodexModelModes(translate: Translate): ModelMode[] {
+export function getCodexModelModes(_translate: Translate): ModelMode[] {
     return [
-        { key: 'gpt-5-codex-high', name: translate('agentInput.codexModel.gpt5CodexHigh'), description: null },
-        { key: 'gpt-5-codex-medium', name: translate('agentInput.codexModel.gpt5CodexMedium'), description: null },
-        { key: 'gpt-5-codex-low', name: translate('agentInput.codexModel.gpt5CodexLow'), description: null },
-        { key: 'gpt-5-minimal', name: translate('agentInput.codexModel.gpt5Minimal'), description: null },
-        { key: 'gpt-5-low', name: translate('agentInput.codexModel.gpt5Low'), description: null },
-        { key: 'gpt-5-medium', name: translate('agentInput.codexModel.gpt5Medium'), description: null },
-        { key: 'gpt-5-high', name: translate('agentInput.codexModel.gpt5High'), description: null },
+        { key: 'default', name: _translate('agentInput.codexModel.default'), description: 'Use Codex CLI config' },
+        { key: 'gpt-5.6-sol:minimal', name: _translate('agentInput.codexModel.gpt5Minimal'), description: 'gpt-5.6-sol / minimal reasoning' },
+        { key: 'gpt-5.6-sol:low', name: _translate('agentInput.codexModel.gpt5Low'), description: 'gpt-5.6-sol / low reasoning' },
+        { key: 'gpt-5.6-sol:medium', name: _translate('agentInput.codexModel.gpt5Medium'), description: 'gpt-5.6-sol / medium reasoning' },
+        { key: 'gpt-5.6-sol:high', name: _translate('agentInput.codexModel.gpt5High'), description: 'gpt-5.6-sol / high reasoning' },
     ];
 }
 
@@ -118,6 +116,10 @@ export function getAvailableModels(
     metadata: Metadata | null | undefined,
     translate: Translate,
 ): ModelMode[] {
+    if (flavor === 'codex') {
+        return getCodexModelModes(translate);
+    }
+
     const metadataModels = mapMetadataOptions(metadata?.models);
     if (metadataModels.length > 0) {
         return metadataModels;
@@ -164,7 +166,7 @@ export function resolveCurrentOption<T extends ModeOption>(
 
 export function getDefaultModelKey(flavor: AgentFlavor): string {
     if (flavor === 'codex') {
-        return 'gpt-5-codex-high';
+        return 'default';
     }
     if (flavor === 'gemini') {
         return 'gemini-2.5-pro';

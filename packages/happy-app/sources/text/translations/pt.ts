@@ -421,13 +421,14 @@ export const pt: TranslationStructure = {
         },
         codexModel: {
             title: 'CODEX MODEL',
+            default: 'Configurações do CLI',
             gpt5CodexLow: 'gpt-5-codex low',
             gpt5CodexMedium: 'gpt-5-codex medium',
             gpt5CodexHigh: 'gpt-5-codex high',
-            gpt5Minimal: 'GPT-5 Minimal',
-            gpt5Low: 'GPT-5 Low',
-            gpt5Medium: 'GPT-5 Medium',
-            gpt5High: 'GPT-5 High',
+            gpt5Minimal: 'GPT-5.6 Minimal',
+            gpt5Low: 'GPT-5.6 Low',
+            gpt5Medium: 'GPT-5.6 Medium',
+            gpt5High: 'GPT-5.6 High',
         },
         geminiPermissionMode: {
             title: 'MODO DE PERMISSÃO GEMINI',

@@ -17,6 +17,7 @@ import { normalizeRawMessage } from './typesRaw';
 // Import the actual schemas from typesRaw.ts
 // Note: We're testing the schemas as black boxes through their public API
 import { RawRecordSchema } from './typesRaw';
+import { ApiEphemeralUpdateSchema } from './apiTypes';
 
 describe('Zod Transform - WOLOG Content Normalization', () => {
 
@@ -1866,5 +1867,32 @@ describe('Zod Transform - WOLOG Content Normalization', () => {
 
             expect(normalized).toBeNull();
         });
+    });
+});
+
+describe('ApiEphemeralUpdateSchema session messages', () => {
+    it('accepts a bounded generic session message', () => {
+        expect(ApiEphemeralUpdateSchema.safeParse({
+            type: 'session-message',
+            id: 'session-1',
+            eventId: 'event-1',
+            message: 'visible error',
+            timestamp: 123,
+        }).success).toBe(true);
+    });
+
+    it('rejects malformed session messages', () => {
+        expect(ApiEphemeralUpdateSchema.safeParse({
+            type: 'session-message',
+            id: 'session-1',
+            eventId: 'event-1',
+            timestamp: 123,
+        }).success).toBe(false);
+        expect(ApiEphemeralUpdateSchema.safeParse({
+            type: 'session-message',
+            id: 'session-1',
+            message: 'visible error',
+            timestamp: 123,
+        }).success).toBe(false);
     });
 });

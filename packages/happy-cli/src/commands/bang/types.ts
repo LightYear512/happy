@@ -39,6 +39,8 @@ export interface BangCommandContext {
     isConsoleSession?: boolean;
     /** Agent flavor — used by handlers that need to branch on backend (e.g., !restart) */
     flavor?: 'claude' | 'codex' | 'gemini';
+    /** Codex app-server owns an atomic child swap and must commit CODEX_HOME only after readiness. */
+    deferCodexProfileSwitch?: boolean;
 }
 
 export interface BangCommandResult {
@@ -46,6 +48,10 @@ export interface BangCommandResult {
     message: string | string[];
     /** Action to perform after sending the message */
     action: 'none' | 'restart-session';
+    /** Validated target profile for a deferred Codex app-server account transaction. */
+    restartProfile?: string;
+    /** Global selection observed by a manual account switch; committed only after the switch succeeds. */
+    restartSeenGlobalSetAt?: number;
     /** Optional clickable quick-reply suggestions rendered as <options> buttons after the message. */
     suggestions?: BangOptionSuggestion[];
     /** Optional message(s) sent after suggestions; useful for secondary, non-clickable details. */

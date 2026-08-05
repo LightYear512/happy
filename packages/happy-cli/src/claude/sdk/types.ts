@@ -175,6 +175,8 @@ export interface QueryOptions {
     canCallTool?: CanCallToolCallback
     /** Path to a settings JSON file to pass to Claude via --settings */
     settingsPath?: string
+    /** Environment overrides for this Claude subprocess only. */
+    environment?: NodeJS.ProcessEnv
 }
 
 /**

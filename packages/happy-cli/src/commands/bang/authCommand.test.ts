@@ -30,7 +30,7 @@ const ccsDir = join(homedir(), '.ccs');
 /** Create a minimal mock context */
 function createMockContext(): BangCommandContext {
     return {
-        client: {} as any,
+        client: { sendSessionEvent: vi.fn() } as any,
         session: { clearSessionId: vi.fn() } as any,
         messageQueue: { pushIsolateAndClear: vi.fn() } as any,
         currentEnhancedMode: { permissionMode: 'default' as const },
@@ -40,6 +40,16 @@ function createMockContext(): BangCommandContext {
 /** Flatten result.message (string or string[]) into a single string for assertion */
 function flatMsg(message: string | string[]): string {
     return Array.isArray(message) ? message.join('\n') : message;
+}
+
+function flatResult(result: Awaited<ReturnType<typeof handleAuthBangCommand>>): string {
+    return [
+        flatMsg(result.message),
+        ...(result.suggestions ?? []),
+        ...(result.afterSuggestionsMessage
+            ? [flatMsg(result.afterSuggestionsMessage)]
+            : []),
+    ].join('\n');
 }
 
 /** Set up mock filesystem with given profiles */
@@ -85,17 +95,17 @@ describe('handleAuthBangCommand', () => {
 
             const result = await handleAuthBangCommand('', createMockContext());
             expect(result.action).toBe('none');
-            const msg = flatMsg(result.message);
+            const msg = flatResult(result);
             expect(msg).toContain('work');
-            expect(msg).toContain('暂无其他可切换账号');
+            expect(msg).toContain('请选择要切换的 Claude 账户');
         });
 
         it('should show no active profile when CLAUDE_CONFIG_DIR is not set', async () => {
             mockCcsProfiles({ work: { type: 'account' } });
 
             const result = await handleAuthBangCommand('', createMockContext());
-            const msg = flatMsg(result.message);
-            expect(msg).toMatch(/当前无 CCS|No CCS/);
+            const msg = flatResult(result);
+            expect(msg).toContain('请选择要切换的 Claude 账户');
             expect(msg).toContain('work');
         });
 
@@ -108,10 +118,9 @@ describe('handleAuthBangCommand', () => {
 
             const result = await handleAuthBangCommand('', createMockContext());
             expect(result.action).toBe('none');
-            const msg = flatMsg(result.message);
+            const msg = flatResult(result);
             expect(msg).toContain('work');
             expect(msg).toContain('personal');
-            expect(msg).toContain('!auth');
         });
     });
 
@@ -187,12 +196,10 @@ describe('handleAuthBangCommand', () => {
             });
 
             const result = await handleAuthAllBangCommand('', consoleCtx());
-            const msg = flatMsg(result.message);
-            expect(msg).toContain('📋 账号列表');
-            expect(msg).not.toContain('当前无 CCS 配置');
+            const msg = flatResult(result);
+            expect(msg).toContain('请选择要切换的 Claude 账户');
             expect(msg).toContain('work');
             expect(msg).toContain('personal');
-            expect(msg).toContain('!auth-all');
         });
 
         it('returns explicit empty message when no profiles exist in console', async () => {
@@ -210,10 +217,9 @@ describe('handleAuthBangCommand', () => {
             mockCcsProfiles({ work: { type: 'account' } });
 
             const result = await handleAuthAllBangCommand('', consoleCtx());
-            const msg = flatMsg(result.message);
-            expect(msg).toContain('📋 账号列表');
+            const msg = flatResult(result);
+            expect(msg).toContain('请选择要切换的 Claude 账户');
             expect(msg).toContain('work');
-            expect(msg).toContain('暂无其他可切换账号');
         });
     });
 

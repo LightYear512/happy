@@ -6,6 +6,7 @@ import { t } from '@/text';
 import { Ionicons } from '@expo/vector-icons';
 import { SessionTypeSelector } from '@/components/SessionTypeSelector';
 import type { PermissionModeKey, ModelModeKey } from '@/components/PermissionModeSelector';
+import { getAvailableModels } from '@/components/modelModeOptions';
 import { ItemGroup } from '@/components/ItemGroup';
 import { Item } from '@/components/Item';
 import { useAllMachines, useSessions, useSetting, storage } from '@/sync/storage';
@@ -14,7 +15,23 @@ import { AIBackendProfile, validateProfileForAgent, getProfileEnvironmentVariabl
 import { Modal } from '@/modal';
 import { sync } from '@/sync/sync';
 import { profileSyncService } from '@/sync/profileSync';
-import { isConsolePath } from '@/utils/pathUtils';
+import { isConsolePath, isConsoleSessionMetadata } from '@/utils/pathUtils';
+
+function getWizardModelIcon(key: string): React.ComponentProps<typeof Ionicons>['name'] {
+    if (key === 'default') {
+        return 'settings-outline';
+    }
+    if (key.includes('minimal') || key.includes('low')) {
+        return 'speedometer-outline';
+    }
+    if (key.includes('high') || key === 'opus') {
+        return 'diamond-outline';
+    }
+    if (key === 'adaptiveUsage') {
+        return 'analytics-outline';
+    }
+    return 'cube-outline';
+}
 
 const stylesheet = StyleSheet.create((theme) => ({
     container: {
@@ -551,6 +568,14 @@ export function NewSessionWizard({ onComplete, onCancel, initialPrompt = '' }: N
     });
     const [permissionMode, setPermissionMode] = useState<PermissionModeKey>('default');
     const [modelMode, setModelMode] = useState<ModelModeKey>('default');
+    const modelModeOptions = useMemo(() => (
+        getAvailableModels(agentType, null, t).map((model) => ({
+            value: model.key,
+            label: model.name,
+            description: model.description ?? '',
+            icon: getWizardModelIcon(model.key),
+        }))
+    ), [agentType]);
     const [selectedProfileId, setSelectedProfileId] = useState<string | null>(() => {
         return lastUsedProfile;
     });
@@ -846,7 +871,7 @@ export function NewSessionWizard({ onComplete, onCancel, initialPrompt = '' }: N
                 if (typeof item === 'string') return; // Skip section headers
 
                 const session = item as any;
-                if (session.metadata?.machineId === selectedMachineId && session.metadata?.path && !isConsolePath(session.metadata.path)) {
+                if (session.metadata?.machineId === selectedMachineId && session.metadata?.path && !isConsoleSessionMetadata(session.metadata)) {
                     const path = session.metadata.path;
                     if (!pathSet.has(path)) {
                         pathSet.add(path);
@@ -1626,16 +1651,7 @@ export function NewSessionWizard({ onComplete, onCancel, initialPrompt = '' }: N
                         </ItemGroup>
 
                         <ItemGroup title="Model Mode">
-                            {(agentType === 'claude' ? [
-                                { value: 'default', label: 'Default', description: 'Balanced performance', icon: 'cube-outline' },
-                                { value: 'adaptiveUsage', label: 'Adaptive Usage', description: 'Automatically choose model', icon: 'analytics-outline' },
-                                { value: 'sonnet', label: 'Sonnet', description: 'Fast and efficient', icon: 'speedometer-outline' },
-                                { value: 'opus', label: 'Opus', description: 'Most capable model', icon: 'diamond-outline' },
-                            ] as const : [
-                                { value: 'gpt-5-codex-high', label: 'GPT-5 Codex High', description: 'Best for complex coding', icon: 'diamond-outline' },
-                                { value: 'gpt-5-codex-medium', label: 'GPT-5 Codex Medium', description: 'Balanced coding assistance', icon: 'cube-outline' },
-                                { value: 'gpt-5-codex-low', label: 'GPT-5 Codex Low', description: 'Fast coding help', icon: 'speedometer-outline' },
-                            ] as const).map((option, index, array) => (
+                            {modelModeOptions.map((option, index, array) => (
                                 <Item
                                     key={option.value}
                                     title={option.label}
