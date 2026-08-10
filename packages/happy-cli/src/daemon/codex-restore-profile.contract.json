@@ -1,7 +1,7 @@
 {
   "schemaVersion": "contract-first-module-gate/v2",
   "contractProfile": "contract-first-minimal-boundary/v1",
-  "riskTriggers": ["public-abi-or-persistent-format"],
+  "riskTriggers": ["public-abi-or-persistent-format", "cross-module-ownership-transfer"],
   "module": "happy.daemon.codex-restore-profile",
   "owner": "happy-cli daemon and Codex app-server runtime",
   "publicApis": [
@@ -12,7 +12,7 @@
       "rejectedStates": ["unsafe profile", "non-Codex record carrying profile", "unknown or closed session authority"],
       "provenanceFields": ["sessionId", "profileName", "restore.agent"],
       "outputState": "restore record binds the next Codex process to the last successful CODEX_HOME",
-      "enforcement": "session-codex-profile endpoint plus parseRestoreFileData and buildRestoreProfileEnvironment",
+      "enforcement": "session-codex-profile endpoint with bounded legacy-daemon 409 retry plus parseRestoreFileData and buildRestoreProfileEnvironment",
       "negativeTests": [
         {
           "name": "codex_restore_profile_boundary",
@@ -24,9 +24,21 @@
   "budgets": {
     "notApplicableReason": "the profile identity boundary adds no resource budget"
   },
-  "lifecycleTransitions": {
-    "notApplicableReason": "the existing open and closed restore lifecycle remains unchanged"
-  },
+  "lifecycleTransitions": [
+    {
+      "from": "provider input ready with an in-memory daemon child",
+      "to": "durable restore authority committed before daemon startup acknowledgement",
+      "creator": "Codex completeProviderInputReady session webhook",
+      "advancer": "daemon processHappySessionWebhook",
+      "consumer": "session-codex-profile and future exact restore",
+      "rejectTests": [
+        {
+          "name": "codex_restore_profile_boundary",
+          "file": "codex-restore-profile-boundary.test.mjs"
+        }
+      ]
+    }
+  ],
   "provenanceFields": {
     "notApplicableReason": "the local hostile endpoint and strict restore parser validate the named fields directly"
   },

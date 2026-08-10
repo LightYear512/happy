@@ -11,7 +11,7 @@ import { randomUUID } from 'node:crypto';
 import { execSync } from 'node:child_process';
 import { logger } from '@/ui/logger';
 import { Credentials, readSettings } from '@/persistence';
-import { initialMachineMetadata } from '@/daemon/run';
+import { initialMachineMetadata, shouldRegisterMachineForSession } from '@/daemon/run';
 import { configuration } from '@/configuration';
 import packageJson from '../../package.json';
 import os from 'node:os';
@@ -36,14 +36,15 @@ import {
     resolveStartupAccountSelection,
     writeSessionAccountSelection,
 } from '@/commands/bang/accountIntent';
-import { notifyDaemonCodexProfile, notifyDaemonSessionStarted } from "@/daemon/controlClient";
+import { notifyDaemonCodexProfile } from "@/daemon/controlClient";
+import { completeProviderInputReady } from '@/utils/completeProviderInputReady';
 import { installHappySessionEnvironment } from '@/utils/projectSessionStartup';
 import { registerKillSessionHandler } from "@/claude/registerKillSessionHandler";
 import { registerSessionTransportFatalHandler } from '@/api/registerSessionTransportFatalHandler';
 import { delay } from "@/utils/time";
 import { stopCaffeinate } from "@/utils/caffeinate";
 import { connectionState } from '@/utils/serverConnectionErrors';
-import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
+import { setupOfflineSession } from '@/utils/setupOfflineSession';
 import { registerShutdownHandlers } from '@/utils/shutdownHandlers';
 import type { ApiSessionClient } from '@/api/apiSession';
 import { resolveCodexExecutionPolicy, resolveCodexSessionPermissionMode } from './executionPolicy';
@@ -175,10 +176,12 @@ export async function runCodex(opts: {
         process.exit(1);
     }
     logger.debug(`Using machineId: ${machineId}`);
-    await api.getOrCreateMachine({
-        machineId,
-        metadata: initialMachineMetadata
-    });
+    if (shouldRegisterMachineForSession(opts.startedBy)) {
+        await api.getOrCreateMachine({
+            machineId,
+            metadata: initialMachineMetadata
+        });
+    }
 
     //
     // Create session
@@ -203,28 +206,15 @@ export async function runCodex(opts: {
         response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
     }
 
-    // Handle server unreachable case - create offline stub with hot reconnection
+    // A failed or unknown create stays local. Replaying POST /v1/sessions can
+    // create duplicate remote sessions when the first response was lost.
     let session: ApiSessionClient;
-    // Permission handler declared here so it can be updated in onSessionSwap callback
-    // (assigned later at line ~385 after client setup)
     let permissionHandler: CodexPermissionHandler;
     let bindTransportFatalHandler: ((client: ApiSessionClient) => void) | null = null;
-    const { session: initialSession, reconnectionHandle } = setupOfflineReconnection({
+    const { session: initialSession } = setupOfflineSession({
         api,
         sessionTag,
-        metadata,
-        state,
         response,
-        onSessionSwap: (newSession) => {
-            session = newSession;
-            installHappySessionEnvironment(newSession.sessionId);
-            session.updateMetadata((metadata) => withCodexModelModeMetadata(metadata));
-            bindTransportFatalHandler?.(newSession);
-            // Update permission handler with new session to avoid stale reference
-            if (permissionHandler) {
-                permissionHandler.updateSession(newSession);
-            }
-        }
     });
     session = initialSession;
     installHappySessionEnvironment(session.sessionId);
@@ -267,21 +257,6 @@ export async function runCodex(opts: {
     }
     session.updateMetadata((metadata) => withCodexModelModeMetadata(metadata));
 
-    // Always report to daemon if it exists (skip if offline)
-    if (response) {
-        try {
-            logger.debug(`[START] Reporting session ${response.id} to daemon`);
-            const result = await notifyDaemonSessionStarted(response.id, metadata);
-            if (result.error) {
-                logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
-            } else {
-                logger.debug(`[START] Reported session ${response.id} to daemon`);
-            }
-        } catch (error) {
-            logger.debug('[START] Failed to report to daemon (may not be running):', error);
-        }
-    }
-
     const messageQueue = new MessageQueue2<EnhancedMode>((mode) => hashObject({
         permissionMode: mode.permissionMode,
         model: mode.model,
@@ -314,7 +289,7 @@ export async function runCodex(opts: {
         messageQueue.push(text, enhancedMode);
     });
 
-    session.onUserMessage((message) => {
+    const onUserMessage = (message: import('@/api/types').UserMessage): void => {
         // Resolve permission mode (accept all modes, will be mapped in switch statement)
         if (message.meta?.permissionMode) {
             currentPermissionMode = message.meta.permissionMode as import('@/api/types').PermissionMode;
@@ -411,18 +386,14 @@ export async function runCodex(opts: {
         const text = modelFacingUserText(message);
         replyMonitor.observeUserMessage();
         messageQueue.push(text, enhancedMode);
-    });
+    };
     let thinking = false;
     let codexSessionIdStored = false;
     let currentTurnId: string | null = null;
     let codexStartedSubagents = new Set<string>();
     let codexActiveSubagents = new Set<string>();
     let codexProviderSubagentToSessionSubagent = new Map<string, string>();
-    session.keepAlive(thinking, 'remote');
-    // Periodic keep-alive; store handle so we can clear on exit
-    const keepAliveInterval = setInterval(() => {
-        session.keepAlive(thinking, 'remote');
-    }, 2000);
+    let keepAliveInterval: ReturnType<typeof setInterval> | null = null;
 
     const sendReady = () => {
         session.sendSessionEvent({ type: 'ready' });
@@ -831,18 +802,29 @@ export async function runCodex(opts: {
         await client.connect();
         logger.debug('[codex]: client.connect done');
 
-        // After restore, fetch pending user messages that arrived while CLI was offline.
-        if (opts.restoreSessionId && response) {
-            try {
-                await fetchAndInjectPendingMessages(
-                    api, session, opts.restoreSessionId,
-                    response.encryptionKey, response.encryptionVariant,
-                    '[Codex]',
-                );
-            } catch (error) {
-                logger.debug('[Codex] Failed to fetch pending messages after restore:', error);
-            }
+        const pendingWindow = opts.restoreSessionId && response
+            ? fetchAndInjectPendingMessages(
+                api, session, opts.restoreSessionId,
+                response.encryptionKey, response.encryptionVariant,
+                '[Codex]',
+              )
+            : undefined;
+        if (response) {
+            await completeProviderInputReady({
+                session,
+                expectedHappySessionId: response.id,
+                pendingWindow,
+                providerSessionId: opts.codexSessionId,
+                expectedProviderSessionId: opts.codexSessionId,
+                onUserMessage,
+            });
+        } else {
+            session.onUserMessage(onUserMessage);
         }
+        session.keepAlive(thinking, 'remote');
+        keepAliveInterval = setInterval(() => {
+            session.keepAlive(thinking, 'remote');
+        }, 2000);
 
         let wasCreated = false;
         let currentModeHash: string | null = null;
@@ -1106,12 +1088,6 @@ export async function runCodex(opts: {
         replyMonitor.dispose();
         removeTransportFatalHandler();
         removeShutdownHandlers();
-        // Cancel offline reconnection if still running
-        if (reconnectionHandle) {
-            logger.debug('[codex]: Cancelling offline reconnection');
-            reconnectionHandle.cancel();
-        }
-
         try {
             logger.debug('[codex]: sendSessionDeath');
             session.sendSessionDeath();
@@ -1143,7 +1119,7 @@ export async function runCodex(opts: {
         }
         // Clear periodic keep-alive to avoid keeping event loop alive
         logger.debug('[codex]: clearInterval(keepAlive)');
-        clearInterval(keepAliveInterval);
+        if (keepAliveInterval) clearInterval(keepAliveInterval);
         if (inkInstance) {
             logger.debug('[codex]: inkInstance.unmount()');
             inkInstance.unmount();

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtemp, mkdir, writeFile, readFile, rm, chmod } from 'node:fs/promises';
 import { tmpdir, platform } from 'node:os';
 import { join } from 'node:path';
@@ -42,6 +42,7 @@ const TURN_DELIM = '@@TURN@@'; // plain-ASCII record separator (avoids escaping 
 class FakeSession extends EventEmitter {
     readonly sessionId = 'fake-session-id';
     readonly sessionEvents: Array<{ type: string; message?: string }> = [];
+    readonly providerTurnEnds: Array<'completed' | 'failed' | 'cancelled'> = [];
     readonly rpcHandlers = new Map<string, (params: unknown) => unknown>();
     metadata: Metadata = {
         path: '/workspace',
@@ -59,19 +60,19 @@ class FakeSession extends EventEmitter {
             this.rpcHandlers.set(method, handler);
         },
     };
-    private cb: ((message: UserMessage) => void) | null = null;
+    private cb: ((message: UserMessage) => unknown | Promise<unknown>) | null = null;
     private pending: UserMessage[] = [];
 
     constructor() {
         super();
     }
 
-    onUserMessage(callback: (data: UserMessage) => void): void {
+    onUserMessage(callback: (data: UserMessage) => unknown | Promise<unknown>): void {
         this.cb = callback;
-        while (this.pending.length > 0) callback(this.pending.shift()!);
+        while (this.pending.length > 0) void callback(this.pending.shift()!);
     }
     injectPendingMessage(message: UserMessage): void {
-        if (this.cb) this.cb(message);
+        if (this.cb) void this.cb(message);
         else this.pending.push(message);
     }
     sendUserText(text: string): void {
@@ -82,6 +83,9 @@ class FakeSession extends EventEmitter {
             meta: { sentFrom: 'cli', modelText, displayText, presentation: 'compact' } });
     }
     sendSessionEvent(event: { type: string; message?: string }): void { this.sessionEvents.push(event); }
+    closeProviderSessionTurn(status: 'completed' | 'failed' | 'cancelled'): void {
+        this.providerTurnEnds.push(status);
+    }
     sendCodexMessage(): void {}
     sendSessionProtocolMessage(): void {}
     sendClaudeSessionMessage(): void {}
@@ -172,7 +176,7 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
                 '  if (msg.method === "thread/start") { reply(msg.id, { threadId: threadIds[Math.min(nextThread++, threadIds.length - 1)] }); continue; }',
                 '  if (msg.method === "thread/resume") {',
                 '    const tid = (msg.params && msg.params.threadId) || threadIds[0];',
-                '    if (resumeTraceLog) { try { fs.appendFileSync(resumeTraceLog, JSON.stringify({ threadId: tid }) + "\\n"); } catch {} }',
+                '    if (resumeTraceLog) { try { fs.appendFileSync(resumeTraceLog, JSON.stringify({ threadId: tid, excludeTurns: msg.params && msg.params.excludeTurns }) + "\\n"); } catch {} }',
                 '    if (rejectResume) { send({ id: msg.id, error: { code: -32000, message: "no rollout found for thread id " + tid } }); continue; }',
                 '    if (resumeDelayMs > 0) { setTimeout(() => reply(msg.id, { threadId: tid }), resumeDelayMs); }',
                 '    else { reply(msg.id, { threadId: tid }); }',
@@ -235,7 +239,7 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
         }
     }
 
-    async function readResumeTraces(): Promise<Array<{ threadId: string }>> {
+    async function readResumeTraces(): Promise<Array<{ threadId: string; excludeTurns?: boolean }>> {
         try {
             const raw = await readFile(resumeTraceLog, 'utf-8');
             return raw.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
@@ -276,7 +280,7 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
         });
 
         await ready;
-        expect(await readResumeTraces()).toEqual([{ threadId: THREAD_UUID_1 }]);
+        expect(await readResumeTraces()).toEqual([{ threadId: THREAD_UUID_1, excludeTurns: true }]);
         expect(await readTurnRecords()).toEqual([]);
         requestExit?.();
         await runtime;
@@ -309,7 +313,7 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
         });
 
         expect(becameReady).toBe(false);
-        expect(await readResumeTraces()).toEqual([{ threadId: THREAD_UUID_1 }]);
+        expect(await readResumeTraces()).toEqual([{ threadId: THREAD_UUID_1, excludeTurns: true }]);
         expect(await readTurnRecords()).toEqual([]);
         expect(fakeSession.sessionEvents).toContainEqual(expect.objectContaining({
             type: 'message',
@@ -350,7 +354,7 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
     });
 
     // BUG-HAPPY-STARTUP diagnostic: reproduces the native-id/thread-id startup gap on the real turn loop.
-    it('leaves fresh-thread XC startup and admission to the shared ApiSession boundary', async () => {
+    it('leaves fresh-thread XC startup to ApiSession and sends a lone @ directly to Codex', async () => {
         const startupDirectory = join(projectCwd, 'xcoding-v2', 'dist');
         await mkdir(startupDirectory, { recursive: true });
         await writeFile(join(startupDirectory, 'cli.js'),
@@ -378,7 +382,7 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
         });
 
         await ready;
-        fakeSession.sendUserText('FIRST_FRESH_PROMPT');
+        fakeSession.sendUserText('@');
         const deadline = Date.now() + 4_000;
         let records: string[] = [];
         while (Date.now() < deadline) {
@@ -392,7 +396,7 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
         }));
         expect(records).toHaveLength(1);
         expect(records[0]).not.toContain('XC_FIRST_THREAD_CONTEXT');
-        expect(records[0]).toContain('FIRST_FRESH_PROMPT');
+        expect(records[0]).toMatch(/\n\n@$/u);
     });
 
     it('prepares a daemon Codex provider identity before the first turn', async () => {
@@ -426,7 +430,7 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
         requestExit?.();
     });
 
-    it('does not duplicate shared ApiSession admission when a provider turn is retried', async () => {
+    it('never invokes the XC input hook when a provider turn is retried', async () => {
         const startupDirectory = join(projectCwd, 'xcoding-v2', 'dist');
         const inputCalls = join(projectCwd, 'xc-input-calls.txt');
         await mkdir(startupDirectory, { recursive: true });
@@ -507,7 +511,7 @@ process.stdout.write(process.argv[3] === 'startup'
         expect(records[0]).not.toContain('VISIBLE_COMPACT_SUMMARY');
     }, 10_000);
 
-    it('routes a raw @ command locally even when XC supplied model context', async () => {
+    it('routes a raw @ command to Codex when the message carries distinct model text', async () => {
         const fakeBin = await writeFakeBin();
         process.env.HAPPY_CODEX_APP_SERVER_BIN = fakeBin;
         process.env.HAPPY_CODEX_APP_SERVER_RPC_TIMEOUT_MS = '4000';
@@ -537,8 +541,10 @@ process.stdout.write(process.argv[3] === 'startup'
         }
         requestExit?.();
 
-        expect(fakeSession.sessionEvents.length).toBeGreaterThan(eventFloor);
-        expect(await readTurnRecords()).toEqual([]);
+        const records = await readTurnRecords();
+        expect(records).toHaveLength(1);
+        expect(records[0]).toContain('[XC required context]');
+        expect(records[0]).toContain('@');
     }, 10_000);
 
     it('emits a compact-failure error → auto-rescue injects .happy docs into the next turn/start', async () => {
@@ -769,7 +775,7 @@ process.stdout.write(process.argv[3] === 'startup'
         requestExit?.();
         await runtime;
 
-        expect(await readResumeTraces()).toEqual([{ threadId: traces[0]?.threadId }]);
+        expect(await readResumeTraces()).toEqual([{ threadId: traces[0]?.threadId, excludeTurns: true }]);
         expect(traces).toHaveLength(2);
         expect(traces[0].threadId).toBe(traces[1].threadId);
         expect(traces[0].codexHome).toBe(workHome);
@@ -962,7 +968,9 @@ process.stdout.write(process.argv[3] === 'startup'
 
         expect(fakeSession.sessionEvents.some((event) => event.message?.includes('本次输入未提交'))).toBe(true);
         expect(resumes).toHaveLength(1);
+        expect(resumes[0]?.excludeTurns).toBe(true);
         expect(traces).toHaveLength(1);
         expect(traces[0].text).toContain('first-account-prompt');
     }, 15_000);
+
 });

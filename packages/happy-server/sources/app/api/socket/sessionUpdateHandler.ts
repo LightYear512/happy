@@ -12,11 +12,8 @@ import { Socket } from "socket.io";
  *  Must be > CACHE_WRITE_INTERVAL(30s) + BATCH_INTERVAL(5s) to avoid false positives. */
 const ZOMBIE_THRESHOLD_MS = 2 * 60 * 1000; // 2 minutes
 
-/** TTL for the restoring lock to prevent duplicate spawn attempts. */
-const RESTORING_LOCK_TTL_MS = 30 * 1000; // 30 seconds
-
-/** In-memory map tracking sessions currently being restored. Value is the timestamp when restore started. */
-const restoringLocks = new Map<string, number>();
+/** One in-flight restore owner per session; the bounded restore call releases it in finally. */
+const restoringSessions = new Set<string>();
 
 /**
  * Check if a session needs restore (inactive or zombie) and trigger daemon spawn if so.
@@ -65,14 +62,11 @@ export async function tryRestoreSession(
         return false;
     }
 
-    // Check restoring lock
-    const lockTime = restoringLocks.get(session.id);
-    if (lockTime && (now - lockTime) < RESTORING_LOCK_TTL_MS) {
+    if (restoringSessions.has(session.id)) {
         return false; // Already restoring, message is stored in DB and will be pulled by CLI
     }
 
-    // Set restoring lock
-    restoringLocks.set(session.id, now);
+    restoringSessions.add(session.id);
     let daemonSocket: Socket | null = null;
     const daemonRestoredSessionIds = new Set<string>();
     try {
@@ -105,7 +99,7 @@ export async function tryRestoreSession(
         }
 
         log({ module: 'restore' }, `Triggering restore for session ${session.id}`);
-        const response: any = await daemonSocket.timeout(20000).emitWithAck('server-restore-session', {
+        const response: any = await daemonSocket.timeout(60_000).emitWithAck('server-restore-session', {
             sessionId: session.id,
             claudeSessionId: session.claudeSessionId,
             summary: session.summary,
@@ -159,7 +153,7 @@ export async function tryRestoreSession(
         await publishRestoreFailure(daemonSocket, error);
         return false;
     } finally {
-        restoringLocks.delete(session.id);
+        restoringSessions.delete(session.id);
     }
 }
 
@@ -181,6 +175,7 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                 where: { id: sid, accountId: userId }
             });
             if (!session) {
+                callback?.({ result: 'error' });
                 return;
             }
 
@@ -209,7 +204,11 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                 data: updateData,
             });
             if (count === 0) {
-                callback({ result: 'version-mismatch', version: session.metadataVersion, metadata: session.metadata });
+                const latest = await db.session.findUnique({
+                    where: { id: sid, accountId: userId }
+                });
+                if (!latest) callback({ result: 'error' });
+                else callback({ result: 'version-mismatch', version: latest.metadataVersion, metadata: latest.metadata });
                 return null;
             }
 
@@ -332,9 +331,6 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                 return;
             }
 
-            // Clear restoring lock if session is alive again
-            restoringLocks.delete(sid);
-
             // Queue database update (will only update if time difference is significant)
             activityCache.queueSessionUpdate(sid, t);
 
@@ -351,11 +347,25 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
     });
 
     const receiveMessageLock = new AsyncLock();
-    socket.on('message', async (data: any) => {
+    socket.on('message', async (data: any, callback?: (response: any) => void) => {
         await receiveMessageLock.inLock(async () => {
+            const respond = (response: any) => {
+                const currentCallback = callback;
+                callback = undefined;
+                currentCallback?.(response);
+            };
             try {
                 websocketEventsCounter.inc({ event_type: 'message' });
                 const { sid, message, localId } = data;
+
+                if (typeof sid !== 'string' || sid.length === 0 || typeof message !== 'string'
+                    || message.length === 0 || Buffer.byteLength(message, 'utf8') > 4 * 1024 * 1024
+                    || (localId !== undefined && (typeof localId !== 'string'
+                        || !/^[^\u0000-\u001f]{1,256}$/u.test(localId)
+                        || Buffer.byteLength(localId, 'utf8') > 256))) {
+                    respond({ ok: false, code: 'invalid' });
+                    return;
+                }
 
                 log({ module: 'websocket' }, `Received message from socket ${socket.id}: sessionId=${sid}, messageLength=${message.length} bytes, connectionType=${connection.connectionType}, connectionSessionId=${connection.connectionType === 'session-scoped' ? connection.sessionId : 'N/A'}`);
 
@@ -364,9 +374,10 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                     where: { id: sid, accountId: userId }
                 });
                 if (!session) {
+                    respond({ ok: false, code: 'not_found' });
                     return;
                 }
-                let useLocalId = typeof localId === 'string' ? localId : null;
+                const useLocalId = typeof localId === 'string' ? localId : null;
 
                 // Create encrypted message
                 const msgContent: PrismaJson.SessionMessageContent = {
@@ -374,19 +385,31 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                     c: message
                 };
 
-                // Resolve seq
-                const updSeq = await allocateUserSeq(userId);
-                const msgSeq = await allocateSessionSeq(sid);
-
                 // Check if message already exists
                 if (useLocalId) {
                     const existing = await db.sessionMessage.findFirst({
                         where: { sessionId: sid, localId: useLocalId }
                     });
                     if (existing) {
-                        return { msg: existing, update: null };
+                        const existingContent = existing.content as PrismaJson.SessionMessageContent;
+                        if (existingContent.t !== 'encrypted' || existingContent.c !== message) {
+                            respond({ ok: false, code: 'invalid' });
+                            return;
+                        }
+                        respond({
+                            ok: true,
+                            id: existing.id,
+                            seq: existing.seq,
+                            localId: existing.localId,
+                            createdAt: existing.createdAt.getTime(),
+                        });
+                        return;
                     }
                 }
+
+                // Allocate sequence numbers only for a genuinely new row.
+                const updSeq = await allocateUserSeq(userId);
+                const msgSeq = await allocateSessionSeq(sid);
 
                 // Create message
                 const msg = await db.sessionMessage.create({
@@ -396,6 +419,14 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                         content: msgContent,
                         localId: useLocalId
                     }
+                });
+
+                respond({
+                    ok: true,
+                    id: msg.id,
+                    seq: msg.seq,
+                    localId: msg.localId,
+                    createdAt: msg.createdAt.getTime(),
                 });
 
                 // Emit new message update to relevant clients
@@ -413,6 +444,7 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                 });
             } catch (error) {
                 log({ module: 'websocket', level: 'error' }, `Error in message handler: ${error}`);
+                respond({ ok: false, code: 'internal' });
             }
         });
     });

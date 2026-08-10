@@ -15,7 +15,8 @@ import { authAndSetupMachineIfNeeded } from './ui/auth'
 import packageJson from '../package.json'
 import { z } from 'zod'
 import { startDaemon } from './daemon/run'
-import { checkIfDaemonRunningAndCleanupStaleState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './daemon/controlClient'
+import { checkIfDaemonRunningAndCleanupStaleState, isDaemonRunningCurrentlyInstalledHappyVersion,
+  shouldSessionEnsureDaemon, stopDaemon } from './daemon/controlClient'
 import { getLatestDaemonLog } from './ui/logger'
 import { killRunawayHappyProcesses } from './daemon/doctor'
 import { install } from './daemon/install'
@@ -32,6 +33,31 @@ import { claudeCliPath } from './claude/claudeLocal'
 import { execFileSync } from 'node:child_process'
 import { extractNoSandboxFlag } from './utils/sandboxFlags'
 import { MessageMetaSchema, type PermissionMode } from './api/types'
+
+async function ensureDaemonForSession(startedBy: 'daemon' | 'terminal' | undefined): Promise<void> {
+  if (!shouldSessionEnsureDaemon(startedBy)) {
+    logger.debug('Daemon-owned session reuses its parent daemon');
+    return;
+  }
+  if (await isDaemonRunningCurrentlyInstalledHappyVersion()) return;
+
+  logger.debug('Starting Happy background service...');
+  const daemonProcess = spawnHappyCLI(['daemon', 'start-sync'], {
+    detached: true,
+    stdio: 'ignore',
+    env: process.env,
+  });
+  daemonProcess.unref();
+
+  for (let i = 0; i < 15; i++) {
+    await new Promise(resolve => setTimeout(resolve, 500));
+    if (await isDaemonRunningCurrentlyInstalledHappyVersion()) {
+      logger.debug('Happy background service is ready');
+      return;
+    }
+  }
+  logger.debug('Happy background service did not become ready before the session startup deadline');
+}
 
 
 (async () => {
@@ -341,18 +367,7 @@ import { MessageMetaSchema, type PermissionMode } from './api/types'
         credentials
       } = await authAndSetupMachineIfNeeded();
 
-      // Auto-start daemon for gemini (same as claude)
-      logger.debug('Ensuring Happy background service is running & matches our version...');
-      if (!(await isDaemonRunningCurrentlyInstalledHappyVersion())) {
-        logger.debug('Starting Happy background service...');
-        const daemonProcess = spawnHappyCLI(['daemon', 'start-sync'], {
-          detached: true,
-          stdio: 'ignore',
-          env: process.env
-        });
-        daemonProcess.unref();
-        await new Promise(resolve => setTimeout(resolve, 200));
-      }
+      await ensureDaemonForSession(startedBy);
 
       await runGemini({ credentials, startedBy, restoreSessionId });
     } catch (error) {
@@ -389,17 +404,7 @@ import { MessageMetaSchema, type PermissionMode } from './api/types'
       const resolved = resolveAcpAgentConfig(acpArgs);
       const { credentials } = await authAndSetupMachineIfNeeded();
 
-      logger.debug('Ensuring Happy background service is running & matches our version...');
-      if (!(await isDaemonRunningCurrentlyInstalledHappyVersion())) {
-        logger.debug('Starting Happy background service...');
-        const daemonProcess = spawnHappyCLI(['daemon', 'start-sync'], {
-          detached: true,
-          stdio: 'ignore',
-          env: process.env
-        });
-        daemonProcess.unref();
-        await new Promise(resolve => setTimeout(resolve, 200));
-      }
+      await ensureDaemonForSession(startedBy);
 
       await runAcp({
         credentials,
@@ -585,8 +590,6 @@ ${chalk.bold('To clean up runaway processes:')} Use ${chalk.cyan('happy doctor c
         unknownArgs.push(arg)
       } else if (arg === '-v' || arg === '--version') {
         showVersion = true
-        // Also pass through to claude (will show after our version)
-        unknownArgs.push(arg)
       } else if (arg === '--happy-starting-mode') {
         options.startingMode = z.enum(['local', 'remote']).parse(args[++i])
       } else if (arg === '--yolo') {
@@ -649,6 +652,11 @@ ${chalk.bold('To clean up runaway processes:')} Use ${chalk.cyan('happy doctor c
     // Add unknown args to claudeArgs
     if (unknownArgs.length > 0) {
       options.claudeArgs = [...(options.claudeArgs || []), ...unknownArgs]
+    }
+
+    if (showVersion) {
+      console.log(`happy version: ${packageJson.version}`)
+      return
     }
 
     // Resolve Chrome mode: explicit flag > settings > false
@@ -716,41 +724,12 @@ ${chalk.bold.cyan('Claude Code Options (from `claude --help`):')}
       process.exit(0)
     }
 
-    // Show version
-    if (showVersion) {
-      console.log(`happy version: ${packageJson.version}`)
-      // Don't exit - continue to pass --version to Claude Code
-    }
-
     // Normal flow - auth and machine setup
     const {
       credentials
     } = await authAndSetupMachineIfNeeded();
 
-    // Always auto-start daemon for simplicity
-    logger.debug('Ensuring Happy background service is running & matches our version...');
-
-    if (!(await isDaemonRunningCurrentlyInstalledHappyVersion())) {
-      logger.debug('Starting Happy background service...');
-
-      // Use the built binary to spawn daemon
-      const daemonProcess = spawnHappyCLI(['daemon', 'start-sync'], {
-        detached: true,
-        stdio: 'ignore',
-        env: process.env
-      })
-      daemonProcess.unref();
-
-      // Wait for daemon to be ready (state file written + version matches)
-      // Daemon needs ~2-3s for auth → lock → state write → machine registration
-      for (let i = 0; i < 15; i++) {
-        await new Promise(resolve => setTimeout(resolve, 500));
-        if (await isDaemonRunningCurrentlyInstalledHappyVersion()) {
-          logger.debug('Happy background service is ready');
-          break;
-        }
-      }
-    }
+    await ensureDaemonForSession(options.startedBy)
 
     // Start the CLI
     try {

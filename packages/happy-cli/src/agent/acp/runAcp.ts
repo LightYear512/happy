@@ -12,10 +12,10 @@ import { logger } from '@/ui/logger';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
 import { Credentials, readSettings } from '@/persistence';
-import { initialMachineMetadata } from '@/daemon/run';
+import { initialMachineMetadata, shouldRegisterMachineForSession } from '@/daemon/run';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
-import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
-import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
+import { setupOfflineSession } from '@/utils/setupOfflineSession';
+import { completeProviderInputReady } from '@/utils/completeProviderInputReady';
 import { registerKillSessionHandler } from '@/claude/registerKillSessionHandler';
 import { startHappyServer } from '@/claude/utils/startHappyServer';
 import { projectPath } from '@/projectPath';
@@ -464,10 +464,12 @@ export async function runAcp(opts: {
     throw new Error('No machine ID found in settings');
   }
 
-  await api.getOrCreateMachine({
-    machineId: settings.machineId,
-    metadata: initialMachineMetadata,
-  });
+  if (shouldRegisterMachineForSession(opts.startedBy)) {
+    await api.getOrCreateMachine({
+      machineId: settings.machineId,
+      metadata: initialMachineMetadata,
+    });
+  }
 
   const { state, metadata } = createSessionMetadata({
     flavor: resolveSessionFlavor(opts.agentName),
@@ -482,28 +484,12 @@ export async function runAcp(opts: {
 
   let session: ApiSessionClient;
   let permissionHandler: GenericAcpPermissionHandler;
-  const { session: initialSession, reconnectionHandle } = setupOfflineReconnection({
+  const { session: initialSession } = setupOfflineSession({
     api,
     sessionTag,
-    metadata,
-    state,
     response,
-    onSessionSwap: (newSession) => {
-      session = newSession;
-      if (permissionHandler) {
-        permissionHandler.updateSession(newSession);
-      }
-    },
   });
   session = initialSession;
-
-  if (response) {
-    try {
-      await notifyDaemonSessionStarted(response.id, metadata);
-    } catch (error) {
-      logger.debug('[acp] Failed to report session to daemon:', error);
-    }
-  }
 
   permissionHandler = new GenericAcpPermissionHandler(session, opts.agentName);
   const sessionManager = new AcpSessionManager();
@@ -819,7 +805,7 @@ export async function runAcp(opts: {
 
   backend.onMessage(onBackendMessage);
 
-  session.onUserMessage((message) => {
+  const onUserMessage = (message: import('@/api/types').UserMessage): void => {
     const text = modelFacingUserText(message);
     if (!text) {
       return;
@@ -839,7 +825,16 @@ export async function runAcp(opts: {
       permissionMode: currentPermissionMode,
       model: currentModel,
     });
-  });
+  };
+  if (response) {
+    await completeProviderInputReady({
+      session,
+      expectedHappySessionId: response.id,
+      onUserMessage,
+    });
+  } else {
+    session.onUserMessage(onUserMessage);
+  }
   session.keepAlive(thinking, 'remote');
 
   const keepAliveInterval = setInterval(() => {
@@ -927,7 +922,6 @@ export async function runAcp(opts: {
     }
   } finally {
     clearInterval(keepAliveInterval);
-    reconnectionHandle?.cancel();
     clearPendingTurn(new Error('ACP runner shutting down'));
 
     try {

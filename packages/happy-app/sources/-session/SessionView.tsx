@@ -207,8 +207,16 @@ function SessionViewLoaded({ sessionId, session }: { sessionId: string, session:
         if (!text.trim()) return;
         setMessage('');
         clearDraft();
-        sync.sendMessage(sessionId, text, displayText);
         trackMessageSent();
+        void sync.sendMessage(sessionId, text, displayText).then((result) => {
+            if (!result.submitted) {
+                setMessage((current) => {
+                    return current.length === 0 ? text : current;
+                });
+            }
+        }).catch(() => {
+            setMessage((current) => current.length === 0 ? text : current);
+        });
     }, [clearDraft, sessionId]);
     const alwaysShowContextSize = useSetting('alwaysShowContextSize');
     const experiments = useSetting('experiments');

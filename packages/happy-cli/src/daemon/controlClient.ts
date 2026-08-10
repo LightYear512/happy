@@ -6,13 +6,11 @@
 import { logger } from '@/ui/logger';
 import { clearDaemonState, readDaemonState } from '@/persistence';
 import type { Metadata, PermissionMode } from '@/api/types';
-import { projectPath } from '@/projectPath';
-import { readFileSync } from 'fs';
-import { join } from 'path';
 import { configuration } from '@/configuration';
-import type { SessionTransportHealthRecord } from '@/api/sessionTransportHealth';
 
-async function daemonPost(path: string, body?: any): Promise<{ error?: string } | any> {
+type DaemonPostError = { error: string; status?: number };
+
+async function daemonPost(path: string, body?: any): Promise<DaemonPostError | any> {
   const state = await readDaemonState();
   if (!state?.httpPort) {
     const errorMessage = 'No daemon running, no state file found';
@@ -46,7 +44,8 @@ async function daemonPost(path: string, body?: any): Promise<{ error?: string } 
       const errorMessage = `Request failed: ${path}, HTTP ${response.status}`;
       logger.debug(`[CONTROL CLIENT] ${errorMessage}`);
       return {
-        error: errorMessage
+        error: errorMessage,
+        status: response.status,
       };
     }
     
@@ -64,21 +63,30 @@ export async function notifyDaemonSessionStarted(
   sessionId: string,
   metadata: Metadata,
   readyProviderSessionId?: string,
-  transportHealth?: SessionTransportHealthRecord | null,
 ): Promise<{ error?: string } | any> {
   return await daemonPost('/session-started', {
     sessionId,
     metadata,
     ...(readyProviderSessionId ? { readyProviderSessionId } : {}),
-    ...(transportHealth !== undefined ? { transportHealth } : {}),
   });
 }
 
 export async function notifyDaemonCodexProfile(
   sessionId: string,
   profileName: string,
+  options: { maxAttempts?: number; retryDelayMs?: number } = {},
 ): Promise<{ error?: string } | any> {
-  return await daemonPost('/session-codex-profile', { sessionId, profileName });
+  const maxAttempts = options.maxAttempts ?? 8;
+  const retryDelayMs = options.retryDelayMs ?? 25;
+  let result: DaemonPostError | any;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    result = await daemonPost('/session-codex-profile', { sessionId, profileName });
+    if (!result.error || result.status !== 409 || attempt === maxAttempts) return result;
+    await new Promise<void>((resolve) => setTimeout(resolve, retryDelayMs));
+  }
+
+  return result;
 }
 
 export async function listDaemonSessions(): Promise<any[]> {
@@ -164,18 +172,16 @@ export async function isDaemonRunningCurrentlyInstalledHappyVersion(): Promise<b
     return false;
   }
   
-  try {
-    // Read package.json on demand from disk - so we are guaranteed to get the latest version
-    const packageJsonPath = join(projectPath(), 'package.json');
-    const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf-8'));
-    const currentCliVersion = packageJson.version;
-    
-    logger.debug(`[DAEMON CONTROL] Current CLI version: ${currentCliVersion}, Daemon started with version: ${state.startedWithCliVersion}`);
-    return currentCliVersion === state.startedWithCliVersion;
-  } catch (error) {
-    logger.debug('[DAEMON CONTROL] Error checking daemon version', error);
-    return false;
-  }
+  logger.debug(`[DAEMON CONTROL] Current process CLI version: ${configuration.currentCliVersion}, Daemon started with version: ${state.startedWithCliVersion}`);
+  return daemonVersionMatchesCurrentProcess(state.startedWithCliVersion);
+}
+
+export function daemonVersionMatchesCurrentProcess(startedWithCliVersion: string): boolean {
+  return configuration.currentCliVersion === startedWithCliVersion;
+}
+
+export function shouldSessionEnsureDaemon(startedBy: 'daemon' | 'terminal' | undefined): boolean {
+  return startedBy !== 'daemon';
 }
 
 export async function cleanupDaemonState(): Promise<void> {

@@ -218,6 +218,7 @@ describe('ApiSessionMessageClient', () => {
         }));
         expect(socket.emit).toHaveBeenCalledWith('message', expect.objectContaining({ sid: 'session-1', localId }));
         expect(socket.close).toHaveBeenCalledOnce();
+        expect(getMock).toHaveBeenCalledTimes(2);
     });
 
     it('encrypts and confirms the admitted permission mode on a user message', async () => {
@@ -470,6 +471,7 @@ describe('ApiSessionMessageClient', () => {
         await expect(client.sendCodexMessageOnce({
             messageRole: 'agent', messageType: 'codex', body, localId, timeoutMs: 10_000,
         })).resolves.toEqual({ result: 'success', id: row.id, seq: row.seq, localId, createdAt: row.createdAt });
+        expect(getMock).toHaveBeenCalledTimes(2);
     });
 
     it('HSR snapshots the admitted Codex body before asynchronous persistence work', async () => {

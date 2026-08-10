@@ -14,6 +14,9 @@ test('codex_restore_profile_boundary', () => {
     assert.throws(() => parseRestoreFileData({ directory: '/workspace', agent: 'codex', codexProfile: '../eliasi' }));
 
     const updates = [];
+    let releasePersistence;
+    let persisted = false;
+    const persistence = new Promise(resolve => { releasePersistence = resolve; });
     const server = await startDaemonControlServer({
       getChildren: () => [],
       stopSession: async () => true,
@@ -21,13 +24,29 @@ test('codex_restore_profile_boundary', () => {
       spawnSession: async () => ({ type: 'error', errorMessage: 'unused' }),
       prepareShutdown: async () => ({ accepted: true }),
       requestShutdown: () => undefined,
-      onHappySessionWebhook: () => undefined,
+      onHappySessionWebhook: async () => {
+        await persistence;
+        persisted = true;
+      },
       onCodexProfile: async (sessionId, profileName) => {
         updates.push({ sessionId, profileName });
-        return sessionId === 'happy-session';
+        return persisted && sessionId === 'happy-session';
       },
     });
     try {
+      let startupAcknowledged = false;
+      const startup = fetch('http://127.0.0.1:' + server.port + '/session-started', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: 'happy-session', metadata: {} }),
+      }).then(response => {
+        startupAcknowledged = true;
+        return response;
+      });
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(startupAcknowledged, false);
+      releasePersistence();
+      assert.equal((await startup).status, 200);
+
       const accepted = await fetch('http://127.0.0.1:' + server.port + '/session-codex-profile', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sessionId: 'happy-session', profileName: 'eliasi' }),

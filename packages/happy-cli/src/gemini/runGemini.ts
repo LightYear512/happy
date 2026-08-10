@@ -17,7 +17,7 @@ import { modelFacingUserText } from '@/api/types';
 import { logger } from '@/ui/logger';
 import { Credentials, readSettings } from '@/persistence';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
-import { initialMachineMetadata } from '@/daemon/run';
+import { initialMachineMetadata, shouldRegisterMachineForSession } from '@/daemon/run';
 import { configuration } from '@/configuration';
 import packageJson from '../../package.json';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
@@ -25,12 +25,11 @@ import { hashObject } from '@/utils/deterministicJson';
 import { projectPath } from '@/projectPath';
 import { startHappyServer } from '@/claude/utils/startHappyServer';
 import { MessageBuffer } from '@/ui/ink/messageBuffer';
-import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
+import { completeProviderInputReady } from '@/utils/completeProviderInputReady';
 import { registerKillSessionHandler } from '@/claude/registerKillSessionHandler';
 import { stopCaffeinate } from '@/utils/caffeinate';
 import { connectionState } from '@/utils/serverConnectionErrors';
-import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
-import type { ApiSessionClient } from '@/api/apiSession';
+import { setupOfflineSession } from '@/utils/setupOfflineSession';
 
 import { createGeminiBackend } from '@/agent/factories/gemini';
 import type { AgentBackend, AgentMessage } from '@/agent';
@@ -89,10 +88,12 @@ export async function runGemini(opts: {
     process.exit(1);
   }
   logger.debug(`Using machineId: ${machineId}`);
-  await api.getOrCreateMachine({
-    machineId,
-    metadata: initialMachineMetadata
-  });
+  if (shouldRegisterMachineForSession(opts.startedBy)) {
+    await api.getOrCreateMachine({
+      machineId,
+      metadata: initialMachineMetadata
+    });
+  }
 
   //
   // Fetch Gemini cloud token (from 'happy connect gemini')
@@ -137,69 +138,10 @@ export async function runGemini(opts: {
   });
   const response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
 
-  // Handle server unreachable case - create offline stub with hot reconnection
-  let session: ApiSessionClient;
-  // Permission handler declared here so it can be updated in onSessionSwap callback
-  // (assigned later after Happy server setup)
+  // A failed or unknown create is not replayed in the background. The provider
+  // remains usable through the local stub until the user starts another session.
+  const session = setupOfflineSession({ api, sessionTag, response }).session;
   let permissionHandler: GeminiPermissionHandler;
-
-  // Session swap synchronization to prevent race conditions during message processing
-  // When a swap is requested during processing, it's queued and applied after the current cycle
-  let isProcessingMessage = false;
-  let pendingSessionSwap: ApiSessionClient | null = null;
-
-  /**
-   * Apply a pending session swap. Called between message processing cycles.
-   * This ensures session swaps happen at safe points, not during message processing.
-   */
-  const applyPendingSessionSwap = () => {
-    if (pendingSessionSwap) {
-      logger.debug('[gemini] Applying pending session swap');
-      session = pendingSessionSwap;
-      if (permissionHandler) {
-        permissionHandler.updateSession(pendingSessionSwap);
-      }
-      pendingSessionSwap = null;
-    }
-  };
-
-  const { session: initialSession, reconnectionHandle } = setupOfflineReconnection({
-    api,
-    sessionTag,
-    metadata,
-    state,
-    response,
-    onSessionSwap: (newSession) => {
-      // If we're processing a message, queue the swap for later
-      // This prevents race conditions where session changes mid-processing
-      if (isProcessingMessage) {
-        logger.debug('[gemini] Session swap requested during message processing - queueing');
-        pendingSessionSwap = newSession;
-      } else {
-        // Safe to swap immediately
-        session = newSession;
-        if (permissionHandler) {
-          permissionHandler.updateSession(newSession);
-        }
-      }
-    }
-  });
-  session = initialSession;
-
-  // Report to daemon (only if we have a real session)
-  if (response) {
-    try {
-      logger.debug(`[START] Reporting session ${response.id} to daemon`);
-      const result = await notifyDaemonSessionStarted(response.id, metadata);
-      if (result.error) {
-        logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
-      } else {
-        logger.debug(`[START] Reported session ${response.id} to daemon`);
-      }
-    } catch (error) {
-      logger.debug('[START] Failed to report to daemon (may not be running):', error);
-    }
-  }
 
   const messageQueue = new MessageQueue2<GeminiMode>((mode) => hashObject({
     permissionMode: mode.permissionMode,
@@ -213,7 +155,7 @@ export async function runGemini(opts: {
   let currentPermissionMode: PermissionMode | undefined = undefined;
   let currentModel: string | undefined = undefined;
 
-  session.onUserMessage((message) => {
+  const onUserMessage = (message: import('@/api/types').UserMessage): void => {
     // Resolve permission mode (validate) - same as Codex
     let messagePermissionMode = currentPermissionMode;
     if (message.meta?.permissionMode) {
@@ -287,7 +229,17 @@ export async function runGemini(opts: {
     
     // Record user message in conversation history for context preservation
     conversationHistory.addUserMessage(originalUserMessage);
-  });
+  };
+
+  if (response) {
+    await completeProviderInputReady({
+      session,
+      expectedHappySessionId: response.id,
+      onUserMessage,
+    });
+  } else {
+    session.onUserMessage(onUserMessage);
+  }
 
   let thinking = false;
   session.keepAlive(thinking, 'remote');
@@ -990,9 +942,6 @@ export async function runGemini(opts: {
       const userMessageToShow = message.mode?.originalUserMessage || message.message;
       messageBuffer.addMessage(userMessageToShow, 'user');
 
-      // Mark that we're processing a message to synchronize session swaps
-      isProcessingMessage = true;
-
       try {
         if (first || !wasSessionCreated) {
           // First message or session not created yet - create backend and start session
@@ -1280,10 +1229,6 @@ export async function runGemini(opts: {
         // Use same logic as Codex - emit ready if idle (no pending operations, no queue)
         emitReadyIfIdle();
 
-        // Message processing complete - safe to apply any pending session swap
-        isProcessingMessage = false;
-        applyPendingSessionSwap();
-
         logger.debug(`[gemini] Main loop: turn completed, continuing to next iteration (queue size: ${messageQueue.size()})`);
       }
     }
@@ -1291,12 +1236,6 @@ export async function runGemini(opts: {
   } finally {
     // Clean up resources
     logger.debug('[gemini]: Final cleanup start');
-
-    // Cancel offline reconnection if still running
-    if (reconnectionHandle) {
-      logger.debug('[gemini]: Cancelling offline reconnection');
-      reconnectionHandle.cancel();
-    }
 
     try {
       session.sendSessionDeath();

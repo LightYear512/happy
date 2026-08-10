@@ -19,8 +19,8 @@ import { renderOptionsBlock } from '@/commands/bang/types';
 import { buildHtaskClaudeEnvironment, findHtaskRoot, htaskCanonicalTitle, resolveHtaskHappyId, restoreHtaskSessionConfig } from '@/commands/bang/htaskCommand';
 import { getEnvironmentInfo } from '@/ui/doctor';
 import { configuration } from '@/configuration';
-import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
-import { initialMachineMetadata } from '@/daemon/run';
+import { completeProviderInputReady } from '@/utils/completeProviderInputReady';
+import { initialMachineMetadata, shouldRegisterMachineForSession } from '@/daemon/run';
 import { startHappyServer } from '@/claude/utils/startHappyServer';
 import { startHookServer } from '@/claude/utils/startHookServer';
 import { generateHookSettingsFile, cleanupHookSettingsFile } from '@/claude/utils/generateHookSettings';
@@ -28,12 +28,12 @@ import { registerKillSessionHandler } from './registerKillSessionHandler';
 import { projectPath } from '../projectPath';
 import { resolve, join } from 'node:path';
 import { existsSync } from 'node:fs';
-import { startOfflineReconnection, connectionState } from '@/utils/serverConnectionErrors';
+import { connectionState } from '@/utils/serverConnectionErrors';
 import { readCcsProfiles, getInstancePath, getCurrentCcsProfile } from '@/commands/bang/ccsProfiles';
 import { formatErrorForUser } from '@/claude/utils/errorFormatter';
 import { queryRateLimitContext } from '@/commands/bang/usageCommand';
 import { claudeLocal } from '@/claude/claudeLocal';
-import { createSessionScanner, readSessionLog } from '@/claude/utils/sessionScanner';
+import { readSessionLog } from '@/claude/utils/sessionScanner';
 import { getProjectPath } from '@/claude/utils/path';
 import { Session } from './session';
 import { applySandboxPermissionPolicy, resolveInitialClaudePermissionMode } from './utils/permissionMode';
@@ -115,11 +115,12 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     }
     logger.debug(`Using machineId: ${machineId}`);
 
-    // Create machine if it doesn't exist
-    await api.getOrCreateMachine({
-        machineId,
-        metadata: initialMachineMetadata
-    });
+    if (shouldRegisterMachineForSession(options.startedBy)) {
+        await api.getOrCreateMachine({
+            machineId,
+            metadata: initialMachineMetadata
+        });
+    }
 
     let metadata: Metadata = {
         path: isConsoleSession ? os.homedir() : workingDirectory,
@@ -152,36 +153,15 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
     }
 
-    // Handle server unreachable case - run Claude locally with hot reconnection
+    // A failed or unknown create is not replayed in the background. Claude can
+    // keep running locally; the next explicit session start may try again.
     // Note: connectionState.notifyOffline() was already called by api.ts with error details
     if (!response) {
-        let offlineSessionId: string | null = null;
-
-        const reconnection = startOfflineReconnection({
-            serverUrl: configuration.serverUrl,
-            onReconnected: async () => {
-                const resp = await api.getOrCreateSession({ tag: randomUUID(), metadata, state });
-                if (!resp) throw new Error('Server unavailable');
-                const session = api.sessionSyncClient(resp);
-                const scanner = await createSessionScanner({
-                    sessionId: null,
-                    workingDirectory,
-                    onMessage: (msg) => session.sendClaudeSessionMessage(msg)
-                });
-                if (offlineSessionId) scanner.onNewSession(offlineSessionId);
-                return { session, scanner };
-            },
-            onNotify: console.log,
-            onCleanup: () => {
-                // Scanner cleanup handled automatically when process exits
-            }
-        });
-
         try {
             await claudeLocal({
                 path: workingDirectory,
                 sessionId: null,
-                onSessionFound: (id) => { offlineSessionId = id; },
+                onSessionFound: () => {},
                 onThinkingChange: () => {},
                 abort: new AbortController().signal,
                 claudeEnvVars: options.claudeEnvVars,
@@ -191,26 +171,12 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                 sandboxConfig,
             });
         } finally {
-            reconnection.cancel();
             stopCaffeinate();
         }
         process.exit(0);
     }
 
     logger.debug(`Session created: ${response.id}`);
-
-    // Always report to daemon if it exists
-    try {
-        logger.debug(`[START] Reporting session ${response.id} to daemon`);
-        const result = await notifyDaemonSessionStarted(response.id, metadata);
-        if (result.error) {
-            logger.debug(`[START] Failed to report to daemon (may not be running):`, result.error);
-        } else {
-            logger.debug(`[START] Reported session ${response.id} to daemon`);
-        }
-    } catch (error) {
-        logger.debug('[START] Failed to report to daemon (may not be running):', error);
-    }
 
     // Create realtime session BEFORE extractSDKMetadataAsync to avoid creating
     // a second session-scoped WebSocket that triggers stale-socket kicking
@@ -462,7 +428,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     let currentAppendSystemPrompt: string | undefined = undefined; // Track current append system prompt
     let currentAllowedTools: string[] | undefined = undefined; // Track current allowed tools
     let currentDisallowedTools: string[] | undefined = undefined; // Track current disallowed tools
-    session.onUserMessage((message) => {
+    const onUserMessage = (message: import('@/api/types').UserMessage): void => {
         const rawText = localCommandUserText(message);
 
         // Resolve permission mode from meta - pass through as-is, mapping happens at SDK boundary
@@ -654,7 +620,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         };
         messageQueue.push(text, enhancedMode);
         logger.debugLargeJson('User message pushed to queue:', message)
-    });
+    };
 
     // Setup signal handlers for graceful shutdown
     const cleanup = async () => {
@@ -716,18 +682,24 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
     registerKillSessionHandler(session.rpcHandlerManager, cleanup);
 
-    // After restore, fetch pending user messages that arrived while CLI was offline.
-    if (options.restoreSessionId) {
-        try {
-            await fetchAndInjectPendingMessages(
-                api, session, options.restoreSessionId,
-                response.encryptionKey, response.encryptionVariant,
-                '[START]',
-            );
-        } catch (error) {
-            logger.debug('[START] Failed to fetch pending messages after restore:', error);
-        }
-    }
+    const pendingWindow = options.restoreSessionId
+        ? fetchAndInjectPendingMessages(
+            api, session, options.restoreSessionId,
+            response.encryptionKey, response.encryptionVariant,
+            '[START]',
+        )
+        : Promise.resolve(0);
+    const restoredProviderSessionId = options.restoreSessionId
+        ? response.metadata.claudeSessionId
+        : undefined;
+    await completeProviderInputReady({
+        session,
+        expectedHappySessionId: response.id,
+        pendingWindow,
+        providerSessionId: restoredProviderSessionId,
+        expectedProviderSessionId: restoredProviderSessionId,
+        onUserMessage,
+    });
 
     // Create claude loop
     const exitCode = await loop({

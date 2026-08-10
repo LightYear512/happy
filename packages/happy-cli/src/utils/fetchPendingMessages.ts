@@ -25,13 +25,25 @@ export async function fetchAndInjectPendingMessages(
     encryptionKey: Uint8Array,
     encryptionVariant: 'legacy' | 'dataKey',
     logPrefix: string,
-): Promise<number> {
+    options?: { deferInjection?: boolean },
+): Promise<number | (() => number)> {
+    let rawMessages: Awaited<ReturnType<ApiClient['getSessionMessages']>>;
     try {
         await session.waitForConnect();
-        const rawMessages = await api.getSessionMessages(sessionId);
+        rawMessages = await api.getSessionMessages(sessionId);
+    } catch {
+        throw new SessionRecoveryError('pending-message restore query failed');
+    }
+
+    const inject = (): number => {
+      try {
         const fullWindow = Array.isArray(rawMessages) && rawMessages.length === RECENT_MESSAGE_WINDOW;
         const rows = validateRecentMessageWindow(rawMessages);
-        const pendingMessages: Array<{ message: UserMessage; seq: number; row: typeof rows[number] }> = [];
+        const pendingRows: Array<{
+            message: UserMessage;
+            seq: number;
+            row: typeof rows[number];
+        }> = [];
         let processedResponseBoundaryFound = false;
 
         for (let index = rows.length - 1; index >= 0; index -= 1) {
@@ -65,28 +77,37 @@ export async function fetchAndInjectPendingMessages(
             if (!parsed.success) {
                 throw new SessionRecoveryError('persisted user restore message is invalid');
             }
-            pendingMessages.push({ message: parsed.data, seq: row.seq, row });
+            pendingRows.push({ message: parsed.data, seq: row.seq, row });
         }
 
         if (fullWindow && !processedResponseBoundaryFound) {
             throw new SessionRecoveryError('full recent message window contains no processed-response boundary');
         }
 
-        pendingMessages.sort((left, right) => left.seq - right.seq);
+        pendingRows.sort((left, right) => left.seq - right.seq);
         let injectedCount = 0;
-        for (const pending of pendingMessages) {
+        for (const pending of pendingRows) {
             logger.debug(`${logPrefix} Injecting pending message from restore: "${modelFacingUserText(pending.message).substring(0, 50)}"`);
             if (session.injectPendingPersistedUserMessage(pending.row)) injectedCount += 1;
         }
         if (injectedCount > 0) {
             logger.debug(`${logPrefix} Injected ${injectedCount} pending message(s) from restore`);
+            try {
+                session.sendSessionEvent({
+                    type: 'message',
+                    message: '⚠️ 正在恢复进程异常退出前未确认完成的输入；该输入可能已部分执行，本次按 at-least-once 语义重新提交。',
+                });
+            } catch (noticeError) {
+                logger.debug(`${logPrefix} Restore notice could not be sent`, noticeError);
+            }
         }
         return injectedCount;
-    } catch (error) {
+      } catch (error) {
         const recoveryError = error instanceof SessionRecoveryError
             ? error
             : new SessionRecoveryError('pending-message restore query failed');
-        session.markRestoreRecoveryFailed(recoveryError);
         throw recoveryError;
-    }
+      }
+    };
+    return options?.deferInjection ? inject : inject();
 }

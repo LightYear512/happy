@@ -28,12 +28,6 @@ import { expandEnvironmentVariables } from '@/utils/expandEnvVars';
 import { getCodexInstancePath } from '@/commands/bang/ccsProfiles';
 import { reportProjectError } from '@/utils/projectSessionStartup';
 import { findAllHappyProcesses } from './doctor';
-import {
-  parseSessionTransportHealthRecord,
-  SESSION_TRANSPORT_HEALTH_CLOCK_SKEW_MS,
-  SESSION_TRANSPORT_HEALTH_FRESH_MS,
-  type SessionTransportHealthRecord,
-} from '@/api/sessionTransportHealth';
 
 // Restore file persistence for session auto-restore.
 // Only stores immutable spawn params. sessionTag and claudeSessionId come from Server at restore time.
@@ -89,40 +83,36 @@ export function runSerial<K, V>(
   return result;
 }
 
-export const SESSION_IDENTITY_TIMEOUT_MS = 15_000;
-export const SESSION_PROVIDER_READY_TIMEOUT_MS = 35_000;
+export const SESSION_STARTUP_TIMEOUT_MS = 120_000;
+
+export function shouldRegisterMachineForSession(startedBy?: 'daemon' | 'terminal'): boolean {
+  return startedBy !== 'daemon';
+}
+
+export function selectTrackedConsoleSessions(
+  sessions: ReadonlyMap<number, TrackedSession>,
+): Array<[number, TrackedSession]> {
+  return Array.from(sessions.entries()).filter(([, tracked]) => tracked.isConsoleSession === true);
+}
 
 export function createSessionStartupDeadline(
-  onTimeout: (phase: 'identity' | 'provider') => void,
-): { providerIdentified: () => void; cancel: () => void } {
-  let providerIdentified = false;
+  onTimeout: () => void,
+): { cancel: () => void } {
   let timeout: ReturnType<typeof setTimeout> | null = setTimeout(() => {
     timeout = null;
-    onTimeout('identity');
-  }, SESSION_IDENTITY_TIMEOUT_MS);
+    onTimeout();
+  }, SESSION_STARTUP_TIMEOUT_MS);
   const cancel = () => {
     if (timeout !== null) clearTimeout(timeout);
     timeout = null;
   };
-  return {
-    providerIdentified: () => {
-      if (providerIdentified || timeout === null) return;
-      providerIdentified = true;
-      clearTimeout(timeout);
-      timeout = setTimeout(() => {
-        timeout = null;
-        onTimeout('provider');
-      }, SESSION_PROVIDER_READY_TIMEOUT_MS);
-    },
-    cancel,
-  };
+  return { cancel };
 }
 
 export interface SessionStartupAwaiter {
   resolve: (session: TrackedSession) => void;
   cancel: () => void;
   fail: (errorMessage: string) => void;
-  providerIdentified: () => void;
 }
 
 export function waitForTrackedSessionStartup(input: {
@@ -154,13 +144,11 @@ export function waitForTrackedSessionStartup(input: {
         () => settle({ type: 'error', errorMessage: `${message}; process cleanup failed` }),
       );
     };
-    const deadline = createSessionStartupDeadline((phase) => {
-      const kind = phase === 'identity' ? 'webhook' : 'provider readiness';
-      const message = `Session ${kind} timeout for PID ${input.pid}${input.suffix ?? ''}`;
+    const deadline = createSessionStartupDeadline(() => {
+      const message = `Session input readiness timeout for PID ${input.pid}${input.suffix ?? ''}`;
       failAfterCleanup(message);
     });
     input.register({
-      providerIdentified: () => { if (accepting) deadline.providerIdentified(); },
       resolve: (session) => {
         if (!accepting) return;
         try {
@@ -231,68 +219,16 @@ export function updateTrackedProviderReadiness(
     || (session.resumeTarget !== undefined && session.observedProviderSessionId === session.resumeTarget)) };
 }
 
-const TERMINAL_TRANSPORT_STATES = new Set(['ownership_conflict', 'failed', 'closed']);
-
-export function updateTrackedTransportHealth(
-  session: TrackedSession,
-  sessionId: string,
-  pid: number,
-  raw: unknown,
-  now = Date.now(),
-): boolean {
-  try {
-    const record = parseSessionTransportHealthRecord(raw);
-    const previous = session.transportHealth;
-    if (record.nativeSessionId !== sessionId || record.processId !== pid
-      || Date.parse(record.updatedAt) > now + SESSION_TRANSPORT_HEALTH_CLOCK_SKEW_MS
-      || (previous && (record.processStartedAt !== previous.processStartedAt
-        || record.generation < previous.generation
-        || Date.parse(record.updatedAt) < Date.parse(previous.updatedAt)
-        || (record.generation === previous.generation
-          && record.recordDigest !== previous.recordDigest)))) {
-      throw new Error('Happy transport health does not belong to the current tracked process');
-    }
-    session.transportHealth = record;
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-export function classifyTrackedInputState(session: TrackedSession, now = Date.now()): SessionInputState {
-  const record = session.transportHealth;
-  const sessionId = session.happySessionId ?? session.expectedHappySessionId;
+export function classifyTrackedInputState(session: TrackedSession): SessionInputState {
   const metadata = session.happySessionMetadataFromLocalWebhook;
   const providerIdentityReady = session.expectedHappySessionId === undefined
     || session.resumeTarget === undefined
     || metadata?.flavor !== 'codex'
     || session.observedProviderSessionId === session.resumeTarget;
-  const workspace = metadata?.path;
-  const proofRequired = record !== undefined
-    || (metadata === undefined && session.expectedHappySessionId !== undefined)
-    || (typeof workspace === 'string' && existsSync(join(workspace, '.virtual-session')));
-  if (!proofRequired) return providerIdentityReady ? 'online' : 'unknown';
-  if (!record || !sessionId || record.nativeSessionId !== sessionId || record.processId !== session.pid) {
-    return 'unknown';
-  }
-  const updatedAt = Date.parse(record.updatedAt);
-  if (!Number.isFinite(updatedAt) || updatedAt > now + SESSION_TRANSPORT_HEALTH_CLOCK_SKEW_MS) return 'unknown';
-  if (TERMINAL_TRANSPORT_STATES.has(record.state)) return 'offline';
-  if (providerIdentityReady && record.state === 'connected'
-    && now - updatedAt <= SESSION_TRANSPORT_HEALTH_FRESH_MS) return 'online';
-  return 'unknown';
-}
-
-export function transportProofAdvanced(
-  baseline: SessionTransportHealthRecord | null | undefined,
-  current: SessionTransportHealthRecord | null | undefined,
-): boolean {
-  if (!current) return false;
-  return baseline === null || baseline === undefined
-    ? true
-    : current.processStartedAt === baseline.processStartedAt
-      && current.generation > baseline.generation
-      && current.recordDigest !== baseline.recordDigest;
+  if (!providerIdentityReady) return 'unknown';
+  return metadata !== undefined || session.expectedHappySessionId === undefined
+    ? 'online'
+    : 'unknown';
 }
 
 export function isCurrentDaemonChild(session: TrackedSession, pid: number): boolean {
@@ -314,58 +250,6 @@ function isCurrentDaemonTmuxWindow(session: TrackedSession, pid: number): boolea
 export function isDaemonManagedSession(session: TrackedSession): boolean {
   return isCurrentDaemonChild(session, session.pid)
     || isCurrentDaemonTmuxWindow(session, session.pid);
-}
-
-export function canResumeCurrentDaemonChild(
-  session: TrackedSession,
-  pid: number,
-  happySessionId: string,
-  providerSessionId: string,
-): boolean {
-  return process.platform !== 'win32'
-    && isCurrentDaemonChild(session, pid)
-    && session.happySessionId === happySessionId
-    && (session.expectedHappySessionId === undefined || session.expectedHappySessionId === happySessionId)
-    && (session.resumeTarget === undefined || session.resumeTarget === providerSessionId)
-    && session.observedProviderSessionId === providerSessionId;
-}
-
-export type ResumeAttempt = 'online' | 'offline' | 'exited' | 'unknown' | 'unsupported';
-
-export async function resumeCurrentDaemonChildProcess(input: {
-  session: TrackedSession;
-  pid: number;
-  happySessionId: string;
-  providerSessionId: string;
-  isCurrent: () => boolean;
-  timeoutMs?: number;
-  pollMs?: number;
-}): Promise<ResumeAttempt> {
-  const { session, pid, happySessionId, providerSessionId } = input;
-  if (!canResumeCurrentDaemonChild(session, pid, happySessionId, providerSessionId)) return 'unsupported';
-  const baseline = session.transportHealth;
-  // No await is permitted between this final ownership proof and the signal.
-  if (!input.isCurrent() || !canResumeCurrentDaemonChild(
-    session, pid, happySessionId, providerSessionId)) return 'unsupported';
-  try { process.kill(-pid, 'SIGCONT'); }
-  catch {
-    try { process.kill(pid, 0); return 'unknown'; }
-    catch { return 'exited'; }
-  }
-
-  const deadline = Date.now() + (input.timeoutMs ?? 15_000);
-  while (Date.now() < deadline) {
-    let alive = true;
-    try { process.kill(pid, 0); } catch { alive = false; }
-    if (!input.isCurrent() || !alive
-      || session.childProcess?.exitCode !== null || session.childProcess?.signalCode !== null) return 'exited';
-    if (transportProofAdvanced(baseline, session.transportHealth)) {
-      const state = classifyTrackedInputState(session);
-      if (state === 'online' || state === 'offline') return state;
-    }
-    await new Promise(resolve => setTimeout(resolve, input.pollMs ?? 250));
-  }
-  return 'unknown';
 }
 
 export function recoverRestoredDaemonSessions(processes: Array<{ pid: number; command: string; type: string }>):
@@ -885,7 +769,6 @@ export async function startDaemon(): Promise<void> {
       sessionId: string,
       sessionMetadata: Metadata,
       readyProviderSessionId?: string,
-      transportHealth?: unknown,
     ) => {
       logger.debugLargeJson(`[DAEMON RUN] Session reported`, sessionMetadata);
 
@@ -937,6 +820,8 @@ export async function startDaemon(): Promise<void> {
         return;
       }
 
+      let readyStartup: { pid: number; awaiter: SessionStartupAwaiter; session: TrackedSession }
+        | undefined;
       if (existingSession && existingSession.startedBy === 'daemon') {
         if (!matchesExpectedHappySessionId(existingSession.expectedHappySessionId, sessionId)) {
           logger.debug(`[DAEMON RUN] Restore identity mismatch: expected ${existingSession.expectedHappySessionId}, received ${sessionId}`);
@@ -957,9 +842,6 @@ export async function startDaemon(): Promise<void> {
         existingSession.happySessionId = sessionId;
         existingSession.happySessionMetadataFromLocalWebhook = { ...sessionMetadata, hostPid: pid };
         existingSession.isConsoleSession = existingSession.isConsoleSession || sessionMetadata.consoleSession === true;
-        if (transportHealth !== undefined) {
-          updateTrackedTransportHealth(existingSession, sessionId, pid, transportHealth);
-        }
         logger.debug(`[DAEMON RUN] Updated daemon-spawned session ${sessionId} with metadata`);
 
         const readiness = updateTrackedProviderReadiness(
@@ -977,24 +859,15 @@ export async function startDaemon(): Promise<void> {
           return;
         }
 
-        // A restored Codex child reports its Happy identity before it has
-        // proved thread/resume. Keep the spawn request pending until the same
-        // child reports the exact provider identity as ready.
         const awaiter = pidToAwaiter.get(pid);
-        awaiter?.providerIdentified();
         if (awaiter && readiness.ready && classifyTrackedInputState(existingSession) === 'online') {
-          pidToAwaiter.delete(pid);
-          awaiter.resolve(existingSession);
-          logger.debug(`[DAEMON RUN] Resolved session awaiter for PID ${pid}`);
+          readyStartup = { pid, awaiter, session: existingSession };
         } else if (awaiter) {
           logger.debug(`[DAEMON RUN] Waiting for provider restore readiness for PID ${pid}`);
         }
       } else if (existingSession) {
         existingSession.happySessionMetadataFromLocalWebhook = { ...sessionMetadata, hostPid: pid };
         existingSession.isConsoleSession = existingSession.isConsoleSession || sessionMetadata.consoleSession === true;
-        if (transportHealth !== undefined) {
-          updateTrackedTransportHealth(existingSession, sessionId, pid, transportHealth);
-        }
         updateTrackedProviderReadiness(existingSession, sessionMetadata, readyProviderSessionId);
       } else {
         // New session started externally
@@ -1006,9 +879,6 @@ export async function startDaemon(): Promise<void> {
           pid,
           isConsoleSession: sessionMetadata.consoleSession === true,
         };
-        if (transportHealth !== undefined) {
-          updateTrackedTransportHealth(trackedSession, sessionId, pid, transportHealth);
-        }
         pidToTrackedSession.set(pid, trackedSession);
         logger.debug(`[DAEMON RUN] Registered externally-started session ${sessionId}`);
       }
@@ -1018,11 +888,32 @@ export async function startDaemon(): Promise<void> {
       const tracked = pidToTrackedSession.get(pid);
       if (sessionId && sessionMetadata.path && !tracked?.isConsoleSession && sessionMetadata.consoleSession !== true) {
         const agent = (sessionMetadata.flavor === 'codex' ? 'codex' : sessionMetadata.flavor === 'gemini' ? 'gemini' : 'claude') as 'claude' | 'codex' | 'gemini';
-        writeRestoreFile(sessionId, {
-          directory: sessionMetadata.path,
-          agent,
-          ...(sessionMetadata.titleAuthority === 'external' ? { titleAuthority: 'external' as const } : {}),
-        }).catch(e => logger.debug(`[DAEMON RUN] Failed to write restore file for ${sessionId}: ${e}`));
+        try {
+          await writeRestoreFile(sessionId, {
+            directory: sessionMetadata.path,
+            agent,
+            ...(sessionMetadata.titleAuthority === 'external' ? { titleAuthority: 'external' as const } : {}),
+          });
+        } catch (error) {
+          logger.debug(`[DAEMON RUN] Failed to write restore file for ${sessionId}: ${error}`);
+          if (readyStartup) {
+            pidToAwaiter.delete(readyStartup.pid);
+            readyStartup.awaiter.fail('Failed to persist session restore authority');
+            void terminateTrackedSession(readyStartup.pid, readyStartup.session);
+          }
+          return;
+        }
+      } else if (readyStartup && !tracked?.isConsoleSession) {
+        pidToAwaiter.delete(readyStartup.pid);
+        readyStartup.awaiter.fail('Session restore authority is missing a working directory');
+        void terminateTrackedSession(readyStartup.pid, readyStartup.session);
+        return;
+      }
+
+      if (readyStartup) {
+        pidToAwaiter.delete(readyStartup.pid);
+        readyStartup.awaiter.resolve(readyStartup.session);
+        logger.debug(`[DAEMON RUN] Resolved session awaiter for PID ${readyStartup.pid}`);
       }
     };
 
@@ -1030,9 +921,8 @@ export async function startDaemon(): Promise<void> {
       sessionId: string,
       sessionMetadata: Metadata,
       readyProviderSessionId?: string,
-      transportHealth?: unknown,
     ): Promise<void> => runSerial(webhookQueue, sessionId, () => processHappySessionWebhook(
-      sessionId, sessionMetadata, readyProviderSessionId, transportHealth));
+      sessionId, sessionMetadata, readyProviderSessionId));
 
     // Spawn a new session (sessionId reserved for future --resume functionality)
     const spawnSession = async (options: SpawnSessionOptions): Promise<SpawnSessionResult> => {
@@ -1262,7 +1152,7 @@ export async function startDaemon(): Promise<void> {
         }
 
         // Check if tmux is available and should be used
-        const tmuxAvailable = await isTmuxAvailable();
+        const tmuxAvailable = options.consoleSession ? false : await isTmuxAvailable();
         let useTmux = tmuxAvailable;
 
         // Get tmux session name from environment variables (now set by profile system)
@@ -1337,13 +1227,6 @@ export async function startDaemon(): Promise<void> {
               terminate: () => terminateTrackedSession(tmuxResult.pid!, trackedSession),
               complete: (completedSession) => {
                 logger.debug(`[DAEMON RUN] Session ${completedSession.happySessionId} fully spawned with webhook (tmux)`);
-                if (completedSession.happySessionId && !options.consoleSession) {
-                  writeRestoreFile(completedSession.happySessionId, {
-                    directory: options.directory,
-                    agent: options.agent || DEFAULT_DAEMON_SESSION_AGENT,
-                    ...(options.titleAuthority === 'external' ? { titleAuthority: 'external' as const } : {}),
-                  }).catch(e => logger.debug(`[DAEMON RUN] Failed to write restore file: ${e}`));
-                }
                 return { type: 'success', sessionId: completedSession.happySessionId! };
               },
             });
@@ -1355,6 +1238,9 @@ export async function startDaemon(): Promise<void> {
 
         // Regular process spawning (fallback or if tmux not available)
         if (!useTmux) {
+          if (shuttingDown) {
+            return { type: 'error', errorMessage: 'Daemon is shutting down' };
+          }
           logger.debug(`[DAEMON RUN] Using regular process spawning`);
 
           const args = buildDaemonSessionArgs(options, sessionAgent);
@@ -1423,13 +1309,6 @@ export async function startDaemon(): Promise<void> {
             terminate: () => terminateTrackedSession(happyProcess.pid!, trackedSession),
             complete: (completedSession) => {
               logger.debug(`[DAEMON RUN] Session ${completedSession.happySessionId} fully spawned with webhook`);
-              if (completedSession.happySessionId && !options.consoleSession) {
-                writeRestoreFile(completedSession.happySessionId, {
-                  directory: options.directory,
-                  agent: options.agent || DEFAULT_DAEMON_SESSION_AGENT,
-                  ...(options.titleAuthority === 'external' ? { titleAuthority: 'external' as const } : {}),
-                }).catch(e => logger.debug(`[DAEMON RUN] Failed to write restore file: ${e}`));
-              }
               return { type: 'success', sessionId: completedSession.happySessionId! };
             },
           });
@@ -1650,36 +1529,14 @@ export async function startDaemon(): Promise<void> {
             && current.observedProviderSessionId !== params.claudeSessionId)) {
           return failOpened('Tracked Happy restore identity does not match the requested session');
         }
-        let state = classifyTrackedInputState(current);
+        const state = classifyTrackedInputState(current);
         if (state === 'online') {
           if (current.observedProviderSessionId !== params.claudeSessionId) {
             return failOpened('Tracked Happy provider identity is not exact');
           }
           return { type: 'success', sessionId: params.sessionId, agent: restoreData.agent };
         }
-        if (state === 'unknown') {
-          const attempt = await resumeCurrentDaemonChildProcess({ session: current, pid,
-            happySessionId: params.sessionId, providerSessionId: params.claudeSessionId,
-            isCurrent: () => pidToTrackedSession.get(pid) === current });
-          if (attempt === 'online') {
-            return { type: 'success', sessionId: params.sessionId, agent: restoreData.agent };
-          }
-          if (attempt === 'unsupported') {
-            const message = process.platform === 'win32'
-              ? 'Unknown Happy session recovery is unsupported on Windows'
-              : 'Happy session process is not owned by the current daemon';
-            return failOpened(message);
-          }
-          if (attempt === 'unknown') return failOpened('Happy session input transport is not ready');
-          if (attempt === 'exited') {
-            if (pidToTrackedSession.get(pid) === current) pidToTrackedSession.delete(pid);
-          } else {
-            state = 'offline';
-          }
-        }
-        if (state === 'offline' && !await terminateTrackedSession(pid, current)) {
-          return failOpened('Offline Happy session could not be terminated safely');
-        }
+        return failOpened('Happy session process is alive but has not registered an input-ready provider');
       }
 
       logger.debug(`[DAEMON RUN] Restoring session ${params.sessionId} in ${restoreData.directory}`);
@@ -1789,7 +1646,6 @@ export async function startDaemon(): Promise<void> {
     apiMachine.connect();
 
     // Spawn console session (lightweight bang-command-only session for mobile control)
-    let consoleSessionPid: number | null = null;
     let consoleSessionSpawning = false;
     const consoleDir = join(configuration.happyHomeDir, 'console');
     try {
@@ -1807,14 +1663,9 @@ export async function startDaemon(): Promise<void> {
           approvedNewDirectoryCreation: true,
         });
         if (result.type === 'success') {
-          // Find the PID of the console session from tracked sessions
-          for (const [pid, tracked] of pidToTrackedSession.entries()) {
-            if (tracked.happySessionId === result.sessionId) {
-              consoleSessionPid = pid;
-              break;
-            }
-          }
-          logger.debug(`[DAEMON RUN] Console session spawned: ${result.sessionId} (PID: ${consoleSessionPid})`);
+          const tracked = selectTrackedConsoleSessions(pidToTrackedSession)
+            .find(([, session]) => session.happySessionId === result.sessionId);
+          logger.debug(`[DAEMON RUN] Console session spawned: ${result.sessionId} (PID: ${tracked?.[0] ?? 'unknown'})`);
         } else {
           logger.debug(`[DAEMON RUN] Failed to spawn console session: ${result.type === 'error' ? result.errorMessage : 'approval needed'}`);
         }
@@ -1840,6 +1691,7 @@ export async function startDaemon(): Promise<void> {
         return;
       }
       heartbeatRunning = true;
+      try {
 
       if (process.env.DEBUG) {
         logger.debug(`[DAEMON RUN] Health check started at ${new Date().toLocaleString()}`);
@@ -1858,13 +1710,11 @@ export async function startDaemon(): Promise<void> {
       }
 
       // Re-spawn console session if it died
-      if (consoleSessionPid !== null) {
-        const consoleAlive = pidToTrackedSession.has(consoleSessionPid);
-        if (!consoleAlive && !consoleSessionSpawning) {
-          logger.debug(`[DAEMON RUN] Console session (PID ${consoleSessionPid}) is dead, re-spawning`);
-          consoleSessionPid = null;
+      const consoleAlive = selectTrackedConsoleSessions(pidToTrackedSession)
+        .some(([pid]) => isProcessAlive(pid));
+      if (!consoleAlive && !consoleSessionSpawning) {
+          logger.debug('[DAEMON RUN] Console session is absent, re-spawning');
           spawnConsoleSession();
-        }
       }
 
       // Check if daemon needs update
@@ -1911,7 +1761,9 @@ export async function startDaemon(): Promise<void> {
         logger.debug('[DAEMON RUN] Failed to write heartbeat', error);
       }
 
-      heartbeatRunning = false;
+      } finally {
+        heartbeatRunning = false;
+      }
     }, heartbeatIntervalMs); // Every 60 seconds in production
 
     // Setup signal handlers
@@ -1938,21 +1790,23 @@ export async function startDaemon(): Promise<void> {
 
       // prepareShutdown has already handled user sessions. The console session
       // is daemon-internal and remains the only process cleanup owns here.
-      if (consoleSessionPid !== null) {
-        const consoleTracked = pidToTrackedSession.get(consoleSessionPid);
-        if (consoleTracked?.happySessionId) {
-          logger.debug(`[DAEMON RUN] Sending session-end for console session ${consoleTracked.happySessionId}`);
-          apiMachine.sendSessionEnd(consoleTracked.happySessionId);
+      const consoleSessions = selectTrackedConsoleSessions(pidToTrackedSession);
+      if (consoleSessions.length > 0) {
+        for (const [, consoleTracked] of consoleSessions) {
+          if (consoleTracked.happySessionId) {
+            logger.debug(`[DAEMON RUN] Sending session-end for console session ${consoleTracked.happySessionId}`);
+            apiMachine.sendSessionEnd(consoleTracked.happySessionId);
+          }
         }
-        // Keep the event loop free while the session-end emit drains to the wire.
         await new Promise(resolve => setTimeout(resolve, 1000));
-        const id = `PID-${consoleSessionPid}`;
-        const terminated = await terminateSession(id).catch(error => {
-          logger.debug(`[DAEMON RUN] terminateSession ${id} failed:`, error);
-          return false;
-        });
-        if (!terminated && isProcessAlive(consoleSessionPid)) {
-          throw new Error('Daemon shutdown left its console process alive');
+        const results = await Promise.all(consoleSessions.map(([pid, tracked]) =>
+          terminateTrackedSession(pid, tracked).catch(error => {
+            logger.debug(`[DAEMON RUN] Failed to terminate console PID ${pid}:`, error);
+            return false;
+          })));
+        if (results.some((terminated, index) => !terminated
+          && isProcessAlive(consoleSessions[index][0]))) {
+          throw new Error('Daemon shutdown left a console process alive');
         }
       }
 

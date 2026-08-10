@@ -1,5 +1,9 @@
 # 已关闭会话自动恢复
 
+> **历史方案，已被取代**：本文描述“创建新 Happy session”的旧设计，与当前精确复用原
+> Happy session 的实现不一致，不得作为实现依据。当前根因分析、状态权威、最小生产方案和
+> 验收标准见 [`../analysis/happy-remote-baseline-stabilization.md`](../analysis/happy-remote-baseline-stabilization.md)。
+
 ## 目标
 
 用户在 App 端已关闭的会话中发送任意消息，系统自动恢复 Claude 上下文，创建新的 happy session 继续对话。

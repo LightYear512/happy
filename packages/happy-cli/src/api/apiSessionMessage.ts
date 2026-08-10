@@ -224,6 +224,8 @@ export class ApiSessionMessageClient {
         let socket: Socket | null = null;
         let observedReceipt: PersistedMessageReceipt | null = null;
         let observedError: Error | null = null;
+        let notifyObserved = () => {};
+        const observed = new Promise<void>((resolve) => { notifyObserved = resolve; });
         let emitted = false;
         try {
             const existing = await this.findPersistedMessage(localId, expected, deadline);
@@ -234,9 +236,13 @@ export class ApiSessionMessageClient {
                 observer = createUserScopedMessageObserver(this.token, (data: unknown) => {
                     try {
                         const receipt = receiptFromUpdate(data, this.session.id, localId, expected, this.session);
-                        if (receipt) observedReceipt = receipt;
+                        if (receipt) {
+                            observedReceipt = receipt;
+                            notifyObserved();
+                        }
                     } catch (error) {
                         observedError = error instanceof Error ? error : new Error('Happy message observation failed');
+                        notifyObserved();
                     }
                 });
                 await this.waitForConnect(observer, remaining(deadline));
@@ -248,13 +254,22 @@ export class ApiSessionMessageClient {
             socket.emit('message', { sid: this.session.id, message, localId });
             emitted = true;
 
-            while (true) {
+            await Promise.race([
+                observed,
+                delay(Math.min(observePersistedEvent ? 500 : 250, remaining(deadline))),
+            ]);
+            if (observedError) throw observedError;
+            if (observedReceipt) return observedReceipt;
+
+            const persisted = await this.findPersistedMessage(localId, expected, deadline);
+            if (persisted) return persisted;
+
+            if (observePersistedEvent) {
+                await Promise.race([observed, delay(remaining(deadline))]);
                 if (observedError) throw observedError;
                 if (observedReceipt) return observedReceipt;
-                const persisted = await this.findPersistedMessage(localId, expected, deadline);
-                if (persisted) return persisted;
-                await delay(Math.min(100, remaining(deadline)));
             }
+            throw new Error('Happy message persistence confirmation deadline exceeded');
         } catch (error) {
             if (error instanceof HappyMessagePersistenceError) throw error;
             const message = error instanceof Error ? error.message : 'Happy message persistence failed';

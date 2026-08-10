@@ -2,16 +2,15 @@ import { execFile } from 'node:child_process';
 import { lstat, realpath } from 'node:fs/promises';
 import { promisify } from 'node:util';
 import { join, resolve } from 'node:path';
-import { createHash, randomBytes } from 'node:crypto';
 
 const execFileAsync = promisify(execFile);
 const watchEnsures = new Map<string, Promise<void>>();
-const activeTurnTokens = new Map<string, string>();
-const PROJECT_SESSION_COMMAND_TIMEOUT_MS = 25_000;
+const PROJECT_SESSION_STOP_TIMEOUT_MS = 2_000;
+const PROJECT_SESSION_LIFECYCLE_TIMEOUT_MS = 25_000;
 
-function detail(error: unknown): string {
+function detail(error: unknown, timeoutMs = PROJECT_SESSION_LIFECYCLE_TIMEOUT_MS): string {
     if (error && typeof error === 'object' && 'killed' in error && error.killed === true) {
-        return `XC v2 command timed out after ${String(PROJECT_SESSION_COMMAND_TIMEOUT_MS)}ms`;
+        return `XC v2 command timed out after ${String(timeoutMs)}ms`;
     }
     const stderr = error && typeof error === 'object' && 'stderr' in error && typeof error.stderr === 'string'
         ? error.stderr.trim() : '';
@@ -59,14 +58,10 @@ interface ProjectSessionOptions {
     nativeSessionId?: string;
     notify: (message: string) => void;
     env?: NodeJS.ProcessEnv;
-    localId?: string;
-    messageText?: string;
-    status?: 'completed' | 'error' | 'cancelled';
-    turnToken?: string;
 }
 
-function turnKey(options: ProjectSessionOptions): string {
-    return `${resolve(options.workspace)}\u0000${options.nativeSessionId ?? ''}`;
+interface ProjectSessionCommandResult {
+    context: string | null;
 }
 
 export function installHappySessionEnvironment(
@@ -90,23 +85,17 @@ export interface ProjectErrorReportOptions {
 }
 
 async function runProjectSessionCommand(
-    action: 'startup' | 'input' | 'turn-end' | 'close', options: ProjectSessionOptions,
-): Promise<string | null | undefined> {
+    action: 'startup' | 'close', options: ProjectSessionOptions,
+): Promise<ProjectSessionCommandResult | null | undefined> {
     const sessionId = options.nativeSessionId;
     if (!sessionId) return null;
     const workspace = resolve(options.workspace);
     try {
-        const inputIdentity = action === 'input' && options.localId && options.messageText !== undefined
-            ? ['--local-id', options.localId, '--payload-digest', `sha256:${createHash('sha256').update(options.messageText).digest('hex')}`]
-            : [];
-        const inputArgs = action === 'input'
-            ? [...inputIdentity, '--turn-token', options.turnToken!]
-            : action === 'turn-end' ? ['--status', options.status ?? 'completed', '--turn-token', options.turnToken!] : [];
         const env = { ...(options.env ?? process.env) };
         installHappySessionEnvironment(sessionId, env);
-        const result = await invokeProjectXc(workspace, ['host', action, '--workspace', workspace, ...inputArgs], {
+        const result = await invokeProjectXc(workspace, ['host', action, '--workspace', workspace], {
             env,
-            timeout: PROJECT_SESSION_COMMAND_TIMEOUT_MS,
+            timeout: PROJECT_SESSION_LIFECYCLE_TIMEOUT_MS,
             maxBuffer: 8 * 1024 * 1024,
         });
         if (!result) return null;
@@ -116,7 +105,8 @@ async function runProjectSessionCommand(
         if (!value || typeof value !== 'object' || Array.isArray(value)) {
             throw new Error('XC v2 startup returned an invalid visible message');
         }
-        const row = value as { systemMessage?: unknown; hookSpecificOutput?: { additionalContext?: unknown } };
+        const row = value as { systemMessage?: unknown;
+            hookSpecificOutput?: { additionalContext?: unknown } };
         const message = typeof row.systemMessage === 'string' && row.systemMessage.trim() ? row.systemMessage : null;
         if (action === 'startup' && !message) throw new Error('XC v2 startup returned an invalid visible message');
         if (message) options.notify(message);
@@ -124,29 +114,18 @@ async function runProjectSessionCommand(
         if (context !== undefined && (typeof context !== 'string' || !context.trim())) {
             throw new Error('XC v2 input returned invalid model context');
         }
-        return typeof context === 'string' ? context : null;
+        return {
+            context: typeof context === 'string' ? context : null,
+        };
     } catch (error) {
-        const failure = detail(error);
+        const failure = detail(error, PROJECT_SESSION_LIFECYCLE_TIMEOUT_MS);
         options.notify(`${action === 'startup' ? '旧版本迁移错误' : action === 'close' ? 'XC v2 关闭错误' : 'XC v2 输入错误'}：${failure}`);
-        if (action === 'input') throw error;
         return undefined;
     }
 }
 
 export async function runProjectSessionStartup(options: ProjectSessionOptions): Promise<boolean> {
     return await runProjectSessionCommand('startup', options) !== undefined;
-}
-
-export async function runProjectSessionInput(options: ProjectSessionOptions): Promise<string | null | undefined> {
-    const key = turnKey(options);
-    const turnToken = `xc-turn-v1-${randomBytes(32).toString('hex')}`;
-    activeTurnTokens.set(key, turnToken);
-    try {
-        return await runProjectSessionCommand('input', { ...options, turnToken });
-    } catch (error) {
-        if (activeTurnTokens.get(key) === turnToken) activeTurnTokens.delete(key);
-        throw error;
-    }
 }
 
 export async function runProjectSessionStop(options: ProjectSessionOptions): Promise<boolean | null> {
@@ -159,7 +138,7 @@ export async function runProjectSessionStop(options: ProjectSessionOptions): Pro
         const result = await invokeProjectXc(workspace,
             ['host', 'stop', '--confirm', '--workspace', workspace], {
                 env,
-                timeout: PROJECT_SESSION_COMMAND_TIMEOUT_MS,
+                timeout: PROJECT_SESSION_STOP_TIMEOUT_MS,
                 maxBuffer: 1024 * 1024,
             });
         if (!result) return null;
@@ -170,22 +149,13 @@ export async function runProjectSessionStop(options: ProjectSessionOptions): Pro
         }
         return true;
     } catch (error) {
-        options.notify(`XC v2 安全停止错误：${detail(error)}`);
+        options.notify(`XC v2 安全停止错误：${detail(error, PROJECT_SESSION_STOP_TIMEOUT_MS)}`);
         return false;
     }
 }
 
 export async function runProjectSessionClose(options: ProjectSessionOptions): Promise<void> {
-    activeTurnTokens.delete(turnKey(options));
     await runProjectSessionCommand('close', options);
-}
-
-export async function runProjectSessionTurnEnd(options: ProjectSessionOptions): Promise<void> {
-    const key = turnKey(options);
-    const turnToken = activeTurnTokens.get(key);
-    if (!turnToken) return;
-    try { await runProjectSessionCommand('turn-end', { ...options, turnToken }); }
-    finally { if (activeTurnTokens.get(key) === turnToken) activeTurnTokens.delete(key); }
 }
 
 export async function reportProjectError(options: ProjectErrorReportOptions): Promise<string | null> {

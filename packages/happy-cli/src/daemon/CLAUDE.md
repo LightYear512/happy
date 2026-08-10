@@ -79,10 +79,11 @@ Initiated by mobile app via backend RPC:
    - Creates directory if needed
    - Spawns detached Happy process with `--happy-starting-mode remote --started-by daemon`
    - Adds to `pidToTrackedSession` map
-   - Sets up 10-second awaiter for session webhook
+   - Sets up one 50-second startup deadline for exact identity and final input readiness
 4. New Happy process:
    - Creates session with backend, receives `happySessionId`
-   - Calls `notifyDaemonSessionStarted()` to POST to daemon's `/session-started`
+   - Installs the provider input consumer and merges the pending restore window
+   - Calls `notifyDaemonSessionStarted()` only after final input readiness
 5. Daemon updates tracking with `happySessionId`, resolves awaiter
 6. RPC returns session info to mobile app
 

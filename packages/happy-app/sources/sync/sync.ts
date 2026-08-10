@@ -17,7 +17,14 @@ import { isRunningOnMac } from '@/utils/platform';
 import { NormalizedMessage, normalizeRawMessage, RawRecord } from './typesRaw';
 import { applySettings, Settings, settingsDefaults, settingsParse, SUPPORTED_SCHEMA_VERSION } from './settings';
 import { Profile, profileParse } from './profile';
-import { loadPendingSettings, savePendingSettings } from './persistence';
+import {
+    clearPendingSessionMessage,
+    loadPendingSessionMessages,
+    loadPendingSettings,
+    savePendingSessionMessage,
+    savePendingSettings,
+    type PendingSessionMessage,
+} from './persistence';
 import { initializeTracking, tracking } from '@/track';
 import { parseToken } from '@/utils/parseToken';
 import { RevenueCat, LogLevel, PaywallResult } from './revenueCat';
@@ -40,11 +47,14 @@ import { fetchFeed } from './apiFeed';
 import { FeedItem } from './feedTypes';
 import { UserProfile } from './friendTypes';
 import { resolveMessageModeMeta } from './messageMeta';
+import {
+    MessagePersistenceError,
+    submitPendingSessionMessageAttempt,
+    TERMINAL_MESSAGE_PERSISTENCE_ERRORS,
+    type MessagePersistenceAck,
+} from './pendingSessionMessage';
 
 class Sync {
-    // Spawned agents (especially in spawn mode) can take noticeable time to connect.
-    private static readonly SESSION_READY_TIMEOUT_MS = 10000;
-
     encryption!: Encryption;
     serverID!: string;
     anonID!: string;
@@ -68,6 +78,7 @@ class Sync {
     private feedSync: InvalidateSync;
     private activityAccumulator: ActivityUpdateAccumulator;
     private pendingSettings: Partial<Settings> = loadPendingSettings();
+    private pendingSessionMessages = loadPendingSessionMessages();
     revenueCatInitialized = false;
 
     // Generic locking mechanism
@@ -207,20 +218,24 @@ class Sync {
     }
 
 
-    async sendMessage(sessionId: string, text: string, displayText?: string) {
+    async sendMessage(sessionId: string, text: string, displayText?: string): Promise<
+        { submitted: true } | { submitted: false; reason: string }
+    > {
 
         // Get encryption
         const encryption = this.encryption.getSessionEncryption(sessionId);
         if (!encryption) { // Should never happen
-            console.error(`Session ${sessionId} not found`);
-            return;
+            const reason = `Session ${sessionId} encryption is unavailable`;
+            console.error(reason);
+            return { submitted: false, reason };
         }
 
         // Get session data from storage
         const session = storage.getState().sessions[sessionId];
         if (!session) {
-            console.error(`Session ${sessionId} not found in storage`);
-            return;
+            const reason = `Session ${sessionId} is unavailable`;
+            console.error(reason);
+            return { submitted: false, reason };
         }
 
         const { permissionMode, model } = resolveMessageModeMeta(session);
@@ -265,26 +280,61 @@ class Sync {
         };
         const encryptedRawRecord = await encryption.encryptRawRecord(content);
 
-        // Add to messages - normalize the raw record
         const createdAt = Date.now();
+        const pending: PendingSessionMessage = { localId, encryptedRecord: encryptedRawRecord, createdAt };
+        const queue = this.pendingSessionMessages[sessionId] ?? [];
+        queue.push(pending);
+        this.pendingSessionMessages[sessionId] = queue;
+        savePendingSessionMessage(sessionId, pending);
+
         const normalizedMessage = normalizeRawMessage(localId, localId, createdAt, content);
-        if (normalizedMessage) {
-            this.applyMessages(sessionId, [normalizedMessage]);
-        }
+        if (normalizedMessage) this.applyMessages(sessionId, [normalizedMessage]);
 
-        const ready = await this.waitForAgentReady(sessionId);
-        if (!ready) {
-            log.log(`Session ${sessionId} not ready after timeout, sending anyway`);
-        }
+        // Socket acknowledgement is a confirmation/retry signal, never a gate
+        // in front of the user's local submission or draft clearing.
+        void this.submitPendingSessionMessage(sessionId, pending);
+        return { submitted: true };
+    }
 
-        // Send message with optional permission mode and source identifier
-        apiSocket.send('message', {
-            sid: sessionId,
-            message: encryptedRawRecord,
-            localId,
-            sentFrom,
-            permissionMode
-        });
+    private async submitPendingSessionMessage(sessionId: string, pending: PendingSessionMessage): Promise<void> {
+        try {
+            await submitPendingSessionMessageAttempt(
+                sessionId,
+                pending,
+                (event, data, timeoutMs) => apiSocket.emitWithAck<MessagePersistenceAck>(event, data, timeoutMs),
+            );
+            this.confirmPendingSessionMessage(sessionId, pending.localId);
+        } catch (error) {
+            if (error instanceof MessagePersistenceError && error.code
+                && TERMINAL_MESSAGE_PERSISTENCE_ERRORS.has(error.code)) {
+                this.confirmPendingSessionMessage(sessionId, pending.localId);
+                const failure = normalizeRawMessage(randomUUID(), null, Date.now(), {
+                    role: 'agent',
+                    content: {
+                        type: 'event',
+                        id: randomUUID(),
+                        data: { type: 'message', message: '消息发送失败，请重新进入会话后重试。' },
+                    },
+                });
+                if (failure) this.applyMessages(sessionId, [failure]);
+                return;
+            }
+            log.log(`Message persistence confirmation pending for ${sessionId}: ${String(error)}`);
+            // Old servers do not acknowledge the event and skip echoing it to
+            // the sending socket. Reconcile only this session in background;
+            // the authoritative row clears the exact localId without delaying UI.
+            this.messagesSync.get(sessionId)?.invalidate();
+        }
+    }
+
+    private confirmPendingSessionMessage(sessionId: string, localId: string | null | undefined): void {
+        if (!localId) return;
+        const queue = this.pendingSessionMessages[sessionId];
+        if (!queue?.some((item) => item.localId === localId)) return;
+        const remaining = queue.filter((item) => item.localId !== localId);
+        if (remaining.length > 0) this.pendingSessionMessages[sessionId] = remaining;
+        else delete this.pendingSessionMessages[sessionId];
+        clearPendingSessionMessage(sessionId, localId);
     }
 
     applySettings = (delta: Partial<Settings>) => {
@@ -1313,6 +1363,9 @@ class Sync {
         // Request
         const response = await apiSocket.request(`/v1/sessions/${sessionId}/messages`);
         const data = await response.json();
+        for (const message of data.messages as ApiMessage[]) {
+            this.confirmPendingSessionMessage(sessionId, message.localId);
+        }
 
         // Collect existing messages
         let eixstingMessages = this.sessionReceivedMessages.get(sessionId);
@@ -1402,8 +1455,14 @@ class Sync {
         apiSocket.onMessage('ephemeral', this.handleEphemeralUpdate.bind(this));
 
         // Subscribe to connection state changes
-        apiSocket.onReconnected(() => {
+        apiSocket.onReconnected((recovered) => {
             log.log('🔌 Socket reconnected');
+            for (const [sessionId, queue] of Object.entries(this.pendingSessionMessages)) {
+                for (const pending of queue) void this.submitPendingSessionMessage(sessionId, pending);
+            }
+            // Socket.IO recovery already replays missed inbound updates. Only
+            // durable outbound inputs need replay; avoid an unrelated full sync.
+            if (recovered) return;
             this.sessionsSync.invalidate();
             this.machinesSync.invalidate();
             log.log('🔌 Socket reconnected: Invalidating artifacts sync');
@@ -1450,6 +1509,7 @@ class Sync {
             if (updateData.body.message) {
                 const decrypted = await encryption.decryptMessage(updateData.body.message);
                 if (decrypted) {
+                    this.confirmPendingSessionMessage(updateData.body.sid, decrypted.localId);
                     lastMessage = normalizeRawMessage(decrypted.id, decrypted.localId, decrypted.createdAt, decrypted.content);
 
                     // Check for task lifecycle events to update thinking state
@@ -1958,38 +2018,6 @@ class Sync {
         }
     }
 
-    /**
-     * Waits for the CLI agent to be ready by watching agentStateVersion.
-     *
-     * When a session is created, agentStateVersion starts at 0. Once the CLI
-     * connects and sends its first state update (via updateAgentState()), the
-     * version becomes > 0. This serves as a reliable signal that the CLI's
-     * WebSocket is connected and ready to receive messages.
-     */
-    private waitForAgentReady(sessionId: string, timeoutMs: number = Sync.SESSION_READY_TIMEOUT_MS): Promise<boolean> {
-        const startedAt = Date.now();
-
-        return new Promise((resolve) => {
-            const done = (ready: boolean, reason: string) => {
-                clearTimeout(timeout);
-                unsubscribe();
-                const duration = Date.now() - startedAt;
-                log.log(`Session ${sessionId} ${reason} after ${duration}ms`);
-                resolve(ready);
-            };
-
-            const check = () => {
-                const s = storage.getState().sessions[sessionId];
-                if (s && s.agentStateVersion > 0) {
-                    done(true, `ready (agentStateVersion=${s.agentStateVersion})`);
-                }
-            };
-
-            const timeout = setTimeout(() => done(false, 'ready wait timed out'), timeoutMs);
-            const unsubscribe = storage.subscribe(check);
-            check(); // Check current state immediately
-        });
-    }
 }
 
 // Global singleton instance

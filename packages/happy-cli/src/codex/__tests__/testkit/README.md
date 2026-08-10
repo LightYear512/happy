@@ -104,7 +104,7 @@ The smoke test proves the testkit chain (env override → spawn → JSONRPC → 
   → runManualCompact → buildHeuristicSeed → push '继续' → next turn/start with seed
 ```
 
-Writing that test is blocked by a hard dependency: `runCodexWithAppServer`'s first ~50 lines call `ApiClient.create() → getOrCreateMachine() → getOrCreateSession() → setupOfflineReconnection()`, all against a live happy-server. There is no injection seam between `opts.credentials` and these calls.
+Writing that test is blocked by a hard dependency: `runCodexWithAppServer`'s first ~50 lines call `ApiClient.create() → getOrCreateMachine() → getOrCreateSession() → setupOfflineSession()`, all against a live happy-server. There is no injection seam between `opts.credentials` and these calls.
 
 After two test-writing attempts (Wave 2 Part 2 and Wave 3 Path X), the verified conclusion is that **Option B is the only clean unblock** — Path A (local dev server) and Path X (real production server with the user's own credentials) both hit the same architectural wall that B resolves.
 

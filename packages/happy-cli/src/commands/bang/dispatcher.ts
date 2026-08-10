@@ -99,7 +99,7 @@ function compactOption(commandText: string, desc: string): string {
     return `${commandText}｜${desc}`;
 }
 
-const MAIN_MENU_OPTION = '❇️ @ 主菜单';
+const MAIN_MENU_OPTION = '❇️ @@ 主菜单';
 const CACHE_AGE_DISPLAY_MIN_MS = 5 * 60 * 1000;
 
 function formatCompactResetTime(resetsAt: string | null): string | null {
@@ -194,8 +194,7 @@ function stripLeadingCommandDecorations(text: string): string {
 
 function stripOptionSuffix(text: string): string {
     const stripped = stripLeadingCommandDecorations(text.trim().split(/[｜|]/, 1)[0].trim());
-    if (stripped === '@' || stripped === '@ 主菜单') return '@';
-    if (stripped === '@@' || stripped.startsWith('@@ ')) return '@@';
+    if (stripped === '@@' || stripped.startsWith('@@ ') || stripped === '@ 主菜单') return '@@';
     return stripped;
 }
 
@@ -220,7 +219,7 @@ function withMainMenuOption(result: BangCommandResult): BangCommandResult {
  */
 export function isBangCommand(text: string): boolean {
     const trimmed = stripOptionSuffix(text);
-    if (trimmed === '@' || trimmed === '@@') return true;
+    if (trimmed === '@@') return true;
     if (trimmed.length <= 1 || trimmed[1] === ' ') return false;
     if (trimmed.startsWith(COMMAND_PREFIX)) return true;
     if (!trimmed.startsWith(ALIAS_PREFIX)) return false;
@@ -235,7 +234,7 @@ export function isBangCommand(text: string): boolean {
  */
 function parseBangCommand(text: string): { prefix: string; name: string; args: string } {
     const trimmed = stripOptionSuffix(text);
-    if (trimmed === '@' || trimmed === '@@') {
+    if (trimmed === '@@') {
         return { prefix: ALIAS_PREFIX, name: '@', args: '' };
     }
     const prefix = trimmed[0] ?? COMMAND_PREFIX;

@@ -1,8 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { createRequire } from 'node:module';
 
-const require = createRequire(import.meta.url);
 const useLocalStorage = !process.env.S3_HOST;
 const dataDir = process.env.DATA_DIR || './data';
 const localFilesDir = path.join(dataDir, 'files');

@@ -41,7 +41,7 @@ describe('isBangCommand', () => {
     it('should reject lone exclamation mark or space after it', () => {
         expect(isBangCommand('!')).toBe(false);
         expect(isBangCommand('! auth')).toBe(false);
-        expect(isBangCommand('@')).toBe(true);
+        expect(isBangCommand('@')).toBe(false);
         expect(isBangCommand('@@')).toBe(true);
         expect(isBangCommand('@ auth')).toBe(false);
     });
@@ -69,7 +69,7 @@ describe('executeBangCommand aliases', () => {
 
     it('uses @ for short aliases', async () => {
         const help = await executeBangCommand('@h', ctx);
-        expect((help.message as string[]).join('\n')).toContain('@h (!help)');
+        expect(help.suggestions).toContain('@a｜切换 CCS 账号');
 
         expect(isBangCommand('@u-codex')).toBe(true);
         expect(isBangCommand('@aa-codex')).toBe(true);
@@ -78,8 +78,8 @@ describe('executeBangCommand aliases', () => {
         expect((oldShortAlias.message as string[]).join('\n')).toContain('未知命令 "!h"');
     });
 
-    it('shows htask toggles only in the ordinary @ quick menu', async () => {
-        const menu = await executeBangCommand('@', ctx);
+    it('shows htask toggles in the @@ quick menu while leaving lone @ as model input', async () => {
+        const menu = await executeBangCommand('@@', ctx);
         expect(menu.suggestions).toContain('@u｜当前账号流量');
         expect(menu.suggestions).toContain('@a｜切换账号');
         expect(menu.suggestions).toContain('@reminder｜设置/取消提示');
@@ -88,10 +88,7 @@ describe('executeBangCommand aliases', () => {
         expect(menu.suggestions?.join('\n')).not.toContain('@task-dismiss');
         expect(menu.suggestions?.join('\n')).not.toContain('@task｜');
 
-        const legacyMenu = await executeBangCommand('@@', ctx);
-        expect(legacyMenu.suggestions).toContain('@reply-monitor｜回复监控开关');
-
-        const consoleMenu = await executeBangCommand('@', { ...ctx, isConsoleSession: true });
+        const consoleMenu = await executeBangCommand('@@', { ...ctx, isConsoleSession: true });
         expect(consoleMenu.suggestions?.join('\n')).not.toContain('@reminder');
         expect(consoleMenu.suggestions?.join('\n')).not.toContain('@reply-monitor');
     });
@@ -143,7 +140,7 @@ describe('buildConsoleWelcome', () => {
         expect(joined).toContain('@u｜⏱️查看Claude 用量');
         expect(joined).toContain('@aa-codex｜🔑设置Codex全局账号');
         expect(joined).toContain('@u-codex｜⏱️查看codex用量');
-        expect(joined).toContain('❇️ @ 主菜单');
+        expect(joined).toContain('❇️ @@ 主菜单');
         expect(joined).not.toContain('!usage (!u)');
         expect(joined).not.toContain('@l (!login)');
         // sessionOnly commands should NOT appear
@@ -184,7 +181,7 @@ describe('buildConsoleWelcome', () => {
         expect(suggestions).not.toContain('@l-codex');
         expect(suggestions).toContain('@u｜⏱️查看Claude 用量');
         expect(suggestions).toContain('@u-codex｜⏱️查看codex用量');
-        expect(suggestions).toContain('❇️ @ 主菜单');
+        expect(suggestions).toContain('❇️ @@ 主菜单');
         // !auth is sessionOnly — should NOT be in console suggestions
         expect(suggestions).not.toContain('!auth');
     });
@@ -205,7 +202,7 @@ describe('buildConsoleWelcome', () => {
         expect(result.suggestions).toBeDefined();
         expect(result.suggestions!.length).toBeGreaterThan(0);
         expect(result.suggestions!.every(s => typeof s === 'string' && (s.startsWith('@') || s.startsWith('!') || s.startsWith('❇️')))).toBe(true);
-        expect(result.suggestions).toContain('❇️ @ 主菜单');
+        expect(result.suggestions).toContain('❇️ @@ 主菜单');
     });
 });
 

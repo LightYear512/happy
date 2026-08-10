@@ -13,6 +13,39 @@ const encrypted = (id: string, seq: number, body: unknown, createdAt = Date.now(
 });
 
 describe('fetchAndInjectPendingMessages', () => {
+    it('returns immediately when there are no pending messages', async () => {
+        const api = { getSessionMessages: vi.fn().mockResolvedValue([]) } as any;
+        const session = {
+            waitForConnect: vi.fn().mockResolvedValue(undefined),
+            injectPendingPersistedUserMessage: vi.fn(),
+        } as any;
+
+        await expect(fetchAndInjectPendingMessages(api, session, 'session-1', key, 'legacy', '[test]'))
+            .resolves.toBe(0);
+    });
+
+    it('can prefetch recovery rows without injecting before provider readiness', async () => {
+        const rows = [
+            encrypted('u-11', 11, { role: 'user', content: { type: 'text', text: 'pending' }, meta: { sentFrom: 'app' } }),
+            encrypted('a-10', 10, { role: 'agent', content: { type: 'codex', data: { type: 'message', message: 'old' } } }),
+        ];
+        const api = { getSessionMessages: vi.fn().mockResolvedValue(rows) } as any;
+        const session = {
+            waitForConnect: vi.fn().mockResolvedValue(undefined),
+            injectPendingPersistedUserMessage: vi.fn().mockReturnValue(true),
+            sendSessionEvent: vi.fn(),
+        } as any;
+
+        const prepared = await fetchAndInjectPendingMessages(
+            api, session, 'session-1', key, 'legacy', '[test]', { deferInjection: true },
+        );
+        expect(api.getSessionMessages).toHaveBeenCalledOnce();
+        expect(session.injectPendingPersistedUserMessage).not.toHaveBeenCalled();
+        expect(typeof prepared).toBe('function');
+        expect((prepared as () => number)()).toBe(1);
+        expect(session.injectPendingPersistedUserMessage).toHaveBeenCalledOnce();
+    });
+
     it('HSR restores distinct repeated user messages in authoritative sequence order', async () => {
         const rows = [
             encrypted('u-12', 12, { role: 'user', content: { type: 'text', text: '!usage' }, meta: { sentFrom: 'app' } }),
@@ -24,7 +57,7 @@ describe('fetchAndInjectPendingMessages', () => {
         const session = {
             waitForConnect: vi.fn().mockResolvedValue(undefined),
             injectPendingPersistedUserMessage: vi.fn((row) => { injected.push(row.seq); return true; }),
-            markRestoreRecoveryFailed: vi.fn(),
+            sendSessionEvent: vi.fn(),
         } as any;
 
         await expect(fetchAndInjectPendingMessages(api, session, 'session-1', key, 'legacy', '[test]'))
@@ -45,12 +78,56 @@ describe('fetchAndInjectPendingMessages', () => {
         const session = {
             waitForConnect: vi.fn().mockResolvedValue(undefined),
             injectPendingPersistedUserMessage: vi.fn((row) => { injected.push(row.localId); return true; }),
-            markRestoreRecoveryFailed: vi.fn(),
+            sendSessionEvent: vi.fn(),
         } as any;
 
         await expect(fetchAndInjectPendingMessages(api, session, 'session-1', key, 'legacy', '[test]'))
             .resolves.toBe(1);
         expect(injected).toEqual([localId]);
+    });
+
+    it('HSR ignores persisted agent events and restores only human input', async () => {
+        const digest = 'd'.repeat(64);
+        const terminalLocalId = `xc-msg-v1-${digest}`;
+        const rows = [
+            encrypted('terminal-12', 12, { role: 'agent', content: {
+                id: `happy-input-rejected-v1-${digest}`,
+                type: 'event',
+                data: { type: 'message', message: 'XC v2 输入已拒绝：input-rejected' },
+            } }, Date.now() - 9_000, terminalLocalId),
+            encrypted('u-11', 11, { role: 'user', content: { type: 'text', text: 'rejected' },
+                meta: { sentFrom: 'app' } }),
+            encrypted('a-10', 10, { role: 'agent', content: { type: 'codex', data: { type: 'message', message: 'old' } } }),
+        ];
+        const injected: string[] = [];
+        const api = { getSessionMessages: vi.fn().mockResolvedValue(rows) } as any;
+        const session = {
+            waitForConnect: vi.fn().mockResolvedValue(undefined),
+            injectPendingPersistedUserMessage: vi.fn((row) => { injected.push(`user:${row.seq}`); return true; }),
+            sendSessionEvent: vi.fn(),
+        } as any;
+
+        await expect(fetchAndInjectPendingMessages(api, session, 'session-1', key, 'legacy', '[test]'))
+            .resolves.toBe(1);
+        expect(injected).toEqual(['user:11']);
+    });
+
+    it('does not block restored input when the at-least-once notice cannot be sent', async () => {
+        const rows = [
+            encrypted('u-11', 11, { role: 'user', content: { type: 'text', text: 'restore me' },
+                meta: { sentFrom: 'app' } }),
+            encrypted('a-10', 10, { role: 'agent', content: { type: 'codex', data: { type: 'message' } } }),
+        ];
+        const session = {
+            waitForConnect: vi.fn().mockResolvedValue(undefined),
+            injectPendingPersistedUserMessage: vi.fn().mockReturnValue(true),
+            sendSessionEvent: vi.fn(() => { throw new Error('notice unavailable'); }),
+        } as any;
+        const api = { getSessionMessages: vi.fn().mockResolvedValue(rows) } as any;
+
+        await expect(fetchAndInjectPendingMessages(api, session, 'session-1', key, 'legacy', '[test]'))
+            .resolves.toBe(1);
+        expect(session.injectPendingPersistedUserMessage).toHaveBeenCalledOnce();
     });
 
     it('HSR fails closed when a full recent window contains no processed-response boundary', async () => {
@@ -63,13 +140,11 @@ describe('fetchAndInjectPendingMessages', () => {
         const session = {
             waitForConnect: vi.fn().mockResolvedValue(undefined),
             injectPendingPersistedUserMessage: vi.fn(),
-            markRestoreRecoveryFailed: vi.fn(),
         } as any;
 
         await expect(fetchAndInjectPendingMessages(api, session, 'session-1', key, 'legacy', '[test]'))
             .rejects.toThrow(/recovery_incomplete/);
         expect(session.injectPendingPersistedUserMessage).not.toHaveBeenCalled();
-        expect(session.markRestoreRecoveryFailed).toHaveBeenCalledOnce();
     });
 
     it('HSR rejects conflicting persisted message identities during restore', async () => {
@@ -79,25 +154,36 @@ describe('fetchAndInjectPendingMessages', () => {
         const session = {
             waitForConnect: vi.fn().mockResolvedValue(undefined),
             injectPendingPersistedUserMessage: vi.fn(),
-            markRestoreRecoveryFailed: vi.fn(),
         } as any;
 
         await expect(fetchAndInjectPendingMessages(api, session, 'session-1', key, 'legacy', '[test]'))
             .rejects.toThrow(/recovery_incomplete/);
-        expect(session.markRestoreRecoveryFailed).toHaveBeenCalledOnce();
     });
 
-    it('HSR makes a restore query failure terminal and observable without injecting partial work', async () => {
-        const api = { getSessionMessages: vi.fn().mockRejectedValue(new Error('session_message_lookup_failed')) } as any;
+    it('HSR delegates its single query to the ApiClient retry boundary', async () => {
+        const api = { getSessionMessages: vi.fn()
+            .mockRejectedValueOnce(new Error('session_message_lookup_failed'))
+            .mockResolvedValueOnce([]) } as any;
         const session = {
             waitForConnect: vi.fn().mockResolvedValue(undefined),
             injectPendingPersistedUserMessage: vi.fn(),
-            markRestoreRecoveryFailed: vi.fn(),
         } as any;
 
         await expect(fetchAndInjectPendingMessages(api, session, 'session-1', key, 'legacy', '[test]'))
             .rejects.toThrow(/recovery_incomplete/);
-        expect(session.injectPendingPersistedUserMessage).not.toHaveBeenCalled();
-        expect(session.markRestoreRecoveryFailed).toHaveBeenCalledOnce();
+        expect(api.getSessionMessages).toHaveBeenCalledOnce();
+    });
+
+    it('HSR fails closed after the bounded restore query attempts are exhausted', async () => {
+        const api = { getSessionMessages: vi.fn().mockRejectedValue(new Error('session_message_lookup_failed')) } as any;
+        const session = {
+            waitForConnect: vi.fn().mockResolvedValue(undefined),
+            getTransportSnapshot: vi.fn().mockReturnValue({ state: 'closed' }),
+            injectPendingPersistedUserMessage: vi.fn(),
+        } as any;
+
+        await expect(fetchAndInjectPendingMessages(api, session, 'session-1', key, 'legacy', '[test]'))
+            .rejects.toThrow(/recovery_incomplete/);
+        expect(api.getSessionMessages).toHaveBeenCalledOnce();
     });
 });

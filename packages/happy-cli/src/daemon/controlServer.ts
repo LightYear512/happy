@@ -36,7 +36,6 @@ export function startDaemonControlServer({
     sessionId: string,
     metadata: Metadata,
     readyProviderSessionId?: string,
-    transportHealth?: unknown,
   ) => void | Promise<void>;
   onCodexProfile?: (sessionId: string, profileName: string) => Promise<boolean>;
 }): Promise<{ port: number; stop: () => Promise<void> }> {
@@ -66,10 +65,10 @@ export function startDaemonControlServer({
         }
       }
     }, async (request) => {
-      const { sessionId, metadata, readyProviderSessionId, transportHealth } = request.body;
+      const { sessionId, metadata, readyProviderSessionId } = request.body;
 
       logger.debug(`[CONTROL SERVER] Session started: ${sessionId}`);
-      await onHappySessionWebhook(sessionId, metadata, readyProviderSessionId, transportHealth);
+      await onHappySessionWebhook(sessionId, metadata, readyProviderSessionId);
 
       return { status: 'ok' as const };
     });

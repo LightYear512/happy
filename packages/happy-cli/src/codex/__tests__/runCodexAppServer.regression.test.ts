@@ -227,6 +227,13 @@ describe('runCodexAppServer — AST regression contracts', () => {
                     .map((p) => p.expression.getText(SF));
                 expect(spreadTexts.some((text) => text.includes('modelConfig.reasoningEffort'))).toBe(true);
             });
+
+            it(`thread/resume call at L${line} requests metadata-only readiness`, () => {
+                const params = call.arguments[1] as ts.ObjectLiteralExpression;
+                const source = params.getText(SF);
+                expect(source).toContain('excludeTurns: true');
+                expect(source).not.toContain('persistExtendedHistory');
+            });
         }
     });
 
@@ -328,60 +335,39 @@ describe('runCodexAppServer — AST regression contracts', () => {
             return decl ? decl.getStart(SF) : -1;
         };
 
-        it('declares `recentUserBuffer` before EVERY `session.onUserMessage(...)` registration', () => {
+        it('declares `recentUserBuffer` before the shared input callback is installed', () => {
             const declPos = findVarDeclPos('recentUserBuffer');
-            // We require the declaration to live before ALL registrations, so a
-            // future second `session.onUserMessage` won't accidentally race.
-            const regPositions = findMethodCalls(SF, 'session', 'onUserMessage').map((c) => c.getStart(SF));
+            const callbackPos = findVarDeclPos('onUserMessage');
+            const registration = findFirstNode(SF, (node): node is ts.CallExpression =>
+                ts.isCallExpression(node)
+                && ts.isIdentifier(node.expression)
+                && node.expression.text === 'completeProviderInputReady');
             expect(declPos, '`recentUserBuffer` must be declared').toBeGreaterThan(-1);
-            expect(regPositions.length, 'at least one onUserMessage registration must exist').toBeGreaterThan(0);
-            for (const regPos of regPositions) {
-                expect(
-                    declPos,
-                    `declaration at offset ${declPos} must precede onUserMessage at offset ${regPos}`,
-                ).toBeLessThan(regPos);
-            }
+            expect(callbackPos, '`onUserMessage` must be declared').toBeGreaterThan(-1);
+            expect(registration, 'shared input readiness registration must exist').not.toBeNull();
+            expect(declPos).toBeLessThan(callbackPos);
+            expect(callbackPos).toBeLessThan(registration!.getStart(SF));
         });
 
         it('records every user prompt via `recentUserBuffer.record(...)` BEFORE pushing into the message queue', () => {
             const pushCalls = findMethodCalls(SF, 'messageQueue', 'push');
             expect(pushCalls.length, '`messageQueue.push(...)` must exist somewhere').toBeGreaterThan(0);
 
-            // We only enforce the contract on push calls inside an
-            // `onUserMessage` callback — `executeBangCommand` etc. may legitimately
-            // push synthesised content without going through the user buffer.
-            // Heuristic: the enclosing scope's parent must be `session.onUserMessage(...)`.
-            for (const pushCall of pushCalls) {
-                let scope: ts.Node | undefined = pushCall.parent;
-                while (
-                    scope &&
-                    !ts.isFunctionDeclaration(scope) &&
-                    !ts.isArrowFunction(scope) &&
-                    !ts.isFunctionExpression(scope)
-                ) {
-                    scope = scope.parent;
-                }
-                if (!scope) continue;
-
-                const parentCall = scope.parent;
-                if (!parentCall || !ts.isCallExpression(parentCall)) continue;
-                const callee = parentCall.expression;
-                if (!ts.isPropertyAccessExpression(callee)) continue;
-                if (!ts.isIdentifier(callee.expression)) continue;
-                if (callee.expression.text !== 'session') continue;
-                if (callee.name.text !== 'onUserMessage') continue;
-
-                const recordCalls = findMethodCalls(scope, 'recentUserBuffer', 'record');
-                expect(
-                    recordCalls.length,
-                    'expected at least one `recentUserBuffer.record(...)` in the onUserMessage callback',
-                ).toBeGreaterThan(0);
-
-                const minRecordPos = Math.min(...recordCalls.map((c) => c.getStart(SF)));
-                expect(
-                    minRecordPos,
-                    'record must commit before push (push throwing synchronously could skip it otherwise)',
-                ).toBeLessThan(pushCall.getStart(SF));
+            const declaration = findFirstNode(SF, (node): node is ts.VariableDeclaration =>
+                ts.isVariableDeclaration(node)
+                && ts.isIdentifier(node.name)
+                && node.name.text === 'onUserMessage');
+            expect(declaration, '`onUserMessage` must be declared').not.toBeNull();
+            const callback = declaration!.initializer;
+            expect(callback && (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback)))
+                .toBe(true);
+            const callbackPushCalls = findMethodCalls(callback!, 'messageQueue', 'push');
+            const recordCalls = findMethodCalls(callback!, 'recentUserBuffer', 'record');
+            expect(callbackPushCalls.length).toBeGreaterThan(0);
+            expect(recordCalls.length).toBeGreaterThan(0);
+            const minRecordPos = Math.min(...recordCalls.map((call) => call.getStart(SF)));
+            for (const pushCall of callbackPushCalls) {
+                expect(minRecordPos).toBeLessThan(pushCall.getStart(SF));
             }
         });
 

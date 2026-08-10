@@ -1,19 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdir, mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { ApiSessionClient } from './apiSession';
 import { decodeBase64, decrypt, encodeBase64, encrypt } from './encryption';
-import { modelFacingUserText } from './types';
 
 // Use vi.hoisted to ensure mock function is available when vi.mock factory runs
 const { mockIo, getMock, ensureProjectWatchMock, runProjectSessionStartupMock,
-    runProjectSessionInputMock, runProjectSessionStopMock, runProjectSessionCloseMock, notifyDaemonSessionStartedMock } = vi.hoisted(() => ({
+    runProjectSessionStopMock, runProjectSessionCloseMock, notifyDaemonSessionStartedMock } = vi.hoisted(() => ({
     mockIo: vi.fn(),
     getMock: vi.fn(),
     ensureProjectWatchMock: vi.fn(),
     runProjectSessionStartupMock: vi.fn(),
-    runProjectSessionInputMock: vi.fn(),
     runProjectSessionStopMock: vi.fn(),
     runProjectSessionCloseMock: vi.fn(),
     notifyDaemonSessionStartedMock: vi.fn(),
@@ -28,11 +23,12 @@ vi.mock('axios', () => ({
 vi.mock('@/utils/projectSessionStartup', () => ({
     ensureProjectWatch: ensureProjectWatchMock,
     runProjectSessionStartup: runProjectSessionStartupMock,
-    runProjectSessionInput: runProjectSessionInputMock,
     runProjectSessionStop: runProjectSessionStopMock,
     runProjectSessionClose: runProjectSessionCloseMock,
 }));
-vi.mock('@/daemon/controlClient', () => ({ notifyDaemonSessionStarted: notifyDaemonSessionStartedMock }));
+vi.mock('@/daemon/controlClient', () => ({
+    notifyDaemonSessionStarted: notifyDaemonSessionStartedMock,
+}));
 
 describe('ApiSessionClient connection handling', () => {
     let mockSocket: any;
@@ -53,14 +49,16 @@ describe('ApiSessionClient connection handling', () => {
             emit: vi.fn(),
             disconnect: vi.fn(),
             close: vi.fn(),
+            emitWithAck: vi.fn(),
+            timeout: vi.fn(),
             volatile: { emit: vi.fn() },
         };
+        mockSocket.timeout.mockReturnValue(mockSocket);
 
         mockIo.mockReturnValue(mockSocket);
         getMock.mockReset().mockResolvedValue({ data: { messages: [] } });
         ensureProjectWatchMock.mockReset().mockResolvedValue(undefined);
         runProjectSessionStartupMock.mockReset().mockResolvedValue(true);
-        runProjectSessionInputMock.mockReset().mockResolvedValue(null);
         runProjectSessionStopMock.mockReset().mockResolvedValue(true);
         runProjectSessionCloseMock.mockReset().mockResolvedValue(undefined);
         notifyDaemonSessionStartedMock.mockReset().mockResolvedValue({ status: 'ok' });
@@ -86,6 +84,143 @@ describe('ApiSessionClient connection handling', () => {
         };
     });
 
+    const persistedUserRow = (id: string, seq: number, text: string, sentFrom = 'app') => ({
+        id,
+        seq,
+        localId: null,
+        createdAt: 1_000 + seq,
+        content: {
+            t: 'encrypted' as const,
+            c: encodeBase64(encrypt(mockSession.encryptionKey, mockSession.encryptionVariant, {
+                role: 'user', content: { type: 'text', text }, meta: { sentFrom },
+            })),
+        },
+    });
+
+    it('bounds metadata acknowledgement waiting to fifteen seconds', async () => {
+        const client = new ApiSessionClient('fake-token', mockSession);
+        const updatedMetadata = { ...mockSession.metadata, name: 'ready' };
+        mockSocket.emitWithAck.mockResolvedValue({
+            result: 'success',
+            version: 1,
+            metadata: encodeBase64(encrypt(mockSession.encryptionKey, mockSession.encryptionVariant, updatedMetadata)),
+        });
+
+        await expect(client.updateMetadata(() => updatedMetadata, { rejectOnServerError: true }))
+            .resolves.toBeUndefined();
+        expect(mockSocket.timeout.mock.calls[0]![0]).toBeGreaterThan(0);
+        expect(mockSocket.timeout.mock.calls[0]![0]).toBeLessThanOrEqual(15_000);
+        expect(mockSocket.emitWithAck).toHaveBeenCalledOnce();
+    });
+
+    it('retries one newer metadata version and never loops indefinitely', async () => {
+        const now = vi.spyOn(Date, 'now')
+            .mockReturnValueOnce(10_000)
+            .mockReturnValueOnce(10_000)
+            .mockReturnValueOnce(14_000);
+        const client = new ApiSessionClient('fake-token', mockSession);
+        const serverMetadata = { ...mockSession.metadata, name: 'concurrent' };
+        const finalMetadata = { ...serverMetadata, name: 'ready' };
+        mockSocket.emitWithAck
+            .mockResolvedValueOnce({
+                result: 'version-mismatch',
+                version: 1,
+                metadata: encodeBase64(encrypt(mockSession.encryptionKey, mockSession.encryptionVariant, serverMetadata)),
+            })
+            .mockResolvedValueOnce({
+                result: 'success',
+                version: 2,
+                metadata: encodeBase64(encrypt(mockSession.encryptionKey, mockSession.encryptionVariant, finalMetadata)),
+            });
+
+        try {
+            await expect(client.updateMetadata((metadata) => ({ ...metadata, name: 'ready' }),
+                { rejectOnServerError: true })).resolves.toBeUndefined();
+            expect(mockSocket.emitWithAck).toHaveBeenCalledTimes(2);
+            expect(mockSocket.timeout.mock.calls).toEqual([[15_000], [11_000]]);
+        } finally {
+            now.mockRestore();
+        }
+    });
+
+    it('retries when the matching version-mismatch broadcast arrived before its acknowledgement', async () => {
+        const client = new ApiSessionClient('fake-token', mockSession);
+        const concurrentMetadata = { ...mockSession.metadata, summary: { text: 'concurrent' } };
+        const finalMetadata = { ...concurrentMetadata, name: 'ready' };
+        mockSocket.emitWithAck
+            .mockImplementationOnce(async () => {
+                handlers.get('update')?.({
+                    body: { t: 'update-session', metadata: {
+                        version: 1,
+                        value: encodeBase64(encrypt(
+                            mockSession.encryptionKey,
+                            mockSession.encryptionVariant,
+                            concurrentMetadata,
+                        )),
+                    } },
+                });
+                return {
+                    result: 'version-mismatch',
+                    version: 1,
+                    metadata: encodeBase64(encrypt(
+                        mockSession.encryptionKey,
+                        mockSession.encryptionVariant,
+                        concurrentMetadata,
+                    )),
+                };
+            })
+            .mockResolvedValueOnce({
+                result: 'success',
+                version: 2,
+                metadata: encodeBase64(encrypt(
+                    mockSession.encryptionKey,
+                    mockSession.encryptionVariant,
+                    finalMetadata,
+                )),
+            });
+
+        await expect(client.updateMetadata(
+            (metadata) => ({ ...metadata, name: 'ready' }),
+            { rejectOnServerError: true },
+        )).resolves.toBeUndefined();
+        expect(mockSocket.emitWithAck).toHaveBeenCalledTimes(2);
+    });
+
+    it('bounds ordinary metadata failure without rejecting fire-and-forget callers', async () => {
+        const client = new ApiSessionClient('fake-token', mockSession);
+        mockSocket.emitWithAck.mockRejectedValue(new Error('ack timeout'));
+
+        await expect(client.updateMetadata((metadata) => ({ ...metadata, name: 'ordinary' })))
+            .resolves.toBeUndefined();
+        await expect(client.updateMetadata((metadata) => ({ ...metadata, name: 'final' }),
+            { rejectOnServerError: true })).rejects.toThrow('ack timeout');
+    });
+
+    it('accepts an exact newer metadata broadcast when only the acknowledgement is lost', async () => {
+        const client = new ApiSessionClient('fake-token', mockSession);
+        const updatedMetadata = { ...mockSession.metadata, claudeSessionId: 'provider-1' };
+        mockSocket.emitWithAck.mockImplementation(async () => {
+            handlers.get('update')?.({
+                body: {
+                    t: 'update-session',
+                    metadata: {
+                        version: 1,
+                        value: encodeBase64(encrypt(
+                            mockSession.encryptionKey,
+                            mockSession.encryptionVariant,
+                            updatedMetadata,
+                        )),
+                    },
+                },
+            });
+            throw new Error('operation has timed out');
+        });
+
+        await expect(client.updateMetadata(() => updatedMetadata, { rejectOnServerError: true }))
+            .resolves.toBeUndefined();
+    });
+
+
     it('should handle socket connection failure gracefully', async () => {
         // Should not throw during client creation
         // Note: socket is created with autoConnect: false, so connection happens later
@@ -105,73 +240,29 @@ describe('ApiSessionClient connection handling', () => {
         expect(mockSocket.on).toHaveBeenCalledWith('error', expect.any(Function));
     });
 
-    it('re-registers an idle connected session with the current process identity', async () => {
+    it('starts periodic daemon re-registration only after final input readiness', async () => {
         vi.useFakeTimers();
-        let finish = (_value: { status: string }) => {};
-        notifyDaemonSessionStartedMock.mockImplementationOnce(() =>
-            new Promise((resolve) => { finish = resolve; }));
-        const client = new ApiSessionClient('fake-token', mockSession);
-        mockSocket.connected = true;
-        handlers.get('connect')?.();
-        await Promise.resolve();
-        expect(notifyDaemonSessionStartedMock).toHaveBeenCalledWith(mockSession.id, {
-            ...mockSession.metadata,
-            hostPid: process.pid,
-        }, undefined, undefined);
-
-        await vi.advanceTimersByTimeAsync(30_000);
-        expect(notifyDaemonSessionStartedMock).toHaveBeenCalledTimes(1);
-        finish({ status: 'ok' });
-        await vi.advanceTimersByTimeAsync(0);
-        await vi.advanceTimersByTimeAsync(10_000);
-        expect(notifyDaemonSessionStartedMock).toHaveBeenCalledWith(mockSession.id, {
-            ...mockSession.metadata,
-            hostPid: process.pid,
-        }, undefined, undefined);
-        expect(notifyDaemonSessionStartedMock).toHaveBeenCalledTimes(3);
-        expect(runProjectSessionInputMock).not.toHaveBeenCalled();
-        await client.close();
-    });
-
-    it('waits for an in-flight daemon registration before closing the provider', async () => {
-        let finish = (_value: { status: string }) => {};
-        notifyDaemonSessionStartedMock.mockImplementationOnce(() =>
-            new Promise((resolve) => { finish = resolve; }));
-        const client = new ApiSessionClient('fake-token', mockSession);
-        mockSocket.connected = true;
-        handlers.get('connect')?.();
-        const closing = client.close();
-        await Promise.resolve();
-        expect(runProjectSessionCloseMock).not.toHaveBeenCalled();
-        finish({ status: 'ok' });
-        await closing;
-        expect(runProjectSessionCloseMock).toHaveBeenCalledOnce();
-    });
-
-    it('pushes connected and terminal input health through the existing daemon webhook', async () => {
-        const workspace = await mkdtemp(join(tmpdir(), 'happy-api-health-push-'));
         try {
-            await mkdir(join(workspace, '.virtual-session'));
-            mockSession.metadata.path = workspace;
             const client = new ApiSessionClient('fake-token', mockSession);
             mockSocket.connected = true;
             handlers.get('connect')?.();
-            await vi.waitFor(() => expect(notifyDaemonSessionStartedMock).toHaveBeenCalled());
-            expect(notifyDaemonSessionStartedMock.mock.calls.at(-1)?.[3]).toMatchObject({
-                schema: 'xc.happy-session-transport-health.v1',
-                nativeSessionId: mockSession.id,
-                processId: process.pid,
-                state: 'connected',
-            });
+            expect(notifyDaemonSessionStartedMock).not.toHaveBeenCalled();
+            client.enableDaemonSessionTracking();
+            await vi.waitFor(() => expect(notifyDaemonSessionStartedMock).toHaveBeenCalledOnce());
+            await vi.advanceTimersByTimeAsync(30_000);
+            await vi.waitFor(() => expect(notifyDaemonSessionStartedMock).toHaveBeenCalledTimes(2));
             await client.close();
-            expect(notifyDaemonSessionStartedMock.mock.calls.at(-1)?.[3]).toMatchObject({
-                nativeSessionId: mockSession.id,
-                processId: process.pid,
-                state: 'closed',
-            });
         } finally {
-            await rm(workspace, { recursive: true, force: true });
+            vi.useRealTimers();
         }
+    });
+
+    it('closes without waiting on daemon registration', async () => {
+        const client = new ApiSessionClient('fake-token', mockSession);
+        mockSocket.connected = true;
+        handlers.get('connect')?.();
+        await client.close();
+        expect(runProjectSessionCloseMock).toHaveBeenCalledOnce();
     });
 
     it('blocks reconnect while the project close hook is still running', async () => {
@@ -285,10 +376,34 @@ describe('ApiSessionClient connection handling', () => {
         expect(client.getTransportSnapshot().state).toBe('connected');
     });
 
-    it('HSR deduplicates an exact restore row against a later live Socket delivery', async () => {
+    it('HSR retains buffered live input and fails closed after one bounded reconnect lookup', async () => {
         const client = new ApiSessionClient('fake-token', mockSession);
         const delivered: string[] = [];
         client.onUserMessage((message) => delivered.push(message.content.text));
+        mockSocket.connected = true;
+        handlers.get('connect')?.();
+        const beforeRow = persistedUserRow('before-reconnect', 10, 'before');
+        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id,
+            message: beforeRow } });
+        await vi.waitFor(() => expect(delivered).toEqual(['before']));
+
+        mockSocket.connected = false;
+        handlers.get('disconnect')?.('transport close');
+        getMock.mockRejectedValueOnce(new Error('temporary 500'));
+        mockSocket.connected = true;
+        handlers.get('connect')?.();
+        const duringRow = persistedUserRow('during-reconnect', 11, 'after');
+        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id,
+            message: duringRow } });
+        await vi.waitFor(() => expect(client.getTransportSnapshot().state).toBe('failed'));
+        expect(delivered).toEqual(['before']);
+        expect((client as any).pendingPersistedInputs).toHaveLength(1);
+        expect(getMock).toHaveBeenCalledOnce();
+    });
+
+    it('HSR deduplicates an exact restore row against a later live Socket delivery', async () => {
+        const client = new ApiSessionClient('fake-token', mockSession);
+        const delivered: string[] = [];
         mockSocket.connected = true;
         handlers.get('connect')?.();
         const row = {
@@ -304,177 +419,162 @@ describe('ApiSessionClient connection handling', () => {
         };
         expect(client.injectPendingPersistedUserMessage(row)).toBe(true);
         handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id, message: row } });
+        client.onUserMessage((message) => delivered.push(message.content.text));
         await vi.waitFor(() => expect(delivered).toEqual(['once']));
         expect(client.injectPendingPersistedUserMessage(row)).toBe(false);
     });
 
-    it('HSR admits a persisted Mail input with the same local identity as live delivery', async () => {
-        const client = new ApiSessionClient('fake-token', mockSession);
-        const delivered: string[] = [];
-        client.onUserMessage((message) => delivered.push(modelFacingUserText(message)));
-        const localId = `xc-msg-v1-${'c'.repeat(64)}`;
-        const row = {
-            id: 'restore-mail-input', seq: 16, localId, createdAt: 1_016,
-            content: { t: 'encrypted' as const, c: encodeBase64(encrypt(mockSession.encryptionKey,
-                mockSession.encryptionVariant, { role: 'user', content: { type: 'text', text: 'Mail display' },
-                    meta: { sentFrom: 'cli', presentation: 'compact', modelText: 'verified command' } })) },
-        };
-        expect(client.injectPendingPersistedUserMessage(row)).toBe(true);
-        await vi.waitFor(() => expect(delivered).toEqual(['verified command']));
-        expect(runProjectSessionInputMock).toHaveBeenCalledWith(expect.objectContaining({
-            workspace: '/tmp', nativeSessionId: mockSession.id, localId, messageText: 'verified command',
-        }));
-    });
 
-    it('wakes the project Watch for queued recovery and live user input', async () => {
+    it('retains a persisted input until the provider callback is registered', async () => {
         const client = new ApiSessionClient('fake-token', mockSession);
-        const recovered = {
-            role: 'user' as const,
-            content: { type: 'text' as const, text: 'recovered' },
-            meta: { sentFrom: 'app' as const },
-        };
-        const live = {
-            role: 'user' as const,
-            content: { type: 'text' as const, text: 'live' },
-            meta: { sentFrom: 'app' as const },
-        };
+        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id,
+            message: persistedUserRow('before-provider', 17, 'first') } });
+
         const delivered: string[] = [];
-        client.injectPendingMessage(recovered);
         client.onUserMessage((message) => delivered.push(message.content.text));
-        client.injectPendingMessage(live);
-        await vi.waitFor(() => expect(delivered).toEqual(['recovered', 'live']));
-        expect(ensureProjectWatchMock).toHaveBeenCalledTimes(2);
-        expect(ensureProjectWatchMock).toHaveBeenCalledWith({ workspace: '/tmp' });
-        expect(notifyDaemonSessionStartedMock).toHaveBeenCalledTimes(2);
-        expect(notifyDaemonSessionStartedMock).toHaveBeenCalledWith(mockSession.id, {
-            ...mockSession.metadata,
-            hostPid: process.pid,
-        }, undefined, undefined);
+        await vi.waitFor(() => expect(delivered).toEqual(['first']));
     });
 
-    it('intercepts an exact human @stop before model delivery but preserves CLI messages', async () => {
+    it('deduplicates a live replay after synchronous provider acceptance', async () => {
+        const delivered: string[] = [];
+        const client = new ApiSessionClient('fake-token', mockSession);
+        client.onUserMessage((message) => delivered.push(message.content.text));
+        const row = persistedUserRow('pending-replay', 18, 'once');
+
+        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id, message: row } });
+        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id, message: row } });
+
+        await vi.waitFor(() => expect(delivered).toEqual(['once']));
+        expect((client as any).lastObservedMessage).toEqual({
+            id: 'pending-replay', seq: 18,
+        });
+    });
+
+    it('does not hold live input behind a pending restore lookup', async () => {
         const client = new ApiSessionClient('fake-token', mockSession);
         const delivered: string[] = [];
-        client.onUserMessage((message) => delivered.push(modelFacingUserText(message)));
-        client.injectPendingMessage({ role: 'user', content: { type: 'text', text: ' @stop\n' },
-            meta: { sentFrom: 'app' } });
-        await vi.waitFor(() => expect(runProjectSessionStopMock).toHaveBeenCalledOnce());
-        expect(ensureProjectWatchMock).not.toHaveBeenCalled();
-        expect(notifyDaemonSessionStartedMock).not.toHaveBeenCalled();
-        expect(runProjectSessionStartupMock).not.toHaveBeenCalled();
-        expect(runProjectSessionInputMock).not.toHaveBeenCalled();
+        client.onUserMessage((message) => delivered.push(message.content.text));
+
+        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id,
+            message: persistedUserRow('restore-live-input', 18, 'live') } });
+
+        await vi.waitFor(() => expect(delivered).toEqual(['live']));
+    });
+
+    it('holds initial live input until older restore rows are merged in sequence order', async () => {
+        const client = new ApiSessionClient('fake-token', mockSession);
+        const delivered: string[] = [];
+
+        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id,
+            message: persistedUserRow('initial-live', 19, 'newer') } });
+        expect(client.injectPendingPersistedUserMessage(
+            persistedUserRow('initial-restore', 18, 'older'),
+        )).toBe(true);
+        await Promise.resolve();
         expect(delivered).toEqual([]);
 
-        client.injectPendingMessage({ role: 'user', content: { type: 'text', text: '@stop' },
-            meta: { sentFrom: 'cli' } });
-        await vi.waitFor(() => expect(delivered).toEqual(['@stop']));
-        expect(runProjectSessionInputMock).toHaveBeenCalledOnce();
+        client.onUserMessage((message) => delivered.push(message.content.text));
+        await vi.waitFor(() => expect(delivered).toEqual(['older', 'newer']));
+    });
+
+    it('keeps persisted human input FIFO through synchronous provider acceptance', async () => {
+        const delivered: string[] = [];
+        const client = new ApiSessionClient('fake-token', mockSession);
+        client.onUserMessage((message) => delivered.push(message.content.text));
+        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id,
+            message: persistedUserRow('fifo-head', 18, 'first') } });
+        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id,
+            message: persistedUserRow('fifo-tail', 19, 'second') } });
+
+        await vi.waitFor(() => expect(delivered).toEqual(['first', 'second']));
+    });
+
+    it('does not wait for XC startup, Watch or daemon refresh on ordinary input', async () => {
+        runProjectSessionStartupMock.mockImplementationOnce(() => new Promise(() => {}));
+        ensureProjectWatchMock.mockImplementationOnce(() => new Promise(() => {}));
+        const client = new ApiSessionClient('fake-token', mockSession);
+        mockSocket.connected = true;
+        handlers.get('connect')?.();
+
+        const delivered: string[] = [];
+        client.onUserMessage((message) => delivered.push(message.content.text));
+        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id,
+            message: persistedUserRow('direct-input', 20, 'direct') } });
+
+        await vi.waitFor(() => expect(delivered).toEqual(['direct']));
+        expect(ensureProjectWatchMock).not.toHaveBeenCalled();
+    });
+
+    it('hands a persisted human input to the provider callback within 200ms', async () => {
+        const client = new ApiSessionClient('fake-token', mockSession);
+        mockSocket.connected = true;
+        handlers.get('connect')?.();
+        mockSocket.emit.mockClear();
+        let resolveDelivery = (_elapsed: number) => {};
+        const delivered = new Promise<number>((resolve) => { resolveDelivery = resolve; });
+        const startedAt = performance.now();
+        client.onUserMessage(() => resolveDelivery(performance.now() - startedAt));
+        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id,
+            message: persistedUserRow('latency-boundary', 21, 'direct') } });
+
+        const elapsed = await Promise.race([delivered, new Promise<number>((_resolve, reject) => {
+            setTimeout(() => reject(new Error('provider callback exceeded 200ms')), 200);
+        })]);
+        expect(elapsed).toBeLessThan(200);
+    });
+
+    it('handles exact human @stop as a bounded safe stop instead of model input', async () => {
+        const client = new ApiSessionClient('fake-token', mockSession);
+        const delivered: string[] = [];
+        client.onUserMessage((message) => delivered.push(message.content.text));
+
+        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id,
+            message: persistedUserRow('direct-stop', 24, '@stop') } });
+        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id,
+            message: persistedUserRow('next-input', 25, 'next') } });
+
+        await vi.waitFor(() => expect(delivered).toEqual(['next']));
         expect(runProjectSessionStopMock).toHaveBeenCalledOnce();
     });
 
-    it('keeps @stop as ordinary model input outside an XC project', async () => {
+    it('reports unavailable @stop locally without sending it to the model', async () => {
         runProjectSessionStopMock.mockResolvedValueOnce(null);
         const client = new ApiSessionClient('fake-token', mockSession);
         const delivered: string[] = [];
-        client.onUserMessage((message) => delivered.push(modelFacingUserText(message)));
-        client.injectPendingMessage({ role: 'user', content: { type: 'text', text: '@stop' },
-            meta: { sentFrom: 'app' } });
-        await vi.waitFor(() => expect(delivered).toEqual(['@stop']));
-        expect(runProjectSessionInputMock).toHaveBeenCalledOnce();
-    });
-
-    it('keeps a failed XC @stop out of the model without running startup work', async () => {
-        runProjectSessionStopMock.mockResolvedValueOnce(false);
-        const client = new ApiSessionClient('fake-token', mockSession);
-        const delivered: string[] = [];
-        client.onUserMessage((message) => delivered.push(modelFacingUserText(message)));
-        client.injectPendingMessage({ role: 'user', content: { type: 'text', text: '@stop' },
-            meta: { sentFrom: 'app' } });
-        await vi.waitFor(() => expect(runProjectSessionStopMock).toHaveBeenCalledOnce());
-        expect(ensureProjectWatchMock).not.toHaveBeenCalled();
-        expect(notifyDaemonSessionStartedMock).not.toHaveBeenCalled();
-        expect(runProjectSessionStartupMock).not.toHaveBeenCalled();
-        expect(runProjectSessionInputMock).not.toHaveBeenCalled();
-        expect(delivered).toEqual([]);
-    });
-
-    it('keeps non-human @stop text as ordinary model input', async () => {
-        const client = new ApiSessionClient('fake-token', mockSession);
-        const delivered: string[] = [];
-        client.onUserMessage((message) => delivered.push(modelFacingUserText(message)));
-        client.injectPendingMessage({ role: 'user', content: { type: 'text', text: '@stop' },
-            meta: { sentFrom: 'happy-agent' } });
-        await vi.waitFor(() => expect(delivered).toEqual(['@stop']));
-        expect(runProjectSessionStopMock).not.toHaveBeenCalled();
-        expect(runProjectSessionInputMock).toHaveBeenCalledOnce();
-    });
-
-    it('never delivers a model turn when XC input admission fails', async () => {
-        runProjectSessionInputMock.mockRejectedValueOnce(new Error('XC input failed'));
-        const client = new ApiSessionClient('fake-token', mockSession);
-        const delivered: string[] = [];
-        client.onUserMessage((message) => delivered.push(modelFacingUserText(message)));
-        client.injectPendingMessage({ role: 'user', content: { type: 'text', text: 'unsafe without context' },
-            meta: { sentFrom: 'app' } });
-        await vi.waitFor(() => expect(runProjectSessionInputMock).toHaveBeenCalledOnce());
-        expect(delivered).toEqual([]);
-    });
-
-    it.each(['web', 'android', 'ios', 'mac'])('intercepts @stop from the %s client', async (source) => {
-        const client = new ApiSessionClient('fake-token', mockSession);
-        const delivered: string[] = [];
-        client.onUserMessage((message) => delivered.push(modelFacingUserText(message)));
-        client.injectPendingMessage({ role: 'user', content: { type: 'text', text: '@stop' },
-            meta: { sentFrom: source } });
-        await vi.waitFor(() => expect(runProjectSessionStopMock).toHaveBeenCalledOnce());
-        expect(runProjectSessionInputMock).not.toHaveBeenCalled();
-        expect(delivered).toEqual([]);
-    });
-
-    it('never derives @stop authority from model-facing metadata', async () => {
-        const client = new ApiSessionClient('fake-token', mockSession);
-        const delivered: string[] = [];
-        client.onUserMessage((message) => delivered.push(modelFacingUserText(message)));
-        client.injectPendingMessage({ role: 'user', content: { type: 'text', text: 'continue' },
-            meta: { sentFrom: 'ios', modelText: '@stop' } });
-        await vi.waitFor(() => expect(delivered).toEqual(['@stop']));
-        expect(runProjectSessionStopMock).not.toHaveBeenCalled();
-        expect(runProjectSessionInputMock).toHaveBeenCalledOnce();
-    });
-
-    it('registers with the daemon before XC input and preserves delivery when registration is unavailable', async () => {
-        let finish = (_value: { error: string }) => {};
-        notifyDaemonSessionStartedMock.mockImplementationOnce(() =>
-            new Promise((resolve) => { finish = resolve; }));
-        const client = new ApiSessionClient('fake-token', mockSession);
-        const delivered: string[] = [];
         client.onUserMessage((message) => delivered.push(message.content.text));
-        client.injectPendingMessage({ role: 'user', content: { type: 'text', text: 'live' },
-            meta: { sentFrom: 'app' } });
-        await Promise.resolve();
-        expect(runProjectSessionInputMock).not.toHaveBeenCalled();
-        finish({ error: 'daemon unavailable' });
-        await vi.waitFor(() => expect(delivered).toEqual(['live']));
-        expect(runProjectSessionInputMock).toHaveBeenCalledOnce();
+
+        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id,
+            message: persistedUserRow('no-xc-stop', 24, '@stop') } });
+
+        await vi.waitFor(() => expect(runProjectSessionStopMock).toHaveBeenCalledOnce());
+        expect(delivered).toEqual([]);
     });
 
-    it('admits a live persisted Mail input before delivery and prepends shared project context', async () => {
+    it('makes provider handoff failure visible as terminal transport failure', async () => {
         const client = new ApiSessionClient('fake-token', mockSession);
-        const delivered: string[] = [];
-        runProjectSessionInputMock.mockResolvedValue('SHARED_CONTEXT');
-        client.onUserMessage((message) => delivered.push(modelFacingUserText(message)));
-        const localId = `xc-msg-v1-${'b'.repeat(64)}`;
-        const row = {
-            id: 'mail-input', seq: 21, createdAt: 1_021, localId,
-            content: { t: 'encrypted' as const, c: encodeBase64(encrypt(mockSession.encryptionKey,
-                mockSession.encryptionVariant, { role: 'user', content: { type: 'text', text: 'Mail display' },
-                    meta: { sentFrom: 'cli', presentation: 'compact', modelText: 'verified command' } })) },
-        };
-        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id, message: row } });
-        await vi.waitFor(() => expect(delivered).toEqual(['SHARED_CONTEXT\n\nverified command']));
-        expect(runProjectSessionInputMock).toHaveBeenCalledWith(expect.objectContaining({
-            workspace: '/tmp', nativeSessionId: mockSession.id, localId, messageText: 'verified command',
-        }));
+        mockSocket.connected = true;
+        handlers.get('connect')?.();
+        mockSocket.emit.mockClear();
+        client.onUserMessage(() => { throw new Error('provider queue rejected input'); });
+        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id,
+            message: persistedUserRow('provider-failure', 20, 'fail') } });
+
+        await vi.waitFor(() => expect(client.getTransportSnapshot()).toEqual(expect.objectContaining({
+            state: 'failed',
+            reason: expect.stringContaining('provider queue rejected input'),
+        })));
+        expect((client as any).lastObservedMessage).toEqual({ id: null, seq: 0 });
+        const notices = mockSocket.emit.mock.calls
+            .filter(([event]: [string]) => event === 'message')
+            .map(([, payload]: [string, { message: string }]) => decrypt(mockSession.encryptionKey,
+                mockSession.encryptionVariant, decodeBase64(payload.message)));
+        expect(notices).toEqual(expect.arrayContaining([expect.objectContaining({
+            role: 'agent',
+            content: expect.objectContaining({
+                type: 'event',
+                data: { type: 'message', message: '模型入口未接纳本次输入。' },
+            }),
+        })]));
     });
 
     it('HSR queues persistent output while disconnected and flushes it only after connection', () => {

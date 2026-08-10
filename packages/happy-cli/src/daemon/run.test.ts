@@ -1,15 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
-import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { once } from 'node:events';
-import { deterministicStringify } from '@/utils/deterministicJson';
-import type { SessionTransportHealthRecord } from '@/api/sessionTransportHealth';
 import type { TrackedSession } from './types';
 import {
   buildDaemonSessionArgs,
   buildDaemonChildEnvironment,
   buildRestoreProfileEnvironment,
-  canResumeCurrentDaemonChild,
   classifyTrackedInputState,
   createSessionStartupDeadline,
   DEFAULT_DAEMON_SESSION_AGENT,
@@ -21,49 +15,58 @@ import {
   matchesExpectedHappySessionId,
   reconcileLiveTrackedSessionOwnership,
   recoverRestoredDaemonSessions,
-  resumeCurrentDaemonChildProcess,
   parseRestoreFileData,
   runSerial,
+  selectTrackedConsoleSessions,
   sessionErrorLocalId,
-  SESSION_IDENTITY_TIMEOUT_MS,
-  SESSION_PROVIDER_READY_TIMEOUT_MS,
+  shouldRegisterMachineForSession,
+  SESSION_STARTUP_TIMEOUT_MS,
   trackedSessionMatchesIdentity,
-  transportProofAdvanced,
   updateTrackedProviderReadiness,
-  updateTrackedTransportHealth,
   waitForTrackedSessionStartup,
 } from './run';
 
+describe('session machine registration ownership', () => {
+  it('leaves machine registration to the daemon for daemon-owned sessions only', () => {
+    expect(shouldRegisterMachineForSession('daemon')).toBe(false);
+    expect(shouldRegisterMachineForSession('terminal')).toBe(true);
+    expect(shouldRegisterMachineForSession()).toBe(true);
+  });
+});
+
+describe('daemon console ownership', () => {
+  it('derives console children from the tracked-session authority', () => {
+    const sessions = new Map<number, TrackedSession>([
+      [41, { startedBy: 'daemon', pid: 41, isConsoleSession: true }],
+      [42, { startedBy: 'daemon', pid: 42, happySessionId: 'session-a' }],
+    ]);
+    expect(selectTrackedConsoleSessions(sessions).map(([pid]) => pid)).toEqual([41]);
+  });
+});
+
 describe('session startup deadline', () => {
-  it('hands the initial identity deadline to the slower provider readiness proof exactly once', async () => {
+  it('keeps one total input-readiness deadline', async () => {
     vi.useFakeTimers();
     try {
-      const phases: string[] = [];
-      const deadline = createSessionStartupDeadline((phase) => phases.push(phase));
-      await vi.advanceTimersByTimeAsync(SESSION_IDENTITY_TIMEOUT_MS - 1);
-      deadline.providerIdentified();
-      deadline.providerIdentified();
-      await vi.advanceTimersByTimeAsync(SESSION_PROVIDER_READY_TIMEOUT_MS - 1);
-      expect(phases).toEqual([]);
+      let timedOut = false;
+      createSessionStartupDeadline(() => { timedOut = true; });
+      await vi.advanceTimersByTimeAsync(SESSION_STARTUP_TIMEOUT_MS - 1);
+      expect(timedOut).toBe(false);
       await vi.advanceTimersByTimeAsync(1);
-      expect(phases).toEqual(['provider']);
+      expect(timedOut).toBe(true);
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it('retains the bounded missing-identity failure and cancels completed starts', async () => {
+  it('cancels completed starts', async () => {
     vi.useFakeTimers();
     try {
-      const phases: string[] = [];
-      createSessionStartupDeadline((phase) => phases.push(phase));
-      await vi.advanceTimersByTimeAsync(SESSION_IDENTITY_TIMEOUT_MS);
-      expect(phases).toEqual(['identity']);
-      const completed = createSessionStartupDeadline((phase) => phases.push(phase));
-      completed.providerIdentified();
+      let timedOut = false;
+      const completed = createSessionStartupDeadline(() => { timedOut = true; });
       completed.cancel();
-      await vi.advanceTimersByTimeAsync(SESSION_PROVIDER_READY_TIMEOUT_MS);
-      expect(phases).toEqual(['identity']);
+      await vi.advanceTimersByTimeAsync(SESSION_STARTUP_TIMEOUT_MS);
+      expect(timedOut).toBe(false);
     } finally {
       vi.useRealTimers();
     }
@@ -85,10 +88,10 @@ describe('session startup deadline', () => {
       });
 
       expect(awaiter).toBeDefined();
-      await vi.advanceTimersByTimeAsync(SESSION_IDENTITY_TIMEOUT_MS);
+      await vi.advanceTimersByTimeAsync(SESSION_STARTUP_TIMEOUT_MS);
       await expect(result).resolves.toEqual({
         type: 'error',
-        errorMessage: 'Session webhook timeout for PID 42',
+        errorMessage: 'Session input readiness timeout for PID 42',
       });
       expect(registered).toBe(false);
       expect(terminate).toHaveBeenCalledOnce();
@@ -108,10 +111,10 @@ describe('session startup deadline', () => {
         terminate: async () => false,
         complete: session => ({ type: 'success', sessionId: session.happySessionId! }),
       });
-      await vi.advanceTimersByTimeAsync(SESSION_IDENTITY_TIMEOUT_MS);
+      await vi.advanceTimersByTimeAsync(SESSION_STARTUP_TIMEOUT_MS);
       await expect(result).resolves.toEqual({
         type: 'error',
-        errorMessage: 'Session webhook timeout for PID 43 (tmux); process cleanup failed',
+        errorMessage: 'Session input readiness timeout for PID 43 (tmux); process cleanup failed',
       });
     } finally {
       vi.useRealTimers();
@@ -149,34 +152,18 @@ describe('session startup deadline', () => {
         complete: session => ({ type: 'success', sessionId: session.happySessionId! }),
       });
 
-      await vi.advanceTimersByTimeAsync(SESSION_IDENTITY_TIMEOUT_MS);
+      await vi.advanceTimersByTimeAsync(SESSION_STARTUP_TIMEOUT_MS);
       awaiter!.resolve({ startedBy: 'daemon', pid: 45, happySessionId: 'late-session' });
       finishCleanup!(true);
       await expect(result).resolves.toEqual({
         type: 'error',
-        errorMessage: 'Session webhook timeout for PID 45',
+        errorMessage: 'Session input readiness timeout for PID 45',
       });
     } finally {
       vi.useRealTimers();
     }
   });
 });
-
-function transportHealth(overrides: Record<string, unknown> = {}): SessionTransportHealthRecord {
-  const updatedAt = String(overrides.updatedAt ?? '2026-08-01T00:00:20.000Z');
-  const state = String(overrides.state ?? 'connected');
-  const base = {
-    schema: 'xc.happy-session-transport-health.v1', nativeSessionId: 'session-a', processId: 42,
-    processStartedAt: '2026-08-01T00:00:00.000Z', generation: 2, state, reconnectCount: 0,
-    queueMessages: 0, queueBytes: 0, reason: null,
-    connectedAt: '2026-08-01T00:00:10.000Z',
-    disconnectedAt: ['ownership_conflict', 'failed', 'closed'].includes(state) ? updatedAt : null,
-    updatedAt,
-    ...overrides,
-  };
-  return { ...base, recordDigest: `sha256:${createHash('sha256')
-    .update(deterministicStringify(base)).digest('hex')}` } as SessionTransportHealthRecord;
-}
 
 describe('buildDaemonSessionArgs', () => {
   it('projects one permission property through new and restored Codex starts', () => {
@@ -341,70 +328,23 @@ describe('isTrackedProviderRestoreReady', () => {
 });
 
 describe('tracked input transport presence', () => {
-  it('derives ordinary readiness while old-daemon recovery stays unknown without current proof', () => {
+  it('uses final provider registration while old-daemon recovery stays unknown without it', () => {
     const ordinary: TrackedSession = { startedBy: 'daemon', pid: 42, happySessionId: 'session-a' };
     expect(classifyTrackedInputState(ordinary)).toBe('online');
     expect(classifyTrackedInputState({ ...ordinary, expectedHappySessionId: 'session-a' })).toBe('unknown');
-  });
-
-  it('accepts only a fresh exact current-process proof and separates terminal from unknown', () => {
-    const now = Date.parse('2026-08-01T00:00:25.000Z');
-    const session: TrackedSession = { startedBy: 'daemon', pid: 42, happySessionId: 'session-a' };
-    expect(updateTrackedTransportHealth(session, 'session-a', 42, transportHealth(), now)).toBe(true);
-    expect(classifyTrackedInputState(session, now)).toBe('online');
-
-    session.transportHealth = transportHealth({ state: 'closed', generation: 3 });
-    expect(classifyTrackedInputState(session, now)).toBe('offline');
-    session.transportHealth = transportHealth({ updatedAt: '2026-08-01T00:00:40.000Z', generation: 4 });
-    expect(classifyTrackedInputState(session, now)).toBe('unknown');
-    session.transportHealth = transportHealth({ updatedAt: '2026-07-31T23:59:00.000Z', generation: 4 });
-    expect(classifyTrackedInputState(session, now)).toBe('unknown');
-    session.transportHealth = transportHealth({ nativeSessionId: 'session-b', generation: 4 });
-    expect(classifyTrackedInputState(session, now)).toBe('unknown');
-  });
-
-  it('rejects regressed, changed-process and future evidence without erasing the last proof', () => {
-    const now = Date.parse('2026-08-01T00:00:25.000Z');
-    const session: TrackedSession = { startedBy: 'daemon', pid: 42, happySessionId: 'session-a' };
-    expect(updateTrackedTransportHealth(session, 'session-a', 42, transportHealth(), now)).toBe(true);
-    expect(updateTrackedTransportHealth(session, 'session-a', 42,
-      transportHealth({ generation: 1 }), now)).toBe(false);
-    expect(classifyTrackedInputState(session, now)).toBe('online');
-
-    const replaced: TrackedSession = { startedBy: 'daemon', pid: 42, happySessionId: 'session-a' };
-    expect(updateTrackedTransportHealth(replaced, 'session-a', 42,
-      transportHealth({ processStartedAt: '2026-07-31T23:00:00.000Z' }), now)).toBe(true);
-    expect(updateTrackedTransportHealth(replaced, 'session-a', 42,
-      transportHealth({ generation: 3, processStartedAt: '2026-08-01T00:00:01.000Z' }), now)).toBe(false);
-
-    const stale: TrackedSession = { startedBy: 'daemon', pid: 42, happySessionId: 'session-a' };
-    expect(updateTrackedTransportHealth(stale, 'session-a', 42,
-      transportHealth({ updatedAt: '2026-08-01T00:00:40.001Z' }), now)).toBe(false);
-  });
-
-  it('requires a newer proof and exact current-daemon child before recovery signals', () => {
-    const baseline = transportHealth();
-    expect(transportProofAdvanced(baseline, transportHealth({ generation: 3 }))).toBe(true);
-    expect(transportProofAdvanced(baseline, transportHealth({ generation: 2 }))).toBe(false);
-    const providerSessionId = '00000000-0000-4000-8000-000000000001';
-    const child = { pid: 42, exitCode: null, signalCode: null } as TrackedSession['childProcess'];
-    const tracked: TrackedSession = { startedBy: 'daemon', pid: 42, childProcess: child,
-      happySessionId: 'session-a', expectedHappySessionId: 'session-a',
-      resumeTarget: providerSessionId, observedProviderSessionId: providerSessionId };
-    expect(isCurrentDaemonChild(tracked, 42)).toBe(true);
-    expect(canResumeCurrentDaemonChild(tracked, 42, 'session-a', providerSessionId))
-      .toBe(process.platform !== 'win32');
-    expect(canResumeCurrentDaemonChild({ ...tracked, childProcess: undefined }, 42,
-      'session-a', providerSessionId)).toBe(false);
-    expect(canResumeCurrentDaemonChild({ ...tracked, startedBy: 'terminal' }, 42,
-      'session-a', providerSessionId)).toBe(false);
-    expect(canResumeCurrentDaemonChild({ ...tracked, tmuxSessionId: 'tmux:1' }, 42,
-      'session-a', providerSessionId)).toBe(false);
-    expect(canResumeCurrentDaemonChild({ ...tracked,
-      childProcess: { ...child, exitCode: 0 } as TrackedSession['childProcess'] }, 42,
-    'session-a', providerSessionId)).toBe(false);
-    expect(canResumeCurrentDaemonChild({ ...tracked, observedProviderSessionId: 'other' }, 42,
-      'session-a', providerSessionId)).toBe(false);
+    expect(classifyTrackedInputState({
+      ...ordinary,
+      expectedHappySessionId: 'session-a',
+      happySessionMetadataFromLocalWebhook: {
+        flavor: 'claude',
+        path: '/workspace',
+        host: 'host',
+        homeDir: '/home',
+        happyHomeDir: '/happy',
+        happyLibDir: '/happy/lib',
+        happyToolsDir: '/happy/tools',
+      },
+    })).toBe('online');
   });
 
   it('defers daemon upgrades for user sessions and never treats recovered PIDs as managed children', () => {
@@ -415,42 +355,6 @@ describe('tracked input transport presence', () => {
     expect(isDaemonManagedSession({ startedBy: 'daemon', pid: 42, tmuxSessionId: 'happy:1' })).toBe(true);
   });
 
-  it.skipIf(process.platform === 'win32')('resumes the exact stopped detached child and requires its newer proof', async () => {
-    const child = spawn(process.execPath, ['-e', 'setInterval(() => process.stdout.write("tick\\n"), 30)'],
-      { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
-    expect(child.pid).toBeTypeOf('number');
-    const pid = child.pid!;
-    const providerSessionId = '00000000-0000-4000-8000-000000000001';
-    try {
-      await once(child.stdout!, 'data');
-      const before = new Date(), started = new Date(before.getTime() - 1_000).toISOString();
-      const baseline = transportHealth({ processId: pid, processStartedAt: started,
-        connectedAt: before.toISOString(), updatedAt: before.toISOString() });
-      const tracked: TrackedSession = { startedBy: 'daemon', pid, childProcess: child,
-        happySessionId: 'session-a', expectedHappySessionId: 'session-a',
-        resumeTarget: providerSessionId, observedProviderSessionId: providerSessionId,
-        transportHealth: baseline };
-      process.kill(-pid, 'SIGSTOP');
-      await new Promise(resolve => setTimeout(resolve, 100));
-      child.stdout!.once('data', () => {
-        const updatedAt = new Date().toISOString();
-        tracked.transportHealth = transportHealth({ processId: pid, processStartedAt: started,
-          connectedAt: updatedAt, updatedAt, generation: baseline.generation + 1 });
-      });
-      await expect(resumeCurrentDaemonChildProcess({ session: tracked, pid,
-        happySessionId: 'session-a', providerSessionId, isCurrent: () => true,
-        timeoutMs: 2_000, pollMs: 10 })).resolves.toBe('online');
-      expect(child.pid).toBe(pid);
-      expect(child.exitCode).toBeNull();
-    } finally {
-      try { process.kill(-pid, 'SIGCONT'); } catch { /* already resumed or exited */ }
-      try { process.kill(-pid, 'SIGTERM'); } catch { /* already exited */ }
-      await Promise.race([once(child, 'exit'), new Promise(resolve => setTimeout(resolve, 1_000))]);
-      if (child.exitCode === null && child.signalCode === null) {
-        try { process.kill(-pid, 'SIGKILL'); } catch { /* already exited */ }
-      }
-    }
-  });
 });
 
 describe('runSerial', () => {

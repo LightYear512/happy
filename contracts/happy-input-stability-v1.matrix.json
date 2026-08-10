@@ -1,0 +1,75 @@
+{
+  "schemaVersion": "contract-first-module-gate/v2",
+  "contractProfile": "contract-first-minimal-boundary/v1",
+  "riskTriggers": ["release-security-or-performance-claim"],
+  "module": "happy-cli.input-stability",
+  "owner": "happy-cli ApiSession input FIFO and daemon final registration",
+  "publicApis": {
+    "notApplicableReason": "the repair keeps the existing App, Server, Socket and daemon-control wire formats unchanged"
+  },
+  "budgets": [
+    {
+      "field": "per-session pending persisted input rows and bytes",
+      "enforcement": "ApiSessionClient enqueuePersistedMessage rejects the existing row and byte limits before insertion",
+      "phase": "Socket or recovery row admission before provider handoff",
+      "errorKind": "typed recovery_incomplete terminal transport failure without advancing the accepted anchor",
+      "zeroTest": {
+        "name": "happy_cli_input_stability_boundary",
+        "file": "happy-input-stability-v1.test.mjs"
+      },
+      "overflowTest": {
+        "name": "happy_cli_input_stability_boundary",
+        "file": "happy-input-stability-v1.test.mjs"
+      }
+    },
+    {
+      "field": "daemon-started provider input-readiness wait",
+      "enforcement": "one SESSION_STARTUP_TIMEOUT_MS deadline followed by exact-child cleanup",
+      "phase": "daemon child spawn through final provider registration",
+      "errorKind": "terminal startup failure; no candidate registration is published",
+      "zeroTest": {
+        "name": "happy_cli_input_stability_boundary",
+        "file": "happy-input-stability-v1.test.mjs"
+      },
+      "overflowTest": {
+        "name": "happy_cli_input_stability_boundary",
+        "file": "happy-input-stability-v1.test.mjs"
+      }
+    }
+  ],
+  "lifecycleTransitions": [
+    {
+      "from": "one validated persisted Server row held in the per-session FIFO",
+      "to": "the existing provider queue synchronously accepts the row and the in-memory anchor advances",
+      "creator": "ApiSessionClient Socket update or bounded recovery query",
+      "advancer": "ApiSessionClient synchronous drain callback",
+      "consumer": "the provider's existing MessageQueue2",
+      "rejectTests": [
+        {
+          "name": "happy_cli_input_stability_boundary",
+          "file": "happy-input-stability-v1.test.mjs"
+        }
+      ]
+    },
+    {
+      "from": "daemon child without an input consumer",
+      "to": "one final registration after the provider callback and exact provider identity are ready",
+      "creator": "Happy CLI daemon child spawn",
+      "advancer": "completeProviderInputReady",
+      "consumer": "Happy CLI daemon tracked-session owner",
+      "rejectTests": [
+        {
+          "name": "happy_cli_input_stability_boundary",
+          "file": "happy-input-stability-v1.test.mjs"
+        }
+      ]
+    }
+  ],
+  "provenanceFields": {
+    "notApplicableReason": "the repair adds no digest-bound or security-critical provenance field"
+  },
+  "evidence": {
+    "mode": "approval",
+    "openFindingCount": 0
+  }
+}

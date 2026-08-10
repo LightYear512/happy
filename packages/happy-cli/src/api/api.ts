@@ -13,6 +13,18 @@ import chalk from 'chalk';
 import { Credentials } from '@/persistence';
 import { connectionState, isNetworkError } from '@/utils/serverConnectionErrors';
 
+const SESSION_MESSAGE_RECOVERY_TIMEOUT_MS = 90_000;
+const SESSION_READ_ATTEMPTS = 2;
+const SESSION_READ_RETRY_MS = 100;
+
+type SessionMessages = Array<{
+  id: string;
+  seq: number;
+  localId: string | null;
+  content: any;
+  createdAt: number;
+}>;
+
 export class ApiClient {
 
   static async create(credential: Credentials) {
@@ -21,6 +33,9 @@ export class ApiClient {
 
   private readonly credential: Credentials;
   private readonly pushClient: PushNotificationClient;
+  private readonly sessionCreations = new Map<string, Promise<Session | null>>();
+  private readonly sessionLookups = new Map<string, Promise<Session | null>>();
+  private readonly sessionMessageLookups = new Map<string, Promise<SessionMessages>>();
 
   private constructor(credential: Credentials) {
     this.credential = credential
@@ -31,6 +46,25 @@ export class ApiClient {
    * Create a new session or load existing one with the given tag
    */
   async getOrCreateSession(opts: {
+    tag: string,
+    metadata: Metadata,
+    state: AgentState | null
+  }): Promise<Session | null> {
+    const active = this.sessionCreations.get(opts.tag);
+    if (active) return active;
+
+    const request = this.getOrCreateSessionOnce(opts);
+    this.sessionCreations.set(opts.tag, request);
+    try {
+      return await request;
+    } finally {
+      if (this.sessionCreations.get(opts.tag) === request) {
+        this.sessionCreations.delete(opts.tag);
+      }
+    }
+  }
+
+  private async getOrCreateSessionOnce(opts: {
     tag: string,
     metadata: Metadata,
     state: AgentState | null
@@ -121,7 +155,8 @@ export class ApiClient {
         return null;
       }
 
-      // Handle 5xx server errors - use offline mode with auto-reconnect
+      // A failed create is not replayed automatically: the response may have
+      // been lost after the Server committed it.
       if (axios.isAxiosError(error) && error.response?.status) {
         const status = error.response.status;
         if (status >= 500) {
@@ -129,7 +164,7 @@ export class ApiClient {
             operation: 'Session creation',
             errorCode: String(status),
             url: `${configuration.serverUrl}/v1/sessions`,
-            details: ['Server encountered an error, will retry automatically']
+            details: ['Server encountered an error; this client will not retry session creation automatically']
           });
           return null;
         }
@@ -249,13 +284,13 @@ export class ApiClient {
           return createMinimalMachine();
         }
 
-        // Handle 5xx - server error, use offline mode with auto-reconnect
+        // Handle 5xx without replaying an identity-bearing machine request.
         if (status >= 500) {
           connectionState.fail({
             operation: 'Machine registration',
             errorCode: String(status),
             url: `${configuration.serverUrl}/v1/machines`,
-            details: ['Server encountered an error, will retry automatically']
+            details: ['Server encountered an error']
           });
           return createMinimalMachine();
         }
@@ -281,6 +316,30 @@ export class ApiClient {
    * Returns null if session not found, not owned by user, or decryption fails (old key).
    */
   async getSessionById(sessionId: string): Promise<Session | null> {
+    try {
+      return await this.getSessionByIdOnce(sessionId);
+    } catch (error) {
+      logger.debug('[API] Session lookup failed', safeLookupFailure(error));
+      return null;
+    }
+  }
+
+  private async getSessionByIdOnce(sessionId: string): Promise<Session | null> {
+    const active = this.sessionLookups.get(sessionId);
+    if (active) return active;
+
+    const request = this.fetchSessionById(sessionId);
+    this.sessionLookups.set(sessionId, request);
+    try {
+      return await request;
+    } finally {
+      if (this.sessionLookups.get(sessionId) === request) {
+        this.sessionLookups.delete(sessionId);
+      }
+    }
+  }
+
+  private async fetchSessionById(sessionId: string): Promise<Session | null> {
     // Resolve encryption key
     let encryptionKey: Uint8Array;
     let encryptionVariant: 'legacy' | 'dataKey';
@@ -293,37 +352,32 @@ export class ApiClient {
       encryptionVariant = 'legacy';
     }
 
-    try {
-      const response = await axios.get(
-        `${configuration.serverUrl}/v1/sessions/${sessionId}`,
-        {
-          headers: {
-            'Authorization': `Bearer ${this.credential.token}`,
-            'Content-Type': 'application/json'
-          },
-          timeout: 10000
-        }
-      );
+    const response = await axios.get(
+      `${configuration.serverUrl}/v1/sessions/${sessionId}`,
+      {
+        headers: {
+          'Authorization': `Bearer ${this.credential.token}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 10000
+      }
+    );
 
-      const raw = response.data.session;
-      const metadata = decrypt(encryptionKey, encryptionVariant, decodeBase64(raw.metadata));
-      if (!metadata) return null; // Decryption failed; exact restore callers fail closed.
+    const raw = response.data.session;
+    const metadata = decrypt(encryptionKey, encryptionVariant, decodeBase64(raw.metadata));
+    if (!metadata) return null; // Decryption failed; exact restore callers fail closed.
 
-      return {
-        id: raw.id,
-        seq: raw.seq,
-        metadata,
-        metadataVersion: raw.metadataVersion,
-        agentState: raw.agentState ? decrypt(encryptionKey, encryptionVariant, decodeBase64(raw.agentState)) : null,
-        agentStateVersion: raw.agentStateVersion,
-        encryptionKey,
-        encryptionVariant,
-        lastActiveAt: raw.lastActiveAt,
-      };
-    } catch (error) {
-      logger.debug('[API] Session lookup failed', safeLookupFailure(error));
-      return null;
-    }
+    return {
+      id: raw.id,
+      seq: raw.seq,
+      metadata,
+      metadataVersion: raw.metadataVersion,
+      agentState: raw.agentState ? decrypt(encryptionKey, encryptionVariant, decodeBase64(raw.agentState)) : null,
+      agentStateVersion: raw.agentStateVersion,
+      encryptionKey,
+      encryptionVariant,
+      lastActiveAt: raw.lastActiveAt,
+    };
   }
 
   /**
@@ -332,35 +386,63 @@ export class ApiClient {
    * across two identities.
    */
   async restoreSessionById(sessionId: string): Promise<Session> {
-    const session = await this.getSessionById(sessionId);
-    if (!session || session.id !== sessionId) {
-      throw new Error('happy_session_restore_failed');
+    for (let attempt = 1; attempt <= SESSION_READ_ATTEMPTS; attempt += 1) {
+      try {
+        const session = await this.getSessionByIdOnce(sessionId);
+        if (!session || session.id !== sessionId) break;
+        return session;
+      } catch (error) {
+        logger.debug('[API] Exact session restore lookup failed', safeLookupFailure(error));
+        if (!isRetryableSessionLookupFailure(error) || attempt === SESSION_READ_ATTEMPTS) break;
+        await new Promise((resolve) => setTimeout(resolve, SESSION_READ_RETRY_MS));
+      }
     }
-    return session;
+    throw new Error('happy_session_restore_failed');
   }
 
   /**
    * Get recent messages for a session. Used after restore to find pending user messages
    * that arrived while the CLI was offline (between session close and restore connect).
    */
-  async getSessionMessages(sessionId: string): Promise<Array<{ id: string, seq: number, localId: string | null, content: any, createdAt: number }>> {
+  async getSessionMessages(sessionId: string): Promise<SessionMessages> {
+    const active = this.sessionMessageLookups.get(sessionId);
+    if (active) return active;
+
+    const request = this.fetchSessionMessages(sessionId);
+    this.sessionMessageLookups.set(sessionId, request);
     try {
-      const response = await axios.get(
-        `${configuration.serverUrl}/v1/sessions/${sessionId}/messages`,
-        {
-          headers: { 'Authorization': `Bearer ${this.credential.token}` },
-          timeout: 10000,
-          maxContentLength: MAX_RECOVERY_RESPONSE_BYTES
-        }
-      );
-      if (!Array.isArray(response.data?.messages)) {
-        throw new Error('session message response is malformed');
+      return await request;
+    } finally {
+      if (this.sessionMessageLookups.get(sessionId) === request) {
+        this.sessionMessageLookups.delete(sessionId);
       }
-      return response.data.messages;
-    } catch (error) {
-      logger.debug('[API] Session messages lookup failed', safeLookupFailure(error));
-      throw new Error('session_message_lookup_failed');
     }
+  }
+
+  private async fetchSessionMessages(sessionId: string): Promise<SessionMessages> {
+    for (let attempt = 1; attempt <= SESSION_READ_ATTEMPTS; attempt += 1) {
+      try {
+        const response = await axios.get(
+          `${configuration.serverUrl}/v1/sessions/${sessionId}/messages`,
+          {
+            headers: { 'Authorization': `Bearer ${this.credential.token}` },
+            timeout: SESSION_MESSAGE_RECOVERY_TIMEOUT_MS,
+            maxContentLength: MAX_RECOVERY_RESPONSE_BYTES
+          }
+        );
+        if (!Array.isArray(response.data?.messages)) {
+          throw new Error('session message response is malformed');
+        }
+        return response.data.messages;
+      } catch (error) {
+        logger.debug('[API] Session messages lookup failed', safeLookupFailure(error));
+        if (!isRetryableSessionLookupFailure(error) || attempt === SESSION_READ_ATTEMPTS) {
+          throw new Error('session_message_lookup_failed');
+        }
+        await new Promise((resolve) => setTimeout(resolve, SESSION_READ_RETRY_MS));
+      }
+    }
+    throw new Error('session_message_lookup_failed');
   }
 
   sessionSyncClient(session: Session): ApiSessionClient {
@@ -507,4 +589,11 @@ function safeLookupFailure(error: unknown): { kind: 'http' | 'network' | 'unknow
     };
   }
   return { kind: 'unknown', status: null, code: null };
+}
+
+function isRetryableSessionLookupFailure(error: unknown): boolean {
+  if (!axios.isAxiosError(error)) return false;
+  const status = error.response?.status;
+  if (typeof status === 'number') return status >= 500;
+  return error.code === 'ECONNABORTED' || isNetworkError(error.code);
 }

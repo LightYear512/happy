@@ -30,7 +30,7 @@ class ApiSocket {
     private config: SyncSocketConfig | null = null;
     private encryption: Encryption | null = null;
     private messageHandlers: Map<string, (data: any) => void> = new Map();
-    private reconnectedListeners: Set<() => void> = new Set();
+    private reconnectedListeners: Set<(recovered: boolean) => void> = new Set();
     private statusListeners: Set<(status: 'disconnected' | 'connecting' | 'connected' | 'error') => void> = new Set();
     private currentStatus: 'disconnected' | 'connecting' | 'connected' | 'error' = 'disconnected';
 
@@ -83,8 +83,9 @@ class ApiSocket {
     // Listener Management
     //
 
-    onReconnected = (listener: () => void) => {
+    onReconnected = (listener: (recovered: boolean) => void) => {
         this.reconnectedListeners.add(listener);
+        if (this.currentStatus === 'connected') listener(this.socket?.recovered === true);
         return () => this.reconnectedListeners.delete(listener);
     };
 
@@ -153,11 +154,12 @@ class ApiSocket {
         return true;
     }
 
-    async emitWithAck<T = any>(event: string, data: any): Promise<T> {
+    async emitWithAck<T = any>(event: string, data: any, timeoutMs?: number): Promise<T> {
         if (!this.socket) {
             throw new Error('Socket not connected');
         }
-        return await this.socket.emitWithAck(event, data);
+        const target = timeoutMs === undefined ? this.socket : this.socket.timeout(timeoutMs);
+        return await target.emitWithAck(event, data);
     }
 
     //
@@ -220,9 +222,11 @@ class ApiSocket {
             // console.log('🔌 SyncSocket: Connected, recovered: ' + this.socket?.recovered);
             // console.log('🔌 SyncSocket: Socket ID:', this.socket?.id);
             this.updateStatus('connected');
-            if (!this.socket?.recovered) {
-                this.reconnectedListeners.forEach(listener => listener());
-            }
+            // Connection-state recovery replays server events, not a lost
+            // acknowledgement for an outbound message. Retry durable pending
+            // submissions on every connection with their original localId.
+            const recovered = this.socket?.recovered === true;
+            this.reconnectedListeners.forEach(listener => listener(recovered));
         });
 
         this.socket.on('disconnect', (reason) => {

@@ -44,8 +44,14 @@ const mocks = vi.hoisted(() => {
     mockApiCreate: vi.fn(),
     mockGetOrCreateMachine: vi.fn(async () => ({})),
     mockGetOrCreateSession: vi.fn(async () => ({ id: 'session-1' })),
-    mockSetupOfflineReconnection: vi.fn(),
+    mockSetupOfflineSession: vi.fn(),
     mockNotifyDaemonSessionStarted: vi.fn(async () => ({ error: null })),
+    mockCompleteProviderInputReady: vi.fn(async (options: {
+      session: typeof mockSession;
+      onUserMessage: (message: any) => void;
+    }) => {
+      options.session.onUserMessage(options.onUserMessage);
+    }),
     mockStartHappyServer: vi.fn(),
     mockProjectPath: vi.fn(() => '/tmp/happy'),
     mockSetBackend: vi.fn(),
@@ -84,14 +90,19 @@ vi.mock('@/api/api', () => ({
 
 vi.mock('@/daemon/run', () => ({
   initialMachineMetadata: { host: 'host', platform: 'darwin', happyCliVersion: 'test', homeDir: '/tmp', happyHomeDir: '/tmp/.happy', happyLibDir: '/tmp/happy' },
+  shouldRegisterMachineForSession: () => true,
 }));
 
-vi.mock('@/utils/setupOfflineReconnection', () => ({
-  setupOfflineReconnection: mocks.mockSetupOfflineReconnection,
+vi.mock('@/utils/setupOfflineSession', () => ({
+  setupOfflineSession: mocks.mockSetupOfflineSession,
 }));
 
 vi.mock('@/daemon/controlClient', () => ({
   notifyDaemonSessionStarted: mocks.mockNotifyDaemonSessionStarted,
+}));
+
+vi.mock('@/utils/completeProviderInputReady', () => ({
+  completeProviderInputReady: mocks.mockCompleteProviderInputReady,
 }));
 
 vi.mock('@/claude/registerKillSessionHandler', () => ({
@@ -210,9 +221,8 @@ describe('runAcp', () => {
       getOrCreateMachine: mocks.mockGetOrCreateMachine,
       getOrCreateSession: mocks.mockGetOrCreateSession,
     });
-    mocks.mockSetupOfflineReconnection.mockImplementation(() => ({
+    mocks.mockSetupOfflineSession.mockImplementation(() => ({
       session: mocks.mockSession,
-      reconnectionHandle: { cancel: vi.fn() },
       isOffline: false,
     }));
     mocks.mockStartHappyServer.mockResolvedValue({

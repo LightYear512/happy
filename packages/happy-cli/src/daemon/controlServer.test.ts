@@ -134,8 +134,8 @@ describe('startDaemonControlServer', () => {
       spawnSession: async () => ({ type: 'error', errorMessage: 'unused' }),
       prepareShutdown: permitShutdown,
       requestShutdown: () => undefined,
-      onHappySessionWebhook: (sessionId, metadata, readyProviderSessionId, transportHealth) => {
-        webhooks.push({ sessionId, metadata, readyProviderSessionId, transportHealth });
+      onHappySessionWebhook: (sessionId, metadata, readyProviderSessionId) => {
+        webhooks.push({ sessionId, metadata, readyProviderSessionId });
       },
     });
 
@@ -153,7 +153,11 @@ describe('startDaemonControlServer', () => {
       });
 
       expect(response.ok).toBe(true);
-      expect(webhooks).toEqual([body]);
+      expect(webhooks).toEqual([{
+        sessionId: body.sessionId,
+        metadata: body.metadata,
+        readyProviderSessionId: body.readyProviderSessionId,
+      }]);
 
       const hostile = await fetch(`http://127.0.0.1:${server.port}/session-started`, {
         method: 'POST',
@@ -161,7 +165,7 @@ describe('startDaemonControlServer', () => {
         body: JSON.stringify({ ...body, readyProviderSessionId: 'not-a-provider-id' }),
       });
       expect(hostile.status).toBe(400);
-      expect(webhooks).toEqual([body]);
+      expect(webhooks).toHaveLength(1);
     } finally {
       await server.stop();
     }

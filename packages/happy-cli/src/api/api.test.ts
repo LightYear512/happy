@@ -85,6 +85,31 @@ describe('Api server error handling', () => {
     });
 
     describe('getOrCreateSession', () => {
+        it('shares one in-flight create for concurrent callers with the same tag', async () => {
+            mockPost.mockResolvedValue({
+                data: {
+                    session: {
+                        id: 'session-1',
+                        seq: 1,
+                        metadata: 'metadata',
+                        metadataVersion: 1,
+                        agentState: null,
+                        agentStateVersion: 0,
+                    },
+                },
+            });
+            const request = { tag: 'same-tag', metadata: testMetadata, state: null };
+
+            const [first, second] = await Promise.all([
+                api.getOrCreateSession(request),
+                api.getOrCreateSession(request),
+            ]);
+
+            expect(first?.id).toBe('session-1');
+            expect(second?.id).toBe('session-1');
+            expect(mockPost).toHaveBeenCalledOnce();
+        });
+
         it('should return null when Happy server is unreachable (ECONNREFUSED)', async () => {
             const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
 
@@ -351,11 +376,113 @@ describe('session lookup log privacy', () => {
         expect(serialized).not.toContain('another-secret');
     });
 
+    it('allows the bounded recovery response budget enough transfer time', async () => {
+        mockGet.mockResolvedValue({ data: { messages: [] } });
+
+        await expect(api.getSessionMessages('session-1')).resolves.toEqual([]);
+        expect(mockGet).toHaveBeenCalledWith(
+            expect.stringMatching(/\/v1\/sessions\/session-1\/messages$/),
+            expect.objectContaining({ timeout: 90_000 })
+        );
+    });
+
     it('fails closed when an exact restore lookup fails', async () => {
         mockGet.mockRejectedValue({ code: 'ECONNRESET' });
 
         await expect(api.restoreSessionById('session-1'))
             .rejects.toThrow('happy_session_restore_failed');
+        expect(mockGet).toHaveBeenCalledTimes(2);
+        expect(mockPost).not.toHaveBeenCalled();
+    });
+
+    it('retries a transient exact restore lookup without replacing the session', async () => {
+        mockGet
+            .mockRejectedValueOnce({ code: 'ECONNABORTED' })
+            .mockResolvedValueOnce({
+                data: {
+                    session: {
+                        id: 'session-1',
+                        seq: 1,
+                        metadata: 'metadata',
+                        metadataVersion: 1,
+                        agentState: null,
+                        agentStateVersion: 0,
+                        dataEncryptionKey: null,
+                        lastActiveAt: Date.now(),
+                    },
+                },
+            });
+
+        await expect(api.restoreSessionById('session-1'))
+            .resolves.toMatchObject({ id: 'session-1' });
+        expect(mockGet).toHaveBeenCalledTimes(2);
+        expect(mockPost).not.toHaveBeenCalled();
+    });
+
+    it('shares one in-flight exact-session lookup between concurrent restores', async () => {
+        mockGet.mockResolvedValue({
+            data: {
+                session: {
+                    id: 'session-1',
+                    seq: 1,
+                    metadata: 'metadata',
+                    metadataVersion: 1,
+                    agentState: null,
+                    agentStateVersion: 0,
+                    lastActiveAt: Date.now(),
+                },
+            },
+        });
+
+        const [first, second] = await Promise.all([
+            api.restoreSessionById('session-1'),
+            api.restoreSessionById('session-1'),
+        ]);
+
+        expect(first.id).toBe('session-1');
+        expect(second.id).toBe('session-1');
+        expect(mockGet).toHaveBeenCalledOnce();
+    });
+
+    it('shares one in-flight message lookup and retries only inside ApiClient', async () => {
+        mockGet.mockResolvedValue({ data: { messages: [] } });
+
+        const [first, second] = await Promise.all([
+            api.getSessionMessages('session-1'),
+            api.getSessionMessages('session-1'),
+        ]);
+
+        expect(first).toEqual([]);
+        expect(second).toEqual([]);
+        expect(mockGet).toHaveBeenCalledOnce();
+    });
+
+    it('retries one transient message lookup once', async () => {
+        mockGet
+            .mockRejectedValueOnce({ code: 'ECONNRESET' })
+            .mockResolvedValueOnce({ data: { messages: [] } });
+
+        await expect(api.getSessionMessages('session-1')).resolves.toEqual([]);
+        expect(mockGet).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not retry a cancelled message lookup', async () => {
+        mockGet.mockRejectedValue({ code: 'ERR_CANCELED' });
+
+        await expect(api.getSessionMessages('session-1'))
+            .rejects.toThrow('session_message_lookup_failed');
+        expect(mockGet).toHaveBeenCalledOnce();
+    });
+
+    it('does not retry a non-transient exact restore rejection', async () => {
+        mockGet.mockRejectedValue({
+            code: 'ERR_BAD_REQUEST',
+            response: { status: 404 },
+        });
+
+        await expect(api.restoreSessionById('session-1'))
+            .rejects.toThrow('happy_session_restore_failed');
+        expect(mockGet).toHaveBeenCalledTimes(1);
         expect(mockPost).not.toHaveBeenCalled();
     });
 

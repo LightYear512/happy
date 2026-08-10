@@ -7,6 +7,67 @@ import type { PermissionModeKey } from '@/components/PermissionModeSelector';
 
 const mmkv = new MMKV();
 const NEW_SESSION_DRAFT_KEY = 'new-session-draft-v1';
+const PENDING_SESSION_MESSAGES_KEY = 'pending-session-messages-v1';
+
+export interface PendingSessionMessage {
+    localId: string;
+    encryptedRecord: string;
+    createdAt: number;
+}
+
+export function loadPendingSessionMessages(): Record<string, PendingSessionMessage[]> {
+    const raw = mmkv.getString(PENDING_SESSION_MESSAGES_KEY);
+    if (!raw) return {};
+    try {
+        const parsed: unknown = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+        const result: Record<string, PendingSessionMessage[]> = {};
+        for (const [sessionId, value] of Object.entries(parsed)) {
+            if (!sessionId) return {};
+            // The first unreleased implementation stored one object per session.
+            // Read it as a one-item queue so an in-place client update cannot lose it.
+            const values = Array.isArray(value) ? value : [value];
+            const queue: PendingSessionMessage[] = [];
+            for (const item of values) {
+                if (!item || typeof item !== 'object' || Array.isArray(item)) return {};
+                const candidate = item as Record<string, unknown>;
+                if (typeof candidate.localId !== 'string' || candidate.localId.length === 0
+                    || typeof candidate.encryptedRecord !== 'string' || candidate.encryptedRecord.length === 0
+                    || typeof candidate.createdAt !== 'number' || !Number.isSafeInteger(candidate.createdAt)
+                    || candidate.createdAt < 0) return {};
+                queue.push({
+                    localId: candidate.localId,
+                    encryptedRecord: candidate.encryptedRecord,
+                    createdAt: candidate.createdAt,
+                });
+            }
+            if (queue.length > 0) result[sessionId] = queue;
+        }
+        return result;
+    } catch {
+        return {};
+    }
+}
+
+export function savePendingSessionMessage(sessionId: string, message: PendingSessionMessage): void {
+    const pending = loadPendingSessionMessages();
+    const queue = pending[sessionId] ?? [];
+    if (!queue.some((item) => item.localId === message.localId)) queue.push(message);
+    mmkv.set(PENDING_SESSION_MESSAGES_KEY, JSON.stringify({
+        ...pending,
+        [sessionId]: queue,
+    }));
+}
+
+export function clearPendingSessionMessage(sessionId: string, localId: string): void {
+    const pending = loadPendingSessionMessages();
+    const queue = pending[sessionId];
+    if (!queue?.some((item) => item.localId === localId)) return;
+    const remaining = queue.filter((item) => item.localId !== localId);
+    if (remaining.length > 0) pending[sessionId] = remaining;
+    else delete pending[sessionId];
+    mmkv.set(PENDING_SESSION_MESSAGES_KEY, JSON.stringify(pending));
+}
 
 export type NewSessionAgentType = 'claude' | 'codex' | 'gemini';
 export type NewSessionSessionType = 'simple' | 'worktree';

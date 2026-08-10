@@ -37,7 +37,7 @@ import { extractCodexErrorDetail, formatCodexErrorForUi } from './utils/codexErr
 import { randomUUID } from 'node:crypto';
 import { logger } from '@/ui/logger';
 import { Credentials, readSettings } from '@/persistence';
-import { initialMachineMetadata } from '@/daemon/run';
+import { initialMachineMetadata, shouldRegisterMachineForSession } from '@/daemon/run';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
@@ -53,13 +53,14 @@ import {
     resolveStartupAccountSelection,
     writeSessionAccountSelection,
 } from '@/commands/bang/accountIntent';
-import { notifyDaemonCodexProfile, notifyDaemonSessionStarted } from '@/daemon/controlClient';
+import { notifyDaemonCodexProfile } from '@/daemon/controlClient';
+import { completeProviderInputReady } from '@/utils/completeProviderInputReady';
 import { installHappySessionEnvironment } from '@/utils/projectSessionStartup';
 import { registerKillSessionHandler } from '@/claude/registerKillSessionHandler';
 import { registerSessionTransportFatalHandler } from '@/api/registerSessionTransportFatalHandler';
 import { stopCaffeinate } from '@/utils/caffeinate';
 import { connectionState } from '@/utils/serverConnectionErrors';
-import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
+import { setupOfflineSession } from '@/utils/setupOfflineSession';
 import { resolveCodexExecutionPolicy, resolveCodexSessionPermissionMode } from './executionPolicy';
 import { emitReadyIfIdle } from './runCodex';
 import type { PermissionResult } from './utils/permissionHandler';
@@ -263,13 +264,10 @@ export async function runCodexWithAppServer(opts: {
 
     // `session` is normally created by the server-backed init below. Tests may
     // inject a SessionLike via `opts.deps.session` to drive the runtime fully
-    // offline. `response` and `reconnectionHandle` are hoisted out here because
-    // they're read later (the restore branch near turn/start, and the finally
-    // block); `sandboxConfig` is hoisted because the turn loop reads it.
+    // offline. `response` is hoisted because the restore branch reads it later.
     let session: ApiSessionClient;
     let permissionHandler: CodexPermissionHandler;
     let bindTransportFatalHandler: ((client: ApiSessionClient) => void) | null = null;
-    let reconnectionHandle: ReturnType<typeof setupOfflineReconnection>['reconnectionHandle'] = null;
     let response: Awaited<ReturnType<typeof api.getOrCreateSession>> | undefined;
 
     if (opts.deps?.session) {
@@ -282,7 +280,9 @@ export async function runCodexWithAppServer(opts: {
             process.exit(1);
         }
         logger.debug(`Using machineId: ${machineId}`);
-        await api.getOrCreateMachine({ machineId, metadata: initialMachineMetadata });
+        if (shouldRegisterMachineForSession(opts.startedBy)) {
+            await api.getOrCreateMachine({ machineId, metadata: initialMachineMetadata });
+        }
 
         const { state, metadata } = createSessionMetadata({
             flavor: 'codex',
@@ -300,26 +300,9 @@ export async function runCodexWithAppServer(opts: {
             response = await api.getOrCreateSession({ tag: sessionTag, metadata, state });
         }
 
-        const reconnection = setupOfflineReconnection({
-            api,
-            sessionTag,
-            metadata,
-            state,
-            response,
-            onSessionSwap: (newSession) => {
-                session = newSession;
-                installHappySessionEnvironment(newSession.sessionId);
-                session.updateMetadata((metadata) => withCodexModelModeMetadata(metadata));
-                bindTransportFatalHandler?.(newSession);
-                if (permissionHandler) {
-                    permissionHandler.updateSession(newSession);
-                }
-            },
-        });
-        session = reconnection.session;
+        session = setupOfflineSession({ api, sessionTag, response }).session;
         installHappySessionEnvironment(session.sessionId);
         session.updateMetadata((metadata) => withCodexModelModeMetadata(metadata));
-        reconnectionHandle = reconnection.reconnectionHandle;
 
     }
 
@@ -350,6 +333,11 @@ export async function runCodexWithAppServer(opts: {
         }));
     }
     let currentModel: string | undefined = undefined;
+    let thinking = false;
+    let threadId: string | null = null;
+    let activeTurnId: string | null = null;
+    let threadIdStored = false;
+    let client: CodexAppServerClient | null = null;
     const replyMonitor = createHtaskReplyMonitorRuntime(session, 'codex', undefined, undefined, (text) => {
         const enhancedMode: EnhancedMode = {
             permissionMode: currentPermissionMode,
@@ -359,7 +347,7 @@ export async function runCodexWithAppServer(opts: {
         messageQueue.push(text, enhancedMode);
     });
 
-    session.onUserMessage((message) => {
+    const onUserMessage = (message: import('@/api/types').UserMessage): void => {
         if (message.meta?.permissionMode) {
             currentPermissionMode = message.meta.permissionMode as PermissionMode;
             session.updateMetadata((metadata) => ({
@@ -510,16 +498,37 @@ export async function runCodexWithAppServer(opts: {
         replyMonitor.observeUserMessage();
         recentUserBuffer.record(text);
         messageQueue.push(text, enhancedMode);
-    });
+    };
+
+    // Prefetch persisted rows in parallel with provider restore, but capture
+    // only a side-effect-free injection closure. The closure is invoked after
+    // the exact provider identity is durably rebound, so cleanup can never be
+    // followed by late input injection.
+    const restoreSessionId = opts.restoreSessionId;
+    const pendingPreparation = restoreSessionId && response
+        ? fetchAndInjectPendingMessages(
+            api, session, restoreSessionId,
+            response.encryptionKey, response.encryptionVariant,
+            '[CodexAppServer]', { deferInjection: true },
+          ).then(
+            (prepared) => ({ ok: true as const, prepared }),
+            (error: unknown) => ({ ok: false as const, error }),
+          )
+        : undefined;
+    const pendingWindow = pendingPreparation
+        ? async () => {
+            const outcome = await pendingPreparation;
+            if (!outcome.ok) throw outcome.error;
+            if (typeof outcome.prepared !== 'function') {
+                throw new Error('Pending-message recovery preparation is invalid');
+            }
+            return outcome.prepared();
+          }
+        : undefined;
 
     //
     // Runtime state
     //
-
-    let thinking = false;
-    let threadId: string | null = null;
-    let activeTurnId: string | null = null;
-    let threadIdStored = false;
 
     // /compact state. When the user runs /compact we read the current rollout
     // file, build a heuristic seed locally, allocate a fresh codex thread, and
@@ -787,10 +796,7 @@ export async function runCodexWithAppServer(opts: {
 
     let shouldExit = false;
 
-    session.keepAlive(thinking, 'remote');
-    const keepAliveInterval = setInterval(() => {
-        session.keepAlive(thinking, 'remote');
-    }, 2000);
+    let keepAliveInterval: ReturnType<typeof setInterval> | null = null;
 
     const sendReady = () => {
         session.sendSessionEvent({ type: 'ready' });
@@ -854,7 +860,6 @@ export async function runCodexWithAppServer(opts: {
     // App-server client + stream bridge
     //
 
-    let client: CodexAppServerClient | null = null;
     const bridge = createAppServerStreamBridge();
 
     // Without these, the main loop has no path to reach client.dispose() on
@@ -1367,6 +1372,7 @@ export async function runCodexWithAppServer(opts: {
             logger.warn('[CodexAppServer] Failed to persist session account selection:', error);
         }
     };
+    const expectedProviderSessionId = opts.codexSessionId;
 
     try {
         // Create app-server client. Build the child env via the shared helper so
@@ -1392,6 +1398,7 @@ export async function runCodexWithAppServer(opts: {
         // mode, so this does not change account or per-turn selection.
         if (opts.codexSessionId) {
             const expectedThreadId = opts.codexSessionId;
+            const modelConfig = resolveCodexModelModeOrDefault(currentModel);
             const executionPolicy = resolveCodexExecutionPolicy(
                 currentPermissionMode,
                 !!sandboxConfig,
@@ -1401,7 +1408,12 @@ export async function runCodexWithAppServer(opts: {
                 threadId: expectedThreadId,
                 approvalPolicy: toApprovalPolicy(executionPolicy.approvalPolicy),
                 sandbox: executionPolicy.sandbox,
-                persistExtendedHistory: true,
+                ...(modelConfig.model ? { model: modelConfig.model } : {}),
+                ...(modelConfig.reasoningEffort ? { config: { model_reasoning_effort: modelConfig.reasoningEffort } } : {}),
+                // Runtime readiness needs the exact provider identity, not a
+                // second copy of the complete rollout. Large threads can make
+                // the default resume response too large to serialize or frame.
+                excludeTurns: true,
             });
             threadId = requireExactCodexThreadResume(
                 readThreadId(threadResponse),
@@ -1415,22 +1427,6 @@ export async function runCodexWithAppServer(opts: {
             opts.codexSessionId = undefined;
             logger.debug(`[CodexAppServer] Provider thread ready: ${threadId}`);
 
-            if (opts.startedBy === 'daemon' && response) {
-                const registration = await notifyDaemonSessionStarted(
-                    response.id,
-                    { ...response.metadata, claudeSessionId: threadId, hostPid: process.pid },
-                    opts.restoreSessionId ? threadId : undefined,
-                );
-                if (registration.error) {
-                    throw new Error(`Daemon provider readiness registration failed: ${registration.error}`);
-                }
-                if (activeCodexProfile) {
-                    const profileRegistration = await notifyDaemonCodexProfile(response.id, activeCodexProfile);
-                    if (profileRegistration.error) {
-                        throw new Error(`Daemon Codex profile registration failed: ${profileRegistration.error}`);
-                    }
-                }
-            }
         }
 
         // A daemon spawn is not ready until it owns a restorable provider
@@ -1443,36 +1439,30 @@ export async function runCodexWithAppServer(opts: {
                 claudeSessionId: threadId!,
             }), { rejectOnServerError: true });
             threadIdStored = true;
-            if (response) {
-                const registration = await notifyDaemonSessionStarted(response.id, {
-                    ...response.metadata,
-                    claudeSessionId: threadId,
-                    hostPid: process.pid,
-                });
-                if (registration.error) {
-                    throw new Error(`Daemon provider readiness registration failed: ${registration.error}`);
-                }
-                if (activeCodexProfile) {
-                    const profileRegistration = await notifyDaemonCodexProfile(response.id, activeCodexProfile);
-                    if (profileRegistration.error) {
-                        throw new Error(`Daemon Codex profile registration failed: ${profileRegistration.error}`);
-                    }
-                }
-            }
         }
 
-        // After restore, fetch pending user messages
-        if (opts.restoreSessionId && response) {
-            try {
-                await fetchAndInjectPendingMessages(
-                    api, session, opts.restoreSessionId,
-                    response.encryptionKey, response.encryptionVariant,
-                    '[CodexAppServer]',
-                );
-            } catch (error) {
-                logger.debug('[CodexAppServer] Failed to fetch pending messages after restore:', error);
+        if (response) {
+            await completeProviderInputReady({
+                session,
+                expectedHappySessionId: response.id,
+                pendingWindow,
+                providerSessionId: threadId ?? undefined,
+                expectedProviderSessionId,
+                onUserMessage,
+            });
+            if (opts.startedBy === 'daemon' && activeCodexProfile) {
+                const profileRegistration = await notifyDaemonCodexProfile(response.id, activeCodexProfile);
+                if (profileRegistration.error) {
+                    throw new Error(`Daemon Codex profile registration failed: ${profileRegistration.error}`);
+                }
             }
+        } else {
+            session.onUserMessage(onUserMessage);
         }
+        session.keepAlive(thinking, 'remote');
+        keepAliveInterval = setInterval(() => {
+            session.keepAlive(thinking, 'remote');
+        }, 2000);
 
         let currentModeHash: string | null = null;
         let pending: { message: string; mode: EnhancedMode; isolate: boolean; hash: string } | null = null;
@@ -1525,7 +1515,7 @@ export async function runCodexWithAppServer(opts: {
                                 sandbox: executionPolicy.sandbox,
                                 ...(modelConfig.model ? { model: modelConfig.model } : {}),
                                 ...(modelConfig.reasoningEffort ? { config: { model_reasoning_effort: modelConfig.reasoningEffort } } : {}),
-                                persistExtendedHistory: true,
+                                excludeTurns: true,
                             });
                             return requireExactCodexThreadResume(
                                 readThreadId(response),
@@ -1773,7 +1763,10 @@ export async function runCodexWithAppServer(opts: {
             }
         }
     } catch (error) {
-        logger.warn('[CodexAppServer] Fatal error:', error);
+        const fatalDetail = error instanceof Error
+            ? `${error.name}: ${error.message}${error.stack ? `\n${error.stack}` : ''}`
+            : String(error);
+        logger.warn(`[CodexAppServer] Fatal error: ${fatalDetail}`);
         session.sendSessionEvent({
             type: 'message',
             message: `Codex app-server error: ${error instanceof Error ? error.message : String(error)}`,
@@ -1785,11 +1778,6 @@ export async function runCodexWithAppServer(opts: {
         removeTransportFatalHandler();
 
         removeShutdownHandlers();
-        if (reconnectionHandle) {
-            logger.debug('[CodexAppServer] Cancelling offline reconnection');
-            reconnectionHandle.cancel();
-        }
-
         try {
             session.sendSessionDeath();
             await session.flush();
@@ -1811,7 +1799,7 @@ export async function runCodexWithAppServer(opts: {
         if (hasTTY) {
             try { process.stdin.pause(); } catch { /* ignore */ }
         }
-        clearInterval(keepAliveInterval);
+        if (keepAliveInterval) clearInterval(keepAliveInterval);
         if (inkInstance) {
             inkInstance.unmount();
         }
