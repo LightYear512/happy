@@ -510,6 +510,10 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, wor
     rpcHandlerManager.registerHandler<RipgrepRequest, RipgrepResponse>('ripgrep', async (data) => {
         logger.debug('Ripgrep request with args:', data.args, 'cwd:', data.cwd);
 
+        if (data.args.includes('--files')) {
+            return { success: false, error: 'Full repository file discovery is disabled' };
+        }
+
         // Validate cwd if provided
         if (data.cwd) {
             const validation = validatePath(data.cwd, workingDirectory);

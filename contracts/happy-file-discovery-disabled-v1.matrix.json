@@ -1,0 +1,36 @@
+{
+  "schemaVersion": "contract-first-module-gate/v2",
+  "contractProfile": "contract-first-minimal-boundary/v1",
+  "riskTriggers": ["release-security-or-performance-claim"],
+  "module": "happy-cli.file-discovery",
+  "owner": "Happy CLI common RPC handlers",
+  "publicApis": {
+    "notApplicableReason": "the existing ripgrep RPC envelope is unchanged"
+  },
+  "budgets": [
+    {
+      "field": "full repository file discovery result size",
+      "enforcement": "the Happy CLI ripgrep RPC rejects the exact --files mode before starting ripgrep",
+      "phase": "RPC admission",
+      "errorKind": "scoped RPC failure",
+      "zeroTest": {
+        "name": "happy_file_discovery_disabled_boundary",
+        "file": "happy-file-discovery-disabled-v1.test.mjs"
+      },
+      "overflowTest": {
+        "name": "happy_file_discovery_disabled_boundary",
+        "file": "happy-file-discovery-disabled-v1.test.mjs"
+      }
+    }
+  ],
+  "lifecycleTransitions": {
+    "notApplicableReason": "the change adds no lifecycle state"
+  },
+  "provenanceFields": {
+    "notApplicableReason": "the change adds no provenance field"
+  },
+  "evidence": {
+    "mode": "approval",
+    "openFindingCount": 0
+  }
+}
