@@ -103,6 +103,10 @@ export async function updateDatabaseMetrics(): Promise<void> {
 }
 
 export function startDatabaseMetricsUpdater(): void {
+    if (process.env.METRICS_ENABLED === 'false') {
+        return;
+    }
+
     forever('database-metrics-updater', async () => {
         await updateDatabaseMetrics();
         
