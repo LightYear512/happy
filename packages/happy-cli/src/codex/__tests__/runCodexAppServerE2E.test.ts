@@ -43,6 +43,7 @@ class FakeSession extends EventEmitter {
     readonly sessionId = 'fake-session-id';
     readonly sessionEvents: Array<{ type: string; message?: string }> = [];
     readonly providerTurnEnds: Array<'completed' | 'failed' | 'cancelled'> = [];
+    readonly codexMessages: unknown[] = [];
     readonly rpcHandlers = new Map<string, (params: unknown) => unknown>();
     metadata: Metadata = {
         path: '/workspace',
@@ -86,7 +87,7 @@ class FakeSession extends EventEmitter {
     closeProviderSessionTurn(status: 'completed' | 'failed' | 'cancelled'): void {
         this.providerTurnEnds.push(status);
     }
-    sendCodexMessage(): void {}
+    sendCodexMessage(message: unknown): void { this.codexMessages.push(message); }
     sendSessionProtocolMessage(): void {}
     sendClaudeSessionMessage(): void {}
     keepAlive(): void {}
@@ -128,6 +129,7 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
         delete process.env.HAPPY_TEST_RESUME_TRACE_LOG;
         delete process.env.HAPPY_TEST_REJECT_RESUME;
         delete process.env.HAPPY_TEST_RESUME_DELAY_MS;
+        delete process.env.HAPPY_TEST_AGENT_MESSAGE_MODE;
         for (const d of [codexHome, projectCwd, binDir]) {
             await rm(d, { recursive: true, force: true });
         }
@@ -162,6 +164,7 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
                 'const threadTraceLog = process.env.HAPPY_TEST_THREAD_TRACE_LOG;',
                 'const resumeTraceLog = process.env.HAPPY_TEST_RESUME_TRACE_LOG;',
                 'const resumeDelayMs = Number(process.env.HAPPY_TEST_RESUME_DELAY_MS || 0);',
+                'const agentMessageMode = process.env.HAPPY_TEST_AGENT_MESSAGE_MODE || "";',
                 `const DELIM = ${JSON.stringify(TURN_DELIM)};`,
             ],
             bodyLines: [
@@ -202,6 +205,14 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
                 '        error: { message: "Error running remote compact task: stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses/compact)", codexErrorInfo: "other", additionalDetails: null },',
                 '        willRetry: false, threadId, turnId,',
                 '      }), 5);',
+                '    } else if (agentMessageMode === "delta-only") {',
+                '      setTimeout(() => notify("item/agentMessage/delta", { threadId, turnId, delta: "FINAL_DELTA_ONLY" }), 1);',
+                '      setTimeout(() => notify("item/completed", { threadId, turnId, item: { id: "final-message", type: "agentMessage" } }), 3);',
+                '      setTimeout(() => notify("turn/completed", { threadId, turn_id: turnId }), 5);',
+                '    } else if (agentMessageMode === "completed-text") {',
+                '      setTimeout(() => notify("item/agentMessage/delta", { threadId, turnId, delta: "FINAL_COMPLETED_TEXT" }), 1);',
+                '      setTimeout(() => notify("item/completed", { threadId, turnId, item: { id: "final-message", type: "agentMessage", text: "FINAL_COMPLETED_TEXT" } }), 3);',
+                '      setTimeout(() => notify("turn/completed", { threadId, turn_id: turnId, lastAgentMessage: "FINAL_COMPLETED_TEXT" }), 5);',
                 '    } else {',
                 '      setTimeout(() => notify("turn/completed", { threadId, turn_id: turnId }), 5);',
                 '    }',
@@ -248,6 +259,58 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
         }
     }
 
+    it.each([
+        ['delta-only', 'FINAL_DELTA_ONLY'],
+        ['completed-text', 'FINAL_COMPLETED_TEXT'],
+    ])('delivers the final agent message exactly once for %s protocol output', async (mode, expectedText) => {
+        const fakeBin = await writeFakeBin();
+        process.env.HAPPY_CODEX_APP_SERVER_BIN = fakeBin;
+        process.env.HAPPY_CODEX_APP_SERVER_RPC_TIMEOUT_MS = '4000';
+        process.env.HAPPY_TEST_AGENT_MESSAGE_MODE = mode;
+        process.env.CODEX_HOME = codexHome;
+
+        const fakeSession = new FakeSession();
+        let requestExit: (() => void) | undefined;
+        let resolveReady: (() => void) | undefined;
+        const ready = new Promise<void>((resolve) => { resolveReady = resolve; });
+        const runtime = runCodexWithAppServer({
+            credentials: {} as Credentials,
+            deps: {
+                apiClient: fakeApi,
+                session: fakeSession as unknown as ApiSessionClient,
+                cwd: projectCwd,
+                onRuntimeReady: ({ requestExit: close }) => {
+                    requestExit = close;
+                    resolveReady?.();
+                },
+            },
+        });
+
+        await ready;
+        fakeSession.sendUserText('emit final answer');
+        const deadline = Date.now() + 4_000;
+        while (Date.now() < deadline) {
+            const delivered = fakeSession.codexMessages.filter((message) =>
+                typeof message === 'object'
+                && message !== null
+                && (message as { type?: unknown }).type === 'message'
+                && (message as { message?: unknown }).message === expectedText);
+            if (delivered.length > 0) break;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        await new Promise((resolve) => setTimeout(resolve, 30));
+
+        const delivered = fakeSession.codexMessages.filter((message) =>
+            typeof message === 'object'
+            && message !== null
+            && (message as { type?: unknown }).type === 'message'
+            && (message as { message?: unknown }).message === expectedText);
+        expect(delivered).toHaveLength(1);
+
+        requestExit?.();
+        await runtime;
+    });
+
     it('resumes the exact restored thread before runtime readiness or queued input', async () => {
         const startupDirectory = join(projectCwd, 'xcoding-v2', 'dist');
         await mkdir(startupDirectory, { recursive: true });
@@ -282,6 +345,7 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
         await ready;
         expect(await readResumeTraces()).toEqual([{ threadId: THREAD_UUID_1, excludeTurns: true }]);
         expect(await readTurnRecords()).toEqual([]);
+        expect(fakeSession.metadata.claudeSessionId).toBeUndefined();
         requestExit?.();
         await runtime;
         expect(fakeSession.sessionEvents).not.toContainEqual(expect.objectContaining({

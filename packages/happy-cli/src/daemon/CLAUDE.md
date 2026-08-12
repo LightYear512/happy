@@ -1,6 +1,6 @@
 # Happy CLI Daemon: Control Flow and Lifecycle
 
-The daemon is a persistent background process that manages Happy sessions, enables remote control from the mobile app, and handles auto-updates when the CLI version changes.
+The daemon is a persistent background process that manages Happy sessions and enables remote control from the mobile app.
 
 ## 1. Daemon Lifecycle
 
@@ -14,16 +14,14 @@ Control Flow:
 3. New process calls `startDaemon()` from `src/daemon/run.ts`
 4. `startDaemon()` performs startup:
    - Sets up shutdown promise and handlers (SIGINT, SIGTERM, uncaughtException, unhandledRejection)
-   - Version check: `isDaemonRunningSameVersion()` reads daemon.state.json, compares `startedWithCliVersion` with `configuration.currentCliVersion`
-   - If version mismatch: calls `stopDaemon()` to drain the old daemon before proceeding
-   - If same version running: exits with "Daemon already running"
+   - If any live daemon already owns the lifecycle, exits with "Daemon already running"
    - Lock acquisition: `acquireDaemonLock()` creates exclusive lock file to prevent multiple daemons
    - Authentication: `authAndSetupMachineIfNeeded()` ensures credentials exist
    - State persistence: writes PID, version, HTTP port to daemon.state.json
    - HTTP server: starts on random port for local CLI control (list, stop, spawn)
    - WebSocket: establishes persistent connection to backend via `ApiMachineClient`
    - RPC registration: exposes `spawn-happy-session`, `stop-session`, `requestShutdown` handlers
-   - Heartbeat loop: every 60s (or HAPPY_DAEMON_HEARTBEAT_INTERVAL) checks for version updates and prunes dead sessions
+   - Heartbeat loop: every 60s (or HAPPY_DAEMON_HEARTBEAT_INTERVAL) prunes dead sessions and bounded logs
 5. Awaits shutdown promise which resolves when:
    - OS signal received (SIGINT/SIGTERM)
    - HTTP `/stop` endpoint called
@@ -38,17 +36,11 @@ Control Flow:
    - Releases lock file
    - Exits process
 
-### Version Mismatch Auto-Update
+### Explicit Upgrade
 
-The daemon detects when `npm upgrade happy-coder` occurs:
-1. Heartbeat reads package.json from disk
-2. Compares `JSON.parse(package.json).version` with compiled `configuration.currentCliVersion`
-3. If mismatch detected:
-   - Defers the upgrade while any user child remains active
-   - Spawns new daemon via `spawnHappyCLI(['daemon', 'start'])` only after the user-child census is empty
-4. New daemon starts, sees old daemon.state.json version != its compiled version
-5. New daemon calls `stopDaemon()`; shutdown fails closed if a user child appeared during the handoff
-6. New daemon takes over
+Installing a different CLI version never replaces a live daemon. Upgrade with an explicit
+`happy daemon stop` followed by `happy daemon start`; this avoids multiple installed clients
+restarting one another and creating duplicate console sessions.
 
 ### Stopping the Daemon
 
@@ -57,7 +49,7 @@ Command: `happy daemon stop`
 Control Flow:
 1. `stopDaemon()` in `controlClient.ts` reads daemon.state.json
 2. Attempts graceful shutdown via HTTP POST to `/stop`
-   - Plain stop is deferred while user sessions remain active
+   - Plain stop preserves active user sessions and stops only the daemon; an unidentifiable daemon child blocks handoff
    - `--kill-sessions` preflights that every target is owned by the current daemon
    - A failed target blocks shutdown and never falls back to killing only the daemon
 3. Daemon receives request, calls `cleanupAndShutdown()`:
@@ -79,7 +71,8 @@ Initiated by mobile app via backend RPC:
    - Creates directory if needed
    - Spawns detached Happy process with `--happy-starting-mode remote --started-by daemon`
    - Adds to `pidToTrackedSession` map
-   - Sets up one 50-second startup deadline for exact identity and final input readiness
+   - Sets up one 58-second startup deadline for exact identity and final input readiness,
+     returning before the Server's 60-second restore RPC boundary
 4. New Happy process:
    - Creates session with backend, receives `happySessionId`
    - Installs the provider input consumer and merges the pending restore window
@@ -156,13 +149,10 @@ Local HTTP server (127.0.0.1 only) provides:
 - Server to Daemon: rpc-request (spawn-happy-session, stop-session, requestShutdown)
 - All data encrypted with TweetNaCl
 
-## 7. Integration Testing Challenges
+## 7. Integration Testing
 
-Version mismatch test simulates npm upgrade:
-- Test modifies package.json, rebuilds with new version
-- Daemon's compiled version != package.json on disk
-- Critical timing: heartbeat interval must exceed rebuild time
-- pkgroll doesn't update compiled imports, must use full yarn build
+The daemon lifecycle test changes the package version on disk and verifies that the current
+daemon PID and loaded version remain unchanged until an explicit stop/start.
 
 # Improvements
 

@@ -5,6 +5,8 @@
 import { Metadata } from '@/api/types';
 import { ChildProcess } from 'child_process';
 
+export const XC_VIRTUAL_SESSION_ID_PATTERN = /^x-[0-9]{6}(?:-[1-9][0-9]{0,2})?$/u;
+
 export type SessionInputState = 'online' | 'offline' | 'unknown';
 
 /**

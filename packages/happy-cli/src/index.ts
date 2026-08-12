@@ -15,8 +15,8 @@ import { authAndSetupMachineIfNeeded } from './ui/auth'
 import packageJson from '../package.json'
 import { z } from 'zod'
 import { startDaemon } from './daemon/run'
-import { checkIfDaemonRunningAndCleanupStaleState, isDaemonRunningCurrentlyInstalledHappyVersion,
-  shouldSessionEnsureDaemon, stopDaemon } from './daemon/controlClient'
+import { checkIfDaemonRunningAndCleanupStaleState, shouldSessionEnsureDaemon,
+  stopDaemon } from './daemon/controlClient'
 import { getLatestDaemonLog } from './ui/logger'
 import { killRunawayHappyProcesses } from './daemon/doctor'
 import { install } from './daemon/install'
@@ -39,7 +39,7 @@ async function ensureDaemonForSession(startedBy: 'daemon' | 'terminal' | undefin
     logger.debug('Daemon-owned session reuses its parent daemon');
     return;
   }
-  if (await isDaemonRunningCurrentlyInstalledHappyVersion()) return;
+  if (await checkIfDaemonRunningAndCleanupStaleState()) return;
 
   logger.debug('Starting Happy background service...');
   const daemonProcess = spawnHappyCLI(['daemon', 'start-sync'], {
@@ -51,7 +51,7 @@ async function ensureDaemonForSession(startedBy: 'daemon' | 'terminal' | undefin
 
   for (let i = 0; i < 15; i++) {
     await new Promise(resolve => setTimeout(resolve, 500));
-    if (await isDaemonRunningCurrentlyInstalledHappyVersion()) {
+    if (await checkIfDaemonRunningAndCleanupStaleState()) {
       logger.debug('Happy background service is ready');
       return;
     }
@@ -702,6 +702,10 @@ ${chalk.bold('Examples:')}
                            Print raw ACP backend/envelope events
   happy auth login --force Authenticate
   happy doctor             Run diagnostics
+
+${chalk.bold('Remote project boundary:')}
+  Repository-wide file enumeration is disabled, so remote file autocomplete does not scan the full project.
+  Explicit content search and scoped file operations remain available.
 
 ${chalk.bold('Happy supports ALL Claude options!')}
   Use any claude flag with happy as you would with claude. Our favorite:

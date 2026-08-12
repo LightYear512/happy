@@ -5,10 +5,11 @@ import { createHash } from 'node:crypto';
 import { killProcessTree } from '@/utils/processKill';
 
 import { ApiClient } from '@/api/api';
-import type { ObservedTrackedSession, SessionInputState, TrackedSession } from './types';
+import { XC_VIRTUAL_SESSION_ID_PATTERN,
+  type ObservedTrackedSession, type SessionInputState, type TrackedSession } from './types';
 import { MachineMetadata, DaemonState, Metadata, type PermissionMode } from '@/api/types';
 import { SpawnSessionOptions, SpawnSessionResult } from '@/modules/common/registerCommonHandlers';
-import { logger } from '@/ui/logger';
+import { logger, pruneLogDirectory } from '@/ui/logger';
 import { authAndSetupMachineIfNeeded } from '@/ui/auth';
 import { configuration } from '@/configuration';
 import { startCaffeinate, stopCaffeinate } from '@/utils/caffeinate';
@@ -17,10 +18,9 @@ import { getEnvironmentInfo } from '@/ui/doctor';
 import { spawnHappyCLI } from '@/utils/spawnHappyCLI';
 import { writeDaemonState, DaemonLocallyPersistedState, readDaemonState, acquireDaemonLock, releaseDaemonLock, readSettings, getActiveProfile, getEnvironmentVariables, validateProfileForAgent, getProfileEnvironmentVariables } from '@/persistence';
 
-import { checkIfDaemonRunningAndCleanupStaleState, cleanupDaemonState,
-  isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './controlClient';
+import { checkIfDaemonRunningAndCleanupStaleState, cleanupDaemonState } from './controlClient';
 import { startDaemonControlServer } from './controlServer';
-import { existsSync, readFileSync } from 'fs';
+import { existsSync } from 'fs';
 import { join } from 'path';
 import { projectPath } from '@/projectPath';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
@@ -83,7 +83,12 @@ export function runSerial<K, V>(
   return result;
 }
 
-export const SESSION_STARTUP_TIMEOUT_MS = 120_000;
+// Mobile new-session RPCs have a 30-second Server relay budget. Leave enough
+// time to terminate an unregistered child and return a structured error.
+export const NEW_SESSION_REGISTRATION_TIMEOUT_MS = 20_000;
+// Server-initiated restore has its own 60-second relay budget and must keep
+// waiting for exact provider identity rather than publishing a false restore.
+export const RESTORE_SESSION_STARTUP_TIMEOUT_MS = 58_000;
 
 export function shouldRegisterMachineForSession(startedBy?: 'daemon' | 'terminal'): boolean {
   return startedBy !== 'daemon';
@@ -97,11 +102,12 @@ export function selectTrackedConsoleSessions(
 
 export function createSessionStartupDeadline(
   onTimeout: () => void,
+  timeoutMs: number,
 ): { cancel: () => void } {
   let timeout: ReturnType<typeof setTimeout> | null = setTimeout(() => {
     timeout = null;
     onTimeout();
-  }, SESSION_STARTUP_TIMEOUT_MS);
+  }, timeoutMs);
   const cancel = () => {
     if (timeout !== null) clearTimeout(timeout);
     timeout = null;
@@ -122,6 +128,7 @@ export function waitForTrackedSessionStartup(input: {
   unregister: () => void;
   terminate: () => Promise<boolean>;
   complete: (session: TrackedSession) => SpawnSessionResult;
+  timeoutMs: number;
 }): Promise<SpawnSessionResult> {
   return new Promise((resolve) => {
     let settled = false;
@@ -145,9 +152,9 @@ export function waitForTrackedSessionStartup(input: {
       );
     };
     const deadline = createSessionStartupDeadline(() => {
-      const message = `Session input readiness timeout for PID ${input.pid}${input.suffix ?? ''}`;
+      const message = `Session startup timeout for PID ${input.pid}${input.suffix ?? ''}`;
       failAfterCleanup(message);
-    });
+    }, input.timeoutMs);
     input.register({
       resolve: (session) => {
         if (!accepting) return;
@@ -192,6 +199,16 @@ export function isProviderReadyForDaemonRegistration(
       && CODEX_PROVIDER_SESSION_ID.test(metadata.claudeSessionId));
 }
 
+export function isFreshDaemonSessionCandidate(
+  session: Pick<TrackedSession, 'startedBy' | 'expectedHappySessionId' | 'resumeTarget'> | undefined,
+  hasPendingStartup: boolean,
+): boolean {
+  return hasPendingStartup
+    && session?.startedBy === 'daemon'
+    && session.expectedHappySessionId === undefined
+    && session.resumeTarget === undefined;
+}
+
 export function isTrackedProviderRestoreReady(
   session: Pick<TrackedSession, 'expectedHappySessionId' | 'resumeTarget'>,
   metadata: Pick<Metadata, 'flavor'>,
@@ -231,6 +248,12 @@ export function classifyTrackedInputState(session: TrackedSession): SessionInput
     : 'unknown';
 }
 
+export function isExactOnlineConsoleOwner(session: TrackedSession, sessionId: string): boolean {
+  return session.isConsoleSession === true
+    && session.happySessionId === sessionId
+    && classifyTrackedInputState(session) === 'online';
+}
+
 export function isCurrentDaemonChild(session: TrackedSession, pid: number): boolean {
   return session.startedBy === 'daemon'
     && session.tmuxSessionId === undefined
@@ -247,9 +270,44 @@ function isCurrentDaemonTmuxWindow(session: TrackedSession, pid: number): boolea
     && session.tmuxSessionId.length > 0;
 }
 
-export function isDaemonManagedSession(session: TrackedSession): boolean {
+export function isDaemonManagedSession(
+  session: TrackedSession,
+  recovered: ReadonlyArray<{ pid: number; sessionId: string }> = [],
+): boolean {
   return isCurrentDaemonChild(session, session.pid)
-    || isCurrentDaemonTmuxWindow(session, session.pid);
+    || isCurrentDaemonTmuxWindow(session, session.pid)
+    || (session.startedBy === 'daemon'
+      && session.childProcess === undefined
+      && session.tmuxSessionId === undefined
+      && typeof session.expectedHappySessionId === 'string'
+      && recovered.some(candidate => candidate.pid === session.pid
+        && candidate.sessionId === session.expectedHappySessionId));
+}
+
+export function shutdownHasUnownedTargets(
+  stopSessions: boolean,
+  sessions: ReadonlyArray<TrackedSession>,
+  recovered: ReadonlyArray<{ pid: number; sessionId: string }> = [],
+): boolean {
+  return stopSessions && sessions.some(session => !isDaemonManagedSession(session, recovered));
+}
+
+export function daemonHandoffHasUnrecoverableSessions(
+  sessions: ReadonlyArray<TrackedSession>,
+  recovered: ReadonlyArray<{ pid: number; sessionId: string }>,
+): boolean {
+  return sessions.some(session => session.startedBy === 'daemon'
+    && !recovered.some(candidate => candidate.pid === session.pid
+      && (candidate.sessionId === session.expectedHappySessionId
+        || candidate.sessionId === session.happySessionId)));
+}
+
+export function daemonHandoffIsBusy(
+  startupCount: number,
+  lifecycleCount: number,
+  webhookCount: number,
+): boolean {
+  return startupCount > 0 || lifecycleCount > 0 || webhookCount > 0;
 }
 
 export function recoverRestoredDaemonSessions(processes: Array<{ pid: number; command: string; type: string }>):
@@ -580,17 +638,13 @@ export async function startDaemon(): Promise<void> {
   logger.debug('[DAEMON RUN] Starting daemon process...');
   logger.debugLargeJson('[DAEMON RUN] Environment', getEnvironmentInfo());
 
-  // Check if already running
-  // Check if running daemon version matches current CLI version
+  // A running daemon is the sole lifecycle owner. Ordinary CLI/session startup
+  // must never replace it merely because another installed CLI has a different
+  // version; explicit daemon stop/start performs upgrades without version ping-pong.
   const daemonRunning = await checkIfDaemonRunningAndCleanupStaleState();
-  const runningDaemonVersionMatches = daemonRunning
-    && await isDaemonRunningCurrentlyInstalledHappyVersion();
-  if (daemonRunning && !runningDaemonVersionMatches) {
-    logger.debug('[DAEMON RUN] Daemon version mismatch detected, restarting daemon with current CLI version');
-    if (!await stopDaemon()) throw new Error('Daemon upgrade deferred while user sessions remain active');
-  } else if (runningDaemonVersionMatches) {
-    logger.debug('[DAEMON RUN] Daemon version matches, keeping existing daemon');
-    console.log('Daemon already running with matching version');
+  if (daemonRunning) {
+    logger.debug('[DAEMON RUN] Daemon already running; keeping the current lifecycle owner');
+    console.log('Daemon already running');
     process.exit(0);
   }
 
@@ -600,6 +654,9 @@ export async function startDaemon(): Promise<void> {
     logger.debug('[DAEMON RUN] Daemon lock file already held, another daemon is running');
     process.exit(0);
   }
+
+  void pruneLogDirectory(configuration.logsDir, logger.logFilePath)
+    .catch(error => logger.debug('[DAEMON RUN] Failed to prune logs', error));
 
   // At this point we should be safe to startup the daemon:
   // 1. Not have a stale daemon state
@@ -669,7 +726,11 @@ export async function startDaemon(): Promise<void> {
         if (pidToTrackedSession.get(pid) === session) pidToTrackedSession.delete(pid);
         return true;
       }
-      if (!isCurrentDaemonChild(session, pid)) {
+      const managed = isCurrentDaemonChild(session, pid) || isDaemonManagedSession(
+        session,
+        recoverRestoredDaemonSessions(await findAllHappyProcesses()),
+      );
+      if (!managed) {
         logger.debug(`[DAEMON RUN] Refusing to signal unowned session PID ${pid}`);
         return false;
       }
@@ -776,14 +837,19 @@ export async function startDaemon(): Promise<void> {
         logger.debug(`[DAEMON RUN] Rejecting webhook with unsafe session id: ${sessionId}`);
         return;
       }
-      if (!isProviderReadyForDaemonRegistration(sessionMetadata)) {
-        logger.debug(`[DAEMON RUN] Deferring daemon Codex webhook without a durable provider identity: ${sessionId}`);
-        return;
-      }
-
       const reportedPid = sessionMetadata.hostPid;
       if (!reportedPid) {
         logger.debug(`[DAEMON RUN] Session webhook missing hostPid for sessionId: ${sessionId}`);
+        return;
+      }
+      const reportedSession = pidToTrackedSession.get(reportedPid);
+      const acceptsFreshCandidate = isFreshDaemonSessionCandidate(
+        reportedSession,
+        pidToAwaiter.has(reportedPid),
+      ) && (isCurrentDaemonChild(reportedSession!, reportedPid)
+        || isCurrentDaemonTmuxWindow(reportedSession!, reportedPid));
+      if (!isProviderReadyForDaemonRegistration(sessionMetadata) && !acceptsFreshCandidate) {
+        logger.debug(`[DAEMON RUN] Deferring daemon Codex webhook without a durable provider identity: ${sessionId}`);
         return;
       }
 
@@ -944,7 +1010,7 @@ export async function startDaemon(): Promise<void> {
         return { type: 'error', errorMessage: `Invalid resume session ID format: ${options.resume}` };
       }
       if (options.xcReplacement && (options.resume !== options.xcReplacement.providerBinding
-        || !/^x-[0-9]{6}-[1-9][0-9]{0,2}$/u.test(options.xcReplacement.sessionId)
+        || !XC_VIRTUAL_SESSION_ID_PATTERN.test(options.xcReplacement.sessionId)
         || !isSafeHappySessionId(options.xcReplacement.previousOpener))) {
         return { type: 'error', errorMessage: 'Invalid XC provider replacement provenance' };
       }
@@ -1222,6 +1288,9 @@ export async function startDaemon(): Promise<void> {
             return waitForTrackedSessionStartup({
               pid: tmuxResult.pid,
               suffix: ' (tmux)',
+              timeoutMs: options.restoreSessionId
+                ? RESTORE_SESSION_STARTUP_TIMEOUT_MS
+                : NEW_SESSION_REGISTRATION_TIMEOUT_MS,
               register: awaiter => pidToAwaiter.set(tmuxResult.pid!, awaiter),
               unregister: () => pidToAwaiter.delete(tmuxResult.pid!),
               terminate: () => terminateTrackedSession(tmuxResult.pid!, trackedSession),
@@ -1304,6 +1373,9 @@ export async function startDaemon(): Promise<void> {
 
           return waitForTrackedSessionStartup({
             pid: happyProcess.pid,
+            timeoutMs: options.restoreSessionId
+              ? RESTORE_SESSION_STARTUP_TIMEOUT_MS
+              : NEW_SESSION_REGISTRATION_TIMEOUT_MS,
             register: awaiter => pidToAwaiter.set(happyProcess.pid!, awaiter),
             unregister: () => pidToAwaiter.delete(happyProcess.pid!),
             terminate: () => terminateTrackedSession(happyProcess.pid!, trackedSession),
@@ -1330,7 +1402,10 @@ export async function startDaemon(): Promise<void> {
     };
 
     // Force-close a session by Happy session id or exact tracked PID fallback.
-    const stopSession = async (sessionId: string): Promise<boolean> => {
+    const stopSession = async (
+      sessionId: string,
+      recoveredEvidence?: ReadonlyArray<{ pid: number; sessionId: string }>,
+    ): Promise<boolean> => {
       const initialMatches = matchingTrackedSessions(sessionId);
       const pidFallback = /^PID-([1-9][0-9]*)$/.test(sessionId);
       const happySessionId = pidFallback
@@ -1340,8 +1415,10 @@ export async function startDaemon(): Promise<void> {
       return runSerial(lifecycleQueue, lifecycleId, async () => {
       logger.debug(`[DAEMON RUN] Attempting to stop session ${sessionId}`);
 
+      const ownershipEvidence = recoveredEvidence
+        ?? recoverRestoredDaemonSessions(await findAllHappyProcesses());
       if (initialMatches.some(([pid, tracked]) => pidToTrackedSession.get(pid) !== tracked
-        || (!isCurrentDaemonChild(tracked, pid) && !isCurrentDaemonTmuxWindow(tracked, pid)))) {
+        || !isDaemonManagedSession(tracked, ownershipEvidence))) {
         logger.debug(`[DAEMON RUN] Refusing to stop an unowned session process for ${sessionId}`);
         return false;
       }
@@ -1378,7 +1455,8 @@ export async function startDaemon(): Promise<void> {
 
       const terminateTarget = happySessionId || sessionId;
       const matches = matchingTrackedSessions(terminateTarget);
-      const results = await Promise.all(matches.map(([pid, tracked]) => terminateTrackedSession(pid, tracked)));
+      const results = await Promise.all(matches.map(([pid, tracked]) =>
+        terminateTrackedSession(pid, tracked)));
       const allExited = results.every(Boolean) && matchingTrackedSessions(terminateTarget).length === 0;
       if (!allExited) {
         if (happySessionId) closingSessionIds.delete(happySessionId);
@@ -1419,12 +1497,17 @@ export async function startDaemon(): Promise<void> {
       spawnSession,
       prepareShutdown: async ({ stopSessions }) => {
         if (shuttingDown) return { accepted: false as const, error: 'Daemon shutdown is already in progress' };
-        const userChildren = getCurrentChildren().filter(child => child.isConsoleSession !== true);
-        if (!stopSessions && userChildren.length > 0) {
+        if (daemonHandoffIsBusy(pidToAwaiter.size, lifecycleQueue.size, webhookQueue.size)) {
           return { accepted: false as const,
-            error: `Daemon shutdown deferred while ${userChildren.length} user session(s) remain active` };
+            error: 'Daemon shutdown deferred while session lifecycle work is in progress' };
         }
-        if (stopSessions && userChildren.some(child => !isDaemonManagedSession(child))) {
+        const userChildren = getCurrentChildren().filter(child => child.isConsoleSession !== true);
+        const recoveredEvidence = recoverRestoredDaemonSessions(await findAllHappyProcesses());
+        if (!stopSessions && daemonHandoffHasUnrecoverableSessions(userChildren, recoveredEvidence)) {
+          return { accepted: false as const,
+            error: 'Daemon shutdown deferred because a daemon child lacks exact restore identity' };
+        }
+        if (shutdownHasUnownedTargets(stopSessions, userChildren, recoveredEvidence)) {
           return { accepted: false as const,
             error: 'A user session is not owned by the current daemon; no session was stopped' };
         }
@@ -1433,7 +1516,7 @@ export async function startDaemon(): Promise<void> {
         const results = await Promise.all(userChildren.map(async (child) => {
           const id = child.happySessionId?.trim() || `PID-${child.pid}`;
           try {
-            return await stopSession(id);
+            return await stopSession(id, recoveredEvidence);
           } catch (error) {
             logger.debug(`[DAEMON RUN] Failed to stop ${id} during shutdown preflight`, error);
             return false;
@@ -1487,9 +1570,6 @@ export async function startDaemon(): Promise<void> {
       summary: string | null; permissionMode?: PermissionMode }): Promise<ExactRestoreResult> => {
       if (shuttingDown) return { type: 'error', errorMessage: 'Daemon is shutting down' };
       if (!isSafeHappySessionId(params.sessionId)) return { type: 'error', errorMessage: 'Invalid Happy session ID' };
-      if (typeof params.claudeSessionId !== 'string' || !params.claudeSessionId) {
-        return { type: 'error', errorMessage: 'Happy provider restore identity is unavailable' };
-      }
       if (closingSessionIds.has(params.sessionId)) {
         return { type: 'error', errorMessage: 'Session close is still in progress' };
       }
@@ -1500,12 +1580,21 @@ export async function startDaemon(): Promise<void> {
         return false;
       });
       if (tracked.length > 1) return { type: 'error', errorMessage: 'Multiple processes own the Happy session' };
+      if (tracked.length === 1 && isExactOnlineConsoleOwner(tracked[0]![1], params.sessionId)) {
+        return { type: 'success', sessionId: params.sessionId };
+      }
+      if (typeof params.claudeSessionId !== 'string' || !params.claudeSessionId) {
+        return { type: 'error', errorMessage: 'Happy provider restore identity is unavailable' };
+      }
 
       let opened: Awaited<ReturnType<typeof reopenRestoreFile>>;
       try { opened = await reopenRestoreFile(params.sessionId); }
       catch (error) { return { type: 'error', errorMessage: error instanceof Error ? error.message : String(error) }; }
       const rollbackReopen = async (): Promise<void> => {
-        if (opened.state !== 'reopened') return;
+        // A failed restore has no live owner, regardless of whether this call
+        // reopened a closed authority or inherited one left open by an earlier
+        // failed candidate. Close it so the next request starts from a truthful
+        // state instead of an open file with no input consumer.
         try { await closeRestoreFile(params.sessionId, true); }
         catch (error) { logger.debug(`[DAEMON RUN] Failed to roll back restore authority for ${params.sessionId}:`, error); }
       };
@@ -1586,7 +1675,7 @@ export async function startDaemon(): Promise<void> {
     replaceControlSession = (input) => runSerial(lifecycleQueue, input.previousSessionId, async () => {
       if (!isSafeHappySessionId(input.previousSessionId)
         || !CODEX_PROVIDER_SESSION_ID.test(input.providerSessionId)
-        || !/^x-[0-9]{6}-[1-9][0-9]{0,2}$/u.test(input.virtualSessionId)) {
+        || !XC_VIRTUAL_SESSION_ID_PATTERN.test(input.virtualSessionId)) {
         return { type: 'error', errorMessage: 'Invalid closed-session replacement identity' };
       }
       if (matchingTrackedSessions(input.previousSessionId).some(([pid]) => isProcessAlive(pid))) {
@@ -1679,14 +1768,11 @@ export async function startDaemon(): Promise<void> {
     // Fire-and-forget — don't block other RPC handling
     spawnConsoleSession();
 
-    // Every 60 seconds:
-    // 1. Prune stale sessions
-    // 2. Check if daemon needs update
-    // 3. If outdated, restart with latest version
-    // 4. Write heartbeat
+    // Every 60 seconds: prune stale sessions, preserve the console, and write
+    // the heartbeat. Version replacement is intentionally an explicit command.
     const heartbeatIntervalMs = parseInt(process.env.HAPPY_DAEMON_HEARTBEAT_INTERVAL || '60000');
     let heartbeatRunning = false
-    const restartOnStaleVersionAndHeartbeat = setInterval(async () => {
+    const healthAndHeartbeat = setInterval(async () => {
       if (heartbeatRunning) {
         return;
       }
@@ -1717,24 +1803,6 @@ export async function startDaemon(): Promise<void> {
           spawnConsoleSession();
       }
 
-      // Check if daemon needs update
-      // If version on disk is different from the one in package.json - we need to restart
-      // BIG if - does this get updated from underneath us on npm upgrade?
-      const projectVersion = JSON.parse(readFileSync(join(projectPath(), 'package.json'), 'utf-8')).version;
-      if (projectVersion !== configuration.currentCliVersion) {
-        const userChildren = getCurrentChildren().filter(child => child.isConsoleSession !== true);
-        if (userChildren.length > 0) {
-          logger.debug(`[DAEMON RUN] Daemon upgrade deferred while ${userChildren.length} user session(s) remain active`);
-        } else {
-          logger.debug('[DAEMON RUN] Daemon is outdated and drained; requesting a new daemon');
-          try {
-            spawnHappyCLI(['daemon', 'start'], { detached: true, stdio: 'ignore' });
-          } catch (error) {
-            logger.debug('[DAEMON RUN] Failed to spawn replacement daemon', error);
-          }
-        }
-      }
-
       // Before wrecklessly overriting the daemon state file, we should check if we are the ones who own it
       // Race condition is possible, but thats okay for the time being :D
       const daemonState = await readDaemonState();
@@ -1761,6 +1829,9 @@ export async function startDaemon(): Promise<void> {
         logger.debug('[DAEMON RUN] Failed to write heartbeat', error);
       }
 
+      await pruneLogDirectory(configuration.logsDir, logger.logFilePath)
+        .catch(error => logger.debug('[DAEMON RUN] Failed to prune logs', error));
+
       } finally {
         heartbeatRunning = false;
       }
@@ -1783,8 +1854,8 @@ export async function startDaemon(): Promise<void> {
       // work instead of racing to spawn children inside the shutdown window.
       shuttingDown = true;
 
-      if (restartOnStaleVersionAndHeartbeat) {
-        clearInterval(restartOnStaleVersionAndHeartbeat);
+      if (healthAndHeartbeat) {
+        clearInterval(healthAndHeartbeat);
         logger.debug('[DAEMON RUN] Health check interval cleared');
       }
 
@@ -1810,13 +1881,14 @@ export async function startDaemon(): Promise<void> {
         }
       }
 
-      // Update daemon state before shutting down
-      await apiMachine.updateDaemonState((state: DaemonState | null) => ({
+      // Remote status is observational. Never let a missing ACK block local
+      // shutdown or the replacement daemon's lock acquisition.
+      void apiMachine.updateDaemonState((state: DaemonState | null) => ({
         ...state,
         status: 'shutting-down',
         shutdownRequestedAt: Date.now(),
         shutdownSource: source
-      }));
+      })).catch(error => logger.debug('[DAEMON RUN] Failed to publish shutdown state', error));
 
       // Give time for metadata update to send
       await new Promise(resolve => setTimeout(resolve, 100));

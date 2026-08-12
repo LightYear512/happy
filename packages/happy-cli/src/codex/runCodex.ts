@@ -2,7 +2,6 @@ import { render } from "ink";
 import React from "react";
 import { ApiClient } from '@/api/api';
 import { localCommandUserText, modelFacingUserText } from '@/api/types';
-import { fetchAndInjectPendingMessages } from '@/utils/fetchPendingMessages';
 import { CodexMcpClient } from './codexMcpClient';
 import { CodexPermissionHandler } from './utils/permissionHandler';
 import { ReasoningProcessor } from './utils/reasoningProcessor';
@@ -384,8 +383,8 @@ export async function runCodex(opts: {
         }
 
         const text = modelFacingUserText(message);
-        replyMonitor.observeUserMessage();
         messageQueue.push(text, enhancedMode);
+        replyMonitor.observeUserMessage();
     };
     let thinking = false;
     let codexSessionIdStored = false;
@@ -802,18 +801,11 @@ export async function runCodex(opts: {
         await client.connect();
         logger.debug('[codex]: client.connect done');
 
-        const pendingWindow = opts.restoreSessionId && response
-            ? fetchAndInjectPendingMessages(
-                api, session, opts.restoreSessionId,
-                response.encryptionKey, response.encryptionVariant,
-                '[Codex]',
-              )
-            : undefined;
         if (response) {
             await completeProviderInputReady({
                 session,
                 expectedHappySessionId: response.id,
-                pendingWindow,
+                reconcilePersistedInputs: Boolean(opts.restoreSessionId),
                 providerSessionId: opts.codexSessionId,
                 expectedProviderSessionId: opts.codexSessionId,
                 onUserMessage,

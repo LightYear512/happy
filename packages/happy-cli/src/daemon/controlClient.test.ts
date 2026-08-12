@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { configuration } from '@/configuration';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { createServer } from 'node:http';
 import { readDaemonState } from '@/persistence';
 import {
-  daemonVersionMatchesCurrentProcess,
   notifyDaemonCodexProfile,
   shouldSessionEnsureDaemon,
+  stopDaemon,
 } from './controlClient';
 
 vi.mock('@/persistence', () => ({
@@ -23,9 +25,35 @@ describe('daemon launch ownership', () => {
     expect(shouldSessionEnsureDaemon(undefined)).toBe(true);
   });
 
-  it('compares daemon state with the executable version instead of mutable package files', () => {
-    expect(daemonVersionMatchesCurrentProcess(configuration.currentCliVersion)).toBe(true);
-    expect(daemonVersionMatchesCurrentProcess(`${configuration.currentCliVersion}-other`)).toBe(false);
+  it('waits beyond the old two-second window for an accepted graceful stop', { timeout: 8_000 }, async () => {
+    const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    await once(child, 'spawn');
+    const server = createServer((_request, response) => {
+      response.writeHead(200, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify({ status: 'stopping' }));
+      setTimeout(() => child.kill('SIGTERM'), 2_500).unref();
+    });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('test server has no TCP port');
+    vi.mocked(readDaemonState).mockResolvedValue({
+      pid: child.pid!,
+      httpPort: address.port,
+    } as Awaited<ReturnType<typeof readDaemonState>>);
+
+    try {
+      await expect(stopDaemon()).resolves.toBe(true);
+    } finally {
+      const childExit = child.exitCode === null && child.signalCode === null
+        ? once(child, 'exit')
+        : Promise.resolve();
+      child.kill('SIGKILL');
+      const serverClose = server.listening
+        ? new Promise<void>(resolve => server.close(() => resolve()))
+        : Promise.resolve();
+      await Promise.allSettled([childExit, serverClose]);
+    }
   });
 });
 

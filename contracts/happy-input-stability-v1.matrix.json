@@ -1,18 +1,41 @@
 {
   "schemaVersion": "contract-first-module-gate/v2",
   "contractProfile": "contract-first-minimal-boundary/v1",
-  "riskTriggers": ["release-security-or-performance-claim"],
+  "riskTriggers": ["public-abi-or-persistent-format", "release-security-or-performance-claim"],
   "module": "happy-cli.input-stability",
   "owner": "happy-cli ApiSession input FIFO and daemon final registration",
-  "publicApis": {
-    "notApplicableReason": "the repair keeps the existing App, Server, Socket and daemon-control wire formats unchanged"
-  },
+  "publicApis": [
+    {
+      "name": "Happy local daemon POST /stop",
+      "inputs": ["optional stopSessions boolean"],
+      "acceptedStates": [
+        "stopSessions omitted or false while user sessions remain active",
+        "stopSessions true when every target has current or revalidated recovered ownership"
+      ],
+      "rejectedStates": [
+        "duplicate shutdown",
+        "session startup, lifecycle or webhook work is in progress",
+        "a daemon child lacks exact restore identity required for handoff",
+        "stopSessions true with an unowned target",
+        "target termination failure"
+      ],
+      "provenanceFields": ["PID", "exact --happy-restore-session identity for recovered children"],
+      "outputState": "daemon stops while user sessions survive unless stopSessions is explicitly true",
+      "enforcement": "happy-cli daemon control server and run.ts shutdown preflight",
+      "negativeTests": [
+        {
+          "name": "happy_cli_input_stability_boundary",
+          "file": "happy-input-stability-v1.test.mjs"
+        }
+      ]
+    }
+  ],
   "budgets": [
     {
       "field": "per-session pending persisted input rows and bytes",
       "enforcement": "ApiSessionClient enqueuePersistedMessage rejects the existing row and byte limits before insertion",
       "phase": "Socket or recovery row admission before provider handoff",
-      "errorKind": "typed recovery_incomplete terminal transport failure without advancing the accepted anchor",
+      "errorKind": "typed recovery_incomplete row rejection without advancing the accepted anchor or terminating a healthy Socket",
       "zeroTest": {
         "name": "happy_cli_input_stability_boundary",
         "file": "happy-input-stability-v1.test.mjs"
@@ -23,10 +46,24 @@
       }
     },
     {
-      "field": "daemon-started provider input-readiness wait",
-      "enforcement": "one SESSION_STARTUP_TIMEOUT_MS deadline followed by exact-child cleanup",
-      "phase": "daemon child spawn through final provider registration",
-      "errorKind": "terminal startup failure; no candidate registration is published",
+      "field": "daemon-started session registration wait",
+      "enforcement": "fresh sessions announce their persisted Happy identity immediately and use a 20-second registration deadline; exact restores retain one 58-second provider-readiness deadline; either timeout performs exact-child cleanup",
+      "phase": "daemon child spawn through Happy identity registration or exact restored-provider registration",
+      "errorKind": "terminal startup failure returned inside the applicable Server relay budget",
+      "zeroTest": {
+        "name": "happy_cli_input_stability_boundary",
+        "file": "happy-input-stability-v1.test.mjs"
+      },
+      "overflowTest": {
+        "name": "happy_cli_input_stability_boundary",
+        "file": "happy-input-stability-v1.test.mjs"
+      }
+    },
+    {
+      "field": "local daemon shutdown wait",
+      "enforcement": "one 10-second waitForProcessDeath deadline after an accepted stop request",
+      "phase": "local control response through daemon process exit",
+      "errorKind": "explicit stop failure while the live daemon remains authoritative",
       "zeroTest": {
         "name": "happy_cli_input_stability_boundary",
         "file": "happy-input-stability-v1.test.mjs"
@@ -40,10 +77,23 @@
   "lifecycleTransitions": [
     {
       "from": "one validated persisted Server row held in the per-session FIFO",
-      "to": "the existing provider queue synchronously accepts the row and the in-memory anchor advances",
+      "to": "the registered input handler synchronously takes ownership of the row, a digest-bound visibility receipt is emitted on the existing encrypted message stream, and the in-memory anchor advances",
       "creator": "ApiSessionClient Socket update or bounded recovery query",
-      "advancer": "ApiSessionClient synchronous drain callback",
-      "consumer": "the provider's existing MessageQueue2",
+      "advancer": "ApiSessionClient synchronous drain callback followed by non-blocking receipt emission",
+      "consumer": "the existing provider queue or local command handler; the receipt is never recovery-completion authority",
+      "rejectTests": [
+        {
+          "name": "happy_cli_input_stability_boundary",
+          "file": "happy-input-stability-v1.test.mjs"
+        }
+      ]
+    },
+    {
+      "from": "a persisted restore or reconnect tail not loaded because its bounded query had a retryable transport failure",
+      "to": "the same per-session recovery owner retries with bounded exponential delay until one complete snapshot is loaded, a deterministic snapshot rejection occurs, or the session stops",
+      "creator": "completeProviderInputReady or a live Socket reconnect",
+      "advancer": "ApiSessionClient startPersistedInputRecovery",
+      "consumer": "ApiSessionClient persisted-input FIFO; live Socket input remains independently available",
       "rejectTests": [
         {
           "name": "happy_cli_input_stability_boundary",
@@ -57,6 +107,19 @@
       "creator": "Happy CLI daemon child spawn",
       "advancer": "completeProviderInputReady",
       "consumer": "Happy CLI daemon tracked-session owner",
+      "rejectTests": [
+        {
+          "name": "happy_cli_input_stability_boundary",
+          "file": "happy-input-stability-v1.test.mjs"
+        }
+      ]
+    },
+    {
+      "from": "running daemon with live detached user sessions",
+      "to": "daemon stopped while sessions survive and register with its replacement",
+      "creator": "POST /stop without stopSessions",
+      "advancer": "daemon cleanup followed by existing process recovery and periodic session registration",
+      "consumer": "replacement Happy CLI daemon through readiness and reconnect registration",
       "rejectTests": [
         {
           "name": "happy_cli_input_stability_boundary",

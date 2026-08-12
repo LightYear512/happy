@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { serializerCompiler, validatorCompiler, ZodTypeProvider } from 'fastify-type-provider-zod';
 import { logger } from '@/ui/logger';
 import type { Metadata, PermissionMode } from '@/api/types';
-import type { ObservedTrackedSession } from './types';
+import { XC_VIRTUAL_SESSION_ID_PATTERN, type ObservedTrackedSession } from './types';
 import { SpawnSessionOptions, SpawnSessionResult } from '@/modules/common/registerCommonHandlers';
 
 export function startDaemonControlServer({
@@ -177,7 +177,7 @@ export function startDaemonControlServer({
         body: z.object({
           previousSessionId: z.string().min(1).max(128),
           providerSessionId: z.string().uuid(),
-          virtualSessionId: z.string().regex(/^x-[0-9]{6}-[1-9][0-9]{0,2}$/u),
+          virtualSessionId: z.string().regex(XC_VIRTUAL_SESSION_ID_PATTERN),
           title: z.string().min(1).max(240),
         }).strict(),
         response: {

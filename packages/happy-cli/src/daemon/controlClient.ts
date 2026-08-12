@@ -6,11 +6,13 @@
 import { logger } from '@/ui/logger';
 import { clearDaemonState, readDaemonState } from '@/persistence';
 import type { Metadata, PermissionMode } from '@/api/types';
-import { configuration } from '@/configuration';
 
 type DaemonPostError = { error: string; status?: number };
+const DAEMON_POST_TIMEOUT_MS = 10_000;
+const DAEMON_RESTORE_TIMEOUT_MS = 55_000;
+const DAEMON_STOP_TIMEOUT_MS = 10_000;
 
-async function daemonPost(path: string, body?: any): Promise<DaemonPostError | any> {
+async function daemonPost(path: string, body?: any, timeoutMs = DAEMON_POST_TIMEOUT_MS): Promise<DaemonPostError | any> {
   const state = await readDaemonState();
   if (!state?.httpPort) {
     const errorMessage = 'No daemon running, no state file found';
@@ -31,7 +33,7 @@ async function daemonPost(path: string, body?: any): Promise<DaemonPostError | a
   }
 
   try {
-    const timeout = process.env.HAPPY_DAEMON_HTTP_TIMEOUT ? parseInt(process.env.HAPPY_DAEMON_HTTP_TIMEOUT) : 10_000;
+    const timeout = process.env.HAPPY_DAEMON_HTTP_TIMEOUT ? parseInt(process.env.HAPPY_DAEMON_HTTP_TIMEOUT) : timeoutMs;
     const response = await fetch(`http://127.0.0.1:${state.httpPort}${path}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -104,7 +106,7 @@ export async function restoreDaemonSession(
   sessionId: string,
   permissionMode?: PermissionMode,
 ): Promise<any> {
-  return await daemonPost('/restore-session', { sessionId, permissionMode });
+  return await daemonPost('/restore-session', { sessionId, permissionMode }, DAEMON_RESTORE_TIMEOUT_MS);
 }
 
 export async function spawnDaemonSession(
@@ -151,35 +153,6 @@ export async function checkIfDaemonRunningAndCleanupStaleState(): Promise<boolea
   }
 }
 
-/**
- * Check if the running daemon version matches the current CLI version.
- * This should work from both the daemon itself & a new CLI process.
- * Works via the daemon.state.json file.
- * 
- * @returns true if versions match, false if versions differ or no daemon running
- */
-export async function isDaemonRunningCurrentlyInstalledHappyVersion(): Promise<boolean> {
-  logger.debug('[DAEMON CONTROL] Checking if daemon is running same version');
-  const runningDaemon = await checkIfDaemonRunningAndCleanupStaleState();
-  if (!runningDaemon) {
-    logger.debug('[DAEMON CONTROL] No daemon running, returning false');
-    return false;
-  }
-
-  const state = await readDaemonState();
-  if (!state) {
-    logger.debug('[DAEMON CONTROL] No daemon state found, returning false');
-    return false;
-  }
-  
-  logger.debug(`[DAEMON CONTROL] Current process CLI version: ${configuration.currentCliVersion}, Daemon started with version: ${state.startedWithCliVersion}`);
-  return daemonVersionMatchesCurrentProcess(state.startedWithCliVersion);
-}
-
-export function daemonVersionMatchesCurrentProcess(startedWithCliVersion: string): boolean {
-  return configuration.currentCliVersion === startedWithCliVersion;
-}
-
 export function shouldSessionEnsureDaemon(startedBy: 'daemon' | 'terminal' | undefined): boolean {
   return startedBy !== 'daemon';
 }
@@ -211,8 +184,7 @@ export async function stopDaemon(options?: { stopSessions?: boolean }): Promise<
         return false;
       }
 
-      // Wait for daemon to die (allow more time when stopping sessions)
-      await waitForProcessDeath(state.pid, options?.stopSessions ? 10000 : 2000);
+      await waitForProcessDeath(state.pid, DAEMON_STOP_TIMEOUT_MS);
       logger.debug('Daemon stopped gracefully via HTTP');
       return true;
     } catch (error) {

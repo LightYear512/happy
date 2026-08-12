@@ -294,7 +294,7 @@ flowchart LR
     subgraph "RPC Surface"
         Handlers --> Bash[bash]
         Handlers --> Files[file read/write]
-        Handlers --> Search[ripgrep]
+        Handlers --> Search[bounded ripgrep]
         Handlers --> Diff[difftastic]
     end
 ```
@@ -367,7 +367,10 @@ sequenceDiagram
 ```
 
 RPC is used to send commands over the Socket.IO connection:
-- Sessions register RPC handlers (e.g., `bash`, file read/write, `ripgrep`, `difftastic`).
+- Sessions register RPC handlers (e.g., `bash`, file read/write, bounded `ripgrep`, `difftastic`).
+- The `ripgrep` handler rejects repository-wide `--files` enumeration before spawning
+  ripgrep. Explicit content search remains available, and the rejection is scoped to
+  that RPC rather than the session lifecycle.
 - The daemon registers a spawn-session handler so the server/mobile client can ask it to start a local session.
 
 This mechanism allows the server and mobile clients to drive local actions without exposing a broad REST surface.

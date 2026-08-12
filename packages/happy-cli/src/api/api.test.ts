@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { ApiClient } from './api';
+import { ApiSessionMessageClient } from './apiSessionMessage';
 import axios from 'axios';
 import { connectionState } from '@/utils/serverConnectionErrors';
 
@@ -365,6 +366,12 @@ describe('session lookup log privacy', () => {
         expect(serialized).not.toContain('secret-token');
     });
 
+    it('constructs a one-shot message client from stable session identity without a server lookup', () => {
+        const client = api.sessionMessageClient('session-1');
+        expect(client).toBeInstanceOf(ApiSessionMessageClient);
+        expect(mockGet).not.toHaveBeenCalled();
+    });
+
     it('sanitizes getSessionMessages Axios errors', async () => {
         mockGet.mockRejectedValue({
             code: 'ECONNRESET',
@@ -374,6 +381,7 @@ describe('session lookup log privacy', () => {
         const serialized = JSON.stringify(loggerDebug.mock.calls);
         expect(serialized).toContain('ECONNRESET');
         expect(serialized).not.toContain('another-secret');
+        expect(mockGet).toHaveBeenCalledOnce();
     });
 
     it('allows the bounded recovery response budget enough transfer time', async () => {
@@ -382,7 +390,7 @@ describe('session lookup log privacy', () => {
         await expect(api.getSessionMessages('session-1')).resolves.toEqual([]);
         expect(mockGet).toHaveBeenCalledWith(
             expect.stringMatching(/\/v1\/sessions\/session-1\/messages$/),
-            expect.objectContaining({ timeout: 90_000 })
+            expect.objectContaining({ timeout: 20_000 })
         );
     });
 
@@ -444,7 +452,7 @@ describe('session lookup log privacy', () => {
         expect(mockGet).toHaveBeenCalledOnce();
     });
 
-    it('shares one in-flight message lookup and retries only inside ApiClient', async () => {
+    it('shares one in-flight message lookup', async () => {
         mockGet.mockResolvedValue({ data: { messages: [] } });
 
         const [first, second] = await Promise.all([
@@ -457,13 +465,12 @@ describe('session lookup log privacy', () => {
         expect(mockGet).toHaveBeenCalledOnce();
     });
 
-    it('retries one transient message lookup once', async () => {
-        mockGet
-            .mockRejectedValueOnce({ code: 'ECONNRESET' })
-            .mockResolvedValueOnce({ data: { messages: [] } });
+    it('does not multiply a transient message lookup inside one restore', async () => {
+        mockGet.mockRejectedValue({ code: 'ECONNRESET' });
 
-        await expect(api.getSessionMessages('session-1')).resolves.toEqual([]);
-        expect(mockGet).toHaveBeenCalledTimes(2);
+        await expect(api.getSessionMessages('session-1'))
+            .rejects.toThrow('session_message_lookup_failed');
+        expect(mockGet).toHaveBeenCalledOnce();
     });
 
     it('does not retry a cancelled message lookup', async () => {

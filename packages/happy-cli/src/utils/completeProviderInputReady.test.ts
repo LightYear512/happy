@@ -5,6 +5,7 @@ function createSession(overrides: Record<string, unknown> = {}) {
     return {
         sessionId: 'happy-1',
         onUserMessage: vi.fn(),
+        reconcilePersistedInputs: vi.fn().mockResolvedValue('complete'),
         updateMetadata: vi.fn().mockResolvedValue(undefined),
         enableDaemonSessionTracking: vi.fn(),
         ...overrides,
@@ -12,43 +13,21 @@ function createSession(overrides: Record<string, unknown> = {}) {
 }
 
 describe('completeProviderInputReady', () => {
-    it('installs the consumer only after the pending restore window is merged', async () => {
-        let release = () => {};
-        const pendingWindow = new Promise<void>((resolve) => { release = resolve; });
+    it('starts one restore lookup after installing the consumer without waiting for it', async () => {
+        const never = new Promise<void>(() => {});
         const session = createSession();
+        session.reconcilePersistedInputs.mockReturnValue(never);
         const onUserMessage = vi.fn();
-        const completion = completeProviderInputReady({
-            session,
-            expectedHappySessionId: 'happy-1',
-            pendingWindow,
-            onUserMessage,
-        });
-
-        await Promise.resolve();
-        expect(session.onUserMessage).not.toHaveBeenCalled();
-        expect(session.enableDaemonSessionTracking).not.toHaveBeenCalled();
-        release();
-        await completion;
-        expect(session.onUserMessage).toHaveBeenCalledWith(onUserMessage);
-        expect(session.enableDaemonSessionTracking).toHaveBeenCalledWith(undefined);
-    });
-
-    it('does not start deferred pending recovery before final provider readiness', async () => {
-        const order: string[] = [];
-        const session = createSession({
-            onUserMessage: vi.fn(() => order.push('consumer')),
-        });
-        const deferred = vi.fn(async () => { order.push('pending'); });
-
-        expect(deferred).not.toHaveBeenCalled();
         await completeProviderInputReady({
             session,
             expectedHappySessionId: 'happy-1',
-            pendingWindow: deferred,
-            onUserMessage: vi.fn(),
+            reconcilePersistedInputs: true,
+            onUserMessage,
         });
 
-        expect(order).toEqual(['pending', 'consumer']);
+        expect(session.onUserMessage).toHaveBeenCalledWith(onUserMessage);
+        expect(session.reconcilePersistedInputs).toHaveBeenCalledWith('restore');
+        expect(session.enableDaemonSessionTracking).toHaveBeenCalledWith(undefined);
     });
 
     it('rejects Happy or provider identity drift before installing the consumer', async () => {
@@ -69,7 +48,7 @@ describe('completeProviderInputReady', () => {
         expect(session.onUserMessage).not.toHaveBeenCalled();
     });
 
-    it('installs the fresh-session consumer before metadata and daemon bookkeeping', async () => {
+    it('does not rewrite metadata for an exact restored provider identity', async () => {
         const order: string[] = [];
         const session = createSession({
             onUserMessage: vi.fn(() => order.push('consumer')),
@@ -88,8 +67,30 @@ describe('completeProviderInputReady', () => {
             onUserMessage: vi.fn(),
         });
 
-        expect(order).toEqual(['consumer', 'metadata', 'daemon']);
+        expect(order).toEqual(['consumer', 'daemon']);
+        expect(session.updateMetadata).not.toHaveBeenCalled();
         expect(session.enableDaemonSessionTracking).toHaveBeenCalledWith('provider-1');
+    });
+
+    it('persists a fresh provider identity before daemon bookkeeping', async () => {
+        const order: string[] = [];
+        const session = createSession({
+            onUserMessage: vi.fn(() => order.push('consumer')),
+            updateMetadata: vi.fn(async (handler) => {
+                expect(handler({ flavor: 'codex' })).toMatchObject({ claudeSessionId: 'provider-1' });
+                order.push('metadata');
+            }),
+            enableDaemonSessionTracking: vi.fn(() => order.push('daemon')),
+        });
+
+        await completeProviderInputReady({
+            session,
+            expectedHappySessionId: 'happy-1',
+            providerSessionId: 'provider-1',
+            onUserMessage: vi.fn(),
+        });
+
+        expect(order).toEqual(['consumer', 'metadata', 'daemon']);
     });
 
     it('does not register the daemon when provider metadata cannot be persisted', async () => {

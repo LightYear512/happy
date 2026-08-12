@@ -4,16 +4,16 @@ import type { UserMessage } from '@/api/types';
 export interface CompleteProviderInputReadyOptions {
     session: ApiSessionClient;
     expectedHappySessionId: string;
-    pendingWindow?: Promise<unknown> | (() => Promise<unknown>);
+    reconcilePersistedInputs?: boolean;
     providerSessionId?: string;
     expectedProviderSessionId?: string;
     onUserMessage: (message: UserMessage) => void;
 }
 
 /**
- * Merges the optional restore window before opening the input consumer. For a
- * fresh session the consumer is installed immediately; provider metadata and
- * daemon bookkeeping cannot delay acceptance of the first human input.
+ * Opens the provider input consumer as soon as the exact identities are known.
+ * Historical-message recovery is best-effort follow-up work: a slow or failed
+ * query must never make a live provider unavailable to new human input.
  */
 export async function completeProviderInputReady(
     options: CompleteProviderInputReadyOptions,
@@ -26,12 +26,14 @@ export async function completeProviderInputReady(
         throw new Error('Provider session identity changed before provider readiness');
     }
 
-    const pendingWindow = typeof options.pendingWindow === 'function'
-        ? options.pendingWindow()
-        : options.pendingWindow;
-    await (pendingWindow ?? Promise.resolve());
     options.session.onUserMessage(options.onUserMessage);
-    if (options.providerSessionId) {
+    if (options.reconcilePersistedInputs) {
+        void options.session.reconcilePersistedInputs('restore');
+    }
+    // An exact restore identity is already persisted by the Server. Rewriting
+    // it here adds an acknowledgement gate after provider resume and can kill
+    // an otherwise usable restored process when that redundant ACK is lost.
+    if (options.providerSessionId && options.expectedProviderSessionId === undefined) {
         await options.session.updateMetadata((metadata) => ({
             ...metadata,
             hostPid: process.pid,
@@ -39,4 +41,5 @@ export async function completeProviderInputReady(
         }), { rejectOnServerError: true });
     }
     options.session.enableDaemonSessionTracking(options.providerSessionId);
+
 }

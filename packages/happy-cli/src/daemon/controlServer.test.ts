@@ -312,7 +312,7 @@ describe('startDaemonControlServer', () => {
     try {
       const body = { previousSessionId: 'old-happy-session',
         providerSessionId: '019f8425-0e76-7b83-bed0-019efc0b6f8f',
-        virtualSessionId: 'x-000015-1', title: 'Work' };
+        virtualSessionId: 'x-000042', title: 'Work' };
       const response = await fetch(`http://127.0.0.1:${server.port}/replace-session`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
       });
@@ -320,12 +320,19 @@ describe('startDaemonControlServer', () => {
       expect(await response.json()).toEqual({ success: true, sessionId: 'new-happy-session', agent: 'codex' });
       expect(replacements).toEqual([body]);
 
+      const group = { ...body, virtualSessionId: 'x-000015-1' };
+      const groupResponse = await fetch(`http://127.0.0.1:${server.port}/replace-session`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(group),
+      });
+      expect(groupResponse.ok).toBe(true);
+      expect(replacements).toEqual([body, group]);
+
       const hostile = await fetch(`http://127.0.0.1:${server.port}/replace-session`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...body, virtualSessionId: 'x-000015-0' }),
       });
       expect(hostile.status).toBe(400);
-      expect(replacements).toEqual([body]);
+      expect(replacements).toEqual([body, group]);
     } finally {
       await server.stop();
     }

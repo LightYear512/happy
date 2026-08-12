@@ -18,7 +18,6 @@ import { join } from 'node:path';
 import { ApiClient } from '@/api/api';
 import { localCommandUserText, modelFacingUserText } from '@/api/types';
 import { projectPath } from '@/projectPath';
-import { fetchAndInjectPendingMessages } from '@/utils/fetchPendingMessages';
 import { registerShutdownHandlers } from '@/utils/shutdownHandlers';
 import { createCodexAppServerClient, type CodexAppServerClient } from './codexAppServerClient';
 import {
@@ -379,26 +378,6 @@ export async function runCodexWithAppServer(opts: {
             return;
         }
 
-        // /compact / /clear swap-race guard: while runManualCompact is between
-        // `findRolloutByConversationId` / `buildHeuristicSeed` (both await) and
-        // the threadId swap, the turn loop is parked on
-        // `messageQueue.waitForMessagesAndGetAsString()`. If a new user message
-        // lands here it would push into the queue, the turn loop would unblock
-        // and dispatch with the OLD threadId (we haven't swapped yet), and the
-        // pending heuristic seed would never be consumed.
-        //
-        // Reject + advise. The user re-sends after they see
-        // `Compaction completed`. Cheaper than building a barrier between the
-        // two coroutines and avoids state-machine surface area.
-        if (compactInFlight) {
-            session.sendSessionEvent({
-                type: 'message',
-                message: '⏳ 本地压缩进行中，请等待 "Compaction completed" 后再发送。',
-            });
-            session.sendSessionEvent({ type: 'ready' });
-            return;
-        }
-
         // Intercept /compact and /clear before they reach codex.
         //
         // Background: codex app-server's auto pre-sampling compaction posts the
@@ -491,40 +470,15 @@ export async function runCodexWithAppServer(opts: {
             return;
         }
 
-        // Must precede messageQueue.push: a synchronous push failure would
-        // otherwise skip the record, leaving the prompt unrecoverable by the
-        // seed builder. All non-prompt traffic has been early-returned above.
+        // Synchronous ownership transfer: ApiSession advances its persisted
+        // cursor only after this callback returns, so a closed queue must throw
+        // here rather than acknowledge input that was not accepted.
         const text = modelFacingUserText(message);
-        replyMonitor.observeUserMessage();
-        recentUserBuffer.record(text);
         messageQueue.push(text, enhancedMode);
+        replyMonitor.observeUserMessage();
     };
 
-    // Prefetch persisted rows in parallel with provider restore, but capture
-    // only a side-effect-free injection closure. The closure is invoked after
-    // the exact provider identity is durably rebound, so cleanup can never be
-    // followed by late input injection.
     const restoreSessionId = opts.restoreSessionId;
-    const pendingPreparation = restoreSessionId && response
-        ? fetchAndInjectPendingMessages(
-            api, session, restoreSessionId,
-            response.encryptionKey, response.encryptionVariant,
-            '[CodexAppServer]', { deferInjection: true },
-          ).then(
-            (prepared) => ({ ok: true as const, prepared }),
-            (error: unknown) => ({ ok: false as const, error }),
-          )
-        : undefined;
-    const pendingWindow = pendingPreparation
-        ? async () => {
-            const outcome = await pendingPreparation;
-            if (!outcome.ok) throw outcome.error;
-            if (typeof outcome.prepared !== 'function') {
-                throw new Error('Pending-message recovery preparation is invalid');
-            }
-            return outcome.prepared();
-          }
-        : undefined;
 
     //
     // Runtime state
@@ -536,10 +490,11 @@ export async function runCodexWithAppServer(opts: {
     // prepends it to the user's prompt. The holder object keeps the type as
     // `string | null` at the read site (a bare `let` would get narrowed to
     // `null` by TS control-flow analysis since the writer lives in a different
-    // closure). `compactInFlight` guards against concurrent /compact
-    // invocations while the swap is in progress.
+    // closure). `compactInFlight` is the one swap barrier shared by concurrent
+    // /compact calls and the turn consumer. User input is still accepted into
+    // MessageQueue2 immediately; only consumption waits for the thread swap.
     const compactState: { pendingSeedText: string | null } = { pendingSeedText: null };
-    let compactInFlight = false;
+    let compactInFlight: Promise<void> | null = null;
 
     // SSoT for the codex session working directory — the same value used for
     // sandbox writableRoots and the turn-message cwd. Project-level fallback
@@ -625,7 +580,8 @@ export async function runCodexWithAppServer(opts: {
             return;
         }
 
-        compactInFlight = true;
+        let finishCompact!: () => void;
+        compactInFlight = new Promise<void>((resolve) => { finishCompact = resolve; });
         try {
             // If a turn is in flight, wait for it to settle before swapping
             // threads — interrupting mid-stream loses partial output, while
@@ -666,9 +622,9 @@ export async function runCodexWithAppServer(opts: {
                     trailerNote: '请基于以上摘要继续。',
                     // Race-recovery snapshot: any prompt accepted into the
                     // queue but not yet flushed by codex into rollout.jsonl.
-                    // `snapshot()` returns a copy, so even though
-                    // compactInFlight gates onUserMessage during this await,
-                    // we hold a frozen view rather than a live reference.
+                    // `snapshot()` returns a copy, so user input accepted into
+                    // MessageQueue2 during this await cannot mutate the seed's
+                    // frozen recovery view.
                     extraUserTexts: recentUserBuffer.snapshot(),
                 });
                 seedText = built.seedText;
@@ -785,12 +741,12 @@ export async function runCodexWithAppServer(opts: {
                     permissionMode: currentPermissionMode,
                     model: currentModel,
                 };
-                recentUserBuffer.record(replayText);
                 messageQueue.push(replayText, replayMode);
                 logger.debug(`[CodexAppServer] [auto] /compact resume: pushed '${replayText}' to queue`);
             }
         } finally {
-            compactInFlight = false;
+            finishCompact();
+            compactInFlight = null;
         }
     }
 
@@ -905,6 +861,7 @@ export async function runCodexWithAppServer(opts: {
 
     // Accumulate streaming text deltas — send as one message on turn completion
     let pendingAgentText = '';
+    let lastDeliveredAgentText: string | null = null;
 
     //
     // Process bridge updates — maps AppServerStreamUpdate into session events
@@ -950,6 +907,7 @@ export async function runCodexWithAppServer(opts: {
                         // Segment finalized — drop any accumulated deltas so
                         // turn-aborted fallback doesn't replay delivered text.
                         pendingAgentText = '';
+                        lastDeliveredAgentText = text.trim();
                     }
                     break;
                 }
@@ -984,6 +942,8 @@ export async function runCodexWithAppServer(opts: {
                 case 'task-started': {
                     replyMonitor.beginActiveReply('task-started');
                     activeTurnId = update.turnId;
+                    pendingAgentText = '';
+                    lastDeliveredAgentText = null;
                     if (!thinking) {
                         logger.debug('[CodexAppServer] thinking started');
                         thinking = true;
@@ -1010,10 +970,25 @@ export async function runCodexWithAppServer(opts: {
                         thinking = false;
                         session.keepAlive(thinking, 'remote');
                     }
-                    // Per-segment delivery already happened via envelope t:'text' —
-                    // no turn-end flush here, it would just reorder text to after
-                    // tool calls and duplicate already-delivered content.
+                    // Codex normally finalizes each message through
+                    // item/completed. Some protocol shapes only provide deltas
+                    // (or only lastAgentMessage on turn/completed), so preserve
+                    // the final answer here when no equivalent segment was sent.
+                    const completedText = update.lastAgentMessage?.trim() ?? '';
+                    const bufferedText = pendingAgentText.trim();
+                    const fallbackText = completedText && completedText !== lastDeliveredAgentText
+                        ? completedText
+                        : bufferedText;
+                    if (fallbackText && fallbackText !== lastDeliveredAgentText) {
+                        messageBuffer.addMessage(fallbackText, 'assistant');
+                        session.sendCodexMessage({
+                            type: 'message',
+                            message: fallbackText,
+                            id: randomUUID(),
+                        });
+                    }
                     pendingAgentText = '';
+                    lastDeliveredAgentText = null;
                     messageBuffer.addMessage('Task completed', 'status');
                     diffProcessor.reset();
                     activeTurnId = null;
@@ -1033,6 +1008,7 @@ export async function runCodexWithAppServer(opts: {
                         });
                     }
                     pendingAgentText = '';
+                    lastDeliveredAgentText = null;
                     if (thinking) {
                         logger.debug('[CodexAppServer] thinking aborted');
                         thinking = false;
@@ -1419,10 +1395,10 @@ export async function runCodexWithAppServer(opts: {
                 readThreadId(threadResponse),
                 expectedThreadId,
             );
-            await session.updateMetadata((currentMetadata) => ({
-                ...currentMetadata,
-                claudeSessionId: threadId!,
-            }), { rejectOnServerError: true });
+            // Exact restore already loaded this provider identity from the
+            // persisted Happy session. Rewriting the same value adds a remote
+            // ACK to the startup critical path and can make a healthy provider
+            // miss the bounded restore window.
             threadIdStored = true;
             opts.codexSessionId = undefined;
             logger.debug(`[CodexAppServer] Provider thread ready: ${threadId}`);
@@ -1445,7 +1421,7 @@ export async function runCodexWithAppServer(opts: {
             await completeProviderInputReady({
                 session,
                 expectedHappySessionId: response.id,
-                pendingWindow,
+                reconcilePersistedInputs: Boolean(restoreSessionId),
                 providerSessionId: threadId ?? undefined,
                 expectedProviderSessionId,
                 onUserMessage,
@@ -1635,6 +1611,21 @@ export async function runCodexWithAppServer(opts: {
                     continue;
                 }
             }
+
+            // Input ownership transfers synchronously to MessageQueue2. Check
+            // the one local thread-swap barrier only after other awaited
+            // preparation and immediately before the synchronous turn-start
+            // setup. An accepted batch therefore starts on either the old
+            // thread before compaction begins or the new thread after it ends;
+            // it is never rejected with a "please resend" response.
+            const compactBarrier = compactInFlight;
+            if (compactBarrier) await compactBarrier;
+
+            // Record only after the batch has crossed the compact barrier.
+            // A prompt accepted while compaction is building its seed remains
+            // solely in MessageQueue2; recording it earlier would put the same
+            // text in both the new seed and the following turn.
+            recentUserBuffer.record(message.message);
 
             // Mode change: keep the same Codex thread.
             //

@@ -195,11 +195,13 @@ describe('handleAuthBangCommand', () => {
                 personal: { type: 'account' },
             });
 
-            const result = await handleAuthAllBangCommand('', consoleCtx());
+            const ctx = consoleCtx();
+            const result = await handleAuthAllBangCommand('', ctx);
             const msg = flatResult(result);
             expect(msg).toContain('请选择要切换的 Claude 账户');
             expect(msg).toContain('work');
             expect(msg).toContain('personal');
+            expect(ctx.client.sendSessionEvent).not.toHaveBeenCalled();
         });
 
         it('returns explicit empty message when no profiles exist in console', async () => {

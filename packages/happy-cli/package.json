@@ -51,8 +51,6 @@
     "dist",
     "bin",
     "scripts",
-    "tools/archives",
-    "tools/licenses",
     "package.json"
   ],
   "scripts": {
@@ -67,7 +65,6 @@
     "dev:integration-test-env": "$npm_execpath run build && tsx --env-file .env.integration-test src/index.ts",
     "prepublishOnly": "$npm_execpath run build && $npm_execpath test",
     "release": "npx --no-install release-it",
-    "postinstall": "node scripts/unpack-tools.cjs",
     "// ==== Dev/Stable Variant Management ====": "",
     "stable": "node scripts/env-wrapper.cjs stable",
     "dev:variant": "node scripts/env-wrapper.cjs dev",

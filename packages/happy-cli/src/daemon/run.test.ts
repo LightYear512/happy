@@ -6,9 +6,13 @@ import {
   buildRestoreProfileEnvironment,
   classifyTrackedInputState,
   createSessionStartupDeadline,
+  daemonHandoffHasUnrecoverableSessions,
+  daemonHandoffIsBusy,
   DEFAULT_DAEMON_SESSION_AGENT,
   filterProfileEnvironmentVariablesForAgent,
   isDaemonManagedSession,
+  isFreshDaemonSessionCandidate,
+  isExactOnlineConsoleOwner,
   isProviderReadyForDaemonRegistration,
   isCurrentDaemonChild,
   isTrackedProviderRestoreReady,
@@ -19,8 +23,10 @@ import {
   runSerial,
   selectTrackedConsoleSessions,
   sessionErrorLocalId,
+  shutdownHasUnownedTargets,
   shouldRegisterMachineForSession,
-  SESSION_STARTUP_TIMEOUT_MS,
+  NEW_SESSION_REGISTRATION_TIMEOUT_MS,
+  RESTORE_SESSION_STARTUP_TIMEOUT_MS,
   trackedSessionMatchesIdentity,
   updateTrackedProviderReadiness,
   waitForTrackedSessionStartup,
@@ -44,13 +50,48 @@ describe('daemon console ownership', () => {
   });
 });
 
+describe('console restore ownership', () => {
+  it('accepts only the exact online console owner', () => {
+    const consoleOwner: TrackedSession = {
+      startedBy: 'daemon',
+      pid: 42,
+      happySessionId: 'console-session',
+      isConsoleSession: true,
+      happySessionMetadataFromLocalWebhook: {
+        path: '/tmp/console',
+        host: 'host',
+        homeDir: '/tmp',
+        happyHomeDir: '/tmp/.happy',
+        happyLibDir: '/tmp/lib',
+        happyToolsDir: '/tmp/tools',
+        consoleSession: true,
+      },
+    };
+
+    expect(isExactOnlineConsoleOwner(consoleOwner, 'console-session')).toBe(true);
+    expect(isExactOnlineConsoleOwner(consoleOwner, 'other-session')).toBe(false);
+    expect(isExactOnlineConsoleOwner({ ...consoleOwner, isConsoleSession: false }, 'console-session')).toBe(false);
+    expect(isExactOnlineConsoleOwner({
+      ...consoleOwner,
+      happySessionMetadataFromLocalWebhook: undefined,
+      expectedHappySessionId: 'console-session',
+    }, 'console-session')).toBe(false);
+  });
+});
+
 describe('session startup deadline', () => {
+  it('keeps new creation below the 30-second relay and restore below its 60-second relay', () => {
+    expect(NEW_SESSION_REGISTRATION_TIMEOUT_MS).toBeLessThan(25_000);
+    expect(RESTORE_SESSION_STARTUP_TIMEOUT_MS).toBeGreaterThan(50_000);
+    expect(RESTORE_SESSION_STARTUP_TIMEOUT_MS).toBeLessThan(60_000);
+  });
+
   it('keeps one total input-readiness deadline', async () => {
     vi.useFakeTimers();
     try {
       let timedOut = false;
-      createSessionStartupDeadline(() => { timedOut = true; });
-      await vi.advanceTimersByTimeAsync(SESSION_STARTUP_TIMEOUT_MS - 1);
+      createSessionStartupDeadline(() => { timedOut = true; }, NEW_SESSION_REGISTRATION_TIMEOUT_MS);
+      await vi.advanceTimersByTimeAsync(NEW_SESSION_REGISTRATION_TIMEOUT_MS - 1);
       expect(timedOut).toBe(false);
       await vi.advanceTimersByTimeAsync(1);
       expect(timedOut).toBe(true);
@@ -63,9 +104,12 @@ describe('session startup deadline', () => {
     vi.useFakeTimers();
     try {
       let timedOut = false;
-      const completed = createSessionStartupDeadline(() => { timedOut = true; });
+      const completed = createSessionStartupDeadline(
+        () => { timedOut = true; },
+        NEW_SESSION_REGISTRATION_TIMEOUT_MS,
+      );
       completed.cancel();
-      await vi.advanceTimersByTimeAsync(SESSION_STARTUP_TIMEOUT_MS);
+      await vi.advanceTimersByTimeAsync(NEW_SESSION_REGISTRATION_TIMEOUT_MS);
       expect(timedOut).toBe(false);
     } finally {
       vi.useRealTimers();
@@ -81,6 +125,7 @@ describe('session startup deadline', () => {
       const terminate = vi.fn(async () => true);
       const result = waitForTrackedSessionStartup({
         pid: 42,
+        timeoutMs: NEW_SESSION_REGISTRATION_TIMEOUT_MS,
         register: value => { awaiter = value; },
         unregister: () => { registered = false; },
         terminate,
@@ -88,10 +133,10 @@ describe('session startup deadline', () => {
       });
 
       expect(awaiter).toBeDefined();
-      await vi.advanceTimersByTimeAsync(SESSION_STARTUP_TIMEOUT_MS);
+      await vi.advanceTimersByTimeAsync(NEW_SESSION_REGISTRATION_TIMEOUT_MS);
       await expect(result).resolves.toEqual({
         type: 'error',
-        errorMessage: 'Session input readiness timeout for PID 42',
+        errorMessage: 'Session startup timeout for PID 42',
       });
       expect(registered).toBe(false);
       expect(terminate).toHaveBeenCalledOnce();
@@ -106,15 +151,16 @@ describe('session startup deadline', () => {
       const result = waitForTrackedSessionStartup({
         pid: 43,
         suffix: ' (tmux)',
+        timeoutMs: NEW_SESSION_REGISTRATION_TIMEOUT_MS,
         register: () => {},
         unregister: () => {},
         terminate: async () => false,
         complete: session => ({ type: 'success', sessionId: session.happySessionId! }),
       });
-      await vi.advanceTimersByTimeAsync(SESSION_STARTUP_TIMEOUT_MS);
+      await vi.advanceTimersByTimeAsync(NEW_SESSION_REGISTRATION_TIMEOUT_MS);
       await expect(result).resolves.toEqual({
         type: 'error',
-        errorMessage: 'Session input readiness timeout for PID 43 (tmux); process cleanup failed',
+        errorMessage: 'Session startup timeout for PID 43 (tmux); process cleanup failed',
       });
     } finally {
       vi.useRealTimers();
@@ -127,6 +173,7 @@ describe('session startup deadline', () => {
     const terminate = vi.fn(async () => true);
     const result = waitForTrackedSessionStartup({
       pid: 44,
+      timeoutMs: NEW_SESSION_REGISTRATION_TIMEOUT_MS,
       register: value => { awaiter = value; },
       unregister: () => {},
       terminate,
@@ -146,18 +193,19 @@ describe('session startup deadline', () => {
       let finishCleanup: ((value: boolean) => void) | undefined;
       const result = waitForTrackedSessionStartup({
         pid: 45,
+        timeoutMs: NEW_SESSION_REGISTRATION_TIMEOUT_MS,
         register: value => { awaiter = value; },
         unregister: () => {},
         terminate: () => new Promise(resolve => { finishCleanup = resolve; }),
         complete: session => ({ type: 'success', sessionId: session.happySessionId! }),
       });
 
-      await vi.advanceTimersByTimeAsync(SESSION_STARTUP_TIMEOUT_MS);
+      await vi.advanceTimersByTimeAsync(NEW_SESSION_REGISTRATION_TIMEOUT_MS);
       awaiter!.resolve({ startedBy: 'daemon', pid: 45, happySessionId: 'late-session' });
       finishCleanup!(true);
       await expect(result).resolves.toEqual({
         type: 'error',
-        errorMessage: 'Session input readiness timeout for PID 45',
+        errorMessage: 'Session startup timeout for PID 45',
       });
     } finally {
       vi.useRealTimers();
@@ -296,6 +344,19 @@ describe('isProviderReadyForDaemonRegistration', () => {
   });
 });
 
+describe('isFreshDaemonSessionCandidate', () => {
+  it('admits only a pending fresh daemon child, never a restore or external child', () => {
+    expect(isFreshDaemonSessionCandidate({ startedBy: 'daemon' }, true)).toBe(true);
+    expect(isFreshDaemonSessionCandidate({ startedBy: 'daemon' }, false)).toBe(false);
+    expect(isFreshDaemonSessionCandidate({ startedBy: 'daemon',
+      expectedHappySessionId: 'session-a' }, true)).toBe(false);
+    expect(isFreshDaemonSessionCandidate({ startedBy: 'daemon',
+      resumeTarget: '00000000-0000-4000-8000-000000000001' }, true)).toBe(false);
+    expect(isFreshDaemonSessionCandidate({ startedBy: 'terminal' }, true)).toBe(false);
+    expect(isFreshDaemonSessionCandidate(undefined, true)).toBe(false);
+  });
+});
+
 describe('isTrackedProviderRestoreReady', () => {
   it('requires an exact Codex resume proof only for restored Codex children', () => {
     const restored = { expectedHappySessionId: 'happy-session', resumeTarget:
@@ -347,12 +408,29 @@ describe('tracked input transport presence', () => {
     })).toBe('online');
   });
 
-  it('defers daemon upgrades for user sessions and never treats recovered PIDs as managed children', () => {
+  it('preserves ordinary shutdown and revalidates recovered ownership before destructive shutdown', () => {
     const child = { pid: 42, exitCode: null, signalCode: null } as TrackedSession['childProcess'];
     const managed: TrackedSession = { startedBy: 'daemon', pid: 42, childProcess: child };
+    const recovered: TrackedSession = {
+      startedBy: 'daemon',
+      pid: 43,
+      expectedHappySessionId: 'session-a',
+    };
     expect(isDaemonManagedSession(managed)).toBe(true);
-    expect(isDaemonManagedSession({ startedBy: 'daemon', pid: 42 })).toBe(false);
+    expect(isDaemonManagedSession(recovered, [{ pid: 43, sessionId: 'session-a' }])).toBe(true);
+    expect(isDaemonManagedSession(recovered, [{ pid: 43, sessionId: 'session-b' }])).toBe(false);
     expect(isDaemonManagedSession({ startedBy: 'daemon', pid: 42, tmuxSessionId: 'happy:1' })).toBe(true);
+    expect(shutdownHasUnownedTargets(false, [{ startedBy: 'daemon', pid: 99 }])).toBe(false);
+    expect(shutdownHasUnownedTargets(true, [{ startedBy: 'daemon', pid: 99 }])).toBe(true);
+    expect(shutdownHasUnownedTargets(true, [recovered], [{ pid: 43, sessionId: 'session-a' }])).toBe(false);
+    expect(daemonHandoffHasUnrecoverableSessions([recovered], [{ pid: 43, sessionId: 'session-a' }]))
+      .toBe(false);
+    expect(daemonHandoffHasUnrecoverableSessions([recovered], [])).toBe(true);
+    expect(daemonHandoffHasUnrecoverableSessions([{ startedBy: 'terminal', pid: 44 }], [])).toBe(false);
+    expect(daemonHandoffIsBusy(0, 0, 0)).toBe(false);
+    expect(daemonHandoffIsBusy(1, 0, 0)).toBe(true);
+    expect(daemonHandoffIsBusy(0, 1, 0)).toBe(true);
+    expect(daemonHandoffIsBusy(0, 0, 1)).toBe(true);
   });
 
 });

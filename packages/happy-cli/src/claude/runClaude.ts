@@ -2,7 +2,6 @@ import os from 'node:os';
 import { randomUUID } from 'node:crypto';
 
 import { ApiClient } from '@/api/api';
-import { fetchAndInjectPendingMessages } from '@/utils/fetchPendingMessages';
 import { logger } from '@/ui/logger';
 import { loop } from '@/claude/loop';
 import { AgentState, localCommandUserText, Metadata, modelFacingUserText } from '@/api/types';
@@ -20,6 +19,7 @@ import { buildHtaskClaudeEnvironment, findHtaskRoot, htaskCanonicalTitle, resolv
 import { getEnvironmentInfo } from '@/ui/doctor';
 import { configuration } from '@/configuration';
 import { completeProviderInputReady } from '@/utils/completeProviderInputReady';
+import { activateConsoleMetadata, createSessionTag } from '@/utils/sessionTag';
 import { initialMachineMetadata, shouldRegisterMachineForSession } from '@/daemon/run';
 import { startHappyServer } from '@/claude/utils/startHappyServer';
 import { startHookServer } from '@/claude/utils/startHookServer';
@@ -75,7 +75,6 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
     const workingDirectory = process.cwd();
     const isConsoleSession = process.env.HAPPY_CONSOLE_SESSION === '1';
-    const sessionTag = randomUUID();
 
     // Log environment info at startup
     logger.debugLargeJson('[START] Happy process started', getEnvironmentInfo());
@@ -114,6 +113,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         process.exit(1);
     }
     logger.debug(`Using machineId: ${machineId}`);
+    const sessionTag = createSessionTag(isConsoleSession, machineId);
 
     if (shouldRegisterMachineForSession(options.startedBy)) {
         await api.getOrCreateMachine({
@@ -181,6 +181,12 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     // Create realtime session BEFORE extractSDKMetadataAsync to avoid creating
     // a second session-scoped WebSocket that triggers stale-socket kicking
     const session = api.sessionSyncClient(response);
+    if (isConsoleSession) {
+        await session.updateMetadata(
+            (currentMetadata) => activateConsoleMetadata(currentMetadata, metadata, Date.now()),
+            { rejectOnServerError: true },
+        );
+    }
     installHappySessionEnvironment(session.sessionId);
     const claudeHtaskEnv = buildHtaskClaudeEnvironment(session.sessionId, options.claudeEnvVars);
     const htaskRoot = isConsoleSession ? null : findHtaskRoot();
@@ -682,20 +688,13 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
 
     registerKillSessionHandler(session.rpcHandlerManager, cleanup);
 
-    const pendingWindow = options.restoreSessionId
-        ? fetchAndInjectPendingMessages(
-            api, session, options.restoreSessionId,
-            response.encryptionKey, response.encryptionVariant,
-            '[START]',
-        )
-        : Promise.resolve(0);
     const restoredProviderSessionId = options.restoreSessionId
         ? response.metadata.claudeSessionId
         : undefined;
     await completeProviderInputReady({
         session,
         expectedHappySessionId: response.id,
-        pendingWindow,
+        reconcilePersistedInputs: Boolean(options.restoreSessionId),
         providerSessionId: restoredProviderSessionId,
         expectedProviderSessionId: restoredProviderSessionId,
         onUserMessage,

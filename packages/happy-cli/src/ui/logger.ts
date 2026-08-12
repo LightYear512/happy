@@ -2,13 +2,13 @@
  * Design decisions:
  * - Logging should be done only through file for debugging, otherwise we might disturb the claude session when in interactive mode
  * - Use info for logs that are useful to the user - this is our UI
- * - File output location: ~/.handy/logs/<date time in local timezone>.log
+ * - In explicit DEBUG mode, file output goes to ~/.happy/logs/<local date-time>.log
  */
 
 import chalk from 'chalk'
-import { appendFileSync } from 'fs'
 import { configuration } from '@/configuration'
 import { existsSync, readdirSync, statSync } from 'node:fs'
+import { appendFile, readdir, stat, unlink } from 'node:fs/promises'
 import { join, basename } from 'node:path'
 // Note: readDaemonState is imported lazily inside listDaemonLogFiles() to avoid
 // circular dependency: logger.ts ↔ persistence.ts
@@ -45,14 +45,64 @@ function getSessionLogPath(): string {
   return join(configuration.logsDir, filename)
 }
 
-class Logger {
+const MAX_LOG_RECORD_BYTES = 64 * 1024
+const MAX_LOG_FILE_BYTES = 8 * 1024 * 1024
+const MAX_LOG_DIRECTORY_BYTES = 256 * 1024 * 1024
+const MAX_LOG_FILES = 128
+const MAX_LOG_AGE_MS = 7 * 24 * 60 * 60 * 1000
+
+function boundedUtf8(value: string, limit: number): string {
+  const bytes = Buffer.from(value, 'utf8')
+  if (bytes.length <= limit) return value
+  let end = limit
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1
+  return bytes.subarray(0, end).toString('utf8')
+}
+
+export async function pruneLogDirectory(
+  directory: string,
+  currentLogPath: string,
+  options: { now?: number; maxAgeMs?: number; maxBytes?: number; maxFiles?: number } = {},
+): Promise<void> {
+  const now = options.now ?? Date.now()
+  const maxAgeMs = options.maxAgeMs ?? MAX_LOG_AGE_MS
+  const maxBytes = options.maxBytes ?? MAX_LOG_DIRECTORY_BYTES
+  const maxFiles = options.maxFiles ?? MAX_LOG_FILES
+  let entries
+  try { entries = await readdir(directory, { withFileTypes: true }) } catch { return }
+  const retained: Array<{ path: string; bytes: number; modifiedAt: number }> = []
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.log')) continue
+    const file = join(directory, entry.name)
+    let info
+    try { info = await stat(file) } catch { continue }
+    if (file !== currentLogPath && now - info.mtimeMs > maxAgeMs) {
+      try { await unlink(file) } catch { /* another cleanup may have removed it */ }
+      continue
+    }
+    retained.push({ path: file, bytes: info.size, modifiedAt: info.mtimeMs })
+  }
+  let total = retained.reduce((sum, row) => sum + row.bytes, 0)
+  let count = retained.length
+  retained.sort((left, right) => left.modifiedAt - right.modifiedAt)
+  for (const row of retained) {
+    if (total <= maxBytes && count <= maxFiles) break
+    if (row.path === currentLogPath) continue
+    try { await unlink(row.path); total -= row.bytes; count -= 1 } catch { /* already removed */ }
+  }
+}
+
+export class Logger {
   private dangerouslyUnencryptedServerLoggingUrl: string | undefined
+  private logBytes = 0
+  private writeChain: Promise<void> = Promise.resolve()
 
   constructor(
-    public readonly logFilePath = getSessionLogPath()
+    public readonly logFilePath = getSessionLogPath(),
+    private readonly maxFileBytes = MAX_LOG_FILE_BYTES,
   ) {
     // Remote logging enabled only when explicitly set with server URL
-    if (process.env.DANGEROUSLY_LOG_TO_SERVER_FOR_AI_AUTO_DEBUGGING 
+    if (process.env.DEBUG && process.env.DANGEROUSLY_LOG_TO_SERVER_FOR_AI_AUTO_DEBUGGING
       && process.env.HAPPY_SERVER_URL) {
       this.dangerouslyUnencryptedServerLoggingUrl = process.env.HAPPY_SERVER_URL
       console.log(chalk.yellow('[REMOTE LOGGING] Sending logs to server for AI debugging'))
@@ -66,6 +116,7 @@ class Logger {
   }
 
   debug(message: string, ...args: unknown[]): void {
+    if (!process.env.DEBUG) return
     this.logToFile(`[${this.localTimezoneTimestamp()}]`, message, ...args)
 
     // NOTE: @kirill does not think its a good ideas,
@@ -78,6 +129,11 @@ class Logger {
     // }
   }
 
+  /** Small, bounded production diagnostics for lifecycle boundaries only. */
+  trace(message: string, ...args: unknown[]): void {
+    this.logToFile(`[${this.localTimezoneTimestamp()}]`, message, ...args)
+  }
+
   debugLargeJson(
     message: string,
     object: unknown,
@@ -85,7 +141,7 @@ class Logger {
     maxArrayLength: number = 10,
   ): void {
     if (!process.env.DEBUG) {
-      this.debug(`In production, skipping message inspection`)
+      return
     }
 
     // Some of our messages are huge, but we still want to show them in the logs
@@ -147,6 +203,10 @@ class Logger {
   getLogPath(): string {
     return this.logFilePath
   }
+
+  async flush(): Promise<void> {
+    await this.writeChain
+  }
   
   private logToConsole(level: 'debug' | 'error' | 'info' | 'warn', prefix: string, message: string, ...args: unknown[]): void {
     switch (level) {
@@ -201,9 +261,13 @@ class Logger {
   }
 
   private logToFile(prefix: string, message: string, ...args: unknown[]): void {
-    const logLine = `${prefix} ${message} ${args.map(arg => 
+    const rawLine = `${prefix} ${message} ${args.map(arg =>
       typeof arg === 'string' ? arg : JSON.stringify(arg)
-    ).join(' ')}\n`
+    ).join(' ')}`
+    const logLine = `${boundedUtf8(rawLine, MAX_LOG_RECORD_BYTES - 1)}\n`
+    const bytes = Buffer.byteLength(logLine, 'utf8')
+    if (this.logBytes + bytes > this.maxFileBytes) return
+    this.logBytes += bytes
     
     // Send to remote server if configured
     if (this.dangerouslyUnencryptedServerLoggingUrl) {
@@ -218,16 +282,11 @@ class Logger {
       })
     }
     
-    // Handle async file path
-    try {
-      appendFileSync(this.logFilePath, logLine)
-    } catch (appendError) {
-      if (process.env.DEBUG) {
-        console.error('[DEV MODE ONLY THROWING] Failed to append to log file:', appendError)
-        throw appendError
-      }
-      // In production, fail silently to avoid disturbing Claude session
-    }
+    this.writeChain = this.writeChain.then(async () => {
+      await appendFile(this.logFilePath, logLine)
+    }).catch((appendError: unknown) => {
+      if (process.env.DEBUG) console.error('[DEV MODE] Failed to append to log file:', appendError)
+    })
   }
 }
 
