@@ -43,6 +43,7 @@ class FakeSession extends EventEmitter {
     readonly sessionId = 'fake-session-id';
     readonly sessionEvents: Array<{ type: string; message?: string }> = [];
     readonly providerTurnEnds: Array<'completed' | 'failed' | 'cancelled'> = [];
+    readonly daemonTurnEvents: Array<'started' | 'ended'> = [];
     readonly codexMessages: unknown[] = [];
     readonly rpcHandlers = new Map<string, (params: unknown) => unknown>();
     metadata: Metadata = {
@@ -84,6 +85,11 @@ class FakeSession extends EventEmitter {
             meta: { sentFrom: 'cli', modelText, displayText, presentation: 'compact' } });
     }
     sendSessionEvent(event: { type: string; message?: string }): void { this.sessionEvents.push(event); }
+    async beginDaemonSessionTurn(): Promise<string> {
+        this.daemonTurnEvents.push('started');
+        return `xc-turn-v1-${'1'.repeat(64)}`;
+    }
+    closeDaemonSessionTurn(): void { this.daemonTurnEvents.push('ended'); }
     closeProviderSessionTurn(status: 'completed' | 'failed' | 'cancelled'): void {
         this.providerTurnEnds.push(status);
     }
@@ -306,6 +312,7 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
             && (message as { type?: unknown }).type === 'message'
             && (message as { message?: unknown }).message === expectedText);
         expect(delivered).toHaveLength(1);
+        expect(fakeSession.daemonTurnEvents).toEqual(['started', 'ended']);
 
         requestExit?.();
         await runtime;

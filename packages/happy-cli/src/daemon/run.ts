@@ -6,7 +6,7 @@ import { killProcessTree } from '@/utils/processKill';
 
 import { ApiClient } from '@/api/api';
 import { XC_VIRTUAL_SESSION_ID_PATTERN,
-  type ObservedTrackedSession, type SessionInputState, type TrackedSession } from './types';
+  type ObservedTrackedSession, type SessionInputState, type SessionTurnReport, type TrackedSession } from './types';
 import { MachineMetadata, DaemonState, Metadata, type PermissionMode } from '@/api/types';
 import { SpawnSessionOptions, SpawnSessionResult } from '@/modules/common/registerCommonHandlers';
 import { logger, pruneLogDirectory } from '@/ui/logger';
@@ -28,6 +28,18 @@ import { expandEnvironmentVariables } from '@/utils/expandEnvVars';
 import { getCodexInstancePath } from '@/commands/bang/ccsProfiles';
 import { reportProjectError } from '@/utils/projectSessionStartup';
 import { findAllHappyProcesses } from './doctor';
+
+export function applyTrackedSessionTurn(session: TrackedSession, report: SessionTurnReport): boolean {
+  if ((report.state === 'running') !== (report.token !== null)) return false;
+  const prior = session.turn;
+  if (prior?.sourceId && prior.sourceId !== report.sourceId) return false;
+  if (prior && report.sequence < prior.sequence) return false;
+  if (prior && report.sequence === prior.sequence) {
+    return prior.state === report.state && prior.token === report.token;
+  }
+  session.turn = { ...report };
+  return true;
+}
 
 // Restore file persistence for session auto-restore.
 // Only stores immutable spawn params. sessionTag and claudeSessionId come from Server at restore time.
@@ -830,6 +842,7 @@ export async function startDaemon(): Promise<void> {
       sessionId: string,
       sessionMetadata: Metadata,
       readyProviderSessionId?: string,
+      turn?: SessionTurnReport,
     ) => {
       logger.debugLargeJson(`[DAEMON RUN] Session reported`, sessionMetadata);
 
@@ -952,6 +965,9 @@ export async function startDaemon(): Promise<void> {
       // Persist restore file for any session (daemon-spawned or external).
       // Skip console sessions — they should not be restorable (would cause multiple consoles).
       const tracked = pidToTrackedSession.get(pid);
+      if (tracked && turn && !applyTrackedSessionTurn(tracked, turn)) {
+        logger.debug(`[DAEMON RUN] Ignored stale turn snapshot for ${sessionId} sequence=${turn.sequence}`);
+      }
       if (sessionId && sessionMetadata.path && !tracked?.isConsoleSession && sessionMetadata.consoleSession !== true) {
         const agent = (sessionMetadata.flavor === 'codex' ? 'codex' : sessionMetadata.flavor === 'gemini' ? 'gemini' : 'claude') as 'claude' | 'codex' | 'gemini';
         try {
@@ -987,8 +1003,16 @@ export async function startDaemon(): Promise<void> {
       sessionId: string,
       sessionMetadata: Metadata,
       readyProviderSessionId?: string,
+      turn?: SessionTurnReport,
     ): Promise<void> => runSerial(webhookQueue, sessionId, () => processHappySessionWebhook(
-      sessionId, sessionMetadata, readyProviderSessionId));
+      sessionId, sessionMetadata, readyProviderSessionId, turn));
+
+    const onSessionTurn = async (sessionId: string, pid: number, turn: SessionTurnReport): Promise<boolean> => {
+      const matches = matchingTrackedSessions(sessionId);
+      if (matches.length !== 1 || matches[0]![0] !== pid || !isProcessAlive(pid)) return false;
+      const tracked = matches[0]![1];
+      return pidToTrackedSession.get(pid) === tracked && applyTrackedSessionTurn(tracked, turn);
+    };
 
     // Spawn a new session (sessionId reserved for future --resume functionality)
     const spawnSession = async (options: SpawnSessionOptions): Promise<SpawnSessionResult> => {
@@ -1528,6 +1552,7 @@ export async function startDaemon(): Promise<void> {
       },
       requestShutdown: () => requestShutdown('happy-cli'),
       onHappySessionWebhook,
+      onSessionTurn,
       onCodexProfile: updateRestoreCodexProfile,
     });
 

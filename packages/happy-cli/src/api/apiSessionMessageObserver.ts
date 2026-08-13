@@ -1,5 +1,6 @@
 import { configuration } from '@/configuration';
 import { io, type Socket } from 'socket.io-client';
+import { traceHappyServerSocket } from './serverOperationTrace';
 
 /** Creates the supplementary user-scoped receipt observer used by exact Codex persistence. */
 export function createUserScopedMessageObserver(
@@ -15,6 +16,7 @@ export function createUserScopedMessageObserver(
         autoConnect: false,
         forceNew: true,
     });
+    traceHappyServerSocket(socket, 'message-observer');
     socket.on('update', onUpdate);
     return socket;
 }

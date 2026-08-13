@@ -115,6 +115,7 @@ export async function handleAuthAllBangCommand(args: string, ctx: BangCommandCon
     const flavor: AuthFlavor = hasCodexFlag ? 'codex' : resolveAuthFlavor(ctx);
 
     if (!cleanArgs) {
+        ctx.client.sendSessionEvent({ type: 'message', message: '⏳ 账号信息查询中' });
         return listProfiles(true, flavor);
     }
 
@@ -438,11 +439,10 @@ async function listProfiles(isConsole: boolean, flavor: AuthFlavor = 'claude'): 
         if (profiles.length === 0) {
             return { message: `❌ 未找到 CCS 配置。(${flavorLabel})`, action: 'none' };
         }
-        const profileNames = profiles.map(p => p.name);
-        // The control console is a selector, not a usage-refresh surface.
-        // Reading the shared cache keeps the command immediate and avoids one
-        // live request per account on every menu open.
-        const usageMap = readCachedUsageSummaries(profileNames, flavor);
+        const usageMap = new Map(await Promise.all(profiles.map(async profile => [
+            profile.name,
+            await fetchProfileUsageSummary(profile.name, flavor, false),
+        ] as const)));
         const suggestions = buildProfileOptions(profiles, usageMap, {
             command: flavor === 'codex' ? '@aa-codex' : '@aa',
             defaultProfile,

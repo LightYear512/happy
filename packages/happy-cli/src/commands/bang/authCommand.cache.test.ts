@@ -95,7 +95,7 @@ function consoleContext(): BangCommandContext & {
     };
 }
 
-describe('console account switch usage cache', () => {
+describe('console account switch live usage', () => {
     let root: string;
 
     beforeEach(() => {
@@ -111,17 +111,29 @@ describe('console account switch usage cache', () => {
         vi.resetModules();
     });
 
-    it('reuses account usage cached less than five minutes ago', async () => {
+    it('queries account usage even when a fresh cache exists', async () => {
         writeConsoleProfile(root, Date.now() - 4 * 60 * 1000);
+        fetchMock.mockResolvedValueOnce({
+            ok: true,
+            json: async () => ({
+                five_hour: { utilization: 23, resets_at: '2030-01-01T00:00:00.000Z' },
+                seven_day: { utilization: 10, resets_at: '2030-01-07T00:00:00.000Z' },
+            }),
+            text: async () => '',
+        });
         const { handleAuthAllBangCommand } = await import('./authCommand');
 
         const result = await handleAuthAllBangCommand('', consoleContext());
 
-        expect(fetchMock).not.toHaveBeenCalled();
+        expect(fetchMock).toHaveBeenCalledTimes(1);
         const options = result.suggestions?.join('\n');
-        expect(options).toContain('5h:91%');
+        expect(options).toContain('5h:23%');
         expect(options).toContain('7d:10%');
-        expect(options).toContain('取4m');
+        expect(options).not.toContain('5h:91%');
+        const cache = JSON.parse(readFileSync(join(root, 'happy', 'usage-cache.json'), 'utf8'));
+        expect(Object.values(cache.claude)[0]).toMatchObject({
+            data: { five_hour: { utilization: 91 } },
+        });
     });
 
     it('queries account usage when the cache is older than five minutes', async () => {
@@ -171,7 +183,7 @@ describe('console account switch usage cache', () => {
         expect(result.suggestions?.join('\n')).toContain('5h:23%');
     });
 
-    it('shows an aged last-known entry when the direct query fails', async () => {
+    it('does not substitute an aged cache when the direct query fails', async () => {
         writeConsoleProfile(root, Date.now() - 6 * 60 * 1000);
         fetchMock.mockRejectedValueOnce(new Error('network down'));
         const { handleAuthAllBangCommand } = await import('./authCommand');
@@ -180,24 +192,39 @@ describe('console account switch usage cache', () => {
 
         expect(fetchMock).toHaveBeenCalledTimes(1);
         const options = result.suggestions?.join('\n');
-        expect(options).toContain('5h:91%');
-        expect(options).toContain('7d:10%');
-        expect(options).toContain('缓6m');
-        expect(options).not.toContain('用量未知');
+        expect(options).not.toContain('5h:91%');
+        expect(options).not.toContain('7d:10%');
+        expect(options).toContain('用量未知');
     });
 
-    it('shows separate 5h and 7d acquisition ages when a Codex window was carried', async () => {
+    it('does not carry a cached Codex window into the live menu result', async () => {
         writeCodexConsoleProfile(root, Date.now() - 60_000, Date.now() - 6 * 60_000);
+        fetchMock.mockResolvedValueOnce({
+            ok: true,
+            json: async () => ({
+                plan_type: 'pro',
+                rate_limit: {
+                    primary_window: {
+                        used_percent: 17,
+                        reset_at: 1893456000,
+                        limit_window_seconds: 18_000,
+                    },
+                    secondary_window: null,
+                },
+                code_review_rate_limit: null,
+            }),
+            text: async () => '',
+        });
         const { handleAuthAllBangCommand } = await import('./authCommand');
 
         const result = await handleAuthAllBangCommand('--codex', consoleContext());
         const options = result.suggestions?.join('\n');
 
-        expect(fetchMock).not.toHaveBeenCalled();
-        expect(options).toContain('5h:23%');
-        expect(options).toContain('7d:11%');
-        expect(options).toContain('5h取1m');
-        expect(options).toContain('7d缓6m');
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(options).toContain('5h:17%');
+        expect(options).toContain('7d:未知');
+        expect(options).not.toContain('5h:23%');
+        expect(options).not.toContain('7d:11%');
     });
 
     it('requeries an ambiguous old single-primary cache and renders a duration-proven 7d window', async () => {

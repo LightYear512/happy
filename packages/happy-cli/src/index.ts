@@ -33,6 +33,9 @@ import { claudeCliPath } from './claude/claudeLocal'
 import { execFileSync } from 'node:child_process'
 import { extractNoSandboxFlag } from './utils/sandboxFlags'
 import { MessageMetaSchema, type PermissionMode } from './api/types'
+import { installHappyServerHttpTrace } from './api/serverOperationTrace'
+
+installHappyServerHttpTrace()
 
 async function ensureDaemonForSession(startedBy: 'daemon' | 'terminal' | undefined): Promise<void> {
   if (!shouldSessionEnsureDaemon(startedBy)) {

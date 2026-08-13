@@ -6,6 +6,7 @@
 import { logger } from '@/ui/logger';
 import { clearDaemonState, readDaemonState } from '@/persistence';
 import type { Metadata, PermissionMode } from '@/api/types';
+import type { SessionTurnReport } from './types';
 
 type DaemonPostError = { error: string; status?: number };
 const DAEMON_POST_TIMEOUT_MS = 10_000;
@@ -65,12 +66,21 @@ export async function notifyDaemonSessionStarted(
   sessionId: string,
   metadata: Metadata,
   readyProviderSessionId?: string,
+  turn?: SessionTurnReport,
 ): Promise<{ error?: string } | any> {
   return await daemonPost('/session-started', {
     sessionId,
     metadata,
     ...(readyProviderSessionId ? { readyProviderSessionId } : {}),
+    ...(turn ? { turn } : {}),
   });
+}
+
+export async function notifyDaemonSessionTurn(
+  sessionId: string,
+  turn: SessionTurnReport,
+): Promise<{ error?: string } | any> {
+  return await daemonPost('/session-turn', { sessionId, pid: process.pid, turn });
 }
 
 export async function notifyDaemonCodexProfile(

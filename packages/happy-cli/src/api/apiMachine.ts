@@ -11,6 +11,7 @@ import { registerCommonHandlers, SpawnSessionOptions, SpawnSessionResult } from 
 import { encodeBase64, decodeBase64, encrypt, decrypt } from './encryption';
 import { backoff } from '@/utils/time';
 import { RpcHandlerManager } from './rpc/RpcHandlerManager';
+import { traceHappyServerSocket } from './serverOperationTrace';
 
 interface ServerToDaemonEvents {
     update: (data: Update) => void;
@@ -272,6 +273,7 @@ export class ApiMachineClient {
             reconnectionDelay: 1000,
             reconnectionDelayMax: 5000
         });
+        traceHappyServerSocket(this.socket, `machine:${this.machine.id}`);
 
         this.socket.on('connect', () => {
             logger.debug('[API MACHINE] Connected to server');

@@ -44,11 +44,10 @@
 
 import { spawn } from 'node:child_process';
 import { promises as fsp } from 'node:fs';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
 
 import { logger } from '@/ui/logger';
+import { createDisposableTempDirectory, removeDisposableTempDirectory } from '@/utils/disposableTemp';
 import { buildWindowsSpawnArgs } from '../codexAppServerClient';
 import { SEED_SENTINEL } from './compactSeedBuilder';
 
@@ -135,7 +134,17 @@ export async function compactViaCodexExec(
     }
 
     const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    const outFile = join(tmpdir(), `happy-l2-out-${randomUUID()}.txt`);
+    let temporaryDirectory: string;
+    try {
+        temporaryDirectory = await createDisposableTempDirectory('happy-l2-output');
+    } catch (err) {
+        const elapsedMs = Date.now() - startMs;
+        return { summary: null, elapsedMs, error: `temporary output unavailable: ${(err as Error).message}` };
+    }
+    const outFile = join(temporaryDirectory, 'output.txt');
+    const cleanupTemporaryDirectory = async () => {
+        try { await removeDisposableTempDirectory(temporaryDirectory); } catch { /* best-effort cleanup */ }
+    };
     const codexBin = opts.codexBin ?? 'codex';
 
     const args = [
@@ -175,6 +184,7 @@ export async function compactViaCodexExec(
             windowsHide: true,
         });
     } catch (err) {
+        await cleanupTemporaryDirectory();
         const elapsedMs = Date.now() - startMs;
         const msg = `spawn failed: ${(err as Error).message}`;
         logger.debug(`[codexExecCompact] ${msg} (${elapsedMs}ms)`);
@@ -189,6 +199,7 @@ export async function compactViaCodexExec(
     const childStdout = child.stdout;
     const childStderr = child.stderr;
     if (!childStdin || !childStdout || !childStderr) {
+        await cleanupTemporaryDirectory();
         const elapsedMs = Date.now() - startMs;
         const msg = 'codex exec spawn returned null stdio handles';
         logger.debug(`[codexExecCompact] ${msg} (${elapsedMs}ms)`);
@@ -266,14 +277,14 @@ export async function compactViaCodexExec(
     const stderrTail = Buffer.concat(stderrChunks).toString('utf-8').slice(-600);
 
     if (killReason === 'timeout') {
-        await fsp.unlink(outFile).catch(() => { /* file may not exist */ });
+        await cleanupTemporaryDirectory();
         const msg = `timed out after ${timeoutMs}ms`;
         logger.debug(`[codexExecCompact] ${msg}; stderr tail: ${stderrTail}`);
         return { summary: null, elapsedMs, error: msg };
     }
 
     if (exitCode !== 0) {
-        await fsp.unlink(outFile).catch(() => { /* file may not exist */ });
+        await cleanupTemporaryDirectory();
         const msg = `codex exec exited ${exitCode ?? 'spawn-failed'}; stderr tail: ${stderrTail}`;
         logger.debug(`[codexExecCompact] ${msg} (${elapsedMs}ms)`);
         return { summary: null, elapsedMs, error: msg };
@@ -287,7 +298,7 @@ export async function compactViaCodexExec(
         logger.debug(`[codexExecCompact] ${msg} (${elapsedMs}ms)`);
         return { summary: null, elapsedMs, error: msg };
     } finally {
-        await fsp.unlink(outFile).catch(() => { /* best-effort cleanup */ });
+        await cleanupTemporaryDirectory();
     }
 
     const summary = raw.trim();

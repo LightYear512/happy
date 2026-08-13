@@ -10,6 +10,7 @@ import { configuration } from '@/configuration';
 import { deepEqual, deterministicStringify } from '@/utils/deterministicJson';
 import axios from 'axios';
 import { io, type Socket } from 'socket.io-client';
+import { traceHappyServerSocket } from './serverOperationTrace';
 import { decodeBase64, decrypt, encodeBase64, encrypt } from './encryption';
 import { MAX_RECOVERY_RESPONSE_BYTES, RECENT_MESSAGE_WINDOW } from './sessionMessageRecovery';
 import { createUserScopedMessageObserver } from './apiSessionMessageObserver';
@@ -317,7 +318,7 @@ export class ApiSessionMessageClient {
     }
 
     private createSocket(): Socket {
-        return io(configuration.serverUrl, {
+        const socket = io(configuration.serverUrl, {
             auth: { token: this.token, clientType: 'user-scoped' as const },
             path: '/v1/updates',
             reconnection: false,
@@ -326,6 +327,8 @@ export class ApiSessionMessageClient {
             autoConnect: false,
             forceNew: true,
         });
+        traceHappyServerSocket(socket, `message-writer:${this.session.id}`);
+        return socket;
     }
 
     private waitForConnect(socket: Socket, timeoutMs: number): Promise<void> {

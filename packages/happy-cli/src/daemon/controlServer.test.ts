@@ -105,24 +105,54 @@ describe('startDaemonControlServer', () => {
             startedBy: 'daemon',
             happySessionId: 'user-session',
             pid: 1002,
+            turnState: 'unknown',
+            turnToken: null,
           },
           {
             startedBy: 'daemon',
             happySessionId: 'restoring-session',
             pid: 1003,
+            turnState: 'unknown',
+            turnToken: null,
           },
           {
             startedBy: 'daemon',
             happySessionId: 'ready-restored-session',
             pid: 1004,
+            turnState: 'unknown',
+            turnToken: null,
           },
         ],
-        presenceVersion: 1,
+        presenceVersion: 2,
         unknownSessionIds: ['restoring-session'],
       });
     } finally {
       await server.stop();
     }
+  });
+
+  it('validates and forwards process-owned turn updates', async () => {
+    const updates: unknown[] = [];
+    const server = await startDaemonControlServer({
+      getChildren: () => [], stopSession: async () => true,
+      restoreSession: async () => ({ type: 'error', errorMessage: 'unused' }),
+      spawnSession: async () => ({ type: 'error', errorMessage: 'unused' }),
+      prepareShutdown: permitShutdown, requestShutdown: () => undefined,
+      onHappySessionWebhook: () => undefined,
+      onSessionTurn: async (sessionId, pid, turn) => {
+        updates.push({ sessionId, pid, turn }); return true;
+      },
+    });
+    try {
+      const turn = { sourceId: '00000000-0000-4000-8000-000000000001', sequence: 1,
+        state: 'running', token: `xc-turn-v1-${'a'.repeat(64)}` } as const;
+      const response = await fetch(`http://127.0.0.1:${server.port}/session-turn`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: 'session-a', pid: 42, turn }),
+      });
+      expect(response.ok).toBe(true);
+      expect(updates).toEqual([{ sessionId: 'session-a', pid: 42, turn }]);
+    } finally { await server.stop(); }
   });
 
   it('forwards exact provider readiness through the local session webhook', async () => {

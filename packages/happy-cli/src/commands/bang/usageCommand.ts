@@ -407,8 +407,12 @@ function isAuthExpiredError(err: unknown): boolean {
  * "no data yet" from "token expired and needs refresh via any cc message", and
  * render a stale marker when the data came from the failure fallback.
  */
-export async function fetchProfileUsageSummary(profileName: string, flavor: AuthFlavor): Promise<ProfileUsageEntry> {
-    ensureHydrated();
+export async function fetchProfileUsageSummary(
+    profileName: string,
+    flavor: AuthFlavor,
+    useCache = true,
+): Promise<ProfileUsageEntry> {
+    if (useCache) ensureHydrated();
     const isCodex = flavor === 'codex';
     const cacheKey = isCodex ? getCodexInstancePath(profileName) : getInstancePath(profileName);
     try {
@@ -420,6 +424,7 @@ export async function fetchProfileUsageSummary(profileName: string, flavor: Auth
                 new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000)),
             ]);
             const now = Date.now();
+            if (!useCache) return makeCodexEntry(data, now);
             const stored = setCodexCache(cacheKey, { data, fetchedAt: now });
             return makeCodexEntry(stored.data, stored.fetchedAt);
         }
@@ -432,14 +437,14 @@ export async function fetchProfileUsageSummary(profileName: string, flavor: Auth
             new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000)),
         ]);
         const now = Date.now();
-        setClaudeCache(cacheKey, { data, fetchedAt: now });
+        if (useCache) setClaudeCache(cacheKey, { data, fetchedAt: now });
         return makeClaudeEntry(data, now);
     } catch (err) {
         logger.debug(`[!usage] fetchProfileUsageSummary failed for ${profileName}:`, err);
         // Fetch failed → fall back to any cached value still within stale window, so users
         // keep seeing their last-known usage alongside the 🔒 / 💡 refresh hint.
         const authExpired = isAuthExpiredError(err);
-        const cached = isCodex ? codexCache.get(cacheKey) : cache.get(cacheKey);
+        const cached = useCache ? (isCodex ? codexCache.get(cacheKey) : cache.get(cacheKey)) : null;
         if (cached && (Date.now() - cached.fetchedAt) < STALE_TTL_MS) {
             return isCodex
                 ? makeCodexEntry((cached as CachedCodexUsage).data, cached.fetchedAt, true, authExpired)

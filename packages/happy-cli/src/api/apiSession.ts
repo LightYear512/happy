@@ -1,4 +1,4 @@
-import { logger } from '@/ui/logger'
+import { diagnosticTrace, logger } from '@/ui/logger'
 import axios from 'axios';
 import { EventEmitter } from 'node:events'
 import { io, Socket } from 'socket.io-client'
@@ -7,7 +7,7 @@ import { decodeBase64, decrypt, encodeBase64, encrypt } from './encryption';
 import { backoff } from '@/utils/time';
 import { configuration } from '@/configuration';
 import { RawJSONLines } from '@/claude/types';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { AsyncLock } from '@/utils/lock';
 import { RpcHandlerManager } from './rpc/RpcHandlerManager';
 import { registerCommonHandlers } from '../modules/common/registerCommonHandlers';
@@ -32,8 +32,11 @@ import {
     type SessionRecoveryRow,
 } from './sessionMessageRecovery';
 import { runProjectSessionClose, runProjectSessionStartup, runProjectSessionStop } from '@/utils/projectSessionStartup';
-import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
+import { notifyDaemonSessionStarted, notifyDaemonSessionTurn } from '@/daemon/controlClient';
+import type { SessionTurnReport, SessionTurnState } from '@/daemon/types';
 import { inputAcceptedEventId } from './inputAcceptanceReceipt';
+import { createUserInputTrace, logUserInputStage } from '@/utils/userInputTrace';
+import { traceHappyServerSocket } from './serverOperationTrace';
 
 const MAX_OUTBOUND_QUEUE_MESSAGES = 256;
 const MAX_OUTBOUND_QUEUE_BYTES = 1_048_576;
@@ -67,6 +70,7 @@ interface QueuedPersistentMessage {
     encrypted: string;
     localId: string;
     bytes: number;
+    kind: string;
 }
 
 interface PendingPersistedInput {
@@ -129,6 +133,11 @@ export class ApiSessionClient extends EventEmitter {
     private daemonRegistration: Promise<void> | null = null;
     private nextDaemonRegistrationAt = 0;
     private daemonProviderSessionId: string | undefined;
+    private readonly daemonTurnSourceId = randomUUID();
+    private daemonTurnSequence = 0;
+    private daemonTurnState: SessionTurnState = 'idle';
+    private daemonTurnToken: string | null = null;
+    private daemonTurnUpdate: Promise<void> = Promise.resolve();
     private hasConnected = false;
     private closing = false;
     private serverEvictionRecoveries = 0;
@@ -194,6 +203,7 @@ export class ApiSessionClient extends EventEmitter {
             withCredentials: true,
             autoConnect: false
         });
+        traceHappyServerSocket(this.socket, `session:${this.sessionId}`);
 
         //
         // Handlers
@@ -256,7 +266,7 @@ export class ApiSessionClient extends EventEmitter {
             } catch (error) {
                 logger.debug('[SOCKET] [UPDATE] [ERROR] Error handling update', boundedTransportReason(error));
                 if (isPersistedMessageUpdate) {
-                    logger.trace('[INPUT] persisted row rejected', this.sessionId,
+                    diagnosticTrace('[INPUT] persisted row rejected', this.sessionId,
                         recoveryFailureReason(error));
                 }
             }
@@ -445,7 +455,7 @@ export class ApiSessionClient extends EventEmitter {
             rawMessages = response.data?.messages;
         } catch (error) {
             if (signal?.aborted) return 'stopped';
-            logger.trace('[INPUT] reconciliation skipped', this.sessionId, mode,
+            diagnosticTrace('[INPUT] reconciliation skipped', this.sessionId, mode,
                 recoveryFailureReason(error));
             return 'retryable';
         }
@@ -477,7 +487,7 @@ export class ApiSessionClient extends EventEmitter {
             }
             return 'complete';
         } catch (error) {
-            logger.trace('[INPUT] reconciliation rejected', this.sessionId, mode,
+            diagnosticTrace('[INPUT] reconciliation rejected', this.sessionId, mode,
                 recoveryFailureReason(error));
             return 'rejected';
         }
@@ -530,7 +540,12 @@ export class ApiSessionClient extends EventEmitter {
             throw new Error('recovery_incomplete: persisted user message body is invalid');
         }
         if (userResult.success) {
-            logger.trace('[INPUT] persisted row received', this.sessionId, message.id, message.seq);
+            const trace = createUserInputTrace(this.sessionId, userResult.data);
+            logUserInputStage('persisted-received', trace, userResult.data.content.text, {
+                persistedMessageId: message.id,
+                persistedSequence: message.seq,
+                sentFrom: userResult.data.meta?.sentFrom ?? null,
+            });
             const bytes = recoveryRowBytes(message);
             if (this.pendingPersistedInputs.length >= MAX_RECOVERY_BUFFER_ROWS
                 || this.pendingPersistedBytes + bytes > MAX_RECOVERY_COLLECTION_BYTES) {
@@ -545,6 +560,11 @@ export class ApiSessionClient extends EventEmitter {
             if (insertionIndex < 0) this.pendingPersistedInputs.push(pending);
             else this.pendingPersistedInputs.splice(insertionIndex, 0, pending);
             this.pendingPersistedBytes += bytes;
+            logUserInputStage('persisted-buffered', trace, userResult.data.content.text, {
+                persistedMessageId: message.id,
+                persistedSequence: message.seq,
+                bufferedInputs: this.pendingPersistedInputs.length,
+            });
             void this.drainPersistedInputs();
         } else {
             this.emit('message', body);
@@ -563,8 +583,25 @@ export class ApiSessionClient extends EventEmitter {
             while (this.pendingPersistedInputs.length > 0) {
                 const input = this.pendingPersistedInputs[0]!;
                 if (!this.pendingMessageCallback) return;
-                this.handoffUserMessage(input.message);
-                logger.trace('[INPUT] provider handoff accepted', this.sessionId, input.row.id, input.row.seq);
+                const trace = createUserInputTrace(this.sessionId, input.message);
+                logUserInputStage('provider-handoff-start', trace, input.message.content.text, {
+                    persistedMessageId: input.row.id,
+                    persistedSequence: input.row.seq,
+                });
+                try {
+                    this.handoffUserMessage(input.message);
+                } catch (error) {
+                    logUserInputStage('provider-handoff-rejected', trace, input.message.content.text, {
+                        persistedMessageId: input.row.id,
+                        persistedSequence: input.row.seq,
+                        reason: recoveryFailureReason(error),
+                    });
+                    throw error;
+                }
+                logUserInputStage('provider-handoff-accepted', trace, input.message.content.text, {
+                    persistedMessageId: input.row.id,
+                    persistedSequence: input.row.seq,
+                });
                 this.sendInputAcceptedReceipt(input.message);
                 this.completePersistedInput(input);
             }
@@ -572,8 +609,7 @@ export class ApiSessionClient extends EventEmitter {
             if (this.socket.connected && this.transportState === 'connected') {
                 this.sendNotice('模型入口未接纳本次输入。');
             }
-            logger.trace('[INPUT] provider handoff rejected', this.sessionId,
-                recoveryFailureReason(error));
+            diagnosticTrace('[INPUT] provider drain stopped', this.sessionId, recoveryFailureReason(error));
         } finally {
             this.inputDrainRunning = false;
         }
@@ -651,6 +687,7 @@ export class ApiSessionClient extends EventEmitter {
             this.sessionId,
             metadata,
             this.daemonProviderSessionId,
+            this.daemonTurnReport(),
         ).then((result) => {
             if (result?.error) {
                 logger.debug('[API] Failed to refresh daemon session tracking:', boundedTransportReason(result.error));
@@ -661,6 +698,49 @@ export class ApiSessionClient extends EventEmitter {
             this.daemonRegistration = null;
         });
         return this.daemonRegistration;
+    }
+
+    private daemonTurnReport(): SessionTurnReport {
+        return {
+            sourceId: this.daemonTurnSourceId,
+            sequence: this.daemonTurnSequence,
+            state: this.daemonTurnState,
+            token: this.daemonTurnToken,
+        };
+    }
+
+    private syncDaemonTurn(): Promise<void> {
+        const report = this.daemonTurnReport();
+        const update = this.daemonTurnUpdate.then(async () => {
+            if (!this.daemonTrackingEnabled || this.closing) return;
+            const result = await notifyDaemonSessionTurn(this.sessionId, report);
+            if (result?.error) logger.debug('[API] Failed to update daemon turn:', boundedTransportReason(result.error));
+        }, async () => {
+            if (!this.daemonTrackingEnabled || this.closing) return;
+            const result = await notifyDaemonSessionTurn(this.sessionId, report);
+            if (result?.error) logger.debug('[API] Failed to update daemon turn:', boundedTransportReason(result.error));
+        });
+        this.daemonTurnUpdate = update.catch((error) => {
+            logger.debug('[API] Failed to update daemon turn:', boundedTransportReason(error));
+        });
+        return update;
+    }
+
+    async beginDaemonSessionTurn(): Promise<string> {
+        if (this.daemonTurnState === 'running') return this.daemonTurnToken!;
+        this.daemonTurnState = 'running';
+        this.daemonTurnToken = `xc-turn-v1-${randomBytes(32).toString('hex')}`;
+        this.daemonTurnSequence += 1;
+        await this.syncDaemonTurn();
+        return this.daemonTurnToken;
+    }
+
+    closeDaemonSessionTurn(_status: SessionTurnEndStatus = 'completed'): void {
+        if (this.daemonTurnState !== 'running') return;
+        this.daemonTurnState = 'idle';
+        this.daemonTurnToken = null;
+        this.daemonTurnSequence += 1;
+        void this.syncDaemonTurn();
     }
 
     private failTransport(reason: string): void {
@@ -675,9 +755,21 @@ export class ApiSessionClient extends EventEmitter {
             this.transportState === 'closed';
     }
 
-    private sendPersistentMessage(encrypted: string): void {
+    private logPersistentSocketEmit(kind: string, bytes: number, delivery: 'direct' | 'queued-flush'): void {
+        diagnosticTrace('[SERVER_SEND]', JSON.stringify({
+            time: Date.now(),
+            sessionId: this.sessionId,
+            kind,
+            bytes,
+            delivery,
+        }));
+    }
+
+    private sendPersistentMessage(encrypted: string, kind: string): void {
+        const bytes = Buffer.byteLength(encrypted, 'utf8');
         if (this.socket.connected && this.transportState === 'connected') {
             const localId = `happy-cli-v1-${randomUUID()}`;
+            this.logPersistentSocketEmit(kind, bytes, 'direct');
             this.socket.emit('message', { sid: this.sessionId, message: encrypted, localId });
             return;
         }
@@ -687,14 +779,13 @@ export class ApiSessionClient extends EventEmitter {
             this.emit('transport-fatal', this.getTransportSnapshot());
             throw new Error(`Happy persistent message rejected: transport is ${this.transportState}`);
         }
-        const bytes = Buffer.byteLength(encrypted, 'utf8');
         if (this.outboundQueue.length >= MAX_OUTBOUND_QUEUE_MESSAGES ||
             this.outboundQueueBytes + bytes > MAX_OUTBOUND_QUEUE_BYTES) {
             this.failTransport('outbound_queue_overflow: persistent message recovery queue exceeded budget');
             throw new Error('Happy persistent message rejected: outbound_queue_overflow');
         }
         const localId = `happy-cli-v1-${randomUUID()}`;
-        this.outboundQueue.push({ encrypted, localId, bytes });
+        this.outboundQueue.push({ encrypted, localId, bytes, kind });
         this.outboundQueueBytes += bytes;
         this.publishTransportState(this.transportState, this.transportReason);
     }
@@ -704,6 +795,7 @@ export class ApiSessionClient extends EventEmitter {
         const queued = this.outboundQueue.splice(0);
         this.outboundQueueBytes = 0;
         for (const message of queued) {
+            this.logPersistentSocketEmit(message.kind, message.bytes, 'queued-flush');
             this.socket.emit('message', { sid: this.sessionId, message: message.encrypted, localId: message.localId });
         }
         this.publishTransportState('connected', null);
@@ -739,6 +831,8 @@ export class ApiSessionClient extends EventEmitter {
                 type: 'message',
                 message: `${time} 已接收，正在投递`,
             }, inputAcceptedEventId(message.localKey));
+            logUserInputStage('acceptance-receipt-emitted', createUserInputTrace(this.sessionId, message),
+                message.content.text);
         } catch (error) {
             logger.debug('[API] Failed to persist input acceptance receipt:', boundedTransportReason(error));
         }
@@ -773,6 +867,11 @@ export class ApiSessionClient extends EventEmitter {
      * @param body - Message body (can be MessageContent or raw content for agent messages)
      */
     sendClaudeSessionMessage(body: RawJSONLines) {
+        const mapped = mapClaudeLogMessageToSessionEnvelopes(body, this.claudeSessionProtocolState);
+        for (const envelope of mapped.envelopes) {
+            if (envelope.ev.t === 'turn-start') void this.beginDaemonSessionTurn();
+            else if (envelope.ev.t === 'turn-end') this.closeDaemonSessionTurn(envelope.ev.status);
+        }
         let content: MessageContent;
 
         // Check if body is already a MessageContent (has role property)
@@ -802,7 +901,7 @@ export class ApiSessionClient extends EventEmitter {
         }
 
         const encrypted = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, content));
-        this.sendPersistentMessage(encrypted);
+        this.sendPersistentMessage(encrypted, `claude:${body.type}`);
 
         // Track usage from assistant messages
         if (body.type === 'assistant' && body.message?.usage) {
@@ -825,8 +924,11 @@ export class ApiSessionClient extends EventEmitter {
         }
     }
 
-    closeClaudeSessionTurn(_status: SessionTurnEndStatus = 'completed') {
-        // Provider lifecycle is owned by the provider queue; XC never gates the next human input.
+    closeClaudeSessionTurn(status: SessionTurnEndStatus = 'completed') {
+        const mapped = closeClaudeTurnWithStatus(this.claudeSessionProtocolState, status);
+        if (mapped.envelopes.some((envelope) => envelope.ev.t === 'turn-end')) {
+            this.closeDaemonSessionTurn(status);
+        }
     }
 
     sendCodexMessage(body: any) {
@@ -842,7 +944,7 @@ export class ApiSessionClient extends EventEmitter {
         };
         const encrypted = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, content));
 
-        this.sendPersistentMessage(encrypted);
+        this.sendPersistentMessage(encrypted, `codex:${typeof body?.type === 'string' ? body.type : 'unknown'}`);
     }
 
     sendSessionProtocolMessage(envelope: SessionEnvelope) {
@@ -859,7 +961,7 @@ export class ApiSessionClient extends EventEmitter {
 
         const encrypted = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, content));
 
-        this.sendPersistentMessage(encrypted);
+        this.sendPersistentMessage(encrypted, `session:${envelope.ev.t}`);
     }
 
     /**
@@ -885,7 +987,7 @@ export class ApiSessionClient extends EventEmitter {
         logger.debug(`[SOCKET] Sending ACP message from ${provider}:`, { type: body.type, hasMessage: 'message' in body });
 
         const encrypted = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, content));
-        this.sendPersistentMessage(encrypted);
+        this.sendPersistentMessage(encrypted, `acp:${provider}:${body.type}`);
     }
 
     sendSessionEvent(event: {
@@ -910,7 +1012,7 @@ export class ApiSessionClient extends EventEmitter {
             }
         };
         const encrypted = encodeBase64(encrypt(this.encryptionKey, this.encryptionVariant, content));
-        this.sendPersistentMessage(encrypted);
+        this.sendPersistentMessage(encrypted, `event:${event.type}`);
     }
 
     /**

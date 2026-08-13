@@ -1,11 +1,18 @@
-import { mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { readFile, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { basename, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { Logger, logger, pruneLogDirectory } from './logger';
+import { createDisposableTempDirectory, disposableTempRoot } from '@/utils/disposableTemp';
+import {
+  diagnosticTrace,
+  flushDiagnosticTrace,
+  Logger,
+  logger,
+  pruneLogDirectory,
+} from './logger';
 
 const originalDebug = process.env.DEBUG;
 const originalRemoteLogging = process.env.DANGEROUSLY_LOG_TO_SERVER_FOR_AI_AUTO_DEBUGGING;
+const originalServerUrl = process.env.HAPPY_SERVER_URL;
 
 beforeEach(() => {
   delete process.env.DANGEROUSLY_LOG_TO_SERVER_FOR_AI_AUTO_DEBUGGING;
@@ -16,6 +23,8 @@ afterEach(() => {
   else process.env.DEBUG = originalDebug;
   if (originalRemoteLogging === undefined) delete process.env.DANGEROUSLY_LOG_TO_SERVER_FOR_AI_AUTO_DEBUGGING;
   else process.env.DANGEROUSLY_LOG_TO_SERVER_FOR_AI_AUTO_DEBUGGING = originalRemoteLogging;
+  if (originalServerUrl === undefined) delete process.env.HAPPY_SERVER_URL;
+  else process.env.HAPPY_SERVER_URL = originalServerUrl;
   vi.restoreAllMocks();
 });
 
@@ -64,7 +73,7 @@ describe('large JSON logging', () => {
   });
 
   it('writes asynchronously within the per-file capacity', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'happy-logger-'));
+    const directory = await createDisposableTempDirectory('happy-logger-test');
     const file = join(directory, 'bounded.log');
     process.env.DEBUG = '1';
     try {
@@ -78,23 +87,25 @@ describe('large JSON logging', () => {
     }
   });
 
-  it('writes bounded lifecycle traces in production without formatting message bodies', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'happy-trace-'));
-    const file = join(directory, 'trace.log');
-    delete process.env.DEBUG;
-    try {
-      const bounded = new Logger(file, 256);
-      bounded.trace('[INPUT] persisted row received', 'session-1', 'message-1', 7);
-      await bounded.flush();
-      await expect(readFile(file, 'utf8')).resolves.toMatch(/session-1 message-1 7/u);
-      expect((await stat(file)).size).toBeLessThanOrEqual(256);
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
+  it('isolates versioned temporary diagnostics in one disposable direct child', async () => {
+    process.env.DEBUG = '1';
+    process.env.DANGEROUSLY_LOG_TO_SERVER_FOR_AI_AUTO_DEBUGGING = '1';
+    process.env.HAPPY_SERVER_URL = 'https://logs.invalid';
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    diagnosticTrace('[USER_INPUT]', JSON.stringify({ inputId: 'local-1', stage: 'received' }));
+    const file = await flushDiagnosticTrace();
+
+    expect(file).not.toBeNull();
+    expect(file!.startsWith(`${disposableTempRoot()}/happy-diagnostic.`)).toBe(true);
+    expect(basename(file!)).toMatch(/^diagnostic-[a-zA-Z0-9._-]+\.log$/u);
+    expect((await readFile(file!, 'utf8'))).toContain('[USER_INPUT]');
+    expect((await stat(file!)).size).toBeLessThanOrEqual(2 * 1024 * 1024);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('prunes expired logs and enforces the directory capacity', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'happy-log-prune-'));
+    const directory = await createDisposableTempDirectory('happy-log-prune-test');
     const current = join(directory, 'current.log');
     const expired = join(directory, 'expired.log');
     const older = join(directory, 'older.log');
@@ -117,7 +128,7 @@ describe('large JSON logging', () => {
   });
 
   it('bounds the number of retained log files even when they are small', async () => {
-    const directory = await mkdtemp(join(tmpdir(), 'happy-log-count-'));
+    const directory = await createDisposableTempDirectory('happy-log-count-test');
     const current = join(directory, 'current.log');
     try {
       await Promise.all([

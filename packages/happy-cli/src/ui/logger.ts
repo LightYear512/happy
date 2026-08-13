@@ -7,9 +7,14 @@
 
 import chalk from 'chalk'
 import { configuration } from '@/configuration'
+import packageJson from '../../package.json'
 import { existsSync, readdirSync, statSync } from 'node:fs'
 import { appendFile, readdir, stat, unlink } from 'node:fs/promises'
 import { join, basename } from 'node:path'
+import {
+  createDisposableTempDirectory,
+  touchDisposableTempDirectory,
+} from '@/utils/disposableTemp'
 // Note: readDaemonState is imported lazily inside listDaemonLogFiles() to avoid
 // circular dependency: logger.ts ↔ persistence.ts
 
@@ -46,10 +51,12 @@ function getSessionLogPath(): string {
 }
 
 const MAX_LOG_RECORD_BYTES = 64 * 1024
-const MAX_LOG_FILE_BYTES = 8 * 1024 * 1024
+const MAX_LOG_FILE_BYTES = 2 * 1024 * 1024
 const MAX_LOG_DIRECTORY_BYTES = 256 * 1024 * 1024
 const MAX_LOG_FILES = 128
 const MAX_LOG_AGE_MS = 7 * 24 * 60 * 60 * 1000
+const DIAGNOSTIC_TOUCH_INTERVAL_MS = 60 * 1000
+const RELEASE_PATH_PATTERN = /[\\/]happy-coder-releases[\\/]([a-f0-9]{64})[\\/]/u
 
 function boundedUtf8(value: string, limit: number): string {
   const bytes = Buffer.from(value, 'utf8')
@@ -57,6 +64,11 @@ function boundedUtf8(value: string, limit: number): string {
   let end = limit
   while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1
   return bytes.subarray(0, end).toString('utf8')
+}
+
+function diagnosticVersion(): string {
+  const release = process.argv[1]?.match(RELEASE_PATH_PATTERN)?.[1]
+  return release ? `${packageJson.version}-${release}` : packageJson.version
 }
 
 export async function pruneLogDirectory(
@@ -100,9 +112,10 @@ export class Logger {
   constructor(
     public readonly logFilePath = getSessionLogPath(),
     private readonly maxFileBytes = MAX_LOG_FILE_BYTES,
+    allowRemoteLogging = true,
   ) {
     // Remote logging enabled only when explicitly set with server URL
-    if (process.env.DEBUG && process.env.DANGEROUSLY_LOG_TO_SERVER_FOR_AI_AUTO_DEBUGGING
+    if (allowRemoteLogging && process.env.DEBUG && process.env.DANGEROUSLY_LOG_TO_SERVER_FOR_AI_AUTO_DEBUGGING
       && process.env.HAPPY_SERVER_URL) {
       this.dangerouslyUnencryptedServerLoggingUrl = process.env.HAPPY_SERVER_URL
       console.log(chalk.yellow('[REMOTE LOGGING] Sending logs to server for AI debugging'))
@@ -129,7 +142,6 @@ export class Logger {
     // }
   }
 
-  /** Small, bounded production diagnostics for lifecycle boundaries only. */
   trace(message: string, ...args: unknown[]): void {
     this.logToFile(`[${this.localTimezoneTimestamp()}]`, message, ...args)
   }
@@ -292,6 +304,40 @@ export class Logger {
 
 // Will be initialized immideately on startup
 export let logger = new Logger()
+
+let diagnosticLoggerPromise: Promise<Logger> | null = null
+
+function getDiagnosticLogger(): Promise<Logger> {
+  if (diagnosticLoggerPromise) return diagnosticLoggerPromise
+  diagnosticLoggerPromise = createDisposableTempDirectory('happy-diagnostic').then((directory) => {
+    const version = diagnosticVersion().replace(/[^a-zA-Z0-9._-]/gu, '_')
+    const diagnosticLogger = new Logger(join(directory, `diagnostic-${version}.log`), MAX_LOG_FILE_BYTES, false)
+    const touchTimer = setInterval(() => {
+      void touchDisposableTempDirectory(directory).catch(() => { /* cleanup service may have won */ })
+    }, DIAGNOSTIC_TOUCH_INTERVAL_MS)
+    touchTimer.unref()
+    return diagnosticLogger
+  })
+  return diagnosticLoggerPromise
+}
+
+/** Temporary, bounded diagnostics isolated from durable Happy logs. */
+export function diagnosticTrace(message: string, ...args: unknown[]): void {
+  void getDiagnosticLogger().then((diagnosticLogger) => {
+    diagnosticLogger.trace(message, ...args)
+  }).catch(() => { /* diagnostics never affect the product path */ })
+}
+
+export async function flushDiagnosticTrace(): Promise<string | null> {
+  if (!diagnosticLoggerPromise) return null
+  try {
+    const diagnosticLogger = await diagnosticLoggerPromise
+    await diagnosticLogger.flush()
+    return diagnosticLogger.getLogPath()
+  } catch {
+    return null
+  }
+}
 
 /**
  * Information about a log file on disk

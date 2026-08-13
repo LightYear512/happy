@@ -37,7 +37,8 @@ import { randomUUID } from 'node:crypto';
 import { logger } from '@/ui/logger';
 import { Credentials, readSettings } from '@/persistence';
 import { initialMachineMetadata, shouldRegisterMachineForSession } from '@/daemon/run';
-import { MessageQueue2 } from '@/utils/MessageQueue2';
+import { MessageQueue2, type MessageQueueBatch } from '@/utils/MessageQueue2';
+import { createUserInputTrace, logUserInputStage } from '@/utils/userInputTrace';
 import { hashObject } from '@/utils/deterministicJson';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { startHappyServer } from '@/claude/utils/startHappyServer';
@@ -372,8 +373,11 @@ export async function runCodexWithAppServer(opts: {
         };
 
         const rawText = localCommandUserText(message);
+        const inputTrace = createUserInputTrace(session.sessionId, message);
+        logUserInputStage('provider-callback-received', inputTrace, rawText);
 
         if (hasActiveInteractiveSession()) {
+            logUserInputStage('interactive-input-dispatched', inputTrace, rawText);
             handleInteractiveInput(rawText);
             return;
         }
@@ -397,6 +401,9 @@ export async function runCodexWithAppServer(opts: {
         // but skip the seed.
         const specialCommand = parseSpecialCommand(rawText);
         if (specialCommand.type === 'compact' || specialCommand.type === 'clear') {
+            logUserInputStage('local-command-dispatched', inputTrace, rawText, {
+                command: specialCommand.type,
+            });
             const verb = specialCommand.type;
             void runManualCompact(verb).catch((err) => {
                 logger.warn(`[CodexAppServer] /${verb} orchestrator failed:`, err);
@@ -410,6 +417,7 @@ export async function runCodexWithAppServer(opts: {
         }
 
         if (isBangCommand(rawText)) {
+            logUserInputStage('local-command-dispatched', inputTrace, rawText, { command: 'bang' });
             const claudeShapedMode: ClaudeEnhancedMode = {
                 permissionMode: enhancedMode.permissionMode,
                 model: enhancedMode.model,
@@ -474,7 +482,10 @@ export async function runCodexWithAppServer(opts: {
         // cursor only after this callback returns, so a closed queue must throw
         // here rather than acknowledge input that was not accepted.
         const text = modelFacingUserText(message);
-        messageQueue.push(text, enhancedMode);
+        messageQueue.push(text, enhancedMode, inputTrace);
+        logUserInputStage('provider-queue-enqueued', inputTrace, text, {
+            queueDepth: messageQueue.size(),
+        });
         replyMonitor.observeUserMessage();
     };
 
@@ -1441,7 +1452,7 @@ export async function runCodexWithAppServer(opts: {
         }, 2000);
 
         let currentModeHash: string | null = null;
-        let pending: { message: string; mode: EnhancedMode; isolate: boolean; hash: string } | null = null;
+        let pending: MessageQueueBatch<EnhancedMode> | null = null;
 
         // Test seam: hand the test a way to unblock the main loop (production
         // exits via the Ink Ctrl-C handler, which needs a TTY). No-op in
@@ -1569,7 +1580,7 @@ export async function runCodexWithAppServer(opts: {
                 continue;
             }
 
-            let message: { message: string; mode: EnhancedMode; isolate: boolean; hash: string } | null = pending;
+            let message: MessageQueueBatch<EnhancedMode> | null = pending;
             pending = null;
             if (!message) {
                 const batch = await messageQueue.waitForMessagesAndGetAsString();
@@ -1586,6 +1597,9 @@ export async function runCodexWithAppServer(opts: {
             }
 
             if (!message) break;
+            for (const input of message.userInputs) {
+                logUserInputStage('provider-queue-dequeued', input, input.content);
+            }
 
             // The global target is sampled only after real input exists and before
             // that input reaches Codex. Keep the batch pending while the existing
@@ -1645,6 +1659,7 @@ export async function runCodexWithAppServer(opts: {
 
             messageBuffer.addMessage(message.message, 'user');
             currentModeHash = message.hash;
+            let tracedTurnId: string | null = null;
 
             try {
                 const requestClient = client;
@@ -1671,6 +1686,10 @@ export async function runCodexWithAppServer(opts: {
                 }
 
                 logger.debug(`[CodexAppServer] Starting turn on thread ${threadId}`);
+                for (const input of message.userInputs) {
+                    logUserInputStage('model-submit-start', input, input.content, { threadId });
+                }
+                await session.beginDaemonSessionTurn();
                 replyMonitor.beginActiveReply('turn-start');
 
                 // turn/start RPC returns immediately with turnId; the turn itself
@@ -1701,8 +1720,15 @@ export async function runCodexWithAppServer(opts: {
                     ...(modelConfig.reasoningEffort ? { effort: modelConfig.reasoningEffort } : {}),
                 });
                 const responseTurnId = readTurnId(turnResponse);
+                tracedTurnId = responseTurnId;
                 if (responseTurnId) {
                     activeTurnId = responseTurnId;
+                }
+                for (const input of message.userInputs) {
+                    logUserInputStage('model-submit-accepted', input, input.content, {
+                        threadId,
+                        turnId: responseTurnId ?? null,
+                    });
                 }
                 if (injectSystemPrompt) {
                     needsSystemPromptInjection = false;
@@ -1720,7 +1746,20 @@ export async function runCodexWithAppServer(opts: {
                     await pending;
                 }
                 logger.debug('[CodexAppServer] Turn fully completed');
+                for (const input of message.userInputs) {
+                    logUserInputStage('model-turn-completed', input, input.content, {
+                        threadId,
+                        turnId: tracedTurnId,
+                    });
+                }
             } catch (error) {
+                for (const input of message.userInputs) {
+                    logUserInputStage('model-submit-or-turn-failed', input, input.content, {
+                        threadId,
+                        turnId: tracedTurnId,
+                        reason: error instanceof Error ? error.message : String(error),
+                    });
+                }
                 logger.warn('[CodexAppServer] Error in app-server session:', error);
                 replyMonitor.endActiveReply('turn-error');
                 // Settle the pending promise on RPC failure (the only path that
@@ -1739,6 +1778,7 @@ export async function runCodexWithAppServer(opts: {
                     session.sendSessionEvent({ type: 'message', message: `Error: ${errorMessage}` });
                 }
             } finally {
+                session.closeDaemonSessionTurn();
                 replyMonitor.endActiveReply('turn-finally');
                 permissionHandler.reset();
                 reasoningProcessor.abort();

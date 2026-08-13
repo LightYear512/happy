@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { TrackedSession } from './types';
 import {
+  applyTrackedSessionTurn,
   buildDaemonSessionArgs,
   buildDaemonChildEnvironment,
   buildRestoreProfileEnvironment,
@@ -31,6 +32,21 @@ import {
   updateTrackedProviderReadiness,
   waitForTrackedSessionStartup,
 } from './run';
+
+describe('tracked session turn authority', () => {
+  it('rejects stale and cross-source completion without clearing the current turn', () => {
+    const session: TrackedSession = { startedBy: 'daemon', pid: 42, happySessionId: 'session-a' };
+    const sourceId = '00000000-0000-4000-8000-000000000001';
+    const first = `xc-turn-v1-${'1'.repeat(64)}`;
+    const second = `xc-turn-v1-${'2'.repeat(64)}`;
+    expect(applyTrackedSessionTurn(session, { sourceId, sequence: 1, state: 'running', token: first })).toBe(true);
+    expect(applyTrackedSessionTurn(session, { sourceId, sequence: 3, state: 'running', token: second })).toBe(true);
+    expect(applyTrackedSessionTurn(session, { sourceId, sequence: 2, state: 'idle', token: null })).toBe(false);
+    expect(applyTrackedSessionTurn(session, { sourceId: '00000000-0000-4000-8000-000000000002',
+      sequence: 4, state: 'idle', token: null })).toBe(false);
+    expect(session.turn).toEqual({ sourceId, sequence: 3, state: 'running', token: second });
+  });
+});
 
 describe('session machine registration ownership', () => {
   it('leaves machine registration to the daemon for daemon-owned sessions only', () => {

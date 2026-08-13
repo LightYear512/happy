@@ -6,7 +6,7 @@ import { inputAcceptedEventId } from './inputAcceptanceReceipt';
 // Use vi.hoisted to ensure mock function is available when vi.mock factory runs
 const { mockIo, getMock, ensureProjectWatchMock, runProjectSessionStartupMock,
     runProjectSessionStopMock, runProjectSessionCloseMock, notifyDaemonSessionStartedMock,
-    loggerTraceMock } = vi.hoisted(() => ({
+    notifyDaemonSessionTurnMock, loggerTraceMock } = vi.hoisted(() => ({
     mockIo: vi.fn(),
     getMock: vi.fn(),
     ensureProjectWatchMock: vi.fn(),
@@ -14,6 +14,7 @@ const { mockIo, getMock, ensureProjectWatchMock, runProjectSessionStartupMock,
     runProjectSessionStopMock: vi.fn(),
     runProjectSessionCloseMock: vi.fn(),
     notifyDaemonSessionStartedMock: vi.fn(),
+    notifyDaemonSessionTurnMock: vi.fn(),
     loggerTraceMock: vi.fn(),
 }));
 
@@ -31,12 +32,13 @@ vi.mock('@/utils/projectSessionStartup', () => ({
 }));
 vi.mock('@/daemon/controlClient', () => ({
     notifyDaemonSessionStarted: notifyDaemonSessionStartedMock,
+    notifyDaemonSessionTurn: notifyDaemonSessionTurnMock,
 }));
 vi.mock('@/ui/logger', () => ({
+    diagnosticTrace: loggerTraceMock,
     logger: {
         debug: vi.fn(),
         debugLargeJson: vi.fn(),
-        trace: loggerTraceMock,
         warn: vi.fn(),
     },
 }));
@@ -74,6 +76,7 @@ describe('ApiSessionClient connection handling', () => {
         runProjectSessionStopMock.mockReset().mockResolvedValue(true);
         runProjectSessionCloseMock.mockReset().mockResolvedValue(undefined);
         notifyDaemonSessionStartedMock.mockReset().mockResolvedValue({ status: 'ok' });
+        notifyDaemonSessionTurnMock.mockReset().mockResolvedValue({ success: true });
         loggerTraceMock.mockReset();
 
         // Create a proper mock session with metadata
@@ -352,6 +355,24 @@ describe('ApiSessionClient connection handling', () => {
                 sentFrom: 'cli'
             }
         });
+    });
+
+    it('reports ordered daemon turns before allowing the next turn to start', async () => {
+        const client = new ApiSessionClient('fake-token', mockSession);
+        client.enableDaemonSessionTracking('00000000-0000-4000-8000-000000000001');
+        await vi.waitFor(() => expect(notifyDaemonSessionStartedMock).toHaveBeenCalled());
+
+        const first = await client.beginDaemonSessionTurn();
+        client.closeDaemonSessionTurn('completed');
+        const second = await client.beginDaemonSessionTurn();
+        await vi.waitFor(() => expect(notifyDaemonSessionTurnMock).toHaveBeenCalledTimes(3));
+
+        const reports = notifyDaemonSessionTurnMock.mock.calls.map((call) => call[1]);
+        expect(reports.map((report) => report.sequence)).toEqual([1, 2, 3]);
+        expect(reports.map((report) => report.state)).toEqual(['running', 'idle', 'running']);
+        expect(first).not.toBe(second);
+        expect(reports[0].token).toBe(first);
+        expect(reports[2].token).toBe(second);
     });
 
     it('HSR performs one delayed reclaim after server eviction and reports a second eviction as conflict', async () => {
@@ -825,6 +846,17 @@ describe('ApiSessionClient connection handling', () => {
         expect(notices).not.toEqual(expect.arrayContaining([expect.objectContaining({
             content: expect.objectContaining({ id: inputAcceptedEventId('provider-failure-local') }),
         })]));
+        const inputLogs = loggerTraceMock.mock.calls
+            .filter(([label]) => label === '[USER_INPUT]')
+            .map(([, record]) => JSON.parse(record));
+        expect(inputLogs).toEqual(expect.arrayContaining([
+            expect.objectContaining({ stage: 'persisted-received', inputId: 'provider-failure-local',
+                content: 'fail' }),
+            expect.objectContaining({ stage: 'provider-handoff-start', inputId: 'provider-failure-local' }),
+            expect.objectContaining({ stage: 'provider-handoff-rejected', inputId: 'provider-failure-local' }),
+        ]));
+        expect(inputLogs.filter(({ stage }) => stage !== 'persisted-received')
+            .every((record) => !Object.hasOwn(record, 'content'))).toBe(true);
     });
 
     it('HSR queues persistent output while disconnected and flushes it only after connection', () => {
@@ -838,6 +870,15 @@ describe('ApiSessionClient connection handling', () => {
         expect(mockSocket.emit).toHaveBeenCalledWith('message', expect.objectContaining({ sid: mockSession.id }));
         expect(mockSocket.emit.mock.calls.find(([event]: [string]) => event === 'message')?.[1].localId)
             .toMatch(/^happy-cli-v1-/);
+        expect(loggerTraceMock).toHaveBeenCalledWith('[SERVER_SEND]', expect.any(String));
+        const sendRecord = JSON.parse(loggerTraceMock.mock.calls
+            .find(([label]) => label === '[SERVER_SEND]')?.[1]);
+        expect(sendRecord).toEqual(expect.objectContaining({
+            sessionId: mockSession.id,
+            kind: 'codex:message',
+            delivery: 'queued-flush',
+        }));
+        expect(sendRecord.bytes).toBeGreaterThan(0);
         expect(client.getTransportSnapshot()).toEqual(expect.objectContaining({ state: 'connected', queueMessages: 0 }));
     });
 
