@@ -5,7 +5,17 @@
 import { Metadata } from '@/api/types';
 import { ChildProcess } from 'child_process';
 
+export const XC_VIRTUAL_SESSION_ID_PATTERN = /^x-[0-9]{6}(?:-[1-9][0-9]{0,2})?$/u;
+
 export type SessionInputState = 'online' | 'offline' | 'unknown';
+export type SessionTurnState = 'idle' | 'running';
+
+export interface SessionTurnReport {
+  sourceId: string;
+  sequence: number;
+  state: SessionTurnState;
+  token: string | null;
+}
 
 /**
  * Session tracking for daemon
@@ -29,6 +39,8 @@ export interface TrackedSession {
   observedProviderSessionId?: string;
   /** Whether this is the daemon console session (should not be restorable) */
   isConsoleSession?: boolean;
+  /** Latest process-owned model turn; absent after daemon recovery until the child reports. */
+  turn?: SessionTurnReport;
 }
 
 export interface ObservedTrackedSession extends TrackedSession {

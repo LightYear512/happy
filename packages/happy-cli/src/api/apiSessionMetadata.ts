@@ -5,6 +5,7 @@ import axios from 'axios';
 import { io, type Socket } from 'socket.io-client';
 import { decodeBase64, decrypt, encodeBase64, encrypt } from './encryption';
 import type { Metadata, Session } from './types';
+import { traceHappyServerSocket } from './serverOperationTrace';
 
 const MAX_METADATA_BYTES = 256 * 1024;
 const MAX_METADATA_CIPHERTEXT_BYTES = 512 * 1024;
@@ -47,6 +48,7 @@ export class ApiSessionMetadataClient {
             autoConnect: false,
             forceNew: true,
         });
+        traceHappyServerSocket(this.socket, `metadata-writer:${this.sessionId}`);
     }
 
     waitForConnect(timeoutMs: number): Promise<void> {

@@ -10,6 +10,8 @@ const mocks = vi.hoisted(() => {
       userMessageHandler = handler;
     }),
     keepAlive: vi.fn(),
+    beginDaemonSessionTurn: vi.fn(async () => `xc-turn-v1-${'1'.repeat(64)}`),
+    closeDaemonSessionTurn: vi.fn(),
     sendSessionProtocolMessage: vi.fn(),
     sendSessionEvent: vi.fn(),
     updateMetadata: vi.fn(),
@@ -264,6 +266,8 @@ describe('runAcp', () => {
 
     const envelopeTypes = mocks.mockSession.sendSessionProtocolMessage.mock.calls.map(([envelope]) => envelope.ev.t);
     expect(envelopeTypes).toEqual(['turn-start', 'text', 'tool-call-start', 'tool-call-end', 'turn-end']);
+    expect(mocks.mockSession.beginDaemonSessionTurn).toHaveBeenCalledTimes(1);
+    expect(mocks.mockSession.closeDaemonSessionTurn).toHaveBeenCalledTimes(1);
     expect(mocks.mockSession.sendSessionEvent).toHaveBeenCalledWith({ type: 'ready' });
     expect(mocks.mockSession.close).toHaveBeenCalled();
     expect(consoleLines()).toEqual(expect.arrayContaining([

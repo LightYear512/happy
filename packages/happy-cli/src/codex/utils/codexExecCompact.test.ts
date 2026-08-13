@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { mkdtemp, writeFile, rm, chmod } from 'node:fs/promises';
-import { tmpdir, platform } from 'node:os';
+import { writeFile, rm, chmod } from 'node:fs/promises';
+import { platform } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
@@ -10,6 +10,7 @@ import {
 } from './codexExecCompact';
 import type { CodexExecCompactResult } from './codexExecCompact';
 import { SEED_SENTINEL } from './compactSeedBuilder';
+import { createDisposableTempDirectory } from '@/utils/disposableTemp';
 
 /**
  * Detect whether the local environment can run `codex exec` against the
@@ -67,7 +68,7 @@ describe('compactViaCodexExec', () => {
         // test only "passed" when concurrent load happened to slow the child
         // past the 800ms timeout. Use a node hang script via the production
         // spawn path (.cmd shim on Windows, sh wrapper on POSIX).
-        const dir = await mkdtemp(join(tmpdir(), 'happy-fake-codex-'));
+        const dir = await createDisposableTempDirectory('happy-fake-codex');
         const hangMjs = join(dir, 'hang.mjs');
         await writeFile(hangMjs, 'process.stdin.resume();process.stdin.on("data",()=>{});setInterval(()=>{},1e9);\n');
         let fakeBin: string;

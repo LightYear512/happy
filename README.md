@@ -76,6 +76,10 @@ happy codex
 
 On your computer, run `happy` instead of `claude` or `happy codex` instead of `codex` to start your AI through our wrapper. When you want to control your coding agent from your phone, it restarts the session in remote mode. To switch back to your computer, just press any key on your keyboard.
 
+Happy deliberately does not enumerate an entire repository for remote file autocomplete.
+Explicit content search and scoped file operations remain available without sending a
+full project file list through one RPC response.
+
 ## 🔥 Why Happy Coder?
 
 - 📱 **Mobile access to Claude Code and Codex** - Check what your AI is building while away from your desk

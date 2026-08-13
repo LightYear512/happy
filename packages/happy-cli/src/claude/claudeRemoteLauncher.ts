@@ -428,6 +428,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             modeHash = msg.hash;
                             mode = msg.mode;
                             permissionHandler.handleModeChange(mode.permissionMode);
+                            await session.client.beginDaemonSessionTurn();
                             return {
                                 message: msg.message,
                                 mode: msg.mode

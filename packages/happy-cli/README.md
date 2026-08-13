@@ -25,7 +25,7 @@ This creates a profile at `~/.ccs/instances/<profile-name>/` with OAuth credenti
 ### 3. Install Happy CLI
 
 ```bash
-npm install -g https://github.com/LightYear512/happy/releases/download/v0.13.0-compat.2/happy-coder-0.13.0-compat.2.tgz
+npm install -g happy-coder
 ```
 
 ## Run From Source
@@ -124,6 +124,14 @@ exists, using the verified Happy session ID. The first real Codex thread then
 runs the project's canonical `host input` path and upgrades the same virtual
 session in place. Projects without XC v2 are unchanged, and startup/input
 failures are shown in the Happy session instead of being silently skipped.
+
+### Remote project boundary
+
+Happy does not enumerate an entire repository for remote file autocomplete.
+This prevents a large workspace from being copied into one RPC response and
+blocking the session process. Explicit content searches and scoped file
+operations remain available; a rejected autocomplete request affects only that
+request and does not restart or disconnect the agent session.
 
 ### Sandbox Subcommands
 

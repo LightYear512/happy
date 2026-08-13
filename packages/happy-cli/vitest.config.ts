@@ -27,6 +27,8 @@ export default defineConfig({
         env: {
             ...process.env,
             ...testEnv,
+            // Tests must never emit debug logs to an external HTTP endpoint.
+            DANGEROUSLY_LOG_TO_SERVER_FOR_AI_AUTO_DEBUGGING: '',
         }
     },
     resolve: {

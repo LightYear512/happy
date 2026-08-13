@@ -2,7 +2,6 @@ import { render } from "ink";
 import React from "react";
 import { ApiClient } from '@/api/api';
 import { localCommandUserText, modelFacingUserText } from '@/api/types';
-import { fetchAndInjectPendingMessages } from '@/utils/fetchPendingMessages';
 import { CodexMcpClient } from './codexMcpClient';
 import { CodexPermissionHandler } from './utils/permissionHandler';
 import { ReasoningProcessor } from './utils/reasoningProcessor';
@@ -15,7 +14,8 @@ import { initialMachineMetadata, shouldRegisterMachineForSession } from '@/daemo
 import { configuration } from '@/configuration';
 import packageJson from '../../package.json';
 import os from 'node:os';
-import { MessageQueue2 } from '@/utils/MessageQueue2';
+import { MessageQueue2, type MessageQueueBatch } from '@/utils/MessageQueue2';
+import { createUserInputTrace, logUserInputStage } from '@/utils/userInputTrace';
 import { hashObject } from '@/utils/deterministicJson';
 import { projectPath } from '@/projectPath';
 import { resolve, join } from 'node:path';
@@ -320,15 +320,19 @@ export async function runCodex(opts: {
         };
 
         const rawText = localCommandUserText(message);
+        const inputTrace = createUserInputTrace(session.sessionId, message);
+        logUserInputStage('provider-callback-received', inputTrace, rawText);
 
         // Route input to active interactive session (e.g., !login OAuth flow)
         if (hasActiveInteractiveSession()) {
+            logUserInputStage('interactive-input-dispatched', inputTrace, rawText);
             handleInteractiveInput(rawText);
             return;
         }
 
         // Check for bang commands (! full commands or @ short aliases) - handle without invoking Codex model
         if (isBangCommand(rawText)) {
+            logUserInputStage('local-command-dispatched', inputTrace, rawText, { command: 'bang' });
             const claudeShapedMode: ClaudeEnhancedMode = {
                 permissionMode: enhancedMode.permissionMode,
                 model: enhancedMode.model,
@@ -384,8 +388,11 @@ export async function runCodex(opts: {
         }
 
         const text = modelFacingUserText(message);
+        messageQueue.push(text, enhancedMode, inputTrace);
+        logUserInputStage('provider-queue-enqueued', inputTrace, text, {
+            queueDepth: messageQueue.size(),
+        });
         replyMonitor.observeUserMessage();
-        messageQueue.push(text, enhancedMode);
     };
     let thinking = false;
     let codexSessionIdStored = false;
@@ -802,18 +809,11 @@ export async function runCodex(opts: {
         await client.connect();
         logger.debug('[codex]: client.connect done');
 
-        const pendingWindow = opts.restoreSessionId && response
-            ? fetchAndInjectPendingMessages(
-                api, session, opts.restoreSessionId,
-                response.encryptionKey, response.encryptionVariant,
-                '[Codex]',
-              )
-            : undefined;
         if (response) {
             await completeProviderInputReady({
                 session,
                 expectedHappySessionId: response.id,
-                pendingWindow,
+                reconcilePersistedInputs: Boolean(opts.restoreSessionId),
                 providerSessionId: opts.codexSessionId,
                 expectedProviderSessionId: opts.codexSessionId,
                 onUserMessage,
@@ -828,7 +828,7 @@ export async function runCodex(opts: {
 
         let wasCreated = false;
         let currentModeHash: string | null = null;
-        let pending: { message: string; mode: EnhancedMode; isolate: boolean; hash: string } | null = null;
+        let pending: MessageQueueBatch<EnhancedMode> | null = null;
         // If we restart (e.g., mode change), use this to carry a resume file
         let nextExperimentalResume: string | null = null;
 
@@ -885,7 +885,7 @@ export async function runCodex(opts: {
             }
 
             // Get next batch; respect mode boundaries like Claude
-            let message: { message: string; mode: EnhancedMode; isolate: boolean; hash: string } | null = pending;
+            let message: MessageQueueBatch<EnhancedMode> | null = pending;
             pending = null;
             if (!message) {
                 // Capture the current signal to distinguish idle-abort from queue close
@@ -907,6 +907,9 @@ export async function runCodex(opts: {
             // Defensive check for TS narrowing
             if (!message) {
                 break;
+            }
+            for (const input of message.userInputs) {
+                logUserInputStage('provider-queue-dequeued', input, input.content);
             }
 
             // Global account changes are sampled only when a real model input is
@@ -966,9 +969,15 @@ export async function runCodex(opts: {
             // Display user messages in the UI
             messageBuffer.addMessage(message.message, 'user');
             currentModeHash = message.hash;
+            await session.beginDaemonSessionTurn();
             replyMonitor.beginActiveReply('turn-start');
 
             try {
+                for (const input of message.userInputs) {
+                    logUserInputStage('model-submit-start', input, input.content, {
+                        providerSessionId: client.getSessionId(),
+                    });
+                }
                 // Map permission mode to approval policy and sandbox for startSession
                 const sandboxManagedByHappy = client.sandboxEnabled;
                 const executionPolicy = resolveCodexExecutionPolicy(
@@ -1044,7 +1053,18 @@ export async function runCodex(opts: {
                     );
                     logger.debug('[Codex] continueSession response:', response);
                 }
+                for (const input of message.userInputs) {
+                    logUserInputStage('model-submit-accepted', input, input.content, {
+                        providerSessionId: client.getSessionId(),
+                    });
+                }
             } catch (error) {
+                for (const input of message.userInputs) {
+                    logUserInputStage('model-submit-or-turn-failed', input, input.content, {
+                        providerSessionId: client.getSessionId(),
+                        reason: error instanceof Error ? error.message : String(error),
+                    });
+                }
                 logger.warn('Error in codex session:', error);
                 const isAbortError = error instanceof Error && error.name === 'AbortError';
                 
@@ -1064,6 +1084,7 @@ export async function runCodex(opts: {
                     }
                 }
             } finally {
+                session.closeDaemonSessionTurn();
                 replyMonitor.endActiveReply('turn-finally');
                 // Reset permission handler, reasoning processor, and diff processor
                 permissionHandler.reset();

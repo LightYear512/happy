@@ -10,10 +10,13 @@ import { configuration } from '@/configuration';
 import { deepEqual, deterministicStringify } from '@/utils/deterministicJson';
 import axios from 'axios';
 import { io, type Socket } from 'socket.io-client';
+import { traceHappyServerSocket } from './serverOperationTrace';
 import { decodeBase64, decrypt, encodeBase64, encrypt } from './encryption';
 import { MAX_RECOVERY_RESPONSE_BYTES, RECENT_MESSAGE_WINDOW } from './sessionMessageRecovery';
 import { createUserScopedMessageObserver } from './apiSessionMessageObserver';
 import { MessageMetaSchema, type PermissionMode, type Session } from './types';
+
+export type MessageSession = Pick<Session, 'id' | 'encryptionKey' | 'encryptionVariant'>;
 
 const MAX_MESSAGE_BYTES = 12_000;
 const MAX_CODEX_BODY_BYTES = 64 * 1024;
@@ -149,14 +152,14 @@ export function validateAgentEventOnceRequest(input: AgentEventOnceRequest): Age
 
 /** User-scoped, one-shot writer confirmed through persisted server evidence. */
 export class ApiSessionMessageClient {
-    private readonly session: Session;
+    private readonly session: MessageSession;
     private readonly token: string;
 
     static validateRequest = validateUserMessageOnceRequest;
     static validateCodexRequest = validateCodexMessageOnceRequest;
     static validateAgentEventRequest = validateAgentEventOnceRequest;
 
-    constructor(token: string, session: Session) {
+    constructor(token: string, session: MessageSession) {
         this.token = token;
         this.session = session;
     }
@@ -226,12 +229,13 @@ export class ApiSessionMessageClient {
         let observedError: Error | null = null;
         let notifyObserved = () => {};
         const observed = new Promise<void>((resolve) => { notifyObserved = resolve; });
+        let acknowledgedReceipt: PersistedMessageReceipt | null = null;
+        let acknowledgementError: Error | null = null;
+        let acknowledgementRejection: string | null = null;
+        let notifyAcknowledged = () => {};
+        const acknowledged = new Promise<void>((resolve) => { notifyAcknowledged = resolve; });
         let emitted = false;
         try {
-            const existing = await this.findPersistedMessage(localId, expected, deadline);
-            if (existing) return existing;
-            remaining(deadline);
-
             if (observePersistedEvent) {
                 observer = createUserScopedMessageObserver(this.token, (data: unknown) => {
                     try {
@@ -251,23 +255,52 @@ export class ApiSessionMessageClient {
             socket = this.createSocket();
             await this.waitForConnect(socket, remaining(deadline));
             const message = encodeBase64(encrypt(this.session.encryptionKey, this.session.encryptionVariant, content));
-            socket.emit('message', { sid: this.session.id, message, localId });
             emitted = true;
+            socket.emit('message', { sid: this.session.id, message, localId }, (response: unknown) => {
+                try {
+                    if (!response || typeof response !== 'object' || Array.isArray(response)) {
+                        throw new Error('Happy message persistence acknowledgement invalid');
+                    }
+                    const record = response as Record<string, unknown>;
+                    if (record.ok === true) acknowledgedReceipt = validatedReceipt(record, localId);
+                    else if (record.ok === false && typeof record.code === 'string') {
+                        acknowledgementRejection = record.code;
+                    } else throw new Error('Happy message persistence acknowledgement invalid');
+                } catch (error) {
+                    acknowledgementError = error instanceof Error ? error :
+                        new Error('Happy message persistence acknowledgement invalid');
+                }
+                notifyAcknowledged();
+            });
 
             await Promise.race([
+                acknowledged,
                 observed,
                 delay(Math.min(observePersistedEvent ? 500 : 250, remaining(deadline))),
             ]);
+            if (acknowledgementError) throw acknowledgementError;
+            if (acknowledgedReceipt) return acknowledgedReceipt;
             if (observedError) throw observedError;
             if (observedReceipt) return observedReceipt;
+            if (acknowledgementRejection === 'not_found') {
+                throw new HappyMessagePersistenceError(
+                    'Happy message persistence rejected (not_found)', 'not-sent', acknowledgementRejection,
+                );
+            }
 
             const persisted = await this.findPersistedMessage(localId, expected, deadline);
             if (persisted) return persisted;
 
-            if (observePersistedEvent) {
-                await Promise.race([observed, delay(remaining(deadline))]);
-                if (observedError) throw observedError;
-                if (observedReceipt) return observedReceipt;
+            if (acknowledgementRejection) {
+                throw new Error(`Happy message persistence rejected (${acknowledgementRejection})`);
+            }
+            await Promise.race([acknowledged, observed, delay(remaining(deadline))]);
+            if (acknowledgementError) throw acknowledgementError;
+            if (acknowledgedReceipt) return acknowledgedReceipt;
+            if (observedError) throw observedError;
+            if (observedReceipt) return observedReceipt;
+            if (acknowledgementRejection) {
+                throw new Error(`Happy message persistence rejected (${acknowledgementRejection})`);
             }
             throw new Error('Happy message persistence confirmation deadline exceeded');
         } catch (error) {
@@ -285,7 +318,7 @@ export class ApiSessionMessageClient {
     }
 
     private createSocket(): Socket {
-        return io(configuration.serverUrl, {
+        const socket = io(configuration.serverUrl, {
             auth: { token: this.token, clientType: 'user-scoped' as const },
             path: '/v1/updates',
             reconnection: false,
@@ -294,6 +327,8 @@ export class ApiSessionMessageClient {
             autoConnect: false,
             forceNew: true,
         });
+        traceHappyServerSocket(socket, `message-writer:${this.session.id}`);
+        return socket;
     }
 
     private waitForConnect(socket: Socket, timeoutMs: number): Promise<void> {
@@ -348,7 +383,7 @@ export class ApiSessionMessageClient {
 /** Validates before constructing a Socket, including zero and overflow budgets. */
 export async function sendUserMessageOnce(
     token: string,
-    session: Session,
+    session: MessageSession,
     raw: UserMessageOnceRequest,
 ): Promise<PersistedMessageReceipt> {
     const input = validateUserMessageOnceRequest(raw);
@@ -358,7 +393,7 @@ export async function sendUserMessageOnce(
 /** Persists one exact Codex agent message without opening an owner Socket. */
 export async function sendCodexMessageOnce(
     token: string,
-    session: Session,
+    session: MessageSession,
     raw: CodexMessageOnceRequest,
 ): Promise<PersistedMessageReceipt> {
     const input = validateCodexMessageOnceRequest(raw);
@@ -368,7 +403,7 @@ export async function sendCodexMessageOnce(
 /** Persists one exact gray agent event through the existing message pipeline. */
 export async function sendAgentEventOnce(
     token: string,
-    session: Session,
+    session: MessageSession,
     raw: AgentEventOnceRequest,
 ): Promise<PersistedMessageReceipt> {
     const input = validateAgentEventOnceRequest(raw);
@@ -473,7 +508,7 @@ function receiptFromUpdate(
     sessionId: string,
     localId: string,
     expected: ExpectedMessage,
-    session: Session,
+    session: MessageSession,
 ): PersistedMessageReceipt | null {
     if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
     const update = value as Record<string, any>;
@@ -487,16 +522,25 @@ function persistedReceipt(
     value: Record<string, unknown>,
     expectedLocalId: string,
     expected: ExpectedMessage,
-    session: Session,
+    session: MessageSession,
+): PersistedMessageReceipt {
+    const receipt = validatedReceipt(value, expectedLocalId);
+    if (!isExpectedMessage(value.content, expected, session)) throw new Error('Happy message confirmation payload mismatch');
+    return receipt;
+}
+
+function validatedReceipt(
+    value: Record<string, unknown>,
+    expectedLocalId: string,
 ): PersistedMessageReceipt {
     if (typeof value.id !== 'string' || value.id.length === 0 || Buffer.byteLength(value.id, 'utf8') > MAX_MESSAGE_ID_BYTES) {
         throw new Error('Happy message confirmation id invalid');
     }
     if (!Number.isSafeInteger(value.seq) || Number(value.seq) <= 0) throw new Error('Happy message confirmation seq invalid');
+    if (value.localId !== expectedLocalId) throw new Error('Happy message confirmation localId invalid');
     if (!Number.isSafeInteger(value.createdAt) || Number(value.createdAt) <= 0 || Number(value.createdAt) > MAX_DATE_MS) {
         throw new Error('Happy message confirmation createdAt invalid');
     }
-    if (!isExpectedMessage(value.content, expected, session)) throw new Error('Happy message confirmation payload mismatch');
     return {
         result: 'success',
         id: value.id,
@@ -506,7 +550,7 @@ function persistedReceipt(
     };
 }
 
-function isExpectedMessage(content: unknown, expected: ExpectedMessage, session: Session): boolean {
+function isExpectedMessage(content: unknown, expected: ExpectedMessage, session: MessageSession): boolean {
     if (!content || typeof content !== 'object') return false;
     const envelope = content as Record<string, unknown>;
     if (envelope.t !== 'encrypted' || typeof envelope.c !== 'string' || envelope.c.length === 0 ||

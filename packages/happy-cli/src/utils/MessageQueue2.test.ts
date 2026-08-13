@@ -23,6 +23,20 @@ describe('MessageQueue2', () => {
         expect(queue.size()).toBe(0);
     });
 
+    it('carries user-input trace data through batching without tagging internal messages', async () => {
+        const queue = new MessageQueue2<string>(mode => mode);
+        queue.push('first', 'remote', { sessionId: 's1', inputId: 'i1' });
+        queue.push('internal', 'remote');
+        queue.push('second', 'remote', { sessionId: 's1', inputId: 'i2' });
+
+        const result = await queue.waitForMessagesAndGetAsString();
+
+        expect(result?.userInputs).toEqual([
+            { sessionId: 's1', inputId: 'i1', content: 'first' },
+            { sessionId: 's1', inputId: 'i2', content: 'second' },
+        ]);
+    });
+
     it('should return only messages with same mode and keep others', async () => {
         const queue = new MessageQueue2<string>(mode => mode);
         

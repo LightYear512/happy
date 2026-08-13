@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { serializerCompiler, validatorCompiler, ZodTypeProvider } from 'fastify-type-provider-zod';
 import { logger } from '@/ui/logger';
 import type { Metadata, PermissionMode } from '@/api/types';
-import type { ObservedTrackedSession } from './types';
+import { XC_VIRTUAL_SESSION_ID_PATTERN, type ObservedTrackedSession, type SessionTurnReport } from './types';
 import { SpawnSessionOptions, SpawnSessionResult } from '@/modules/common/registerCommonHandlers';
 
 export function startDaemonControlServer({
@@ -20,6 +20,7 @@ export function startDaemonControlServer({
   prepareShutdown,
   requestShutdown,
   onHappySessionWebhook,
+  onSessionTurn,
   onCodexProfile,
 }: {
   getChildren: () => ObservedTrackedSession[] | Promise<ObservedTrackedSession[]>;
@@ -36,7 +37,9 @@ export function startDaemonControlServer({
     sessionId: string,
     metadata: Metadata,
     readyProviderSessionId?: string,
+    turn?: SessionTurnReport,
   ) => void | Promise<void>;
+  onSessionTurn?: (sessionId: string, pid: number, turn: SessionTurnReport) => Promise<boolean>;
   onCodexProfile?: (sessionId: string, profileName: string) => Promise<boolean>;
 }): Promise<{ port: number; stop: () => Promise<void> }> {
   return new Promise((resolve) => {
@@ -57,6 +60,12 @@ export function startDaemonControlServer({
           metadata: z.any(), // Metadata type from API
           readyProviderSessionId: z.string().uuid().optional(),
           transportHealth: z.unknown().nullable().optional(),
+          turn: z.object({
+            sourceId: z.string().uuid(),
+            sequence: z.number().int().nonnegative(),
+            state: z.enum(['idle', 'running']),
+            token: z.string().regex(/^xc-turn-v1-[a-f0-9]{64}$/u).nullable(),
+          }).strict().optional(),
         }).strict(),
         response: {
           200: z.object({
@@ -65,12 +74,37 @@ export function startDaemonControlServer({
         }
       }
     }, async (request) => {
-      const { sessionId, metadata, readyProviderSessionId } = request.body;
+      const { sessionId, metadata, readyProviderSessionId, turn } = request.body;
 
       logger.debug(`[CONTROL SERVER] Session started: ${sessionId}`);
-      await onHappySessionWebhook(sessionId, metadata, readyProviderSessionId);
+      await onHappySessionWebhook(sessionId, metadata, readyProviderSessionId, turn);
 
       return { status: 'ok' as const };
+    });
+
+    typed.post('/session-turn', {
+      schema: {
+        body: z.object({
+          sessionId: z.string().min(1).max(128),
+          pid: z.number().int().positive(),
+          turn: z.object({
+            sourceId: z.string().uuid(),
+            sequence: z.number().int().nonnegative(),
+            state: z.enum(['idle', 'running']),
+            token: z.string().regex(/^xc-turn-v1-[a-f0-9]{64}$/u).nullable(),
+          }).strict(),
+        }).strict(),
+        response: {
+          200: z.object({ success: z.literal(true) }),
+          409: z.object({ success: z.literal(false), error: z.string() }),
+        },
+      },
+    }, async (request, reply) => {
+      if (onSessionTurn && await onSessionTurn(request.body.sessionId, request.body.pid, request.body.turn)) {
+        return { success: true as const };
+      }
+      reply.code(409);
+      return { success: false as const, error: 'Session turn owner or sequence is stale' };
     });
 
     typed.post('/session-codex-profile', {
@@ -100,9 +134,11 @@ export function startDaemonControlServer({
             children: z.array(z.object({
               startedBy: z.string(),
               happySessionId: z.string(),
-              pid: z.number()
+              pid: z.number(),
+              turnState: z.enum(['idle', 'running', 'unknown']),
+              turnToken: z.string().nullable(),
             })),
-            presenceVersion: z.literal(1),
+            presenceVersion: z.literal(2),
             unknownSessionIds: z.array(z.string()),
           })
         }
@@ -116,12 +152,15 @@ export function startDaemonControlServer({
       logger.debug(`[CONTROL SERVER] Listing ${children.length} sessions`);
       return {
         children: visible
-          .map(child => ({
+          .map((child): { startedBy: string; happySessionId: string; pid: number;
+            turnState: 'idle' | 'running' | 'unknown'; turnToken: string | null } => ({
             startedBy: child.startedBy,
             happySessionId: child.happySessionId!,
-            pid: child.pid
+            pid: child.pid,
+            turnState: child.turn?.state ?? 'unknown',
+            turnToken: child.turn?.state === 'running' ? child.turn.token : null,
           })),
-        presenceVersion: 1 as const,
+        presenceVersion: 2 as const,
         unknownSessionIds,
       };
     });
@@ -177,7 +216,7 @@ export function startDaemonControlServer({
         body: z.object({
           previousSessionId: z.string().min(1).max(128),
           providerSessionId: z.string().uuid(),
-          virtualSessionId: z.string().regex(/^x-[0-9]{6}-[1-9][0-9]{0,2}$/u),
+          virtualSessionId: z.string().regex(XC_VIRTUAL_SESSION_ID_PATTERN),
           title: z.string().min(1).max(240),
         }).strict(),
         response: {

@@ -35,7 +35,6 @@ const DEFAULT_HIGH_USAGE_PROFILE_MARKER = '💔';
 const USABLE_PROFILE_MARKER = '🔵';
 const UNAVAILABLE_PROFILE_MARKER = '🚫';
 const GUESS_AVAILABLE_PROFILE_MARKER = '🟣';
-const ACCOUNT_SWITCH_CACHE_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_HIGH_USAGE_PERCENT = 85;
 const UNAVAILABLE_DAY_MARKERS = ['0️⃣', '1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'] as const;
 
@@ -88,7 +87,9 @@ export async function handleAuthBangCommand(args: string, ctx: BangCommandContex
     const flavor: AuthFlavor = hasCodexFlag ? 'codex' : resolveAuthFlavor(ctx);
 
     if (!cleanArgs) {
-        ctx.client.sendSessionEvent({ type: 'message', message: '⏳ 账号信息查询中' });
+        if (!ctx.isConsoleSession) {
+            ctx.client.sendSessionEvent({ type: 'message', message: '⏳ 账号信息查询中' });
+        }
         return listProfiles(!!ctx.isConsoleSession, flavor);
     }
 
@@ -143,31 +144,6 @@ function readCachedUsageSummaries(profileNames: string[], flavor: AuthFlavor): M
         if (entry) map.set(name, entry);
     }
     return map;
-}
-
-async function loadConsoleUsageSummaries(
-    profileNames: string[],
-    flavor: AuthFlavor,
-): Promise<Map<string, ProfileUsageEntry>> {
-    const usageMap = new Map<string, ProfileUsageEntry>();
-    const now = Date.now();
-    await Promise.all(profileNames.map(async name => {
-        const cached = getCachedProfileUsageEntry(name, flavor);
-        if (cached?.cachedAt != null && now - cached.cachedAt <= ACCOUNT_SWITCH_CACHE_TTL_MS) {
-            usageMap.set(name, cached);
-            return;
-        }
-
-        try {
-            const fresh = await fetchProfileUsageSummary(name, flavor);
-            if (fresh.summary || fresh.cachedAt || fresh.authExpired) {
-                usageMap.set(name, fresh);
-            }
-        } catch (err) {
-            logger.debug(`[!auth] console usage refresh failed for ${name}:`, err);
-        }
-    }));
-    return usageMap;
 }
 
 async function refreshMissingCodexUsageSummaries(
@@ -463,8 +439,10 @@ async function listProfiles(isConsole: boolean, flavor: AuthFlavor = 'claude'): 
         if (profiles.length === 0) {
             return { message: `❌ 未找到 CCS 配置。(${flavorLabel})`, action: 'none' };
         }
-        const profileNames = profiles.map(p => p.name);
-        const usageMap = await loadConsoleUsageSummaries(profileNames, flavor);
+        const usageMap = new Map(await Promise.all(profiles.map(async profile => [
+            profile.name,
+            await fetchProfileUsageSummary(profile.name, flavor, false),
+        ] as const)));
         const suggestions = buildProfileOptions(profiles, usageMap, {
             command: flavor === 'codex' ? '@aa-codex' : '@aa',
             defaultProfile,

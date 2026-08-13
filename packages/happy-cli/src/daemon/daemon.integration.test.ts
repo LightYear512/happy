@@ -15,7 +15,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { execSync, spawn } from 'child_process';
+import { spawn } from 'child_process';
 import { existsSync, unlinkSync, readFileSync, writeFileSync, readdirSync } from 'fs';
 import path, { join } from 'path';
 import { configuration } from '@/configuration';
@@ -83,7 +83,8 @@ describe.skipIf(!await isServerHealthy())('Daemon Integration Tests', { timeout:
     // Start fresh daemon for this test
     // This will return and start a background process - we don't need to wait for it
     void spawnHappyCLI(['daemon', 'start'], {
-      stdio: 'ignore'
+      stdio: 'ignore',
+      env: { ...process.env, DEBUG: '1' },
     });
     
     // Wait for daemon to write its state file (it needs to auth, setup, and start server)
@@ -382,38 +383,7 @@ describe.skipIf(!await isServerHealthy())('Daemon Integration Tests', { timeout:
     await clearDaemonState();
   });
 
-  /**
-   * Version mismatch detection test - control flow:
-   * 
-   * 1. Test starts daemon with original version (e.g., 0.9.0-6) compiled into dist/
-   * 2. Test modifies package.json to new version (e.g., 0.0.0-integration-test-*)
-   * 3. Test runs `yarn build` to recompile with new version
-   * 4. Daemon's heartbeat (every 30s) reads package.json and compares to its compiled version
-   * 5. Daemon detects mismatch: package.json != configuration.currentCliVersion
-   * 6. Daemon spawns new daemon via spawnHappyCLI(['daemon', 'start'])
-   * 7. New daemon starts, reads daemon.state.json, sees old version != its compiled version
-   * 8. New daemon calls stopDaemon() to kill old daemon, then takes over
-   * 
-   * This simulates what happens during `npm upgrade happy-coder`:
-   * - Running daemon has OLD version loaded in memory (configuration.currentCliVersion)
-   * - npm replaces node_modules/happy-coder/ with NEW version files
-   * - package.json on disk now has NEW version
-   * - Daemon reads package.json, detects mismatch, triggers self-update
-   * - Key difference: npm atomically replaces the entire module directory, while
-   *   our test must carefully rebuild to avoid missing entrypoint errors
-   * 
-   * Critical timing constraints:
-   * - Heartbeat must be long enough (30s) for yarn build to complete before daemon tries to spawn
-   * - If heartbeat fires during rebuild, spawn fails (dist/index.mjs missing) and test fails
-   * - pkgroll doesn't reliably update compiled version, must use full yarn build
-   * - Test modifies package.json BEFORE rebuild to ensure new version is compiled in
-   * 
-   * Common failure modes:
-   * - Heartbeat too short: daemon tries to spawn while dist/ is being rebuilt
-   * - Using pkgroll alone: doesn't update compiled configuration.currentCliVersion
-   * - Modifying package.json after daemon starts: triggers immediate version check on startup
-   */
-  it('[takes 1 minute to run] should detect version mismatch and kill old daemon', { timeout: 100_000 }, async () => {
+  it('[takes 1 minute to run] keeps the current daemon across an on-disk version change', { timeout: 100_000 }, async () => {
     // Read current package.json to get version
     const packagePath = path.join(process.cwd(), 'package.json');
     const packageJsonOriginalRawText = readFileSync(packagePath, 'utf8');
@@ -434,41 +404,27 @@ describe.skipIf(!await isServerHealthy())('Daemon Integration Tests', { timeout:
       expect(initialState!.startedWithCliVersion).toBe(originalVersion);
       const initialPid = initialState!.pid;
 
-      // Re-build the CLI - so it will import the new package.json in its configuartion.ts
-      // and think it is a new version
-      // We are not using yarn build here because it cleans out dist/
-      // and we want to avoid that, 
-      // otherwise daemon will spawn a non existing happy js script.
-      // We need to remove index, but not the other files, otherwise some of our code might fail when called from within the daemon.
-      execSync('yarn build', { stdio: 'ignore' });
-      
       console.log(`[TEST] Current daemon running with version ${originalVersion}, PID: ${initialPid}`);
-      
       console.log(`[TEST] Changed package.json version to ${testVersion}`);
 
-      // The daemon should automatically detect the version mismatch and restart itself
-      // We check once per minute, wait for a little longer than that
+      // Package installation must not restart a live daemon. Upgrades are explicit.
       await new Promise(resolve => setTimeout(resolve, parseInt(process.env.HAPPY_DAEMON_HEARTBEAT_INTERVAL || '30000') + 10_000));
 
-      // Check that the daemon is running with the new version
       const finalState = await readDaemonState();
       expect(finalState).toBeDefined();
-      expect(finalState!.startedWithCliVersion).toBe(testVersion);
-      expect(finalState!.pid).not.toBe(initialPid);
-      console.log('[TEST] Daemon version mismatch detection successful');
+      expect(finalState!.startedWithCliVersion).toBe(originalVersion);
+      expect(finalState!.pid).toBe(initialPid);
+      console.log('[TEST] Daemon remained stable across package version change');
     } finally {
       // CRITICAL: Restore original package.json version
       writeFileSync(packagePath, packageJsonOriginalRawText);
       console.log(`[TEST] Restored package.json version to ${originalVersion}`);
 
-      // Lets rebuild it so we keep it as we found it
-      execSync('yarn build', { stdio: 'ignore' });
     }
   });
 
   // TODO: Add a test to see if a corrupted file will work
   
-  // TODO: Test npm uninstall scenario - daemon should gracefully handle when happy-coder is uninstalled
-  // Current behavior: daemon tries to spawn new daemon on version mismatch but dist/index.mjs is gone
-  // Expected: daemon should detect missing entrypoint and either exit cleanly or at minimum not respawn infinitely
+  // TODO: Test npm uninstall scenario - the live daemon must remain stable until an
+  // explicit stop/start, even when the currently installed CLI entrypoint is gone.
 });

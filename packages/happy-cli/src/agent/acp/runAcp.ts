@@ -896,6 +896,7 @@ export async function runAcp(opts: {
       }
 
       logAcp('incoming', `Incoming prompt: ${formatUnknownForConsole(batch.message, ACP_EVENT_PREVIEW_CHARS)}`);
+      await session.beginDaemonSessionTurn();
       sendEnvelopes(sessionManager.startTurn());
       const turnEnded = waitForTurnEnd();
       try {
@@ -918,6 +919,8 @@ export async function runAcp(opts: {
         logAcp('error', `Prompt error from ${opts.agentName}: ${error instanceof Error ? error.message : String(error)}`);
         clearPendingTurn(error instanceof Error ? error : new Error(String(error)));
         throw error;
+      } finally {
+        session.closeDaemonSessionTurn();
       }
     }
   } finally {

@@ -24,8 +24,7 @@ import { findAllNodes, findFirstNode, findMethodCalls } from './astHelpers';
  *      starts auto-replaying — would be a UX bug).
  *   3. The replay text drifts (e.g. someone changes it to "请继续" — log
  *      analysis says "继续" is what users actually type byte-for-byte).
- *   4. The `recentUserBuffer.record` ordering breaks (push throws sync →
- *      buffer never sees the replay → next seed loses the turn).
+ *   4. The replay bypasses the ordinary consumer and is recorded twice.
  *
  * Plus one runtime sanity check against the largest real ~/.codex rollout
  * to confirm the fallback path (heuristic seed) still produces a valid
@@ -118,31 +117,13 @@ describe('runCodexAppServer — auto-resume after fallback compact', () => {
             ).toBe('继续');
         });
 
-        it('calls `recentUserBuffer.record(...)` with the SAME value BEFORE `messageQueue.push(...)`', () => {
-            // Mirror of the onUserMessage contract: record → push, never the
-            // reverse. If push throws synchronously, an unrecorded prompt is
-            // unrecoverable by the next /compact's seed builder.
+        it('leaves recovery-buffer recording to the ordinary turn consumer', () => {
             expect(block, 'auto-resume block must exist (anchor)').not.toBeNull();
             if (!block) return;
             const records = findMethodCalls(block.thenStatement, 'recentUserBuffer', 'record');
             const pushes = findMethodCalls(block.thenStatement, 'messageQueue', 'push');
-            expect(records.length, 'recentUserBuffer.record(...) must be called inside the auto-resume block').toBeGreaterThan(0);
-            expect(pushes.length).toBeGreaterThan(0);
-
-            const minRecordPos = Math.min(...records.map((c) => c.getStart(SF)));
-            const minPushPos = Math.min(...pushes.map((c) => c.getStart(SF)));
-            expect(
-                minRecordPos,
-                'record must come before push so the replay is recoverable if the next /compact races',
-            ).toBeLessThan(minPushPos);
-
-            // record() and push() must reference the same value (identifier or
-            // literal text) — otherwise we'd record one thing and push another.
-            const recordArg = records[0].arguments[0];
-            const pushArg = pushes[0].arguments[0];
-            expect(recordArg, 'record must receive a first argument').toBeDefined();
-            expect(pushArg, 'push must receive a first argument').toBeDefined();
-            expect(recordArg!.getText(SF)).toBe(pushArg!.getText(SF));
+            expect(pushes).toHaveLength(1);
+            expect(records, 'the consumer records the replay after the compact barrier').toHaveLength(0);
         });
 
         it('the messageQueue.push second argument carries `currentPermissionMode` and `currentModel` (no hardcoded mode/model)', () => {
@@ -277,10 +258,10 @@ describe('runCodexAppServer — auto-resume after fallback compact', () => {
         //   B: sendSessionEvent({ type: 'ready' })       (loop unblocked)
         //   C: messageQueue.push('继续', ...)            (replay)
         // And C must precede:
-        //   D: compactInFlight = false                   (critical section exit)
-        // — so the replay is enqueued while the lock is still held, preventing
+        //   D: compactInFlight = null                    (barrier cleared)
+        // — so the replay is enqueued while the barrier is still held, preventing
         // a second /compact from snatching the queue before our replay lands.
-        it('replay push falls between `pendingSeedText = seedText` and `compactInFlight = false`', () => {
+        it('replay push falls between `pendingSeedText = seedText` and the compact barrier clear', () => {
             const compactFn = findRunManualCompact();
             expect(compactFn, 'runManualCompact must exist (anchor)').not.toBeNull();
             if (!compactFn) return;
@@ -293,22 +274,22 @@ describe('runCodexAppServer — auto-resume after fallback compact', () => {
                 && n.left.expression.text === 'compactState'
                 && n.left.name.text === 'pendingSeedText',
             );
-            const inFlightFalse = findFirstNode(compactFn, (n): n is ts.BinaryExpression =>
+            const inFlightClear = findFirstNode(compactFn, (n): n is ts.BinaryExpression =>
                 ts.isBinaryExpression(n)
                 && n.operatorToken.kind === ts.SyntaxKind.EqualsToken
                 && ts.isIdentifier(n.left)
                 && n.left.text === 'compactInFlight'
-                && n.right.kind === ts.SyntaxKind.FalseKeyword,
+                && n.right.kind === ts.SyntaxKind.NullKeyword,
             );
             const pushes = findMethodCalls(compactFn, 'messageQueue', 'push');
 
             expect(seedAssign, 'A: `compactState.pendingSeedText = seedText` must exist').not.toBeNull();
-            expect(inFlightFalse, 'D: `compactInFlight = false` must exist').not.toBeNull();
+            expect(inFlightClear, 'D: `compactInFlight = null` must exist').not.toBeNull();
             expect(pushes.length, 'C: messageQueue.push inside runManualCompact must exist').toBeGreaterThan(0);
-            if (!seedAssign || !inFlightFalse) return;
+            if (!seedAssign || !inFlightClear) return;
 
             const posA = seedAssign.getStart(SF);
-            const posD = inFlightFalse.getStart(SF);
+            const posD = inFlightClear.getStart(SF);
             // Every push must obey A < push-position < D. Equivalent to
             // "lives in the critical section, after the seed has been
             // committed".
@@ -321,7 +302,7 @@ describe('runCodexAppServer — auto-resume after fallback compact', () => {
                 ).toBe(true);
                 expect(
                     posC < posD,
-                    `replay push at offset ${posC} must come BEFORE compactInFlight=false at ${posD} ` +
+                    `replay push at offset ${posC} must come BEFORE compactInFlight=null at ${posD} ` +
                     `— otherwise a concurrent /compact could drain the queue first`,
                 ).toBe(true);
             }

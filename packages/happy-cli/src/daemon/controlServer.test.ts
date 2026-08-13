@@ -105,24 +105,54 @@ describe('startDaemonControlServer', () => {
             startedBy: 'daemon',
             happySessionId: 'user-session',
             pid: 1002,
+            turnState: 'unknown',
+            turnToken: null,
           },
           {
             startedBy: 'daemon',
             happySessionId: 'restoring-session',
             pid: 1003,
+            turnState: 'unknown',
+            turnToken: null,
           },
           {
             startedBy: 'daemon',
             happySessionId: 'ready-restored-session',
             pid: 1004,
+            turnState: 'unknown',
+            turnToken: null,
           },
         ],
-        presenceVersion: 1,
+        presenceVersion: 2,
         unknownSessionIds: ['restoring-session'],
       });
     } finally {
       await server.stop();
     }
+  });
+
+  it('validates and forwards process-owned turn updates', async () => {
+    const updates: unknown[] = [];
+    const server = await startDaemonControlServer({
+      getChildren: () => [], stopSession: async () => true,
+      restoreSession: async () => ({ type: 'error', errorMessage: 'unused' }),
+      spawnSession: async () => ({ type: 'error', errorMessage: 'unused' }),
+      prepareShutdown: permitShutdown, requestShutdown: () => undefined,
+      onHappySessionWebhook: () => undefined,
+      onSessionTurn: async (sessionId, pid, turn) => {
+        updates.push({ sessionId, pid, turn }); return true;
+      },
+    });
+    try {
+      const turn = { sourceId: '00000000-0000-4000-8000-000000000001', sequence: 1,
+        state: 'running', token: `xc-turn-v1-${'a'.repeat(64)}` } as const;
+      const response = await fetch(`http://127.0.0.1:${server.port}/session-turn`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: 'session-a', pid: 42, turn }),
+      });
+      expect(response.ok).toBe(true);
+      expect(updates).toEqual([{ sessionId: 'session-a', pid: 42, turn }]);
+    } finally { await server.stop(); }
   });
 
   it('forwards exact provider readiness through the local session webhook', async () => {
@@ -312,7 +342,7 @@ describe('startDaemonControlServer', () => {
     try {
       const body = { previousSessionId: 'old-happy-session',
         providerSessionId: '019f8425-0e76-7b83-bed0-019efc0b6f8f',
-        virtualSessionId: 'x-000015-1', title: 'Work' };
+        virtualSessionId: 'x-000042', title: 'Work' };
       const response = await fetch(`http://127.0.0.1:${server.port}/replace-session`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
       });
@@ -320,12 +350,19 @@ describe('startDaemonControlServer', () => {
       expect(await response.json()).toEqual({ success: true, sessionId: 'new-happy-session', agent: 'codex' });
       expect(replacements).toEqual([body]);
 
+      const group = { ...body, virtualSessionId: 'x-000015-1' };
+      const groupResponse = await fetch(`http://127.0.0.1:${server.port}/replace-session`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(group),
+      });
+      expect(groupResponse.ok).toBe(true);
+      expect(replacements).toEqual([body, group]);
+
       const hostile = await fetch(`http://127.0.0.1:${server.port}/replace-session`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...body, virtualSessionId: 'x-000015-0' }),
       });
       expect(hostile.status).toBe(400);
-      expect(replacements).toEqual([body]);
+      expect(replacements).toEqual([body, group]);
     } finally {
       await server.stop();
     }

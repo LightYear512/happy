@@ -13,7 +13,7 @@ import chalk from 'chalk';
 import { Credentials } from '@/persistence';
 import { connectionState, isNetworkError } from '@/utils/serverConnectionErrors';
 
-const SESSION_MESSAGE_RECOVERY_TIMEOUT_MS = 90_000;
+const SESSION_MESSAGE_RECOVERY_TIMEOUT_MS = 20_000;
 const SESSION_READ_ATTEMPTS = 2;
 const SESSION_READ_RETRY_MS = 100;
 
@@ -420,29 +420,23 @@ export class ApiClient {
   }
 
   private async fetchSessionMessages(sessionId: string): Promise<SessionMessages> {
-    for (let attempt = 1; attempt <= SESSION_READ_ATTEMPTS; attempt += 1) {
-      try {
-        const response = await axios.get(
-          `${configuration.serverUrl}/v1/sessions/${sessionId}/messages`,
-          {
-            headers: { 'Authorization': `Bearer ${this.credential.token}` },
-            timeout: SESSION_MESSAGE_RECOVERY_TIMEOUT_MS,
-            maxContentLength: MAX_RECOVERY_RESPONSE_BYTES
-          }
-        );
-        if (!Array.isArray(response.data?.messages)) {
-          throw new Error('session message response is malformed');
+    try {
+      const response = await axios.get(
+        `${configuration.serverUrl}/v1/sessions/${sessionId}/messages`,
+        {
+          headers: { 'Authorization': `Bearer ${this.credential.token}` },
+          timeout: SESSION_MESSAGE_RECOVERY_TIMEOUT_MS,
+          maxContentLength: MAX_RECOVERY_RESPONSE_BYTES
         }
-        return response.data.messages;
-      } catch (error) {
-        logger.debug('[API] Session messages lookup failed', safeLookupFailure(error));
-        if (!isRetryableSessionLookupFailure(error) || attempt === SESSION_READ_ATTEMPTS) {
-          throw new Error('session_message_lookup_failed');
-        }
-        await new Promise((resolve) => setTimeout(resolve, SESSION_READ_RETRY_MS));
+      );
+      if (!Array.isArray(response.data?.messages)) {
+        throw new Error('session message response is malformed');
       }
+      return response.data.messages;
+    } catch (error) {
+      logger.debug('[API] Session messages lookup failed', safeLookupFailure(error));
+      throw new Error('session_message_lookup_failed');
     }
-    throw new Error('session_message_lookup_failed');
   }
 
   sessionSyncClient(session: Session): ApiSessionClient {
@@ -453,8 +447,17 @@ export class ApiClient {
     return new ApiSessionMetadataClient(this.credential.token, session);
   }
 
-  sessionMessageClient(session: Session): ApiSessionMessageClient {
-    return new ApiSessionMessageClient(this.credential.token, session);
+  sessionMessageClient(session: Session | string): ApiSessionMessageClient {
+    if (typeof session !== 'string') return new ApiSessionMessageClient(this.credential.token, session);
+    const encryption = this.credential.encryption;
+    if (encryption.type === 'dataKey' && !encryption.dataKey) {
+      throw new Error('session_message_encryption_unavailable');
+    }
+    return new ApiSessionMessageClient(this.credential.token, {
+      id: session,
+      encryptionKey: encryption.type === 'dataKey' ? encryption.dataKey! : encryption.secret,
+      encryptionVariant: encryption.type,
+    });
   }
 
   machineSyncClient(machine: Machine): ApiMachineClient {

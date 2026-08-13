@@ -1,10 +1,12 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { ApiSessionClient } from './apiSession';
 import { decodeBase64, decrypt, encodeBase64, encrypt } from './encryption';
+import { inputAcceptedEventId } from './inputAcceptanceReceipt';
 
 // Use vi.hoisted to ensure mock function is available when vi.mock factory runs
 const { mockIo, getMock, ensureProjectWatchMock, runProjectSessionStartupMock,
-    runProjectSessionStopMock, runProjectSessionCloseMock, notifyDaemonSessionStartedMock } = vi.hoisted(() => ({
+    runProjectSessionStopMock, runProjectSessionCloseMock, notifyDaemonSessionStartedMock,
+    notifyDaemonSessionTurnMock, loggerTraceMock } = vi.hoisted(() => ({
     mockIo: vi.fn(),
     getMock: vi.fn(),
     ensureProjectWatchMock: vi.fn(),
@@ -12,6 +14,8 @@ const { mockIo, getMock, ensureProjectWatchMock, runProjectSessionStartupMock,
     runProjectSessionStopMock: vi.fn(),
     runProjectSessionCloseMock: vi.fn(),
     notifyDaemonSessionStartedMock: vi.fn(),
+    notifyDaemonSessionTurnMock: vi.fn(),
+    loggerTraceMock: vi.fn(),
 }));
 
 vi.mock('socket.io-client', () => ({
@@ -28,6 +32,15 @@ vi.mock('@/utils/projectSessionStartup', () => ({
 }));
 vi.mock('@/daemon/controlClient', () => ({
     notifyDaemonSessionStarted: notifyDaemonSessionStartedMock,
+    notifyDaemonSessionTurn: notifyDaemonSessionTurnMock,
+}));
+vi.mock('@/ui/logger', () => ({
+    diagnosticTrace: loggerTraceMock,
+    logger: {
+        debug: vi.fn(),
+        debugLargeJson: vi.fn(),
+        warn: vi.fn(),
+    },
 }));
 
 describe('ApiSessionClient connection handling', () => {
@@ -49,6 +62,7 @@ describe('ApiSessionClient connection handling', () => {
             emit: vi.fn(),
             disconnect: vi.fn(),
             close: vi.fn(),
+            io: { engine: { close: vi.fn() } },
             emitWithAck: vi.fn(),
             timeout: vi.fn(),
             volatile: { emit: vi.fn() },
@@ -62,6 +76,8 @@ describe('ApiSessionClient connection handling', () => {
         runProjectSessionStopMock.mockReset().mockResolvedValue(true);
         runProjectSessionCloseMock.mockReset().mockResolvedValue(undefined);
         notifyDaemonSessionStartedMock.mockReset().mockResolvedValue({ status: 'ok' });
+        notifyDaemonSessionTurnMock.mockReset().mockResolvedValue({ success: true });
+        loggerTraceMock.mockReset();
 
         // Create a proper mock session with metadata
         mockSession = {
@@ -84,7 +100,21 @@ describe('ApiSessionClient connection handling', () => {
         };
     });
 
-    const persistedUserRow = (id: string, seq: number, text: string, sentFrom = 'app') => ({
+    const persistedUserRow = (id: string, seq: number, text: string, sentFrom = 'app',
+        localId: string | null = null) => ({
+        id,
+        seq,
+        localId,
+        createdAt: 1_000 + seq,
+        content: {
+            t: 'encrypted' as const,
+            c: encodeBase64(encrypt(mockSession.encryptionKey, mockSession.encryptionVariant, {
+                role: 'user', content: { type: 'text', text }, meta: { sentFrom },
+            })),
+        },
+    });
+
+    const persistedAgentEventRow = (id: string, seq: number, eventId: string) => ({
         id,
         seq,
         localId: null,
@@ -92,7 +122,8 @@ describe('ApiSessionClient connection handling', () => {
         content: {
             t: 'encrypted' as const,
             c: encodeBase64(encrypt(mockSession.encryptionKey, mockSession.encryptionVariant, {
-                role: 'user', content: { type: 'text', text }, meta: { sentFrom },
+                role: 'agent',
+                content: { type: 'event', id: eventId, data: { type: 'message', message: 'accepted' } },
             })),
         },
     });
@@ -240,17 +271,25 @@ describe('ApiSessionClient connection handling', () => {
         expect(mockSocket.on).toHaveBeenCalledWith('error', expect.any(Function));
     });
 
-    it('starts periodic daemon re-registration only after final input readiness', async () => {
+    it('re-registers final input readiness from the existing keepalive after daemon replacement', async () => {
         vi.useFakeTimers();
         try {
             const client = new ApiSessionClient('fake-token', mockSession);
             mockSocket.connected = true;
             handlers.get('connect')?.();
-            expect(notifyDaemonSessionStartedMock).not.toHaveBeenCalled();
-            client.enableDaemonSessionTracking();
             await vi.waitFor(() => expect(notifyDaemonSessionStartedMock).toHaveBeenCalledOnce());
-            await vi.advanceTimersByTimeAsync(30_000);
+            expect(notifyDaemonSessionStartedMock).toHaveBeenLastCalledWith(
+                'test-session-id',
+                expect.objectContaining({ hostPid: process.pid }),
+            );
+            client.enableDaemonSessionTracking();
             await vi.waitFor(() => expect(notifyDaemonSessionStartedMock).toHaveBeenCalledTimes(2));
+            await vi.advanceTimersByTimeAsync(30_000);
+            expect(notifyDaemonSessionStartedMock).toHaveBeenCalledTimes(2);
+            client.keepAlive(false, 'remote');
+            await vi.waitFor(() => expect(notifyDaemonSessionStartedMock).toHaveBeenCalledTimes(3));
+            client.keepAlive(false, 'remote');
+            expect(notifyDaemonSessionStartedMock).toHaveBeenCalledTimes(3);
             await client.close();
         } finally {
             vi.useRealTimers();
@@ -318,6 +357,24 @@ describe('ApiSessionClient connection handling', () => {
         });
     });
 
+    it('reports ordered daemon turns before allowing the next turn to start', async () => {
+        const client = new ApiSessionClient('fake-token', mockSession);
+        client.enableDaemonSessionTracking('00000000-0000-4000-8000-000000000001');
+        await vi.waitFor(() => expect(notifyDaemonSessionStartedMock).toHaveBeenCalled());
+
+        const first = await client.beginDaemonSessionTurn();
+        client.closeDaemonSessionTurn('completed');
+        const second = await client.beginDaemonSessionTurn();
+        await vi.waitFor(() => expect(notifyDaemonSessionTurnMock).toHaveBeenCalledTimes(3));
+
+        const reports = notifyDaemonSessionTurnMock.mock.calls.map((call) => call[1]);
+        expect(reports.map((report) => report.sequence)).toEqual([1, 2, 3]);
+        expect(reports.map((report) => report.state)).toEqual(['running', 'idle', 'running']);
+        expect(first).not.toBe(second);
+        expect(reports[0].token).toBe(first);
+        expect(reports[2].token).toBe(second);
+    });
+
     it('HSR performs one delayed reclaim after server eviction and reports a second eviction as conflict', async () => {
         vi.useFakeTimers();
         const client = new ApiSessionClient('fake-token', mockSession);
@@ -376,7 +433,21 @@ describe('ApiSessionClient connection handling', () => {
         expect(client.getTransportSnapshot().state).toBe('connected');
     });
 
-    it('HSR retains buffered live input and fails closed after one bounded reconnect lookup', async () => {
+    it('does not query message history on a normal first Socket connection', async () => {
+        const client = new ApiSessionClient('fake-token', mockSession);
+        const delivered: string[] = [];
+        client.onUserMessage((message) => delivered.push(message.content.text));
+
+        mockSocket.connected = true;
+        handlers.get('connect')?.();
+        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id,
+            message: persistedUserRow('first-live', 1, 'first') } });
+
+        await vi.waitFor(() => expect(delivered).toEqual(['first']));
+        expect(getMock).not.toHaveBeenCalled();
+    });
+
+    it('keeps live input available when reconnect reconciliation fails', async () => {
         const client = new ApiSessionClient('fake-token', mockSession);
         const delivered: string[] = [];
         client.onUserMessage((message) => delivered.push(message.content.text));
@@ -389,19 +460,22 @@ describe('ApiSessionClient connection handling', () => {
 
         mockSocket.connected = false;
         handlers.get('disconnect')?.('transport close');
+        const duringRow = persistedUserRow('during-reconnect', 11, 'after');
         getMock.mockRejectedValueOnce(new Error('temporary 500'));
         mockSocket.connected = true;
         handlers.get('connect')?.();
-        const duringRow = persistedUserRow('during-reconnect', 11, 'after');
         handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id,
             message: duringRow } });
-        await vi.waitFor(() => expect(client.getTransportSnapshot().state).toBe('failed'));
-        expect(delivered).toEqual(['before']);
-        expect((client as any).pendingPersistedInputs).toHaveLength(1);
+        await vi.waitFor(() => expect(delivered).toEqual(['before', 'after']));
+        expect(client.getTransportSnapshot().state).toBe('connected');
+        expect((client as any).pendingPersistedInputs).toHaveLength(0);
         expect(getMock).toHaveBeenCalledOnce();
+        expect(mockSocket.io.engine.close).not.toHaveBeenCalled();
+        expect(mockSocket.disconnect).not.toHaveBeenCalled();
+        await client.close();
     });
 
-    it('HSR deduplicates an exact restore row against a later live Socket delivery', async () => {
+    it('initial restore and a later live Socket delivery share one deduplicating reader', async () => {
         const client = new ApiSessionClient('fake-token', mockSession);
         const delivered: string[] = [];
         mockSocket.connected = true;
@@ -417,11 +491,12 @@ describe('ApiSessionClient connection handling', () => {
                 })),
             },
         };
-        expect(client.injectPendingPersistedUserMessage(row)).toBe(true);
-        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id, message: row } });
         client.onUserMessage((message) => delivered.push(message.content.text));
+        getMock.mockResolvedValueOnce({ data: { messages: [row] } });
+        void client.reconcilePersistedInputs('restore');
+        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id, message: row } });
         await vi.waitFor(() => expect(delivered).toEqual(['once']));
-        expect(client.injectPendingPersistedUserMessage(row)).toBe(false);
+        expect((client as any).pendingPersistedInputs).toHaveLength(0);
     });
 
 
@@ -448,6 +523,14 @@ describe('ApiSessionClient connection handling', () => {
         expect((client as any).lastObservedMessage).toEqual({
             id: 'pending-replay', seq: 18,
         });
+        const cachedIdentity = (client as any).recentDeliveredMessages.get('pending-replay');
+        expect(cachedIdentity).toEqual(expect.objectContaining({
+            seq: 18,
+            localId: null,
+            createdAt: 1_018,
+            cipherDigest: expect.any(String),
+        }));
+        expect(cachedIdentity).not.toHaveProperty('content');
     });
 
     it('does not hold live input behind a pending restore lookup', async () => {
@@ -455,26 +538,168 @@ describe('ApiSessionClient connection handling', () => {
         const delivered: string[] = [];
         client.onUserMessage((message) => delivered.push(message.content.text));
 
+        let finishLookup!: (value: unknown) => void;
+        getMock.mockReturnValueOnce(new Promise((resolve) => { finishLookup = resolve; }));
+        const reconciliation = client.reconcilePersistedInputs('restore');
+
         handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id,
             message: persistedUserRow('restore-live-input', 18, 'live') } });
 
         await vi.waitFor(() => expect(delivered).toEqual(['live']));
+        finishLookup({ data: { messages: [] } });
+        await reconciliation;
     });
 
-    it('holds initial live input until older restore rows are merged in sequence order', async () => {
+    it('keeps live input immediate and deduplicates the later restore result', async () => {
         const client = new ApiSessionClient('fake-token', mockSession);
         const delivered: string[] = [];
-
-        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id,
-            message: persistedUserRow('initial-live', 19, 'newer') } });
-        expect(client.injectPendingPersistedUserMessage(
-            persistedUserRow('initial-restore', 18, 'older'),
-        )).toBe(true);
-        await Promise.resolve();
-        expect(delivered).toEqual([]);
-
+        mockSocket.connected = true;
+        handlers.get('connect')?.();
         client.onUserMessage((message) => delivered.push(message.content.text));
-        await vi.waitFor(() => expect(delivered).toEqual(['older', 'newer']));
+
+        const liveRow = persistedUserRow('initial-live', 19, 'newer');
+        let finishLookup!: (value: unknown) => void;
+        getMock.mockReturnValueOnce(new Promise((resolve) => { finishLookup = resolve; }));
+        const reconciliation = client.reconcilePersistedInputs('restore');
+        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id,
+            message: liveRow } });
+        await vi.waitFor(() => expect(delivered).toEqual(['newer']));
+
+        finishLookup({ data: { messages: [
+            persistedUserRow('initial-restore', 18, 'older'),
+            liveRow,
+        ] } });
+        await reconciliation;
+        expect(delivered).toEqual(['newer', 'older']);
+    });
+
+    it('shows the at-least-once notice only when initial restore actually replays input', async () => {
+        const empty = new ApiSessionClient('fake-token', mockSession);
+        const emptyNotice = vi.spyOn(empty, 'sendSessionEvent');
+        mockSocket.connected = true;
+        handlers.get('connect')?.();
+        getMock.mockResolvedValueOnce({ data: { messages: [] } });
+        await empty.reconcilePersistedInputs('restore');
+        expect(emptyNotice).not.toHaveBeenCalled();
+
+        const replay = new ApiSessionClient('fake-token', mockSession);
+        const replayNotice = vi.spyOn(replay, 'sendSessionEvent');
+        replay.onUserMessage(() => {});
+        getMock.mockResolvedValueOnce({ data: { messages: [
+            persistedUserRow('actual-replay', 20, 'retry me'),
+        ] } });
+        await replay.reconcilePersistedInputs('restore');
+        expect(replayNotice).toHaveBeenCalledTimes(1);
+        expect(replayNotice).toHaveBeenCalledWith({
+            type: 'message',
+            message: '正在恢复进程异常退出前未确认完成的输入；该输入可能已部分执行，本次按 at-least-once 语义重新提交。',
+        });
+    });
+
+    it('does not show a restore replay notice for input already accepted from the live Socket', async () => {
+        const row = persistedUserRow('already-live-before-restore', 21, 'once');
+        const client = new ApiSessionClient('fake-token', mockSession);
+        const notice = vi.spyOn(client, 'sendSessionEvent');
+        const delivered: string[] = [];
+        client.onUserMessage((message) => delivered.push(message.content.text));
+        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id, message: row } });
+        await vi.waitFor(() => expect(delivered).toEqual(['once']));
+
+        mockSocket.connected = true;
+        getMock.mockResolvedValueOnce({ data: { messages: [row] } });
+        await expect(client.reconcilePersistedInputs('restore')).resolves.toBe('complete');
+        expect(notice).not.toHaveBeenCalledWith({
+            type: 'message',
+            message: '正在恢复进程异常退出前未确认完成的输入；该输入可能已部分执行，本次按 at-least-once 语义重新提交。',
+        });
+        expect(delivered).toEqual(['once']);
+    });
+
+    it('replays an accepted-but-unconsumed input after process restart', async () => {
+        const client = new ApiSessionClient('fake-token', mockSession);
+        const delivered: string[] = [];
+        mockSocket.connected = true;
+        handlers.get('connect')?.();
+        client.onUserMessage((message) => delivered.push(message.content.text));
+        const localId = 'accepted-before-process-exit';
+        getMock.mockResolvedValueOnce({ data: { messages: [
+            persistedUserRow('accepted-before-exit', 24, 'must replay', 'app', localId),
+            persistedAgentEventRow('accepted-receipt', 25, inputAcceptedEventId(localId)),
+        ] } });
+
+        await expect(client.reconcilePersistedInputs('restore')).resolves.toBe('complete');
+        expect(delivered).toEqual(['must replay']);
+    });
+
+    it('defers an explicit restore lookup until the first Socket connection', async () => {
+        getMock.mockResolvedValueOnce({ data: { messages: [] } });
+        const client = new ApiSessionClient('fake-token', mockSession);
+
+        await expect(client.reconcilePersistedInputs('restore')).resolves.toBe('stopped');
+        expect(getMock).not.toHaveBeenCalled();
+
+        mockSocket.connected = true;
+        handlers.get('connect')?.();
+        await vi.waitFor(() => expect(getMock).toHaveBeenCalledOnce());
+    });
+
+    it('preserves restore reconciliation across a Socket disconnect', async () => {
+        mockSession.seq = 5;
+        const pending = persistedUserRow('restore-after-reconnect', 5, 'resume me');
+        const client = new ApiSessionClient('fake-token', mockSession);
+        const delivered: string[] = [];
+        client.onUserMessage((message) => delivered.push(message.content.text));
+        mockSocket.connected = true;
+        handlers.get('connect')?.();
+        expect(getMock).not.toHaveBeenCalled();
+
+        getMock.mockImplementationOnce((_url, options) => new Promise((_resolve, reject) => {
+            options.signal.addEventListener('abort', () => reject(new Error('canceled')), { once: true });
+        })).mockResolvedValueOnce({ data: { messages: [pending] } });
+        const interruptedRestore = client.reconcilePersistedInputs('restore');
+        await vi.waitFor(() => expect(getMock).toHaveBeenCalledOnce());
+        mockSocket.connected = false;
+        handlers.get('disconnect')?.('transport close');
+        await expect(interruptedRestore).resolves.toBe('stopped');
+
+        mockSocket.connected = true;
+        handlers.get('connect')?.();
+        await vi.waitFor(() => expect(delivered).toEqual(['resume me']));
+        expect(getMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not loop a failed restore lookup and keeps live input available', async () => {
+        const client = new ApiSessionClient('fake-token', mockSession);
+        const delivered: string[] = [];
+        mockSocket.connected = true;
+        handlers.get('connect')?.();
+        client.onUserMessage((message) => delivered.push(message.content.text));
+        expect(getMock).not.toHaveBeenCalled();
+        getMock.mockRejectedValueOnce(new Error('temporary 500'));
+
+        const recovery = client.reconcilePersistedInputs('restore');
+        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id,
+            message: persistedUserRow('live-during-retry', 27, 'live') } });
+        await vi.waitFor(() => expect(delivered).toEqual(['live']));
+        await expect(recovery).resolves.toBe('retryable');
+
+        expect(getMock).toHaveBeenCalledOnce();
+        expect(delivered).toEqual(['live']);
+        expect(mockSocket.disconnect).not.toHaveBeenCalled();
+    });
+
+    it('does not retry a deterministically invalid recovery snapshot', async () => {
+        const client = new ApiSessionClient('fake-token', mockSession);
+        mockSocket.connected = true;
+        handlers.get('connect')?.();
+        expect(getMock).not.toHaveBeenCalled();
+        getMock.mockResolvedValue({ data: { messages: [{}] } });
+
+        await client.reconcilePersistedInputs('restore');
+
+        expect(getMock).toHaveBeenCalledOnce();
+        expect(loggerTraceMock.mock.calls.flat().join(' ')).toContain('reconciliation rejected');
+        expect(mockSocket.disconnect).not.toHaveBeenCalled();
     });
 
     it('keeps persisted human input FIFO through synchronous provider acceptance', async () => {
@@ -523,6 +748,50 @@ describe('ApiSessionClient connection handling', () => {
         expect(elapsed).toBeLessThan(200);
     });
 
+    it('emits one deterministic visible receipt after synchronous provider acceptance', async () => {
+        const client = new ApiSessionClient('fake-token', mockSession);
+        mockSocket.connected = true;
+        handlers.get('connect')?.();
+        mockSocket.emit.mockClear();
+        const order: string[] = [];
+        mockSocket.emit.mockImplementation((event: string) => {
+            if (event === 'message') order.push('receipt');
+        });
+        client.onUserMessage(() => order.push('provider'));
+        const localId = 'mobile-input-accepted-1';
+
+        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id,
+            message: persistedUserRow('accepted-input', 22, 'hello', 'app', localId) } });
+
+        await vi.waitFor(() => expect(order).toEqual(['provider', 'receipt']));
+        const payload = mockSocket.emit.mock.calls.find(([event]: [string]) => event === 'message')?.[1];
+        const receipt = decrypt(mockSession.encryptionKey, mockSession.encryptionVariant,
+            decodeBase64(payload.message));
+        expect(receipt).toEqual({
+            role: 'agent',
+            content: {
+                id: inputAcceptedEventId(localId),
+                type: 'event',
+                data: { type: 'message', message: expect.stringMatching(/^\d{2}:\d{2} 已接收，正在投递$/u) },
+            },
+        });
+    });
+
+    it('does not roll back accepted input when its receipt cannot be sent', async () => {
+        const client = new ApiSessionClient('fake-token', mockSession);
+        const delivered: string[] = [];
+        client.onUserMessage((message) => delivered.push(message.content.text));
+        vi.spyOn(client, 'sendSessionEvent').mockImplementationOnce(() => {
+            throw new Error('receipt unavailable');
+        });
+
+        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id,
+            message: persistedUserRow('accepted-without-receipt', 23, 'continue', 'app', 'mobile-23') } });
+
+        await vi.waitFor(() => expect(delivered).toEqual(['continue']));
+        expect((client as any).lastObservedMessage).toEqual({ id: 'accepted-without-receipt', seq: 23 });
+    });
+
     it('handles exact human @stop as a bounded safe stop instead of model input', async () => {
         const client = new ApiSessionClient('fake-token', mockSession);
         const delivered: string[] = [];
@@ -550,19 +819,18 @@ describe('ApiSessionClient connection handling', () => {
         expect(delivered).toEqual([]);
     });
 
-    it('makes provider handoff failure visible as terminal transport failure', async () => {
+    it('makes provider handoff failure visible without killing the live Socket', async () => {
         const client = new ApiSessionClient('fake-token', mockSession);
         mockSocket.connected = true;
         handlers.get('connect')?.();
         mockSocket.emit.mockClear();
         client.onUserMessage(() => { throw new Error('provider queue rejected input'); });
         handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id,
-            message: persistedUserRow('provider-failure', 20, 'fail') } });
+            message: persistedUserRow('provider-failure', 20, 'fail', 'app', 'provider-failure-local') } });
 
-        await vi.waitFor(() => expect(client.getTransportSnapshot()).toEqual(expect.objectContaining({
-            state: 'failed',
-            reason: expect.stringContaining('provider queue rejected input'),
-        })));
+        await vi.waitFor(() => expect((client as any).pendingPersistedInputs).toHaveLength(1));
+        expect(client.getTransportSnapshot().state).toBe('connected');
+        expect(mockSocket.disconnect).not.toHaveBeenCalled();
         expect((client as any).lastObservedMessage).toEqual({ id: null, seq: 0 });
         const notices = mockSocket.emit.mock.calls
             .filter(([event]: [string]) => event === 'message')
@@ -575,6 +843,20 @@ describe('ApiSessionClient connection handling', () => {
                 data: { type: 'message', message: '模型入口未接纳本次输入。' },
             }),
         })]));
+        expect(notices).not.toEqual(expect.arrayContaining([expect.objectContaining({
+            content: expect.objectContaining({ id: inputAcceptedEventId('provider-failure-local') }),
+        })]));
+        const inputLogs = loggerTraceMock.mock.calls
+            .filter(([label]) => label === '[USER_INPUT]')
+            .map(([, record]) => JSON.parse(record));
+        expect(inputLogs).toEqual(expect.arrayContaining([
+            expect.objectContaining({ stage: 'persisted-received', inputId: 'provider-failure-local',
+                content: 'fail' }),
+            expect.objectContaining({ stage: 'provider-handoff-start', inputId: 'provider-failure-local' }),
+            expect.objectContaining({ stage: 'provider-handoff-rejected', inputId: 'provider-failure-local' }),
+        ]));
+        expect(inputLogs.filter(({ stage }) => stage !== 'persisted-received')
+            .every((record) => !Object.hasOwn(record, 'content'))).toBe(true);
     });
 
     it('HSR queues persistent output while disconnected and flushes it only after connection', () => {
@@ -588,6 +870,15 @@ describe('ApiSessionClient connection handling', () => {
         expect(mockSocket.emit).toHaveBeenCalledWith('message', expect.objectContaining({ sid: mockSession.id }));
         expect(mockSocket.emit.mock.calls.find(([event]: [string]) => event === 'message')?.[1].localId)
             .toMatch(/^happy-cli-v1-/);
+        expect(loggerTraceMock).toHaveBeenCalledWith('[SERVER_SEND]', expect.any(String));
+        const sendRecord = JSON.parse(loggerTraceMock.mock.calls
+            .find(([label]) => label === '[SERVER_SEND]')?.[1]);
+        expect(sendRecord).toEqual(expect.objectContaining({
+            sessionId: mockSession.id,
+            kind: 'codex:message',
+            delivery: 'queued-flush',
+        }));
+        expect(sendRecord.bytes).toBeGreaterThan(0);
         expect(client.getTransportSnapshot()).toEqual(expect.objectContaining({ state: 'connected', queueMessages: 0 }));
     });
 
@@ -616,7 +907,7 @@ describe('ApiSessionClient connection handling', () => {
         expect(client.getTransportSnapshot()).toEqual(expect.objectContaining({ state: 'failed' }));
     });
 
-    it('HSR fails terminally on a conflicting live persisted identity', () => {
+    it('rejects one conflicting live identity without killing the session', () => {
         const client = new ApiSessionClient('fake-token', mockSession);
         mockSocket.connected = true;
         handlers.get('connect')?.();
@@ -633,20 +924,22 @@ describe('ApiSessionClient connection handling', () => {
         };
         handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id, message } });
         handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id, message: { ...message, seq: 11 } } });
-        expect(client.getTransportSnapshot()).toEqual(expect.objectContaining({
-            state: 'failed',
-            reason: expect.stringContaining('recovery_incomplete'),
-        }));
-        expect(mockSocket.disconnect).toHaveBeenCalled();
+        expect(client.getTransportSnapshot().state).toBe('connected');
+        expect((client as any).pendingPersistedInputs).toHaveLength(1);
+        expect(mockSocket.disconnect).not.toHaveBeenCalled();
     });
 
-    it('HSR redacts credential-shaped transport failure reasons', () => {
+    it('HSR redacts credential-shaped retryable recovery reasons', async () => {
         const client = new ApiSessionClient('fake-token', mockSession);
-        client.markRestoreRecoveryFailed(new Error('Bearer private-token token=second-secret'));
-        const reason = client.getTransportSnapshot().reason ?? '';
-        expect(reason).not.toContain('private-token');
-        expect(reason).not.toContain('second-secret');
-        expect(reason).toContain('[redacted]');
+        mockSocket.connected = true;
+        handlers.get('connect')?.();
+        getMock.mockRejectedValueOnce(new Error('Bearer private-token token=second-secret'));
+        await client.reconcilePersistedInputs('reconnect');
+        const trace = loggerTraceMock.mock.calls.flat().join(' ');
+        expect(trace).not.toContain('private-token');
+        expect(trace).not.toContain('second-secret');
+        expect(trace).toContain('[redacted]');
+        expect(client.getTransportSnapshot().state).toBe('connected');
     });
 
     afterEach(() => {

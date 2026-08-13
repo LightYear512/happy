@@ -55,12 +55,22 @@ const session = {
     agentStateVersion: 1,
 };
 const localId = `xc-msg-v1-${'a'.repeat(64)}`;
+const acknowledge = (target: ReturnType<typeof makeSocket>, row: {
+    id: string; seq: number; localId: string; createdAt: number;
+}) => target.emit.mockImplementation((event: string, _data: unknown, callback?: (response: unknown) => void) => {
+    if (event === 'message') callback?.({ ok: true, ...row });
+});
+const rejectMessage = (target: ReturnType<typeof makeSocket>, code = 'invalid') =>
+    target.emit.mockImplementation((event: string, _data: unknown, callback?: (response: unknown) => void) => {
+        if (event === 'message') callback?.({ ok: false, code });
+    });
 
 describe('ApiSessionMessageClient', () => {
     beforeEach(() => {
         vi.clearAllMocks();
         ioMock.mockReset().mockReturnValue(socket);
         socket.connected = false;
+        socket.emit.mockReset();
         socket.__handlers.clear();
         socket.__listeners.clear();
         getMock.mockReset();
@@ -71,7 +81,7 @@ describe('ApiSessionMessageClient', () => {
         encryptMock.mockReset().mockReturnValue(new Uint8Array([1, 2, 3]));
     });
 
-    it('does not create a socket before request admission and preflight', async () => {
+    it('does not create a socket before request admission', async () => {
         const client = new ApiSessionMessageClient('secret-token', session);
         expect(client).toBeDefined();
         expect(ioMock).not.toHaveBeenCalled();
@@ -203,12 +213,10 @@ describe('ApiSessionMessageClient', () => {
         expect(ioMock).not.toHaveBeenCalled();
     });
 
-    it('returns the exact persisted row from the existing query API and closes its own socket', async () => {
+    it('returns the exact persisted row from the server acknowledgement without querying history', async () => {
         const row = { id: 'message-1', seq: 17, localId, createdAt: 12345, content: { t: 'encrypted', c: 'ciphertext' } };
         socket.connected = true;
-        getMock
-            .mockResolvedValueOnce({ data: { messages: [] } })
-            .mockResolvedValueOnce({ data: { messages: [row] } });
+        acknowledge(socket, row);
         const client = new ApiSessionMessageClient('secret-token', session);
         await expect(client.sendUserMessageOnce({ messageRole: 'user', messageText: 'hello', localId, timeoutMs: 10_000 })).resolves.toEqual({ result: 'success', id: row.id, seq: row.seq, localId, createdAt: row.createdAt });
         expect(ioMock).toHaveBeenCalledWith('https://happy.test', expect.objectContaining({
@@ -216,9 +224,35 @@ describe('ApiSessionMessageClient', () => {
             reconnection: false,
             autoConnect: false,
         }));
-        expect(socket.emit).toHaveBeenCalledWith('message', expect.objectContaining({ sid: 'session-1', localId }));
+        expect(socket.emit).toHaveBeenCalledWith('message', expect.objectContaining({ sid: 'session-1', localId }),
+            expect.any(Function));
         expect(socket.close).toHaveBeenCalledOnce();
-        expect(getMock).toHaveBeenCalledTimes(2);
+        expect(getMock).not.toHaveBeenCalled();
+    });
+
+    it('keeps query read-back as a compatibility fallback when the server sends no acknowledgement', async () => {
+        const row = { id: 'message-readback', seq: 18, localId, createdAt: 12346,
+            content: { t: 'encrypted', c: 'ciphertext' } };
+        socket.connected = true;
+        getMock.mockResolvedValue({ data: { messages: [row] } });
+        const client = new ApiSessionMessageClient('secret-token', session);
+
+        await expect(client.sendUserMessageOnce({
+            messageRole: 'user', messageText: 'hello', localId, timeoutMs: 10_000,
+        })).resolves.toEqual({ result: 'success', id: row.id, seq: row.seq, localId, createdAt: row.createdAt });
+        expect(socket.emit).toHaveBeenCalledOnce();
+        expect(getMock).toHaveBeenCalledOnce();
+    });
+
+    it('reports a definitive not-sent result when the server rejects the target session', async () => {
+        socket.connected = true;
+        rejectMessage(socket, 'not_found');
+        const client = new ApiSessionMessageClient('secret-token', session);
+
+        await expect(client.sendUserMessageOnce({
+            messageRole: 'user', messageText: 'hello', localId, timeoutMs: 10_000,
+        })).rejects.toMatchObject({ persistenceOutcome: 'not-sent' });
+        expect(getMock).not.toHaveBeenCalled();
     });
 
     it('encrypts and confirms the admitted permission mode on a user message', async () => {
@@ -228,9 +262,7 @@ describe('ApiSessionMessageClient', () => {
             role: 'user', content: { type: 'text', text: 'hello' },
             meta: { sentFrom: 'cli', permissionMode: 'yolo' },
         });
-        getMock
-            .mockResolvedValueOnce({ data: { messages: [] } })
-            .mockResolvedValueOnce({ data: { messages: [row] } });
+        acknowledge(socket, row);
 
         const client = new ApiSessionMessageClient('secret-token', session);
         await expect(client.sendUserMessageOnce({
@@ -252,9 +284,7 @@ describe('ApiSessionMessageClient', () => {
             meta: { sentFrom: 'cli', modelText: 'full model context',
                 displayText: 'compact summary', presentation: 'compact' },
         });
-        getMock
-            .mockResolvedValueOnce({ data: { messages: [] } })
-            .mockResolvedValueOnce({ data: { messages: [row] } });
+        acknowledge(socket, row);
 
         const client = new ApiSessionMessageClient('secret-token', session);
         await expect(client.sendUserMessageOnce({
@@ -282,9 +312,7 @@ describe('ApiSessionMessageClient', () => {
             meta: { sentFrom: 'cli', modelText: 'full model context',
                 displayText: 'x-000028 01:19\nMixedCase 邮件标题', presentation: 'mail' },
         });
-        getMock
-            .mockResolvedValueOnce({ data: { messages: [] } })
-            .mockResolvedValueOnce({ data: { messages: [row] } });
+        acknowledge(socket, row);
 
         const client = new ApiSessionMessageClient('secret-token', session);
         await expect(client.sendUserMessageOnce({
@@ -304,25 +332,27 @@ describe('ApiSessionMessageClient', () => {
         );
     });
 
-    it('returns an existing localId without connecting or emitting again', async () => {
+    it('recovers an existing logical message after the server rejects re-encrypted localId reuse', async () => {
         const row = { id: 'message-1', seq: 17, localId, createdAt: 12345, content: { t: 'encrypted', c: 'ciphertext' } };
+        socket.connected = true;
+        rejectMessage(socket);
         getMock.mockResolvedValue({ data: { messages: [row] } });
         const client = new ApiSessionMessageClient('secret-token', session);
         await expect(client.sendUserMessageOnce({ messageRole: 'user', messageText: 'hello', localId, timeoutMs: 10_000 })).resolves.toEqual({ result: 'success', id: row.id, seq: row.seq, localId, createdAt: row.createdAt });
-        expect(socket.connect).not.toHaveBeenCalled();
-        expect(socket.emit).not.toHaveBeenCalled();
-        expect(socket.close).not.toHaveBeenCalled();
+        expect(socket.emit).toHaveBeenCalledOnce();
+        expect(socket.close).toHaveBeenCalledOnce();
     });
 
     it('rejects an existing localId whose decrypted payload differs', async () => {
         const row = { id: 'message-1', seq: 17, localId, createdAt: 12345, content: { t: 'encrypted', c: 'ciphertext' } };
+        socket.connected = true;
+        rejectMessage(socket);
         decryptMock.mockReturnValue({ role: 'user', content: { type: 'text', text: 'different' } });
         getMock.mockResolvedValue({ data: { messages: [row] } });
         const client = new ApiSessionMessageClient('secret-token', session);
         await expect(client.sendUserMessageOnce({ messageRole: 'user', messageText: 'hello', localId, timeoutMs: 10_000 })).rejects.toThrow(/payload mismatch/);
-        expect(socket.connect).not.toHaveBeenCalled();
-        expect(socket.emit).not.toHaveBeenCalled();
-        expect(socket.close).not.toHaveBeenCalled();
+        expect(socket.emit).toHaveBeenCalledOnce();
+        expect(socket.close).toHaveBeenCalledOnce();
     });
 
     it('persisted user message confirmation binds permission mode', async () => {
@@ -331,13 +361,14 @@ describe('ApiSessionMessageClient', () => {
             role: 'user', content: { type: 'text', text: 'hello' },
             meta: { sentFrom: 'cli', permissionMode: 'default' },
         });
+        socket.connected = true;
+        rejectMessage(socket);
         getMock.mockResolvedValue({ data: { messages: [row] } });
         const client = new ApiSessionMessageClient('secret-token', session);
         await expect(client.sendUserMessageOnce({
             messageRole: 'user', messageText: 'hello', localId, timeoutMs: 10_000, permissionMode: 'yolo',
         })).rejects.toThrow(/payload mismatch/);
-        expect(socket.connect).not.toHaveBeenCalled();
-        expect(socket.emit).not.toHaveBeenCalled();
+        expect(socket.emit).toHaveBeenCalledOnce();
     });
 
     it.each([
@@ -345,12 +376,13 @@ describe('ApiSessionMessageClient', () => {
         [{ id: 'message-1', seq: 17, createdAt: 8_640_000_000_000_001 }, /createdAt invalid/],
     ])('MNA-054 rejects malformed persisted identity fields before claiming success', async (identity, error) => {
         const row = { ...identity, localId, content: { t: 'encrypted', c: 'ciphertext' } };
+        socket.connected = true;
+        rejectMessage(socket);
         getMock.mockResolvedValue({ data: { messages: [row] } });
         const client = new ApiSessionMessageClient('secret-token', session);
         await expect(client.sendUserMessageOnce({ messageRole: 'user', messageText: 'hello', localId, timeoutMs: 10_000 })).rejects.toThrow(error);
-        expect(socket.connect).not.toHaveBeenCalled();
-        expect(socket.emit).not.toHaveBeenCalled();
-        expect(socket.close).not.toHaveBeenCalled();
+        expect(socket.emit).toHaveBeenCalledOnce();
+        expect(socket.close).toHaveBeenCalledOnce();
     });
 
     it('persisted user message confirmation binds display text and compact presentation', async () => {
@@ -360,14 +392,15 @@ describe('ApiSessionMessageClient', () => {
             meta: { sentFrom: 'cli', modelText: 'hello',
                 displayText: 'different summary', presentation: 'compact' },
         });
+        socket.connected = true;
+        rejectMessage(socket);
         getMock.mockResolvedValue({ data: { messages: [row] } });
         const client = new ApiSessionMessageClient('secret-token', session);
         await expect(client.sendUserMessageOnce({
             messageRole: 'user', messageText: 'hello', displayText: 'compact summary',
             localId, timeoutMs: 10_000, presentation: 'compact',
         })).rejects.toThrow(/payload mismatch/);
-        expect(socket.connect).not.toHaveBeenCalled();
-        expect(socket.emit).not.toHaveBeenCalled();
+        expect(socket.emit).toHaveBeenCalledOnce();
     });
 
     it('uses the same monotonic deadline for connect and read-back confirmation', async () => {
@@ -379,30 +412,38 @@ describe('ApiSessionMessageClient', () => {
         expect(socket.close).toHaveBeenCalledOnce();
     });
 
-    it('MNA-056 does not create a socket when preflight exhausts the shared deadline', async () => {
-        getMock.mockImplementation(() => new Promise((resolve) => setTimeout(() => resolve({ data: { messages: [] } }), 20)));
+    it('does not let a stalled history query delay the first socket submission', async () => {
+        const row = { id: 'message-fast', seq: 21, localId, createdAt: 12349 };
+        socket.connected = true;
+        acknowledge(socket, row);
+        getMock.mockImplementation(() => new Promise(() => {}));
         const client = new ApiSessionMessageClient('secret-token', session);
-        await expect(client.sendUserMessageOnce({ messageRole: 'user', messageText: 'hello', localId, timeoutMs: 5 })).rejects.toThrow(/deadline/);
-        expect(ioMock).not.toHaveBeenCalled();
-        expect(socket.close).not.toHaveBeenCalled();
+        await expect(client.sendUserMessageOnce({ messageRole: 'user', messageText: 'hello', localId, timeoutMs: 5 }))
+            .resolves.toMatchObject({ result: 'success', id: row.id, localId });
+        expect(socket.emit).toHaveBeenCalledOnce();
+        expect(getMock).not.toHaveBeenCalled();
+        expect(socket.close).toHaveBeenCalledOnce();
     });
 
-    it('fails closed on a malformed message collection before emitting', async () => {
+    it('fails closed on a malformed recovery collection after emitting', async () => {
+        socket.connected = true;
+        rejectMessage(socket);
         getMock.mockResolvedValue({ data: { messages: { invalid: true } } });
         const client = new ApiSessionMessageClient('secret-token', session);
         await expect(client.sendUserMessageOnce({ messageRole: 'user', messageText: 'hello', localId, timeoutMs: 10_000 })).rejects.toThrow(/message collection/);
-        expect(socket.connect).not.toHaveBeenCalled();
-        expect(socket.emit).not.toHaveBeenCalled();
-        expect(socket.close).not.toHaveBeenCalled();
+        expect(socket.emit).toHaveBeenCalledOnce();
+        expect(socket.close).toHaveBeenCalledOnce();
     });
 
     it('HSR rejects a confirmation query larger than the deployed recent window', async () => {
+        socket.connected = true;
+        rejectMessage(socket);
         getMock.mockResolvedValue({ data: { messages: Array.from({ length: 151 }, () => ({})) } });
         const client = new ApiSessionMessageClient('secret-token', session);
         await expect(client.sendUserMessageOnce({
             messageRole: 'user', messageText: 'hello', localId, timeoutMs: 10_000,
         })).rejects.toThrow(/message collection/);
-        expect(ioMock).not.toHaveBeenCalled();
+        expect(socket.emit).toHaveBeenCalledOnce();
     });
 
     it('bounds recent-window confirmation without claiming recovery for an evicted row', async () => {
@@ -415,8 +456,10 @@ describe('ApiSessionMessageClient', () => {
         }));
         getMock.mockResolvedValue({ data: { messages: recentRows } });
         socket.connected = true;
+        rejectMessage(socket);
         const client = new ApiSessionMessageClient('secret-token', session);
-        await expect(client.sendUserMessageOnce({ messageRole: 'user', messageText: 'hello', localId, timeoutMs: 20 })).rejects.toThrow(/deadline/);
+        await expect(client.sendUserMessageOnce({ messageRole: 'user', messageText: 'hello', localId, timeoutMs: 10_000 }))
+            .rejects.toThrow(/rejected/);
         expect(socket.emit).toHaveBeenCalledTimes(1);
         expect(socket.close).toHaveBeenCalledOnce();
     });
@@ -449,7 +492,8 @@ describe('ApiSessionMessageClient', () => {
                 forceNew: true,
             }));
         }
-        expect(writer.emit).toHaveBeenCalledWith('message', expect.objectContaining({ sid: session.id, localId }));
+        expect(writer.emit).toHaveBeenCalledWith('message', expect.objectContaining({ sid: session.id, localId }),
+            expect.any(Function));
         expect(observer.close).toHaveBeenCalledOnce();
         expect(writer.close).toHaveBeenCalledOnce();
     });
@@ -463,15 +507,13 @@ describe('ApiSessionMessageClient', () => {
         const body = { type: 'message', message: 'done' };
         const row = { id: 'codex-message-2', seq: 32, localId, createdAt: 54322, content: { t: 'encrypted', c: 'ciphertext' } };
         decryptMock.mockReturnValue({ role: 'agent', content: { type: 'codex', data: body }, meta: { sentFrom: 'cli' } });
-        getMock
-            .mockResolvedValueOnce({ data: { messages: [] } })
-            .mockResolvedValueOnce({ data: { messages: [row] } });
+        getMock.mockResolvedValue({ data: { messages: [row] } });
 
         const client = new ApiSessionMessageClient('secret-token', session);
         await expect(client.sendCodexMessageOnce({
             messageRole: 'agent', messageType: 'codex', body, localId, timeoutMs: 10_000,
         })).resolves.toEqual({ result: 'success', id: row.id, seq: row.seq, localId, createdAt: row.createdAt });
-        expect(getMock).toHaveBeenCalledTimes(2);
+        expect(getMock).toHaveBeenCalledOnce();
     });
 
     it('HSR snapshots the admitted Codex body before asynchronous persistence work', async () => {
@@ -480,8 +522,6 @@ describe('ApiSessionMessageClient', () => {
         observer.connected = true;
         writer.connected = true;
         ioMock.mockReset().mockReturnValueOnce(observer).mockReturnValueOnce(writer);
-        let releasePreflight!: (value: unknown) => void;
-        getMock.mockImplementationOnce(() => new Promise((resolve) => { releasePreflight = resolve; }));
         const body = { type: 'message', message: 'original' };
         const row = { id: 'codex-message-snapshot', seq: 34, localId, createdAt: 54324, content: { t: 'encrypted', c: 'ciphertext' } };
         decryptMock.mockReturnValue({
@@ -495,23 +535,29 @@ describe('ApiSessionMessageClient', () => {
             messageRole: 'agent', messageType: 'codex', body, localId, timeoutMs: 10_000,
         });
         body.message = 'mutated-after-admission';
-        releasePreflight({ data: { messages: [] } });
         await expect(pending).resolves.toEqual({ result: 'success', id: row.id, seq: row.seq, localId, createdAt: row.createdAt });
     });
 
-    it('HSR rejects a changed Codex payload for an existing localId before allocating a socket', async () => {
+    it('HSR rejects a changed Codex payload after a retry collision without duplicating it', async () => {
         const expectedBody = { type: 'message', message: 'expected' };
         const row = { id: 'codex-message-3', seq: 33, localId, createdAt: 54323, content: { t: 'encrypted', c: 'ciphertext' } };
         decryptMock.mockReturnValue({
             role: 'agent', content: { type: 'codex', data: { type: 'message', message: 'changed' } }, meta: { sentFrom: 'cli' },
         });
         getMock.mockResolvedValue({ data: { messages: [row] } });
+        const observer = makeSocket();
+        const writer = makeSocket();
+        observer.connected = true;
+        writer.connected = true;
+        rejectMessage(writer);
+        ioMock.mockReset().mockReturnValueOnce(observer).mockReturnValueOnce(writer);
 
         const client = new ApiSessionMessageClient('secret-token', session);
         await expect(client.sendCodexMessageOnce({
             messageRole: 'agent', messageType: 'codex', body: expectedBody, localId, timeoutMs: 10_000,
         })).rejects.toThrow(/payload mismatch/);
-        expect(ioMock).not.toHaveBeenCalled();
+        expect(writer.emit).toHaveBeenCalledOnce();
+        expect(writer.close).toHaveBeenCalledOnce();
     });
 
     it('HSR rejects malformed or oversized Codex requests before allocating a socket', async () => {

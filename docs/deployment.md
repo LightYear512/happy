@@ -41,7 +41,7 @@ This document describes how to deploy the Happy backend (`packages/happy-server`
   - `GITHUB_REDIRECT_URL` is used by the OAuth callback handler.
   - `GITHUB_REDIRECT_URI` is used by the GitHub App initializer.
 - Voice: `ELEVENLABS_API_KEY` (required for `/v1/voice/token` in production).
-- Debug logging: `DANGEROUSLY_LOG_TO_SERVER_FOR_AI_AUTO_DEBUGGING` (enables file logging + dev log endpoint).
+- Debug logging: `DANGEROUSLY_LOG_TO_SERVER_FOR_AI_AUTO_DEBUGGING` enables the dev log endpoint without synchronous local file writes; set `DEBUG` explicitly for local debug files.
 
 ## Docker image
 A production Dockerfile is provided at `Dockerfile.server`.

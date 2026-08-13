@@ -1,13 +1,14 @@
 /**
- * Bounded ring buffer of recently-accepted user prompts.
+ * Bounded ring buffer of recently-started user prompts.
  *
  * Sole purpose: race recovery for /compact. The seed builder reads codex's
  * rollout.jsonl on disk, but codex writes user prompts to rollout
  * asynchronously, so an auto-rescue /compact firing too soon after a fresh
- * prompt can scan a rollout that does not yet contain it. We mirror every
- * accepted prompt into this in-memory ring and pass a snapshot to the seed
- * builder as `extraUserTexts`, which splices them in regardless of rollout
- * flush timing.
+ * prompt can scan a rollout that does not yet contain it. The turn consumer
+ * records each batch only after it crosses the thread-swap barrier, then the
+ * seed builder reads a snapshot as `extraUserTexts`. Queued-but-unconsumed
+ * input stays solely in MessageQueue2 and therefore cannot appear in both a
+ * compact seed and the following turn.
  *
  * Industry parallel: same staleness-reconciliation pattern as
  *   - Kafka producer's `RecordAccumulator` (in-memory batch before broker ack)

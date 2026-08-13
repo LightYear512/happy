@@ -291,27 +291,16 @@ describe('runCodexAppServer — AST regression contracts', () => {
     // ─── Race-recovery buffer for /compact ────────────────────────────────
     //
     // Contract: every prompt accepted by onUserMessage must be mirrored into
-    // an in-memory ring (`recentUserBuffer.record`) BEFORE pushing into the
-    // message queue, and that ring must be snapshotted into buildHeuristicSeed
+    // an in-memory ring (`recentUserBuffer.record`) only when the turn consumer
+    // crosses the compact barrier, and that ring must be snapshotted into buildHeuristicSeed
     // as `extraUserTexts` so the seed can recover prompts that haven't yet
     // flushed to rollout. The ring must also be cleared inside the compact
-    // critical section (between compactInFlight=true and compactInFlight=false)
+    // compact barrier (between publishing compactInFlight and clearing it)
     // and AFTER the seed has been committed to compactState.pendingSeedText.
     //
     // The buffer FIFO behaviour itself is covered in `recentUserBuffer.test.ts`
     // — these contracts only enforce wiring at the call site, not algorithm.
     describe('race-recovery buffer wiring contracts', () => {
-        // Find an assignment `target = <literal>` whose RHS is a specific
-        // SyntaxKind (e.g. TrueKeyword / FalseKeyword).
-        const findLiteralAssignment = (root: ts.Node, target: string, valueKind: ts.SyntaxKind) =>
-            findFirstNode(root, (n): n is ts.BinaryExpression =>
-                ts.isBinaryExpression(n)
-                && n.operatorToken.kind === ts.SyntaxKind.EqualsToken
-                && ts.isIdentifier(n.left)
-                && n.left.text === target
-                && n.right.kind === valueKind,
-            );
-
         // Find an assignment `<obj>.<prop> = anything` in a subtree.
         const findPropertyAssignment = (root: ts.Node, obj: string, prop: string) =>
             findFirstNode(root, (n): n is ts.BinaryExpression =>
@@ -349,10 +338,7 @@ describe('runCodexAppServer — AST regression contracts', () => {
             expect(callbackPos).toBeLessThan(registration!.getStart(SF));
         });
 
-        it('records every user prompt via `recentUserBuffer.record(...)` BEFORE pushing into the message queue', () => {
-            const pushCalls = findMethodCalls(SF, 'messageQueue', 'push');
-            expect(pushCalls.length, '`messageQueue.push(...)` must exist somewhere').toBeGreaterThan(0);
-
+        it('accepts input synchronously and records it only after the compact barrier', () => {
             const declaration = findFirstNode(SF, (node): node is ts.VariableDeclaration =>
                 ts.isVariableDeclaration(node)
                 && ts.isIdentifier(node.name)
@@ -362,13 +348,20 @@ describe('runCodexAppServer — AST regression contracts', () => {
             expect(callback && (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback)))
                 .toBe(true);
             const callbackPushCalls = findMethodCalls(callback!, 'messageQueue', 'push');
-            const recordCalls = findMethodCalls(callback!, 'recentUserBuffer', 'record');
             expect(callbackPushCalls.length).toBeGreaterThan(0);
-            expect(recordCalls.length).toBeGreaterThan(0);
-            const minRecordPos = Math.min(...recordCalls.map((call) => call.getStart(SF)));
-            for (const pushCall of callbackPushCalls) {
-                expect(minRecordPos).toBeLessThan(pushCall.getStart(SF));
-            }
+            const activityCalls = findMethodCalls(callback!, 'replyMonitor', 'observeUserMessage');
+            expect(activityCalls, 'accepted input records activity exactly once').toHaveLength(1);
+            expect(callbackPushCalls[0].getStart(SF)).toBeLessThan(activityCalls[0].getStart(SF));
+            expect(findMethodCalls(callback!, 'recentUserBuffer', 'record')).toHaveLength(0);
+
+            const barrierAwait = findFirstNode(SF, (node): node is ts.AwaitExpression =>
+                ts.isAwaitExpression(node)
+                && ts.isIdentifier(node.expression)
+                && node.expression.text === 'compactBarrier');
+            const recordCalls = findMethodCalls(SF, 'recentUserBuffer', 'record');
+            expect(barrierAwait, 'the turn consumer must await the compact barrier').not.toBeNull();
+            expect(recordCalls, 'the consumer owns one recovery-buffer record').toHaveLength(1);
+            expect(barrierAwait!.getStart(SF)).toBeLessThan(recordCalls[0].getStart(SF));
         });
 
         it('passes `recentUserBuffer.snapshot()` as `extraUserTexts` to buildHeuristicSeed inside runManualCompact', () => {
@@ -408,23 +401,36 @@ describe('runCodexAppServer — AST regression contracts', () => {
             }
         });
 
-        it('clears the buffer inside the compact critical section after committing the seed', () => {
+        it('clears the buffer inside the compact barrier after committing the seed', () => {
             // Four anchor points must obey A < B < C < D:
-            //   A: compactInFlight = true       (entry to critical section)
+            //   A: compactInFlight = new Promise (barrier published)
             //   B: compactState.pendingSeedText = seedText  (seed committed)
             //   C: recentUserBuffer.clear()     (the reset itself)
-            //   D: compactInFlight = false      (exit of critical section)
+            //   D: compactInFlight = null       (barrier cleared)
             const compactFn = findRunManualCompact();
             expect(compactFn, 'runManualCompact must exist (anchor)').not.toBeNull();
             if (!compactFn) return;
 
-            const a = findLiteralAssignment(compactFn, 'compactInFlight', ts.SyntaxKind.TrueKeyword);
-            const d = findLiteralAssignment(compactFn, 'compactInFlight', ts.SyntaxKind.FalseKeyword);
+            const a = findFirstNode(compactFn, (n): n is ts.BinaryExpression =>
+                ts.isBinaryExpression(n)
+                && n.operatorToken.kind === ts.SyntaxKind.EqualsToken
+                && ts.isIdentifier(n.left)
+                && n.left.text === 'compactInFlight'
+                && ts.isNewExpression(n.right)
+                && n.right.expression.getText(SF) === 'Promise',
+            );
+            const d = findFirstNode(compactFn, (n): n is ts.BinaryExpression =>
+                ts.isBinaryExpression(n)
+                && n.operatorToken.kind === ts.SyntaxKind.EqualsToken
+                && ts.isIdentifier(n.left)
+                && n.left.text === 'compactInFlight'
+                && n.right.kind === ts.SyntaxKind.NullKeyword,
+            );
             const b = findPropertyAssignment(compactFn, 'compactState', 'pendingSeedText');
             const clearCalls = findMethodCalls(compactFn, 'recentUserBuffer', 'clear');
 
-            expect(a, 'A: `compactInFlight = true` must exist').not.toBeNull();
-            expect(d, 'D: `compactInFlight = false` must exist').not.toBeNull();
+            expect(a, 'A: the compact Promise barrier must be published').not.toBeNull();
+            expect(d, 'D: the compact Promise barrier must be cleared').not.toBeNull();
             expect(b, 'B: `compactState.pendingSeedText = seedText` must exist').not.toBeNull();
             expect(
                 clearCalls.length,
@@ -445,8 +451,26 @@ describe('runCodexAppServer — AST regression contracts', () => {
                 validClears.length,
                 'expected `recentUserBuffer.clear()` to be placed AFTER ' +
                 '`compactState.pendingSeedText = seedText` and BEFORE ' +
-                '`compactInFlight = false` (i.e. on the try-block success path)',
+                '`compactInFlight = null` (i.e. on the try-block success path)',
             ).toBeGreaterThan(0);
+        });
+
+        it('accepts ordinary input during compaction and waits only at the turn consumer', () => {
+            const declaration = findFirstNode(SF, (node): node is ts.VariableDeclaration =>
+                ts.isVariableDeclaration(node)
+                && ts.isIdentifier(node.name)
+                && node.name.text === 'onUserMessage');
+            expect(declaration, '`onUserMessage` must be declared').not.toBeNull();
+            const callback = declaration!.initializer;
+            expect(callback && (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback))).toBe(true);
+            expect(callback!.getText(SF)).not.toMatch(/if\s*\(compactInFlight\)/u);
+            expect(findMethodCalls(callback!, 'messageQueue', 'push').length).toBeGreaterThan(0);
+
+            const barrierAwait = findFirstNode(SF, (node): node is ts.AwaitExpression =>
+                ts.isAwaitExpression(node)
+                && ts.isIdentifier(node.expression)
+                && node.expression.text === 'compactBarrier');
+            expect(barrierAwait, 'the turn consumer must await the compact barrier').not.toBeNull();
         });
     });
 });
