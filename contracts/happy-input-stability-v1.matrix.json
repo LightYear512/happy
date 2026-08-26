@@ -90,9 +90,9 @@
     },
     {
       "from": "a persisted restore or reconnect tail not loaded because its bounded query had a retryable transport failure",
-      "to": "the same per-session recovery owner retries with bounded exponential delay until one complete snapshot is loaded, a deterministic snapshot rejection occurs, or the session stops",
+      "to": "the same per-session recovery owner permits at most two history requests in one unresolved recovery generation, keeps its original reconnect anchor and live Socket input available, emits one short degraded-recovery notice after exhaustion, retains incomplete recovery state, and permits a later explicit recovery generation",
       "creator": "completeProviderInputReady or a live Socket reconnect",
-      "advancer": "ApiSessionClient startPersistedInputRecovery",
+      "advancer": "ApiSessionClient startPersistedInputReconciliation finite request gate",
       "consumer": "ApiSessionClient persisted-input FIFO; live Socket input remains independently available",
       "rejectTests": [
         {

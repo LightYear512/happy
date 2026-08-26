@@ -643,7 +643,7 @@ describe('ApiSessionClient connection handling', () => {
         await vi.waitFor(() => expect(getMock).toHaveBeenCalledOnce());
     });
 
-    it('preserves restore reconciliation across a Socket disconnect', async () => {
+    it('keeps one restore lookup in flight across a Socket disconnect and reconnect', async () => {
         mockSession.seq = 5;
         const pending = persistedUserRow('restore-after-reconnect', 5, 'resume me');
         const client = new ApiSessionClient('fake-token', mockSession);
@@ -653,19 +653,20 @@ describe('ApiSessionClient connection handling', () => {
         handlers.get('connect')?.();
         expect(getMock).not.toHaveBeenCalled();
 
-        getMock.mockImplementationOnce((_url, options) => new Promise((_resolve, reject) => {
-            options.signal.addEventListener('abort', () => reject(new Error('canceled')), { once: true });
-        })).mockResolvedValueOnce({ data: { messages: [pending] } });
-        const interruptedRestore = client.reconcilePersistedInputs('restore');
+        let finishLookup!: (value: unknown) => void;
+        getMock.mockReturnValueOnce(new Promise((resolve) => { finishLookup = resolve; }));
+        const restore = client.reconcilePersistedInputs('restore');
         await vi.waitFor(() => expect(getMock).toHaveBeenCalledOnce());
         mockSocket.connected = false;
         handlers.get('disconnect')?.('transport close');
-        await expect(interruptedRestore).resolves.toBe('stopped');
 
         mockSocket.connected = true;
         handlers.get('connect')?.();
+        expect(getMock).toHaveBeenCalledOnce();
+        finishLookup({ data: { messages: [pending] } });
+        await expect(restore).resolves.toBe('complete');
         await vi.waitFor(() => expect(delivered).toEqual(['resume me']));
-        expect(getMock).toHaveBeenCalledTimes(2);
+        expect(getMock).toHaveBeenCalledOnce();
     });
 
     it('does not loop a failed restore lookup and keeps live input available', async () => {
@@ -686,6 +687,92 @@ describe('ApiSessionClient connection handling', () => {
         expect(getMock).toHaveBeenCalledOnce();
         expect(delivered).toEqual(['live']);
         expect(mockSocket.disconnect).not.toHaveBeenCalled();
+    });
+
+    it('caps automatic restore lookups across reconnects and preserves an explicit retry', async () => {
+        const client = new ApiSessionClient('fake-token', mockSession);
+        const delivered: string[] = [];
+        const recoveryNotices = () => mockSocket.emit.mock.calls
+            .filter(([event]: [string]) => event === 'message')
+            .map(([, payload]: [string, { message: string }]) => decrypt(mockSession.encryptionKey,
+                mockSession.encryptionVariant, decodeBase64(payload.message)))
+            .filter((body: any) => body.content?.data?.message ===
+                '⚠️ 部分消息可能未送达。会话仍可使用，请先确认最近操作的结果。');
+        client.onUserMessage((message) => delivered.push(message.content.text));
+        mockSocket.connected = true;
+        handlers.get('connect')?.();
+        getMock.mockRejectedValue(new Error('database timeout'));
+
+        await expect(client.reconcilePersistedInputs('restore')).resolves.toBe('retryable');
+        expect(getMock).toHaveBeenCalledOnce();
+        expect(recoveryNotices()).toHaveLength(0);
+
+        mockSocket.connected = false;
+        handlers.get('disconnect')?.('transport close');
+        mockSocket.connected = true;
+        handlers.get('connect')?.();
+        await vi.waitFor(() => expect(getMock).toHaveBeenCalledTimes(2));
+        await vi.waitFor(() => expect((client as any).persistedInputReconciliationHalted)
+            .toBe('retryable'));
+        expect(recoveryNotices()).toHaveLength(1);
+
+        for (let reconnect = 0; reconnect < 3; reconnect += 1) {
+            mockSocket.connected = false;
+            handlers.get('disconnect')?.('transport close');
+            mockSocket.connected = true;
+            handlers.get('connect')?.();
+            await Promise.resolve();
+        }
+        expect(getMock).toHaveBeenCalledTimes(2);
+        expect((client as any).restoreReconciliationPending).toBe(true);
+        expect(loggerTraceMock.mock.calls.filter(([label]) =>
+            label === '[INPUT] reconciliation retry budget exhausted')).toHaveLength(1);
+
+        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id,
+            message: persistedUserRow('live-after-recovery-gate', 28, 'still live') } });
+        await vi.waitFor(() => expect(delivered).toEqual(['still live']));
+        expect(getMock).toHaveBeenCalledTimes(2);
+        expect(recoveryNotices()).toHaveLength(1);
+
+        getMock.mockResolvedValueOnce({ data: { messages: [] } });
+        await expect(client.reconcilePersistedInputs('restore')).resolves.toBe('complete');
+        expect(getMock).toHaveBeenCalledTimes(3);
+        expect((client as any).restoreReconciliationPending).toBe(false);
+    });
+
+    it('keeps the original reconnect anchor while live input continues after recovery failures', async () => {
+        mockSession.seq = 10;
+        const client = new ApiSessionClient('fake-token', mockSession);
+        const delivered: string[] = [];
+        client.onUserMessage((message) => delivered.push(message.content.text));
+        mockSocket.connected = true;
+        handlers.get('connect')?.();
+        getMock.mockRejectedValue(new Error('database timeout'));
+
+        await expect(client.reconcilePersistedInputs('reconnect')).resolves.toBe('retryable');
+        expect((client as any).persistedInputReconciliationAnchor).toEqual({ id: null, seq: 10 });
+
+        const missed = persistedUserRow('missed-during-gap', 11, 'missed');
+        const newer = persistedUserRow('newer-live-input', 12, 'newer');
+        handlers.get('update')?.({ body: { t: 'new-message', sid: mockSession.id, message: newer } });
+        await vi.waitFor(() => expect(delivered).toEqual(['newer']));
+        expect(getMock).toHaveBeenCalledOnce();
+        expect((client as any).lastObservedMessage).toEqual({ id: 'newer-live-input', seq: 12 });
+
+        mockSocket.connected = false;
+        handlers.get('disconnect')?.('transport close');
+        mockSocket.connected = true;
+        handlers.get('connect')?.();
+        await vi.waitFor(() => expect((client as any).persistedInputReconciliationHalted)
+            .toBe('retryable'));
+        expect(getMock).toHaveBeenCalledTimes(2);
+        expect((client as any).persistedInputReconciliationAnchor).toEqual({ id: null, seq: 10 });
+
+        getMock.mockResolvedValueOnce({ data: { messages: [missed, newer] } });
+        await expect(client.reconcilePersistedInputs('reconnect')).resolves.toBe('complete');
+        expect(getMock).toHaveBeenCalledTimes(3);
+        expect(delivered).toEqual(['newer', 'missed']);
+        expect((client as any).persistedInputReconciliationAnchor).toBeNull();
     });
 
     it('does not retry a deterministically invalid recovery snapshot', async () => {

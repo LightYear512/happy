@@ -43,10 +43,12 @@ const MAX_OUTBOUND_QUEUE_BYTES = 1_048_576;
 const MAX_RECOVERY_BUFFER_ROWS = 512;
 const MAX_RECENT_DELIVERED_MESSAGES = 512;
 const RECONNECT_RECOVERY_TIMEOUT_MS = 10_000;
+const MAX_PERSISTED_INPUT_RECONCILIATION_ATTEMPTS = 2;
 const METADATA_UPDATE_TIMEOUT_MS = 15_000;
 const METADATA_UPDATE_ATTEMPTS = 4;
 const DAEMON_REGISTRATION_INTERVAL_MS = 30_000;
 const RESTORE_REPLAY_NOTICE = '正在恢复进程异常退出前未确认完成的输入；该输入可能已部分执行，本次按 at-least-once 语义重新提交。';
+const RECOVERY_DEGRADED_NOTICE = '⚠️ 部分消息可能未送达。会话仍可使用，请先确认最近操作的结果。';
 
 type SessionTransportHealthState =
     | 'connecting'
@@ -84,6 +86,12 @@ interface DeliveredPersistedIdentity {
     localId: string | null;
     createdAt: number;
     cipherDigest: string;
+}
+
+interface PersistedInputReconciliationOperation {
+    controller: AbortController;
+    mode: 'restore' | 'reconnect';
+    operation: Promise<ReconciliationOutcome>;
 }
 
 /**
@@ -146,7 +154,11 @@ export class ApiSessionClient extends EventEmitter {
     private pendingPersistedBytes = 0;
     private inputDrainRunning = false;
     private recentDeliveredMessages = new Map<string, DeliveredPersistedIdentity>();
-    private persistedInputReconciliation: AbortController | null = null;
+    private persistedInputReconciliation: PersistedInputReconciliationOperation | null = null;
+    private persistedInputReconciliationAttempts = 0;
+    private persistedInputReconciliationHalted: Extract<ReconciliationOutcome, 'retryable' | 'rejected'> | null = null;
+    private persistedInputReconciliationHaltPublished = false;
+    private persistedInputReconciliationAnchor: SessionRecoveryAnchor | null = null;
     private restoreReconciliationPending = false;
     private outboundQueue: QueuedPersistentMessage[] = [];
     private outboundQueueBytes = 0;
@@ -384,17 +396,21 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     private handleSocketDisconnect(reason: string): void {
-        this.stopPersistedInputReconciliation();
         if (this.closing) {
+            this.stopPersistedInputReconciliation();
             if (this.transportState !== 'closed') this.publishTransportState('closed', null);
             return;
         }
-        if (this.isTerminalTransport()) return;
+        if (this.isTerminalTransport()) {
+            this.stopPersistedInputReconciliation();
+            return;
+        }
         if (reason !== 'io server disconnect') {
             this.publishTransportState('recovering', reason);
             return;
         }
         if (this.serverEvictionRecoveries >= 1) {
+            this.stopPersistedInputReconciliation();
             this.publishTransportState('ownership_conflict', reason);
             this.emit('transport-fatal', this.getTransportSnapshot());
             return;
@@ -407,6 +423,10 @@ export class ApiSessionClient extends EventEmitter {
     }
 
     reconcilePersistedInputs(mode: 'restore' | 'reconnect'): Promise<ReconciliationOutcome> {
+        // Public calls begin an explicit recovery generation. Socket reconnects
+        // continue that same generation through startPersistedInputReconciliation
+        // and therefore cannot refresh an exhausted request budget forever.
+        if (!this.persistedInputReconciliation) this.resetPersistedInputReconciliationGate();
         if (mode === 'restore') {
             this.restoreReconciliationPending = true;
             if (!this.socket.connected) return Promise.resolve('stopped');
@@ -417,33 +437,91 @@ export class ApiSessionClient extends EventEmitter {
     private startPersistedInputReconciliation(
         mode: 'restore' | 'reconnect',
     ): Promise<ReconciliationOutcome> {
-        this.stopPersistedInputReconciliation();
+        const active = this.persistedInputReconciliation;
+        if (active) {
+            if (mode === 'restore' && active.mode !== 'restore') {
+                return active.operation.then((outcome) => {
+                    if (!this.restoreReconciliationPending || this.closing || this.isTerminalTransport()) {
+                        return outcome;
+                    }
+                    return this.startPersistedInputReconciliation('restore');
+                });
+            }
+            return active.operation;
+        }
+        if (this.persistedInputReconciliationHalted !== null
+            || this.persistedInputReconciliationAttempts >= MAX_PERSISTED_INPUT_RECONCILIATION_ATTEMPTS) {
+            const outcome = this.persistedInputReconciliationHalted ?? 'retryable';
+            this.publishPersistedInputReconciliationHalt(outcome, mode);
+            return Promise.resolve(outcome);
+        }
         const controller = new AbortController();
-        this.persistedInputReconciliation = controller;
-        const operation = this.runPersistedInputReconciliation(mode, controller.signal);
+        this.persistedInputReconciliationAttempts += 1;
+        const anchor = mode === 'reconnect'
+            ? this.persistedInputReconciliationAnchor ?? { ...this.lastObservedMessage }
+            : { ...this.lastObservedMessage };
+        if (mode === 'reconnect' && this.persistedInputReconciliationAnchor === null) {
+            this.persistedInputReconciliationAnchor = anchor;
+        }
+        const operation = this.runPersistedInputReconciliation(mode, anchor, controller.signal);
+        const reconciliation: PersistedInputReconciliationOperation = { controller, mode, operation };
+        this.persistedInputReconciliation = reconciliation;
         void operation.then((outcome) => {
-            if (this.persistedInputReconciliation !== controller) return;
+            if (this.persistedInputReconciliation !== reconciliation) return;
             this.persistedInputReconciliation = null;
+            if (outcome === 'complete') {
+                this.resetPersistedInputReconciliationGate();
+                this.persistedInputReconciliationAnchor = null;
+            } else if (outcome === 'rejected'
+                || outcome === 'retryable'
+                && this.persistedInputReconciliationAttempts >= MAX_PERSISTED_INPUT_RECONCILIATION_ATTEMPTS) {
+                this.publishPersistedInputReconciliationHalt(outcome, mode);
+            }
             if (mode === 'restore' && outcome !== 'stopped' && outcome !== 'retryable') {
                 this.restoreReconciliationPending = false;
             }
         }, () => {
-            if (this.persistedInputReconciliation === controller) this.persistedInputReconciliation = null;
+            if (this.persistedInputReconciliation === reconciliation) this.persistedInputReconciliation = null;
         });
         return operation;
     }
 
+    private publishPersistedInputReconciliationHalt(
+        outcome: Extract<ReconciliationOutcome, 'retryable' | 'rejected'>,
+        mode: 'restore' | 'reconnect',
+    ): void {
+        this.persistedInputReconciliationHalted = outcome;
+        if (this.persistedInputReconciliationHaltPublished) return;
+        this.persistedInputReconciliationHaltPublished = true;
+        diagnosticTrace(
+            outcome === 'retryable'
+                ? '[INPUT] reconciliation retry budget exhausted'
+                : '[INPUT] reconciliation halted',
+            this.sessionId,
+            mode,
+            this.persistedInputReconciliationAttempts,
+        );
+        this.sendNotice(RECOVERY_DEGRADED_NOTICE);
+    }
+
+    private resetPersistedInputReconciliationGate(): void {
+        this.persistedInputReconciliationAttempts = 0;
+        this.persistedInputReconciliationHalted = null;
+        this.persistedInputReconciliationHaltPublished = false;
+    }
+
     private stopPersistedInputReconciliation(): void {
-        this.persistedInputReconciliation?.abort();
+        this.persistedInputReconciliation?.controller.abort();
         this.persistedInputReconciliation = null;
+        this.persistedInputReconciliationAnchor = null;
     }
 
     private async runPersistedInputReconciliation(
         mode: 'restore' | 'reconnect',
+        anchor: SessionRecoveryAnchor,
         signal?: AbortSignal,
     ): Promise<ReconciliationOutcome> {
         if (signal?.aborted || this.closing || this.isTerminalTransport()) return 'stopped';
-        const anchor = { ...this.lastObservedMessage };
         let rawMessages: unknown;
         try {
             const response = await axios.get(`${configuration.serverUrl}/v1/sessions/${this.sessionId}/messages`, {
