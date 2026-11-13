@@ -285,8 +285,11 @@ export async function claudeLocal(opts: {
             // Prepare environment variables
             // Note: Local mode uses global Claude installation with --session-id flag
             // Launcher only intercepts fetch for thinking state tracking
+            // Drop inherited Happy IDs; the scoped session environment below
+            // supplies this conversation's identity and its Happy mail route.
+            const { HAPPY_CHAT_ID, HAPPY_SESSION_ID, ...cleanProcessEnv } = process.env;
             const env = {
-                ...process.env,
+                ...cleanProcessEnv,
                 ...opts.claudeEnvVars
             }
 

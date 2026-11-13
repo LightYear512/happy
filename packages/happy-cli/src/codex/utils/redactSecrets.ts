@@ -10,9 +10,9 @@
  * Extracted from compactSeedBuilder so both it (full set) and
  * projectFallbackDocs (high-confidence subset) can depend on a leaf module —
  * avoids a circular dependency (compactSeedBuilder already imports
- * projectFallbackDocs for stripProjectDocs). `redactSensitive` (full set) is
- * byte-for-byte identical to the pre-extraction implementation — no behavioural
- * change.
+ * projectFallbackDocs for stripProjectDocs). Startup diagnostics also use the
+ * full set: recognized credential fields must not depend on password length
+ * or a restricted token alphabet.
  */
 
 type Pattern = readonly [RegExp, string];
@@ -38,10 +38,11 @@ export const HIGH_CONFIDENCE_SECRET_PATTERNS: Pattern[] = [
 // user's authoritative project doc.
 export const GENERALIZED_SECRET_PATTERNS: Pattern[] = [
     // HTTP Authorization header (bearer / basic)
-    [/(Authorization\s*:\s*)(?:Bearer|Basic|Token)\s+\S+/gi, '$1[REDACTED]'],
-    // Generic name=value (api_key, secret, password, access_token, ...)
-    // Capture the variable name + delimiter, replace only the value.
-    [/\b((?:api[_-]?key|secret|access[_-]?token|password|passwd|auth[_-]?token|bearer|client[_-]?secret)["']?\s*[:=]\s*["']?)([A-Za-z0-9_\-+=/.~]{8,})/gi, '$1[REDACTED]'],
+    [/(Authorization["']?\s*:\s*)(?:Bearer|Basic|Token)\s+\S+/gi, '$1[REDACTED]'],
+    // Include quoted Authorization headers, environment prefixes and OAuth fields. Quoted values may
+    // contain spaces, punctuation and escapes; unquoted values end at whitespace.
+    // Preserve only a complete unquoted marker, never a marker + secret suffix.
+    [/\b((?:[a-z][a-z0-9]*[_-])*(?:authorization|api[_-]?key|secret|(?:access|refresh|id|auth)[_-]?token|token|password|passwd|bearer|client[_-]?secret)["']?\s*[:=]\s*)(?!\[REDACTED(?:-[A-Z-]+)?\](?=$|\s))(?:"(?:\\[\s\S]|[^"\\])*(?:"|\\?$)|'(?:\\[\s\S]|[^'\\])*(?:'|\\?$)|\S+)/gi, '$1[REDACTED]'],
 ];
 
 function applyPatterns(text: string, patterns: Pattern[]): string {
@@ -54,8 +55,8 @@ function applyPatterns(text: string, patterns: Pattern[]): string {
 }
 
 /**
- * Full set (high-confidence + generalized) — for conversation content scanned
- * by compactSeedBuilder. Identical behaviour to the pre-extraction function.
+ * Full set for conversation content and bounded startup diagnostics. Preserve
+ * the established typed markers when subsequently redacting credential fields.
  */
 export function redactSensitive(text: string): string {
     return applyPatterns(text, [...HIGH_CONFIDENCE_SECRET_PATTERNS, ...GENERALIZED_SECRET_PATTERNS]);

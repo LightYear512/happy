@@ -420,7 +420,9 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                                 }
                                 if (pending) return null;
                             }
-                            if ((modeHash && msg.hash !== modeHash) || msg.isolate) {
+                            // An isolated command starts a fresh run, then must be
+                            // consumed on that run's first read instead of deferred again.
+                            if (modeHash !== null && (msg.hash !== modeHash || msg.isolate)) {
                                 logger.debug('[remote]: mode has changed, pending message');
                                 pending = msg;
                                 return null;
@@ -458,9 +460,13 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     },
                     onSessionReset: () => {
                         logger.debug('[remote]: Session reset');
+                        session.consumeOneTimeFlags();
                         session.clearSessionId();
                     },
-                    onReady: () => {
+                    onReady: async () => {
+                        // Result text is queued too; publish it before closing the turn
+                        // so a delayed assistant message cannot reopen a completed turn.
+                        await messageQueue.flush();
                         session.client.closeClaudeSessionTurn('completed');
                         if (!pending && session.queue.size() === 0) {
                             session.api.push().sendToAllDevices(
@@ -470,7 +476,8 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                             );
                         }
                     },
-                    onErrorResult: (message: string) => {
+                    onErrorResult: async (message: string) => {
+                        await messageQueue.flush();
                         session.client.closeClaudeSessionTurn('failed');
                         const { display, raw, severity, recoverySteps } = formatErrorForUser(message);
                         logger.debug(`[remote] Error result (raw): ${raw} severity=${severity}`);
@@ -556,7 +563,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                 });
                 
                 // Consume one-time Claude flags after spawn
-                session.consumeOneTimeFlags();
+                if (remoteResult !== 'resume-unavailable' && remoteResult !== 'no-input') session.consumeOneTimeFlags();
                 
                 if (!exitReason && abortController.signal.aborted) {
                     session.client.closeClaudeSessionTurn('cancelled');

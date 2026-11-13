@@ -53,3 +53,36 @@ CLAUDE.local.md
 notes/
 # ralphex progress logs
 progress*.txt
+# Downloaded/installable software, archives, and generated runtimes
+*.dmg
+*.pkg
+*.msi
+*.deb
+*.rpm
+*.apk
+*.ipa
+*.aab
+*.exe
+*.dll
+*.dylib
+*.so
+*.wasm
+*.zip
+*.7z
+*.rar
+*.tar
+*.tgz
+*.tar.gz
+*.iso
+*.img
+*.bin
+*.app/
+*.framework/
+*.xcarchive/
+*.dSYM/
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+*.log

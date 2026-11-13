@@ -7,7 +7,7 @@ import { ProxyAgent, fetch as undiciFetch } from 'undici';
 import { logger } from '@/ui/logger';
 import { configuration } from '@/configuration';
 import { getCurrentCcsProfile, readCcsProfiles, getInstancePath, getCurrentCodexProfile, getCodexInstancePath, readCodexProfiles, type AuthFlavor } from './ccsProfiles';
-import { SEPARATOR, codeBlock, parseCodexFlag, rejectCodexFlagInSession, type BangCommandContext, type BangCommandResult } from './types';
+import { SEPARATOR, codeBlock, parseProviderFlags, rejectProviderFlags, type BangCommandContext, type BangCommandResult } from './types';
 import { formatRelativeTime } from './relativeTime';
 
 const USAGE_API_URL = 'https://api.anthropic.com/api/oauth/usage';
@@ -1107,7 +1107,7 @@ function usageMenuOption(command: string, profileName: string, entry: ProfileUsa
 
 /** Handle !usage for codex flavor. */
 async function handleCodexUsage(profileArg: string, ctx: BangCommandContext): Promise<BangCommandResult> {
-    // In console mode, `@u-codex` without a profile is an account picker.
+    // In console mode, `@u --codex` without a profile is an account picker.
     // In a normal Codex session, bare `@u` reports the current account directly.
     if (!profileArg && ctx.isConsoleSession) {
         const codexProfiles = readCodexProfiles();
@@ -1117,7 +1117,7 @@ async function handleCodexUsage(profileArg: string, ctx: BangCommandContext): Pr
         }
 
         const defaultProfile = getCurrentCodexProfile();
-        const command = ctx.isConsoleSession ? '@u-codex' : '@u';
+        const command = '@u --codex';
         const suggestions = codexProfiles
             .map(p => ({ name: p.name, entry: getCachedProfileUsageEntry(p.name, 'codex') }))
             .sort(compareUsageMenuItems)
@@ -1172,13 +1172,13 @@ async function handleCodexUsage(profileArg: string, ctx: BangCommandContext): Pr
  * - `!usage <profile>` — Show usage for a specific CCS profile
  */
 export async function handleUsageBangCommand(args: string, ctx: BangCommandContext): Promise<BangCommandResult> {
-    const codexReject = rejectCodexFlagInSession(args, ctx);
-    if (codexReject) return codexReject;
+    const rejected = rejectProviderFlags(args, ctx);
+    if (rejected) return rejected;
 
-    const { cleanArgs: profileArg, hasCodexFlag } = parseCodexFlag(args);
+    const { cleanArgs: profileArg, flavor } = parseProviderFlags(args);
 
-    // Codex flavor (from session) or explicit --codex flag: delegate to codex handler
-    if (ctx.flavor === 'codex' || hasCodexFlag) {
+    // Explicit console selection takes precedence over the transport flavor.
+    if ((flavor ?? ctx.flavor) === 'codex') {
         return handleCodexUsage(profileArg, ctx);
     }
 
@@ -1194,7 +1194,7 @@ export async function handleUsageBangCommand(args: string, ctx: BangCommandConte
         const suggestions = claudeProfiles
             .map(p => ({ name: p.name, entry: getCachedProfileUsageEntry(p.name, 'claude') }))
             .sort(compareUsageMenuItems)
-            .map(item => usageMenuOption('@u', item.name, item.entry, item.name === defaultProfile));
+            .map(item => usageMenuOption('@u --Claude', item.name, item.entry, item.name === defaultProfile));
         return { message: [], action: 'none', suggestions };
     }
 

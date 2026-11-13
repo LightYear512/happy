@@ -27,7 +27,7 @@ export async function handleRestartBangCommand(args: string, ctx: BangCommandCon
                 action: 'none',
             };
         }
-        return restartCurrent(ctx.flavor);
+        return restartCurrent(ctx.flavor, ctx.codexRecoveryTarget);
     }
 
     return {
@@ -39,11 +39,12 @@ export async function handleRestartBangCommand(args: string, ctx: BangCommandCon
 /**
  * Restart the current session only.
  */
-function restartCurrent(flavor?: 'claude' | 'codex' | 'gemini'): BangCommandResult {
-    const currentProfile = flavor === 'codex' ? getCurrentCodexProfile() : getCurrentCcsProfile();
+function restartCurrent(flavor?: 'claude' | 'codex' | 'gemini', recoveryTarget?: string): BangCommandResult {
+    const currentProfile = flavor === 'codex' ? recoveryTarget ?? getCurrentCodexProfile() : getCurrentCcsProfile();
     const profileLabel = currentProfile ? ` (${currentProfile})` : '';
 
     logger.debug(`[!restart] Restarting current session${profileLabel} [flavor=${flavor ?? 'claude'}]`);
 
-    return { message: `🔄 正在重启会话${profileLabel}`, action: 'restart-session' };
+    return { message: `🔄 正在重启会话${profileLabel}`, action: 'restart-session',
+        ...(flavor === 'codex' && recoveryTarget ? { restartProfile: recoveryTarget } : {}) };
 }

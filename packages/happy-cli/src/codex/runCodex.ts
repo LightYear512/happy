@@ -27,7 +27,7 @@ import { CodexDisplay } from "@/ui/ink/CodexDisplay";
 import { trimIdent } from "@/utils/trimIdent";
 import type { CodexSessionConfig } from './types';
 import { withCodexModelModeMetadata } from './modelMode';
-import { resolveCodexModelModeOrDefault } from './defaultModelConfig';
+import { resolveCodexModelModeOrDefault, readCodexModelFamily } from './defaultModelConfig';
 import { readCodexDefaultProfile, getCodexInstancePath, getCurrentCodexProfile } from '@/commands/bang/ccsProfiles';
 import {
     accountIntentIsNewer,
@@ -60,6 +60,7 @@ import { createHtaskReplyMonitorRuntime } from '@/commands/bang/replyMonitorRunt
 import { renderOptionsBlock } from '@/commands/bang/types';
 import type { EnhancedMode as ClaudeEnhancedMode } from '@/claude/loop';
 import { performCodexMcpAccountRestart } from './codexAccountSwap';
+import { runCodexConsole } from './runCodexConsole';
 
 // ---------------------------------------------------------------------------
 // App-server mode detection
@@ -120,6 +121,9 @@ export async function runCodex(opts: {
     /** Codex session ID from previous run — used to find transcript file for experimental_resume */
     codexSessionId?: string;
 }): Promise<void> {
+    if (process.env.HAPPY_CONSOLE_SESSION === '1') {
+        return runCodexConsole(opts);
+    }
     // Route to app-server backend when available
     const useAppServer = await shouldUseAppServer();
     if (useAppServer) {
@@ -128,6 +132,8 @@ export async function runCodex(opts: {
         return runCodexWithAppServer(opts);
     }
     logger.debug('[codex] Using MCP backend');
+    const explicitCodexProfile = !opts.restoreSessionId && !opts.codexSessionId
+        ? getCurrentCodexProfile() ?? undefined : undefined;
 
     // Use shared PermissionMode type for cross-agent compatibility
     type PermissionMode = import('@/api/types').PermissionMode;
@@ -148,6 +154,9 @@ export async function runCodex(opts: {
         }
     }
     let activeCodexProfile = getCurrentCodexProfile();
+    const accountIntentFamily = readCodexModelFamily(process.env.CODEX_HOME || join(os.homedir(), '.codex'));
+    const readGlobalAccountIntent = () => accountIntentFamily
+        ? readAccountIntent('codex', undefined, accountIntentFamily) : null;
     let lastSeenAccountIntent = 0;
 
     //
@@ -219,7 +228,7 @@ export async function runCodex(opts: {
     session = initialSession;
     installHappySessionEnvironment(session.sessionId);
     const savedAccount = readSessionAccountSelection(session.sessionId, 'codex');
-    const startupAccount = resolveStartupAccountSelection(savedAccount, readAccountIntent('codex'));
+    const startupAccount = resolveStartupAccountSelection(savedAccount, readGlobalAccountIntent(), explicitCodexProfile);
     if (startupAccount && startupAccount.profileName !== activeCodexProfile) {
         const savedHome = getCodexInstancePath(startupAccount.profileName);
         if (!fs.existsSync(join(savedHome, 'auth.json'))) {
@@ -228,7 +237,7 @@ export async function runCodex(opts: {
         process.env.CODEX_HOME = savedHome;
         activeCodexProfile = startupAccount.profileName;
     }
-    if (startupAccount?.source === 'global') {
+    if (startupAccount && (startupAccount.source === 'global' || explicitCodexProfile)) {
         try {
             writeSessionAccountSelection(
                 session.sessionId,
@@ -915,7 +924,7 @@ export async function runCodex(opts: {
             // Global account changes are sampled only when a real model input is
             // ready. The input remains pending while the existing restart path
             // reconnects, so no file watcher can wake, interrupt, or stop this process.
-            const currentIntent = readAccountIntent('codex');
+            const currentIntent = readGlobalAccountIntent();
             if (accountIntentIsNewer(currentIntent, lastSeenAccountIntent)) {
                 if (currentIntent.profileName === activeCodexProfile) {
                     if (opts.startedBy === 'daemon' && response) {

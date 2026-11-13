@@ -11,7 +11,7 @@ import { EnhancedMode, PermissionMode } from './loop';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
 import { startCaffeinate, stopCaffeinate } from '@/utils/caffeinate';
-import { extractSDKMetadataAsync } from '@/claude/sdk/metadataExtractor';
+import { extractSDKMetadata } from '@/claude/sdk/metadataExtractor';
 import { parseSpecialCommand } from '@/parsers/specialCommands';
 import { isBangCommand, executeBangCommand, hasActiveInteractiveSession, handleInteractiveInput, buildConsoleWelcome, buildSessionWelcome } from '@/commands/bang/dispatcher';
 import { renderOptionsBlock } from '@/commands/bang/types';
@@ -35,6 +35,7 @@ import { queryRateLimitContext } from '@/commands/bang/usageCommand';
 import { claudeLocal } from '@/claude/claudeLocal';
 import { readSessionLog } from '@/claude/utils/sessionScanner';
 import { getProjectPath } from '@/claude/utils/path';
+import { resolveClaudeSessionFile } from '@/claude/utils/resolveClaudeSessionFile';
 import { Session } from './session';
 import { applySandboxPermissionPolicy, resolveInitialClaudePermissionMode } from './utils/permissionMode';
 import { HAPPY_CONSOLE_TITLE } from '@/utils/createSessionMetadata';
@@ -143,6 +144,25 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         sandbox: sandboxConfig?.enabled ? sandboxConfig : null,
         dangerouslySkipPermissions,
     };
+
+    // Extract Claude SDK session ID BEFORE creating Happy session
+    // (only for non-console sessions, since console uses ccs not SDK)
+    let claudeSessionId: string | undefined;
+    if (!isConsoleSession) {
+        try {
+            logger.debug('[START] Extracting Claude SDK metadata (including sessionId)...');
+            const sdkMetadata = await extractSDKMetadata(options.claudeEnvVars);
+            claudeSessionId = sdkMetadata.sessionId;
+            logger.debug(`[START] Claude sessionId extracted: ${claudeSessionId}`);
+            // Store tools/commands in metadata for Happy session creation
+            metadata.tools = sdkMetadata.tools;
+            metadata.slashCommands = sdkMetadata.slashCommands;
+        } catch (error) {
+            logger.debug('[START] Failed to extract Claude sessionId:', error);
+            // Continue without sessionId — XC auto-detection may still work
+        }
+    }
+
     // Restore must rejoin the exact Happy session. A failed lookup must not
     // silently create a second conversation identity.
     let response;
@@ -187,8 +207,13 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
             { rejectOnServerError: true },
         );
     }
+    // Install Happy session environment in Happy CLI process
     installHappySessionEnvironment(session.sessionId);
-    const claudeHtaskEnv = buildHtaskClaudeEnvironment(session.sessionId, options.claudeEnvVars);
+    // Also install XC environment variables in Claude process env
+    // (so Claude's spawned tools can access XC bindings)
+    const claudeEnvWithXc = { ...options.claudeEnvVars };
+    installHappySessionEnvironment(session.sessionId, claudeEnvWithXc);
+    const claudeHtaskEnv = buildHtaskClaudeEnvironment(session.sessionId, claudeEnvWithXc);
     const htaskRoot = isConsoleSession ? null : findHtaskRoot();
     const restoreHtaskProjection = (reason: string): Promise<boolean> => {
         if (!htaskRoot || !session.sessionId) return Promise.resolve(false);
@@ -224,27 +249,6 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     const htaskTitleInterval = htaskRoot ? setInterval(() => {
         void syncHtaskTitle('poll');
     }, 2000) : null;
-
-    // Extract SDK metadata in background and update session when ready
-    // Skip for console sessions — they don't use Claude SDK and the SDK query
-    // can call process.exit(1) when running in the console directory
-    if (!isConsoleSession) {
-        extractSDKMetadataAsync(async (sdkMetadata) => {
-            logger.debug('[start] SDK metadata extracted, updating session:', sdkMetadata);
-            try {
-                // Reuse the existing session client — do NOT create a new one,
-                // as that would open a second WebSocket and trigger stale-socket kicking
-                session.updateMetadata((currentMetadata) => ({
-                    ...currentMetadata,
-                    tools: sdkMetadata.tools,
-                    slashCommands: sdkMetadata.slashCommands
-                }));
-                logger.debug('[start] Session metadata updated with SDK capabilities');
-            } catch (error) {
-                logger.debug('[start] Failed to update session metadata:', error);
-            }
-        }, claudeHtaskEnv);
-    }
 
     // Console session: set title, send welcome message
     if (isConsoleSession) {
@@ -366,8 +370,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     const happyServer = await startHappyServer(session, {
         getSessionFilePath: () => {
             if (!currentSession?.sessionId) return null;
-            const projDir = getProjectPath(currentSession.path);
-            return join(projDir, `${currentSession.sessionId}.jsonl`);
+            return resolveClaudeSessionFile(currentSession.sessionId, currentSession.path);
         },
     });
     logger.debug(`[START] Happy MCP server started at ${happyServer.url}`);
@@ -380,7 +383,7 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
     const hookServer = await startHookServer({
         onSessionHook: (sessionId, data) => {
             logger.debug(`[START] Session hook received: ${sessionId}`, data);
-            
+
             // Update session ID in the Session instance
             if (currentSession) {
                 const previousSessionId = currentSession.sessionId;
@@ -389,6 +392,12 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
                     currentSession.onSessionFound(sessionId);
                 }
             }
+
+            // NOTE: Do NOT update XC environment variables here!
+            // XC_CONVERSATION_ID must always be the Happy session ID (session.sessionId),
+            // NOT the Claude session ID. This was already set correctly in installHappySessionEnvironment.
+            // The Claude session ID is tracked separately via currentSession.sessionId.
+            logger.debug(`[START] Claude session ID updated to: ${sessionId} (XC_CONVERSATION_ID remains: ${process.env.XC_CONVERSATION_ID})`);
         }
     });
     logger.debug(`[START] Hook server started on port ${hookServer.port}`);
@@ -719,7 +728,20 @@ export async function runClaude(credentials: Credentials, options: StartOptions 
         onSessionReady: (sessionInstance) => {
             // Store reference for hook server callback
             currentSession = sessionInstance;
-            sessionInstance.addSessionFoundCallback(() => {
+            sessionInstance.addSessionFoundCallback((newSessionId) => {
+                // Native Claude resume/compact/fork IDs do not own the XC binding.
+                logger.debug(`[START] Claude session ID changed to ${newSessionId}; retaining Happy XC identity ${session.sessionId}`);
+
+                // Update Happy CLI process environment
+                installHappySessionEnvironment(session.sessionId);
+
+                // Update Claude subprocess environment for future spawns
+                // An already running subprocess keeps the environment of its spawn.
+                if (sessionInstance.claudeEnvVars) {
+                    installHappySessionEnvironment(session.sessionId, sessionInstance.claudeEnvVars);
+                }
+
+                // Restore htask projection and sync title
                 void restoreHtaskProjection('claude-session-found').then(() => syncHtaskTitle('claude-session-found'));
             });
         },

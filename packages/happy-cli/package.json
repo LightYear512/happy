@@ -1,6 +1,6 @@
 {
   "name": "happy-coder",
-  "version": "0.13.0-compat.17",
+  "version": "0.13.0-compat.19",
   "description": "Mobile and Web client for Claude Code and Codex",
   "author": "Kirill Dubovitskiy",
   "license": "MIT",
@@ -134,6 +134,7 @@
     "pkgroll": "^2.14.2",
     "release-it": "^19.0.6",
     "shx": "^0.3.3",
+    "socket.io": "^4.8.1",
     "ts-node": "^10",
     "tsx": "^4.20.6",
     "typescript": "5.9.3",

@@ -19,11 +19,26 @@
           "file": "codex-restore-profile-boundary.test.mjs"
         }
       ]
+    },
+    {
+      "name": "automatic_restore_retry_and_result_delivery",
+      "inputs": ["existing Happy restore authority", "canonical pending user sequence", "unchanged Server restore RPC"],
+      "acceptedStates": ["new real user input", "legacy authority without a retry marker", "explicit local restore can retry"],
+      "rejectedStates": ["same input authorizing another automatic provider", "notification authorizing a provider", "invalid retry marker", "full delivery backlog"],
+      "provenanceFields": ["sessionId", "lastAttemptedUserSeq", "restoreNotices.id"],
+      "outputState": "one admitted automatic attempt per input; exact result or explicit uncertainty retained until notification persistence is confirmed",
+      "enforcement": "RemoteRestoreDelivery and atomic updateRestoreState under the existing lifecycle owner; default message events only",
+      "negativeTests": [{"name": "remote_restore_notifications_never_authorize_a_second_provider", "file": "remote-restore-boundary.test.mjs"}]
     }
   ],
-  "budgets": {
-    "notApplicableReason": "the profile identity boundary adds no resource budget"
-  },
+  "budgets": [{
+    "field": "restore notification delivery backlog and end-to-end time",
+    "enforcement": "16 durable notices maximum before admitting an automatic attempt; one 20-second lookup-plus-send budget below the unchanged Server 25-second notification ACK",
+    "phase": "automatic restore admission and notification delivery",
+    "errorKind": "backlog full or confirmation unknown; never provider success",
+    "zeroTest": {"name": "remote_restore_notifications_never_authorize_a_second_provider", "file": "remote-restore-boundary.test.mjs"},
+    "overflowTest": {"name": "remote_restore_notifications_never_authorize_a_second_provider", "file": "remote-restore-boundary.test.mjs"}
+  }],
   "lifecycleTransitions": [
     {
       "from": "provider input ready with an in-memory daemon child",

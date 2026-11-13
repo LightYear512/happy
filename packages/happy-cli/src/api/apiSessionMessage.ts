@@ -36,7 +36,7 @@ const CODEX_REQUEST_KEYS = new Set(['messageRole', 'messageType', 'body', 'local
 const AGENT_EVENT_REQUEST_REQUIRED_KEYS = new Set([
     'messageRole', 'messageType', 'message', 'eventId', 'localId', 'timeoutMs',
 ]);
-const AGENT_EVENT_REQUEST_KEYS = new Set([...AGENT_EVENT_REQUEST_REQUIRED_KEYS, 'presentation']);
+const AGENT_EVENT_REQUEST_KEYS = new Set([...AGENT_EVENT_REQUEST_REQUIRED_KEYS, 'presentation', 'encryptedRecord']);
 
 export interface UserMessageOnceRequest {
     messageRole: 'user';
@@ -64,6 +64,8 @@ export interface AgentEventOnceRequest {
     localId: string;
     timeoutMs: number;
     presentation?: 'compact';
+    /** Optional exact ciphertext persisted by a durable sender before first emit. */
+    encryptedRecord?: string;
 }
 
 export interface PersistedMessageReceipt {
@@ -146,8 +148,18 @@ export function validateAgentEventOnceRequest(input: AgentEventOnceRequest): Age
     if (typeof input.eventId !== 'string' || Buffer.byteLength(input.eventId, 'utf8') <= 0 ||
         Buffer.byteLength(input.eventId, 'utf8') > MAX_MESSAGE_ID_BYTES) throw new Error('Invalid agent event id');
     if (input.presentation !== undefined && input.presentation !== 'compact') throw new Error('Invalid presentation');
+    if (input.encryptedRecord !== undefined && (typeof input.encryptedRecord !== 'string'
+        || !input.encryptedRecord || Buffer.byteLength(input.encryptedRecord) > 32_768)) {
+        throw new Error('Invalid encrypted agent event');
+    }
     validateCommonRequest(input.localId, input.timeoutMs);
     return { ...input };
+}
+
+function agentEventContent(input: AgentEventOnceRequest): Record<string, unknown> {
+    return { role: 'agent', content: { id: input.eventId, type: 'event', data: {
+        type: input.presentation === 'compact' ? 'compact-message' : 'message', message: input.message,
+    } } };
 }
 
 /** User-scoped, one-shot writer confirmed through persisted server evidence. */
@@ -165,8 +177,9 @@ export class ApiSessionMessageClient {
     }
 
     async sendUserMessageOnce(raw: UserMessageOnceRequest): Promise<PersistedMessageReceipt> {
+        const startedAt = performance.now();
         const input = validateUserMessageOnceRequest(raw);
-        const split = input.displayText !== undefined;
+        const split = input.displayText !== undefined || input.presentation !== undefined;
         const expected: ExpectedMessage = {
             kind: 'user', text: input.displayText ?? input.messageText,
             modelText: split ? input.messageText : undefined, permissionMode: input.permissionMode,
@@ -183,10 +196,11 @@ export class ApiSessionMessageClient {
                 ...(input.presentation === undefined ? {} : { presentation: input.presentation }),
             },
         };
-        return this.sendOnce(input.localId, input.timeoutMs, content, expected, false);
+        return this.sendOnce(input.localId, startedAt + input.timeoutMs, content, expected, false);
     }
 
     async sendCodexMessageOnce(raw: CodexMessageOnceRequest): Promise<PersistedMessageReceipt> {
+        const startedAt = performance.now();
         const input = validateCodexMessageOnceRequest(raw);
         const expected: ExpectedMessage = { kind: 'codex', body: input.body };
         const content = {
@@ -194,35 +208,41 @@ export class ApiSessionMessageClient {
             content: { type: 'codex', data: input.body },
             meta: { sentFrom: 'cli' },
         };
-        return this.sendOnce(input.localId, input.timeoutMs, content, expected, true);
+        return this.sendOnce(input.localId, startedAt + input.timeoutMs, content, expected, true);
+    }
+
+    /** Produce or verify the exact envelope before a durable sender records it. */
+    prepareAgentEventOnce(raw: AgentEventOnceRequest): string {
+        const input = validateAgentEventOnceRequest(raw);
+        const content = agentEventContent(input);
+        if (input.encryptedRecord !== undefined) {
+            const decoded = decrypt(this.session.encryptionKey, this.session.encryptionVariant,
+                decodeBase64(input.encryptedRecord));
+            if (!deepEqual(decoded, content)) throw new Error('Encrypted agent event does not match the requested payload');
+            return input.encryptedRecord;
+        }
+        return encodeBase64(encrypt(this.session.encryptionKey, this.session.encryptionVariant, content));
     }
 
     async sendAgentEventOnce(raw: AgentEventOnceRequest): Promise<PersistedMessageReceipt> {
+        const startedAt = performance.now();
         const input = validateAgentEventOnceRequest(raw);
         const expected: ExpectedMessage = {
             kind: 'agent-event', message: input.message, eventId: input.eventId,
             presentation: input.presentation,
         };
-        const content = {
-            role: 'agent',
-            content: {
-                id: input.eventId,
-                type: 'event',
-                data: { type: input.presentation === 'compact' ? 'compact-message' : 'message',
-                    message: input.message },
-            },
-        };
-        return this.sendOnce(input.localId, input.timeoutMs, content, expected, true);
+        return this.sendOnce(input.localId, startedAt + input.timeoutMs, agentEventContent(input), expected, true,
+            this.prepareAgentEventOnce(input));
     }
 
     private async sendOnce(
         localId: string,
-        timeoutMs: number,
+        deadline: number,
         content: Record<string, unknown>,
         expected: ExpectedMessage,
         observePersistedEvent: boolean,
+        encryptedRecord?: string,
     ): Promise<PersistedMessageReceipt> {
-        const deadline = performance.now() + timeoutMs;
         let observer: Socket | null = null;
         let socket: Socket | null = null;
         let observedReceipt: PersistedMessageReceipt | null = null;
@@ -254,7 +274,9 @@ export class ApiSessionMessageClient {
 
             socket = this.createSocket();
             await this.waitForConnect(socket, remaining(deadline));
-            const message = encodeBase64(encrypt(this.session.encryptionKey, this.session.encryptionVariant, content));
+            const message = encryptedRecord ?? encodeBase64(encrypt(this.session.encryptionKey, this.session.encryptionVariant, content));
+            // Connect callbacks and encryption can consume the remaining budget.
+            remaining(deadline);
             emitted = true;
             socket.emit('message', { sid: this.session.id, message, localId }, (response: unknown) => {
                 try {

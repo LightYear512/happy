@@ -180,6 +180,31 @@ These commands are only available in the console (multi-session) mode:
 - `!auth-all <name>` – Record the global CCS profile. Existing sessions are not interrupted; each applies a newer setting immediately before its next real input.
 - `!auth-all --codex <name>` – Apply the same input-boundary behavior to Codex sessions.
 
+Codex app-server recovery retains input that has not yet reached `turn/start`.
+A timed-out resume may rebuild only that session's sidecar once, after verified
+process cleanup, preserving the exact thread ID. A second failure suspends model
+submission: `!restart` retries the failed target, or `!auth <name>` selects another
+account. Ordinary queued input does not repeat the failed attempt; a newer global
+choice is checked on the next real input. Cold startup shares the daemon's total
+deadline and never reports readiness before successful provider restoration.
+Recovery does not replay an already-dispatched turn whose acknowledgement is unknown.
+New threads persist Happy's existing bootstrap instructions through the native
+history API before publishing their identity, so a thread with zero user turns
+can still be restarted. No placeholder user turn or model request is generated.
+Daemon termination retires the owned process tree before removing a tmux window,
+including Codex sidecars that have their own process group.
+An exact provider restore refreshes the process PID and running lifecycle after
+input readiness; a delayed or failed metadata acknowledgement does not block chat.
+
+Missing native history is not an ordinary resume failure: it never silently starts
+an empty replacement. `scripts/codex-recover-session.mjs` is explicit maintenance
+for one closed conversation, preserving its Happy/XC identity and keeping the old
+history while preparing a summary-seeded native thread. Its apply phase rechecks
+input after the old wake settles and stops on any observed new user input or a
+truncated history window. This is not an atomic server recovery lock: keep the
+target quiet during maintenance, and reconcile concurrent input before retrying.
+Do not rerun this operation on an already recovered or running conversation.
+
 ## MCP Server
 
 Happy CLI includes an MCP (Model Context Protocol) server (`happy-mcp`) that acts as a bridge for AI agents (Codex, Gemini, ACP). It is invoked automatically when running `happy codex`, `happy gemini`, or `happy acp` — no manual setup required.

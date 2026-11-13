@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isBangCommand, buildConsoleWelcome, executeBangCommand, SEPARATOR } from './dispatcher';
+import { isBangCommand, buildConsoleWelcome, executeBangCommand, consoleCommandText, createConsoleMenu, SEPARATOR } from './dispatcher';
 import { renderOptionSuggestion, type BangOptionSuggestion } from './types';
 import { buildTaskMessageActionSuggestions } from './taskMessageCommand';
 
@@ -43,6 +43,7 @@ describe('isBangCommand', () => {
         expect(isBangCommand('! auth')).toBe(false);
         expect(isBangCommand('@')).toBe(false);
         expect(isBangCommand('@@')).toBe(true);
+        expect(isBangCommand('❇️ @@ 主菜单')).toBe(true);
         expect(isBangCommand('@ auth')).toBe(false);
     });
 
@@ -89,8 +90,22 @@ describe('executeBangCommand aliases', () => {
         expect(menu.suggestions?.join('\n')).not.toContain('@task｜');
 
         const consoleMenu = await executeBangCommand('@@', { ...ctx, isConsoleSession: true });
+        expect(consoleMenu.suggestions).toContainEqual({ label: '其他功能', value: '!help' });
         expect(consoleMenu.suggestions?.join('\n')).not.toContain('@reminder');
         expect(consoleMenu.suggestions?.join('\n')).not.toContain('@reply-monitor');
+    });
+});
+
+describe('index maintenance entry', () => {
+    const ctx = { client: {} as never, session: null, messageQueue: {} as never, currentEnhancedMode: {} as never };
+    it('blocks maintenance in a model conversation', async () => {
+        const result = await executeBangCommand('!index', ctx);
+        expect(result.message).toContain('仅在控制台');
+    });
+    it('rejects unregistered names and paths before doing work', async () => {
+        const result = await executeBangCommand('!index ../../not-an-account', { ...ctx, isConsoleSession: true });
+        expect(result.message).toContain('未找到已登录');
+        expect(result.suggestions).toContain('!index');
     });
 });
 
@@ -112,6 +127,51 @@ describe('@task action suggestions', () => {
 });
 
 describe('buildConsoleWelcome', () => {
+    it('renders all console actions in the original mobile option format and routes visible labels', async () => {
+        // Original App parser before value attributes were supported (8384cbf3).
+        const parseOriginalOptions = (text: string) => text.split('\n').flatMap(line => {
+            const match = line.match(/<option>(.*?)<\/option>/);
+            return match ? [match[1]] : [];
+        });
+        const welcome = buildConsoleWelcome();
+        const menu = createConsoleMenu();
+        const rendered = menu.render(welcome.suggestions!);
+        const labels = parseOriginalOptions(rendered);
+        expect(labels).toEqual(welcome.suggestions!.map(optionLabel));
+        expect(labels.map(consoleCommandText)).toEqual([
+            '!create-codex gpt', '!create-codex deepseek',
+            '!switch-codex gpt', '!switch-codex deepseek', '@aa --Claude', '!help',
+        ]);
+        const ctx = { isConsoleSession: true, flavor: 'codex' } as const;
+        const tools = await executeBangCommand(consoleCommandText(labels.at(-1)!), ctx as never);
+        const back = parseOriginalOptions(menu.render(tools.suggestions!)).at(-1)!;
+        expect(await executeBangCommand(consoleCommandText(back), ctx as never)).toEqual(welcome);
+
+        const dynamic = parseOriginalOptions(menu.render([
+            { label: 'allall', value: '!create-codex gpt allall' },
+            { label: '/project with spaces', value: '!create-codex deepseek deepseek %2Fproject%20with%20spaces' },
+            { label: 'Project A', value: '!switch-codex gpt session-a' },
+            { label: 'allall', value: '!switch-codex gpt session-a allall' },
+            { label: 'Unavailable', value: '!switch-codex gpt unavailable', disabled: true },
+        ]));
+        expect(dynamic).toEqual([
+            'allall', '/project with spaces', 'Project A', 'allall (2)',
+        ]);
+        expect(dynamic.map(text => menu.resolve(text))).toEqual([
+            '!create-codex gpt allall',
+            '!create-codex deepseek deepseek %2Fproject%20with%20spaces',
+            '!switch-codex gpt session-a', '!switch-codex gpt session-a allall',
+        ]);
+        menu.clear();
+        expect(menu.resolve('/project with spaces')).toBe('/project with spaces');
+        expect(menu.resolve('创建codex+DeepSeek会话')).toBe('!create-codex deepseek');
+        const escaped = parseOriginalOptions(menu.render([{ label: '/A & B <目录>', value: '!create-codex deepseek deepseek %2FA' }]))[0];
+        expect(menu.resolve(escaped)).toBe('!create-codex deepseek deepseek %2FA');
+        expect(menu.resolve('/A & B <目录>')).toBe('!create-codex deepseek deepseek %2FA');
+        menu.render(welcome.suggestions!);
+        expect(menu.resolve('/A & B <目录>')).toBe('/A & B <目录>');
+    });
+
     it('returns a BangCommandResult with message array', () => {
         const result = buildConsoleWelcome();
         const messages = result.message as string[];
@@ -133,57 +193,37 @@ describe('buildConsoleWelcome', () => {
         expect(joined).not.toContain('普通消息');
     });
 
-    it('includes commands available in console (not sessionOnly)', () => {
-        const joined = buildConsoleWelcome().suggestions!.join('\n');
-        // These are consoleOnly or shared commands
-        expect(joined).toContain('@aa｜🔑设置Claude全局账号');
-        expect(joined).toContain('@u｜⏱️查看Claude 用量');
-        expect(joined).toContain('@aa-codex｜🔑设置Codex全局账号');
-        expect(joined).toContain('@u-codex｜⏱️查看codex用量');
-        expect(joined).toContain('❇️ @@ 主菜单');
-        expect(joined).not.toContain('!usage (!u)');
-        expect(joined).not.toContain('@l (!login)');
-        // sessionOnly commands should NOT appear
-        expect(joined).not.toMatch(/!restart(?!-all)/);
-        // !auth is sessionOnly — must NOT appear in console welcome
-        expect(joined).not.toMatch(/^!auth\b(?!-all)/m);
+    it('keeps all provider account actions accessible and moves maintenance to a submenu', async () => {
+        expect(buildConsoleWelcome().suggestions).toEqual([
+            { label: '创建codex+GPT会话', value: '!create-codex gpt' },
+            { label: '创建codex+DeepSeek会话', value: '!create-codex deepseek' },
+            { label: '切换GPT账号', value: '!switch-codex gpt' },
+            { label: '切换DeepSeek账号', value: '!switch-codex deepseek' },
+            { label: '切换Claude账号', value: '@aa --Claude' },
+            { label: '其他功能', value: '!help' },
+        ]);
+        const tools = await executeBangCommand('!help', { isConsoleSession: true } as never);
+        expect(tools.suggestions).toContain('!index｜检查并修复 Codex 索引');
+        expect(tools.suggestions).toContain('@l --Claude｜登录 Claude 账号');
+        expect(tools.suggestions).toContain('@u --codex｜⏱️查看codex用量');
+        expect(tools.suggestions).toContain('@l --codex｜登录 Codex 账号');
+        expect(tools.suggestions).toContainEqual({ label: '❇️ @@ 主菜单', value: '@@' });
     });
 
-    it('lists login/usage/auth-all in registry order with codex variants interleaved', () => {
-        const messages = buildConsoleWelcome().suggestions!;
-        const indices = {
-            usage: messages.findIndex(m => optionLabel(m).startsWith('@u｜')),
-            usageCodex: messages.findIndex(m => optionLabel(m).startsWith('@u-codex｜')),
-            authAll: messages.findIndex(m => optionLabel(m).startsWith('@aa｜')),
-            authAllCodex: messages.findIndex(m => optionLabel(m).startsWith('@aa-codex｜')),
-            mainMenu: messages.findIndex(m => optionLabel(m).startsWith('❇️ @')),
-        };
-        for (const [k, v] of Object.entries(indices)) {
-            expect(v, `${k} not found`).toBeGreaterThanOrEqual(0);
+    it('returns the Codex console menu for both existing labels and new button values', async () => {
+        const ctx = { isConsoleSession: true, flavor: 'codex' } as const;
+        for (const text of ['❇️ @@ 主菜单', '@@']) {
+            expect(await executeBangCommand(text, ctx as never)).toEqual(buildConsoleWelcome());
         }
-        expect(indices.usage).toBeLessThan(indices.usageCodex);
-        expect(indices.usageCodex).toBeLessThan(indices.authAll);
-        expect(indices.authAll).toBeLessThan(indices.authAllCodex);
-        expect(indices.authAllCodex).toBeLessThan(indices.mainMenu);
-    });
-
-    it('shows auth-all in the welcome listing (not hidden)', () => {
-        const joined = buildConsoleWelcome().suggestions!.join('\n');
-        expect(joined).toContain('@aa｜🔑设置Claude全局账号');
-        expect(joined).toContain('@aa-codex｜🔑设置Codex全局账号');
-    });
-
-    it('suggestions list console-available commands', () => {
-        const suggestions = buildConsoleWelcome().suggestions!;
-        expect(suggestions).toContain('@aa｜🔑设置Claude全局账号');
-        expect(suggestions).toContain('@aa-codex｜🔑设置Codex全局账号');
-        expect(suggestions).not.toContain('@l');
-        expect(suggestions).not.toContain('@l-codex');
-        expect(suggestions).toContain('@u｜⏱️查看Claude 用量');
-        expect(suggestions).toContain('@u-codex｜⏱️查看codex用量');
-        expect(suggestions).toContain('❇️ @@ 主菜单');
-        // !auth is sessionOnly — should NOT be in console suggestions
-        expect(suggestions).not.toContain('!auth');
+        const tools = await executeBangCommand('!help', ctx as never);
+        expect(tools.suggestions).toContain('@l --codex｜登录 Codex 账号');
+        expect(tools.suggestions).toContain('@u --codex｜⏱️查看codex用量');
+        expect(tools.suggestions).toContain('@aa --Claude｜🔑设置Claude全局账号');
+        expect(tools.suggestions).toContain('@aa --codex｜🔑设置Codex全局账号');
+        expect(tools.suggestions).toContain('@l --Claude｜登录 Claude 账号');
+        expect(renderOptionSuggestion(tools.suggestions!.at(-1)!)).toBe(
+            '<option value="@@">❇️ @@ 主菜单</option>',
+        );
     });
 
     it('does not include hidden commands', () => {
@@ -201,8 +241,14 @@ describe('buildConsoleWelcome', () => {
         const result = buildConsoleWelcome();
         expect(result.suggestions).toBeDefined();
         expect(result.suggestions!.length).toBeGreaterThan(0);
-        expect(result.suggestions!.every(s => typeof s === 'string' && (s.startsWith('@') || s.startsWith('!') || s.startsWith('❇️')))).toBe(true);
-        expect(result.suggestions).toContain('❇️ @@ 主菜单');
+        expect(result.suggestions!.every(s => typeof s === 'string'
+            ? s.startsWith('@') || s.startsWith('!') || s.startsWith('❇️')
+            : isBangCommand(s.value ?? s.label))).toBe(true);
+        expect(result.suggestions).toEqual(expect.arrayContaining([
+            { label: '创建codex+GPT会话', value: '!create-codex gpt' },
+            { label: '创建codex+DeepSeek会话', value: '!create-codex deepseek' },
+        ]));
+        expect(result.suggestions).toContainEqual({ label: '其他功能', value: '!help' });
     });
 });
 

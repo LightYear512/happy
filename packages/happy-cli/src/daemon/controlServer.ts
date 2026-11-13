@@ -10,6 +10,7 @@ import { logger } from '@/ui/logger';
 import type { Metadata, PermissionMode } from '@/api/types';
 import { XC_VIRTUAL_SESSION_ID_PATTERN, type ObservedTrackedSession, type SessionTurnReport } from './types';
 import { SpawnSessionOptions, SpawnSessionResult } from '@/modules/common/registerCommonHandlers';
+import { getCodexInstancePath, readCodexProfiles } from '@/commands/bang/ccsProfiles';
 
 export function startDaemonControlServer({
   getChildren,
@@ -247,8 +248,15 @@ export function startDaemonControlServer({
           title: z.string().optional(),
           titleAuthority: z.literal('external').optional(),
           agent: z.enum(['claude', 'codex', 'gemini']).optional(),
+          codexProfile: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u).optional(),
           permissionMode: z.enum(['default', 'acceptEdits', 'bypassPermissions', 'plan',
             'read-only', 'safe-yolo', 'yolo']).optional(),
+        }).superRefine((body, ctx) => {
+          if (body.codexProfile !== undefined && (body.agent !== 'codex' || body.sessionId || body.resume
+            || !readCodexProfiles().some(profile => profile.name === body.codexProfile))) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['codexProfile'],
+              message: 'A configured Codex profile is required for a fresh Codex session' });
+          }
         }),
         response: {
           200: z.object({
@@ -269,7 +277,7 @@ export function startDaemonControlServer({
         }
       }
     }, async (request, reply) => {
-      const { directory, sessionId, resume, title, titleAuthority, agent, permissionMode } = request.body;
+      const { directory, sessionId, resume, title, titleAuthority, agent, permissionMode, codexProfile } = request.body;
 
       logger.debug(`[CONTROL SERVER] Spawn session request: dir=${directory}, sessionId=${sessionId || 'new'}, resume=${resume || 'none'}, agent=${agent || 'default'}`);
       const result = await spawnSession({
@@ -280,6 +288,7 @@ export function startDaemonControlServer({
         titleAuthority,
         agent,
         permissionMode,
+        ...(codexProfile ? { environmentVariables: { CODEX_HOME: getCodexInstancePath(codexProfile) } } : {}),
       });
 
       switch (result.type) {

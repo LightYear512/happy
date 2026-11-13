@@ -430,6 +430,10 @@ export const pl: TranslationStructure = {
             badgeYolo: 'YOLO',
         },
         codexModel: {
+            gpt6Low: 'GPT-6 Astra Niski',
+            gpt6Medium: 'GPT-6 Astra Średni',
+            gpt6High: 'GPT-6 Astra Wysoki',
+            gpt6XHigh: 'GPT-6 Astra Bardzo wysoki',
             title: 'CODEX MODEL',
             default: 'Ustawienia CLI',
             gpt5CodexLow: 'gpt-5-codex low',

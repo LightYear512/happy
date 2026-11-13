@@ -1,27 +1,28 @@
 {
-    "name": "monorepo",
-    "private": true,
-    "scripts": {
-        "cli": "yarn workspace happy-coder cli",
-        "release": "node ./scripts/release.cjs",
-        "web": "yarn workspace happy-app web"
-    },
-    "workspaces": {
-        "packages": [
-            "packages/happy-app",
-            "packages/happy-agent",
-            "packages/happy-cli",
-            "packages/happy-server"
-        ],
-        "nohoist": [
-            "**/zod",
-            "**/react",
-            "**/react-dom",
-            "**/react-native",
-            "**/react-native/**",
-            "**/react-native-edge-to-edge/**",
-            "**/react-native-incall-manager/**"
-        ]
-    },
-    "packageManager": "yarn@1.22.22"
+  "name": "monorepo",
+  "private": true,
+  "scripts": {
+    "check:git-policy": "node scripts/check-git-policy.mjs",
+    "cli": "yarn workspace happy-coder cli",
+    "release": "node ./scripts/release.cjs",
+    "web": "yarn workspace happy-app web"
+  },
+  "workspaces": {
+    "packages": [
+      "packages/happy-app",
+      "packages/happy-agent",
+      "packages/happy-cli",
+      "packages/happy-server"
+    ],
+    "nohoist": [
+      "**/zod",
+      "**/react",
+      "**/react-dom",
+      "**/react-native",
+      "**/react-native/**",
+      "**/react-native-edge-to-edge/**",
+      "**/react-native-incall-manager/**"
+    ]
+  },
+  "packageManager": "yarn@1.22.22"
 }

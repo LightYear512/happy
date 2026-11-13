@@ -26,9 +26,12 @@ export function handleInteractiveInput(text: string): void {
 }
 
 /** Register an input handler for an interactive session. */
-export function registerInteractiveSession(inputHandler: InputHandler): void {
+export function registerInteractiveSession(inputHandler: InputHandler): () => void {
     handler = inputHandler;
     logger.debug('[interactive] Session registered');
+    return () => {
+        if (handler === inputHandler) unregisterInteractiveSession();
+    };
 }
 
 /** Unregister the current interactive session. */

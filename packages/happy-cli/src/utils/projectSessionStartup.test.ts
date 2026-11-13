@@ -80,7 +80,31 @@ process.stdout.write(process.argv[3] === 'startup'
             XC_HOST_NAME: 'Codex' };
         installHappySessionEnvironment('native-bound', env);
         expect(env).toEqual({ HAPPY_CHAT_ID: 'native-bound', XC_HOST: 'happy',
-            XC_CONVERSATION_ID: 'native-bound', XC_HOST_NAME: 'Happy' });
+            XC_CONVERSATION_ID: 'native-bound', XC_HOST_NAME: 'Happy', XC_SESSION_ID: 'native-bound' });
+    });
+
+    it.each(['native-claude-before-compact', 'native-claude-after-compact'])
+    ('keeps a Happy binding when inherited Claude identity is %s', (nativeId) => {
+        const env = { HAPPY_CHAT_ID: 'parent-happy', XC_HOST: 'claude',
+            XC_CONVERSATION_ID: nativeId, XC_SESSION_ID: nativeId,
+            XC_HOST_NAME: 'Claude Code', CLAUDE_CODE_SESSION_ID: nativeId };
+        // Older launchers supplied this hint. It must not select a native
+        // provider even if such a caller survives a rolling deployment.
+        const legacyOptions = { skipXcBinding: false, claudeSession: nativeId };
+        installHappySessionEnvironment('stable-happy', env, legacyOptions);
+        expect(env).toEqual({ HAPPY_CHAT_ID: 'stable-happy', XC_HOST: 'happy',
+            XC_CONVERSATION_ID: 'stable-happy', XC_SESSION_ID: 'stable-happy',
+            XC_HOST_NAME: 'Happy', CLAUDE_CODE_SESSION_ID: nativeId });
+    });
+
+    it('skips XC binding when skipXcBinding option is set', () => {
+        const env = { HAPPY_CHAT_ID: 'old', XC_HOST: 'claude', XC_CONVERSATION_ID: 'claude-session-123' };
+        installHappySessionEnvironment('happy-session-456', env, { skipXcBinding: true });
+        expect(env).toEqual({
+            HAPPY_CHAT_ID: 'happy-session-456',
+            XC_HOST: 'claude',
+            XC_CONVERSATION_ID: 'claude-session-123',
+        });
     });
 
     it('keeps startup failure visible without blocking the Happy session', async () => {

@@ -452,6 +452,10 @@ export const ja: TranslationStructure = {
             badgeYolo: 'YOLO',
         },
         codexModel: {
+            gpt6Low: 'GPT-6 Astra 低',
+            gpt6Medium: 'GPT-6 Astra 中',
+            gpt6High: 'GPT-6 Astra 高',
+            gpt6XHigh: 'GPT-6 Astra 超高',
             title: 'CODEXモデル',
             default: 'CLI設定',
             gpt5CodexLow: 'gpt-5-codex 低',

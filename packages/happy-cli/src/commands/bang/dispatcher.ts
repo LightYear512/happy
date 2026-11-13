@@ -1,13 +1,16 @@
 import { logger } from '@/ui/logger';
 import { handleAuthBangCommand, handleAuthAllBangCommand } from './authCommand';
 import { handleLoginBangCommand } from './loginCommand';
+import { handleIndexBangCommand } from './indexCommand';
+import { CODEX_CREATE_OPTIONS, handleCreateCodexCommand } from './createCodexCommand';
+import { CODEX_SWITCH_OPTIONS, handleSwitchCodexCommand } from './switchCodexCommand';
 import { handleRestartBangCommand } from './restartCommand';
 import { getCachedProfileUsageEntry, handleUsageBangCommand, type ProfileUsageEntry } from './usageCommand';
 import { handleTestBangCommand } from './testCommand';
 import { handleReminderBangCommand } from './reminderCommand';
 import { handleReplyMonitorBangCommand } from './replyMonitorCommand';
 import { buildTaskMessageMenuSuggestions, handleTaskMessageAckBangCommand, handleTaskMessageDismissBangCommand, handleTaskMessagesBangCommand } from './taskMessageCommand';
-import { SEPARATOR, type BangCommandContext, type BangCommandHandler, type BangCommandResult, type BangOptionSuggestion } from './types';
+import { SEPARATOR, renderOptionsBlock, renderOptionSuggestion, type BangCommandContext, type BangCommandHandler, type BangCommandResult, type BangOptionSuggestion } from './types';
 import { getCurrentProfileForFlavor, readCcsProfiles, readCodexDefaultProfile, type AuthFlavor } from './ccsProfiles';
 
 export { SEPARATOR };
@@ -19,7 +22,10 @@ export { hasActiveInteractiveSession, handleInteractiveInput } from './interacti
  * consoleOnly: only available in console sessions (not normal agent sessions)
  */
 const commands: Record<string, { handler: BangCommandHandler; desc: string; loadingMsg?: string; sessionOnly?: boolean; consoleOnly?: boolean; hidden?: boolean }> = {
+    'create-codex': { handler: handleCreateCodexCommand, desc: '创建 Codex 会话', consoleOnly: true, hidden: true },
+    'switch-codex': { handler: handleSwitchCodexCommand, desc: '切换 Codex 账号', consoleOnly: true, hidden: true },
     'auth':        { handler: handleAuthBangCommand,        desc: '切换 CCS 账号', sessionOnly: true },
+    'index':       { handler: handleIndexBangCommand,       desc: '检查并修复 Codex 索引', consoleOnly: true },
     'login':       { handler: handleLoginBangCommand,       desc: '登录账户' },
     'usage':       { handler: handleUsageBangCommand,       desc: '⏱️查看Claude 用量' },
     'auth-all':    { handler: handleAuthAllBangCommand,     desc: '🔑设置Claude全局账号', consoleOnly: true },
@@ -78,8 +84,6 @@ function formatPrimaryInvocation(name: string): string {
 }
 
 function formatPrimaryInvocationWithArgs(name: string, args: string): string {
-    const alias = Object.entries(aliases).find(([aliasName, target]) => target === name && aliasArgs[aliasName] === args)?.[0];
-    if (alias) return formatAlias(alias);
     return `${formatPrimaryInvocation(name)} ${args}`.trim();
 }
 
@@ -99,7 +103,46 @@ function compactOption(commandText: string, desc: string): string {
     return `${commandText}｜${desc}`;
 }
 
-const MAIN_MENU_OPTION = '❇️ @@ 主菜单';
+const MAIN_MENU_OPTION = { label: '❇️ @@ 主菜单', value: '@@' };
+const CONSOLE_MENU_OPTIONS: BangOptionSuggestion[] = [
+    ...CODEX_CREATE_OPTIONS, ...CODEX_SWITCH_OPTIONS,
+    { label: '切换Claude账号', value: '@aa --Claude' }, { label: '其他功能', value: '!help' },
+];
+
+/** Old mobile apps send the visible option text and cannot read value attributes. */
+export function consoleCommandText(text: string): string {
+    const option = [...CONSOLE_MENU_OPTIONS, MAIN_MENU_OPTION].find(option =>
+        typeof option !== 'string' && option.label === text.trim());
+    return option && typeof option !== 'string' ? option.value ?? option.label : text;
+}
+
+/** Old apps return the button label; only the current console menu owns that label's command. */
+export function createConsoleMenu() {
+    const commandsByLabel = new Map<string, string>();
+    return {
+        clear(): void { commandsByLabel.clear(); },
+        resolve(text: string): string {
+            return commandsByLabel.get(text.trim()) ?? consoleCommandText(text);
+        },
+        render(suggestions: BangOptionSuggestion[]): string {
+            commandsByLabel.clear();
+            const labels: string[] = [];
+            for (const option of suggestions) {
+                if (typeof option !== 'string' && option.disabled) continue;
+                const originalLabel = typeof option === 'string' ? option : option.label;
+                const command = typeof option === 'string' ? option : option.value ?? option.label;
+                let label = originalLabel;
+                for (let suffix = 2; commandsByLabel.has(label); suffix++) label = `${originalLabel} (${suffix})`;
+                commandsByLabel.set(label, command);
+                // The original App keeps XML entities in its clicked text; newer Apps decode them.
+                const escaped = renderOptionSuggestion(label).slice('<option>'.length, -'</option>'.length);
+                commandsByLabel.set(escaped, command);
+                labels.push(label);
+            }
+            return renderOptionsBlock(labels);
+        },
+    };
+}
 const CACHE_AGE_DISPLAY_MIN_MS = 5 * 60 * 1000;
 
 function formatCompactResetTime(resetsAt: string | null): string | null {
@@ -258,7 +301,7 @@ function parseBangCommand(text: string): { prefix: string; name: string; args: s
 /** Commands hidden from help output (low-frequency commands not worth showing). */
 const helpHidden = new Set<string>();
 
-/** Commands that support --codex flag, with their codex-specific descriptions. */
+/** Commands that support provider flags, with their Codex-specific descriptions. */
 const codexVariants: Record<string, string> = {
     'auth':     '切换当前会话 Codex 账号',
     'auth-all': '🔑设置Codex全局账号',
@@ -271,12 +314,14 @@ function buildHelp(isConsole: boolean): BangCommandResult {
         .filter(([name, entry]) => !entry.hidden && !helpHidden.has(name) && !(isConsole && entry.sessionOnly) && !(!isConsole && entry.consoleOnly))
         .map(([name, { desc }]) => [name, desc] as [string, string]);
 
-    const suggestions: string[] = [];
+    const suggestions: BangOptionSuggestion[] = [];
 
     for (const [name, desc] of baseCommands) {
-        suggestions.push(compactOption(formatPrimaryInvocation(name), desc));
         if (isConsole && codexVariants[name]) {
+            suggestions.push(compactOption(formatPrimaryInvocationWithArgs(name, '--Claude'), name === 'login' ? '登录 Claude 账号' : desc));
             suggestions.push(compactOption(formatPrimaryInvocationWithArgs(name, '--codex'), codexVariants[name]));
+        } else {
+            suggestions.push(compactOption(formatPrimaryInvocation(name), desc));
         }
     }
 
@@ -287,33 +332,14 @@ function buildHelp(isConsole: boolean): BangCommandResult {
     };
 }
 
-/** Commands hidden from console welcome (available via !help but not shown on launch). */
-const consoleWelcomeHidden = new Set(['login']);
-
 /**
- * Build the console welcome message listing key commands.
- * Derived from the commands registry to stay in sync with !help.
+ * Keep the console's primary actions distinct from the maintenance tools.
  */
 export function buildConsoleWelcome(): BangCommandResult {
-    const messages: string[] = [
-        '🖥️ 控制台',
-    ];
-
-    // Show commands available in console (consoleOnly + shared, exclude hidden and welcome-hidden)
-    const consoleCommands = Object.entries(commands)
-        .filter(([name, entry]) => !entry.hidden && !entry.sessionOnly && !consoleWelcomeHidden.has(name));
-
-    const suggestions: string[] = [];
-    for (const [name, { desc }] of consoleCommands) {
-        suggestions.push(compactOption(formatPrimaryInvocation(name), desc));
-        if (codexVariants[name]) {
-            suggestions.push(compactOption(formatPrimaryInvocationWithArgs(name, '--codex'), codexVariants[name]));
-        }
-    }
     return {
-        message: messages,
+        message: ['🖥️ 控制台'],
         action: 'none',
-        suggestions: [...suggestions, MAIN_MENU_OPTION],
+        suggestions: [...CONSOLE_MENU_OPTIONS],
     };
 }
 
@@ -373,7 +399,7 @@ export async function executeBangCommand(text: string, ctx: BangCommandContext):
 
     // Built-in help command
     if (name === 'help') {
-        return buildHelp(!!ctx.isConsoleSession);
+        return withMainMenuOption(buildHelp(!!ctx.isConsoleSession));
     }
 
     // !cancel without an active interactive session

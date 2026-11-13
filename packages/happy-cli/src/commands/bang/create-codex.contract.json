@@ -1,0 +1,60 @@
+{
+  "schemaVersion": "contract-first-module-gate/v2",
+  "contractProfile": "contract-first-minimal-boundary/v1",
+  "riskTriggers": [
+    "public-abi-or-persistent-format",
+    "release-security-or-performance-claim"
+  ],
+  "module": "happy.codex-session-creation",
+  "owner": "happy-cli",
+  "publicApis": [
+    {
+      "name": "console-created provider-bound Codex session",
+      "inputs": [
+        "model family and configured account",
+        "existing working directory",
+        "optional spawn-session codexProfile",
+        "original mobile button labels without command text"
+      ],
+      "acceptedStates": [
+        "fresh Codex session with explicit configured profile",
+        "existing callers without profile",
+        "machine-scoped Codex console with its command consumer installed"
+      ],
+      "rejectedStates": [
+        "unknown or unsafe profile",
+        "profile on non-Codex request",
+        "profile combined with restore or resume",
+        "cross-family account choice",
+        "disabled menu selection"
+      ],
+      "provenanceFields": [
+        "agent",
+        "codexProfile",
+        "CODEX_HOME",
+        "seenGlobalSetAt"
+      ],
+      "outputState": "creation preserves its selected family; console account switching updates only that family global intent for the next actual input; current menu labels resolve to hidden commands",
+      "enforcement": "create-codex and switch-codex handlers, shared auth profile UI, spawn validation, runCodexConsole and createConsoleMenu",
+      "negativeTests": [
+        {
+          "name": "codex_menu_creation_keeps_provider_and_session_selection",
+          "file": "create-codex-boundary.test.mjs"
+        }
+      ]
+    }
+  ],
+  "budgets": {
+    "notApplicableReason": "Creation reuses the existing daemon startup deadline; no new resource budget."
+  },
+  "lifecycleTransitions": {
+    "notApplicableReason": "No new lifecycle states. The daemon Codex console is ready after its command callback is installed and reuses the machine console identity without a provider thread. Ordinary Codex creation and restore retain provider identity checks."
+  },
+  "provenanceFields": {
+    "notApplicableReason": "The local endpoint validates profile identity and the existing session-selection record consumes global account intent."
+  },
+  "evidence": {
+    "mode": "approval",
+    "openFindingCount": 0
+  }
+}

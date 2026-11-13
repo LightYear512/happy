@@ -20,6 +20,12 @@ afterEach(() => {
 });
 
 describe('readCodexDefaultModelConfig', () => {
+    it('uses Astra high from CLI defaults and allows an explicit Astra effort selection', () => {
+        process.env.CODEX_HOME = createCodexHome('model = "gpt-6-astra"\nmodel_reasoning_effort = "high"\n');
+        expect(resolveCodexModelModeOrDefault('default')).toEqual({ model: 'gpt-6-astra', reasoningEffort: 'high' });
+        expect(resolveCodexModelModeOrDefault('gpt-6-astra:low')).toEqual({ model: 'gpt-6-astra', reasoningEffort: 'low' });
+    });
+
     it('reads the active CODEX_HOME config model and reasoning effort', () => {
         const codexHome = createCodexHome(`
 model = "gpt-5.6-sol"

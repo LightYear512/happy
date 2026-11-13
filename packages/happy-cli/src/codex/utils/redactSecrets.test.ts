@@ -2,17 +2,14 @@ import { describe, it, expect } from 'vitest';
 import { redactSensitive, redactHighConfidenceSecrets } from './redactSecrets';
 
 /**
- * Guards the redaction logic extracted from compactSeedBuilder into this shared
- * leaf module. The `redactSensitive` block is the *regression anchor*: its
- * behaviour must stay byte-for-byte identical to the pre-extraction inline
- * version, since compactSeedBuilder still relies on it for every user/assistant
- * turn that enters the seed.
+ * Shared credential redaction, including startup errors. High-confidence-only
+ * project documentation handling must retain its distinct, narrower policy.
  */
 describe('redactSecrets', () => {
-    describe('redactSensitive — full set (regression anchor for the inline version)', () => {
+    describe('redactSensitive — full set', () => {
         it('redacts OpenAI / Anthropic style keys', () => {
             expect(redactSensitive('sk-' + 'a'.repeat(24))).toBe('[REDACTED-API-KEY]');
-            expect(redactSensitive('use key=sk-ant-abcdefghijklmnopqrstuvwxyz0123 here')).toContain('[REDACTED-API-KEY]');
+            expect(redactSensitive('use key=sk-ant-' + 'DUMMY_'.repeat(6) + ' here')).toContain('[REDACTED-API-KEY]');
         });
 
         it('redacts GitHub PATs', () => {
@@ -36,6 +33,49 @@ describe('redactSecrets', () => {
         it('leaves ordinary text and empty input untouched', () => {
             expect(redactSensitive('')).toBe('');
             expect(redactSensitive('a normal sentence touching files.ts and foo.py')).toBe('a normal sentence touching files.ts and foo.py');
+        });
+
+        it('redacts quoted Authorization fields including spaces, escapes and partial values', () => {
+            for (const field of ['Authorization', 'authorization', 'AUTHORIZATION', 'Proxy-Authorization']) {
+                for (const scheme of ['Bearer', 'Basic', 'Token']) {
+                    const input = JSON.stringify({ [field]: `${scheme} private value \\" suffix`, status: 'failed' });
+                    expect(redactSensitive(input)).toBe(`{"${field}":[REDACTED],"status":"failed"}`);
+                }
+            }
+            expect(redactSensitive("'Authorization': 'Bearer private value'"))
+                .toBe("'Authorization': [REDACTED]");
+            expect(redactSensitive('Authorization: "Bearer unfinished private value'))
+                .toBe('Authorization: [REDACTED]');
+            expect(redactSensitive('"Authorization": Bearer private-value'))
+                .toBe('"Authorization": [REDACTED]');
+        });
+
+        it('redacts short and punctuation-bearing credential values', () => {
+            expect(redactSensitive('password=P@ssw0rd!')).toBe('password=[REDACTED]');
+            expect(redactSensitive('passwd=a')).toBe('passwd=[REDACTED]');
+            expect(redactSensitive('secret="two words, !@#$"')).toBe('secret=[REDACTED]');
+            expect(redactSensitive("password='with spaces and punctuation!'")).toBe('password=[REDACTED]');
+        });
+
+        it('redacts OAuth fields and environment-prefixed credentials', () => {
+            for (const field of ['refresh_token', 'id_token', 'token', 'OPENAI_API_KEY', 'MY_CLIENT_SECRET']) {
+                expect(redactSensitive(`${field}=review-credential`)).toBe(`${field}=[REDACTED]`);
+            }
+            expect(redactSensitive('{"refresh_token":"private value", "status":"failed"}'))
+                .toBe('{"refresh_token":[REDACTED], "status":"failed"}');
+        });
+
+        it('handles quoted escapes and incomplete quoted values without leaking their suffix', () => {
+            expect(redactSensitive(String.raw`password="escaped\" quote and space"`))
+                .toBe('password=[REDACTED]');
+            expect(redactSensitive('password="unfinished private value')).toBe('password=[REDACTED]');
+            expect(redactSensitive('api_key=sk-' + 'a'.repeat(32))).toBe('api_key=[REDACTED-API-KEY]');
+        });
+
+        it('never treats a redaction marker inside a larger credential as an already safe value', () => {
+            for (const value of ['[REDACTED]private', 'a,b;c}d]e!', '"[REDACTED] private suffix"', '"private value\\']) {
+                expect(redactSensitive(`password=${value}`)).toBe('password=[REDACTED]');
+            }
         });
     });
 

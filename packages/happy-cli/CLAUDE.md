@@ -164,11 +164,21 @@ HAPPY_SERVER_URL=http://localhost:3005 ./bin/happy.mjs daemon start
 - 调试 interactive CLI：node-pty spawn + `CODEX_HOME=/tmp/xxx` + setTimeout kill，用 `JSON.stringify(output)` 保留 ANSI 方便写回放用例
 - Windows node-pty 会打印 `AttachConsole failed` 警告，无害，不影响 PTY 捕获
 
-# PTY Output Parsing (loginCommand.ts)
+# Account Login (loginCommand.ts)
 
-- `stripTerminalOutput(buf)` → cursor-positioning escapes 变 `\n`，适合**短 URL / 按行识别关键词**（防止贪婪正则吞入下一行 TUI 文本）
-- `stripAnsiOnly(buf)` → ANSI 全删但不加空白，适合**长 URL 跨 PTY 换行拼接**（Claude `/oauth/authorize` 在 80/120 列被拆）
-- Codex device-auth URL 短（`auth.openai.com/codex/device`），用前者；Claude OAuth URL 长，用后者
+- Claude login uses the official `claude auth login --claudeai` command, never an ordinary chat TUI. Keep `CLAUDE_CONFIG_DIR` scoped to the requested account. Do not infer fresh OAuth completion from existing credentials or screen text; require a normal exit with code 0 and no termination signal.
+- Forward only a complete, terminated OAuth URL. Validate manual `code#state` input against that URL's state, reject commands/menu shortcuts, and leave incorrect input retryable. Do not log OAuth URLs or codes.
+- Bound startup and browser authorization waits. Cancel/timeout/exit must clear pending submit timers and release only the flow's own interactive handler; an old child must not clear a newer flow.
+- `stripTerminalOutput(buf)` remains the Codex terminal-text reader; `stripAnsiOnly(buf)` preserves long Claude OAuth URLs across ANSI sequences.
+- Native-login validation may use an isolated `CLAUDE_CONFIG_DIR` and `BROWSER=/usr/bin/true`, stopping after the authorization URL. This verifies startup and cancellation, not completed OAuth authorization.
+
+## Console-only activation while user tasks are running
+
+- An old daemon spawns its own release's `dist/index.mjs`; changing the global `happy` symlink alone does not update its console. Do not interrupt user tasks to activate a console fix.
+- The one-time macOS/Unix adapter `scripts/console-release-bridge.mjs` (repository root) accepts the old release, a validated sibling release, and the old entry's SHA-256. It atomically replaces only the import-only launcher facade, retaining the exact original beside it; directory/file permissions are preserved. The old release now has a documented launcher exception and must not be described as byte-identical to its original artifact.
+- Only `HAPPY_CONSOLE_SESSION=1` plus the exact daemon console arguments select the new release. User-task and daemon invocations retain the original facade. Keep the receipt and original entry under `$HAPPY_HOME_DIR/incidents`, outside Git. Do not stack bridges or delete either referenced release while the old daemon remains active.
+- Verify the console session ID, PID, parent daemon and command before sending that console SIGTERM. Let its existing daemon respawn it. Verify the same console ID reports the new `happyLibDir`, is online and is still owned by the same daemon; compare all user session IDs/PIDs before and after. Never use a force-close endpoint that creates a persistent closed-session marker for this restart.
+- Run `HAPPY_CONSOLE_BRIDGE_TEST_ROOT=<disposable-directory> node --test scripts/console-release-bridge.test.mjs`. The tests execute both entry paths and check checksum/backup conflicts and preserved permissions. If activation fails, restore the receipt's exact original facade atomically only after matching the current bridge checksum; do not restart user tasks. After the old daemon is eventually retired, restore its launcher or retire that entire unused release through the normal cleanup policy.
 
 # Codex CLI Gotchas
 

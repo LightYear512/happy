@@ -201,7 +201,11 @@ describe('handleAuthBangCommand', () => {
             expect(msg).toContain('请选择要切换的 Claude 账户');
             expect(msg).toContain('work');
             expect(msg).toContain('personal');
-            expect(ctx.client.sendSessionEvent).not.toHaveBeenCalled();
+            // Console listing already emits a loading notice; it must not
+            // emit the normal-session "no current account" fallback header.
+            expect(ctx.client.sendSessionEvent).toHaveBeenCalledExactlyOnceWith({
+                type: 'message', message: '⏳ 账号信息查询中',
+            });
         });
 
         it('returns explicit empty message when no profiles exist in console', async () => {

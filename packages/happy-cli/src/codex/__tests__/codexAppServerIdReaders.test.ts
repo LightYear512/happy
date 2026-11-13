@@ -177,3 +177,34 @@ describe('createAppServerStreamBridge.turn/started', () => {
         }
     });
 });
+
+
+describe('app-server terminal status', () => {
+    it.each([
+        [{ turn: { status: 'failed', error: { message: 'bad context' } } }, 'failed'],
+        [{ turn: { status: 'failed' } }, 'failed'],
+        [{ status: 'completed', turn: { error: { message: 'bad context' } } }, 'failed'],
+        [{ status: 'failed' }, 'failed'],
+        [{ error: 'bad context' }, 'failed'],
+        [{ turn: { status: 'interrupted' } }, 'cancelled'],
+        [{ status: 'canceled' }, 'cancelled'],
+        [{ turn: { status: 'completed', error: null } }, 'completed'],
+        [{}, 'completed'],
+    ])('preserves the actual terminal result %j', (params, status) => {
+        const bridge = createAppServerStreamBridge();
+        bridge.onNotification('turn/started', { turn: { id: 't1' } });
+        const updates = bridge.onNotification('turn/completed', params);
+        expect(updates).toContainEqual(expect.objectContaining({ type: 'envelope', envelope: expect.objectContaining({ ev: { t: 'turn-end', status } }) }));
+        expect(updates.some((u) => u.type === 'task-complete')).toBe(status === 'completed');
+        expect(updates.some((u) => u.type === 'turn-aborted')).toBe(status !== 'completed');
+    });
+
+    it('ends a terminal error once, without turning a late completion into success', () => {
+        const bridge = createAppServerStreamBridge();
+        bridge.onNotification('turn/started', { turn: { id: 't1' } });
+        expect(bridge.onNotification('error', { willRetry: true, error: 'temporary' })).toEqual([]);
+        const updates = bridge.onNotification('error', { willRetry: false, error: 'broken' });
+        expect(updates).toContainEqual(expect.objectContaining({ type: 'envelope', envelope: expect.objectContaining({ ev: { t: 'turn-end', status: 'failed' } }) }));
+        expect(bridge.onNotification('turn/completed', { turn: { id: 't1', status: 'completed' } })).toEqual([]);
+    });
+});

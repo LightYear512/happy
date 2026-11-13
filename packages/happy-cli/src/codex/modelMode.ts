@@ -8,6 +8,10 @@ export type CodexModelModeConfig = {
 export const CODEX_GPT56_MODEL = 'gpt-5.6-sol';
 export const CODEX_MODEL_MODE_OPTIONS = [
     { code: 'default', value: '使用 CLI 设置', description: 'Use Codex CLI config' },
+    { code: 'gpt-6-astra:low', value: 'GPT-6 Astra 低', description: 'gpt-6-astra / low reasoning' },
+    { code: 'gpt-6-astra:medium', value: 'GPT-6 Astra 中', description: 'gpt-6-astra / medium reasoning' },
+    { code: 'gpt-6-astra:high', value: 'GPT-6 Astra 高', description: 'gpt-6-astra / high reasoning' },
+    { code: 'gpt-6-astra:xhigh', value: 'GPT-6 Astra 超高', description: 'gpt-6-astra / xhigh reasoning' },
     { code: 'gpt-5.6-sol:minimal', value: 'GPT-5.6 极简', description: 'gpt-5.6-sol / minimal reasoning' },
     { code: 'gpt-5.6-sol:low', value: 'GPT-5.6 低', description: 'gpt-5.6-sol / low reasoning' },
     { code: 'gpt-5.6-sol:medium', value: 'GPT-5.6 中', description: 'gpt-5.6-sol / medium reasoning' },
@@ -51,6 +55,11 @@ const GPT56_EFFORT_BY_MODE = new Map<string, CodexReasoningEffort>([
 export function resolveCodexModelMode(modelMode: string | null | undefined): CodexModelModeConfig {
     if (!modelMode || modelMode === 'default') {
         return {};
+    }
+
+    const astraMode = /^gpt-6-astra:(low|medium|high|xhigh)$/.exec(modelMode);
+    if (astraMode) {
+        return { model: 'gpt-6-astra', reasoningEffort: astraMode[1] as CodexReasoningEffort };
     }
 
     const effort = GPT56_EFFORT_BY_MODE.get(modelMode);

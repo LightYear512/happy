@@ -9,9 +9,8 @@ import { logger } from '@/ui/logger';
 import {
     hasActiveInteractiveSession,
     registerInteractiveSession,
-    unregisterInteractiveSession,
 } from './interactiveSession';
-import { SEPARATOR, codeBlock, parseCodexFlag, rejectCodexFlagInSession, type BangCommandContext, type BangCommandResult } from './types';
+import { SEPARATOR, codeBlock, parseProviderFlags, rejectProviderFlags, type BangCommandContext, type BangCommandResult } from './types';
 import { getCodexInstancePath, getHappyHome, registerCodexProfile, readCodexDefaultProfile, setCodexDefaultProfile, readCodexProfiles, type AuthFlavor } from './ccsProfiles';
 import { buildCodexChildEnv } from '@/codex/codexEnvBuilder';
 
@@ -37,7 +36,8 @@ export function parseLoginArgs(
     args: string,
     ctxFlavor: 'claude' | 'codex' | 'gemini' | undefined,
 ): ParsedLoginArgs {
-    const { cleanArgs, hasCodexFlag } = parseCodexFlag(args);
+    const { cleanArgs, flavor, error } = parseProviderFlags(args);
+    if (error) return { kind: 'error', message: error };
     const parts = cleanArgs.split(/\s+/).filter(Boolean);
 
     let profileName: string | undefined;
@@ -55,9 +55,7 @@ export function parseLoginArgs(
     }
 
     // gemini/undefined fall back to claude — matches authCommand.resolveAuthFlavor contract
-    const targetAgent: AuthFlavor = hasCodexFlag
-        ? 'codex'
-        : (ctxFlavor === 'codex' ? 'codex' : 'claude');
+    const targetAgent: AuthFlavor = flavor ?? (ctxFlavor === 'codex' ? 'codex' : 'claude');
 
     return {
         kind: 'ok',
@@ -151,117 +149,110 @@ export function stripAnsiOnly(text: string): string {
         .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '');
 }
 
-/**
- * Analyze PTY output buffer and decide what action to take.
- * Returns:
- * - `{ action: 'auto-respond', response: string }` — send response to PTY, discard buffer
- * - `{ action: 'forward-url', url: string }` — OAuth URL detected, forward to mobile
- * - `{ action: 'discard' }` — not enough data yet, discard after timeout
- * - `{ action: 'forward' }` — post-login output, forward to mobile
- */
-export type PtyAction =
-    | { action: 'auto-respond'; response: string }
-    | { action: 'forward-url'; url: string }
-    | { action: 'already-authenticated' }
-    | { action: 'discard' }
-    | { action: 'forward' };
+/** Native `claude auth login` is a finite process; its exit status owns success. */
+export type ClaudeLoginResult =
+    | { success: true }
+    | { success: false; reason: 'cancelled' | 'startup-timeout' | 'authorization-timeout' | 'input-error' | 'exit'; exitCode?: number; signal?: number };
 
-export function analyzePtyOutput(buffer: string, loginUrlSent: boolean, loginCommandSent: boolean): PtyAction {
-    if (!loginUrlSent) {
-        // URL extraction: strip ANSI without adding whitespace (keeps URL intact across line wraps).
-        // Then strip trailing Claude UI text that merges with the URL.
-        const continuous = stripAnsiOnly(buffer);
-        const urlMatch = continuous.match(/https:\/\/[^\s]*\/oauth\/authorize[^\s]*/);
-        if (urlMatch) {
-            const url = urlMatch[0]
-                .replace(/Paste.*$/, '')
-                .replace(/Enter.*$/, '')
-                .replace(/Esc.*$/, '')
-                .replace(/>+$/, '');
-            return { action: 'forward-url', url };
-        }
-
-        // Keyword detection: strip with whitespace preservation (proper word boundaries).
-        const cleanBuffer = stripTerminalOutput(buffer);
-
-        // "Not logged in" → send /login command (only once to avoid loop)
-        if (!loginCommandSent && cleanBuffer.includes('Not logged in')) {
-            return { action: 'auto-respond', response: '/login\r' };
-        }
-
-        // Interactive prompts — ink Select expects Enter to confirm pre-selected first option.
-        if (
-            cleanBuffer.includes('Select login method')
-            || cleanBuffer.includes('trust this folder')
-            || cleanBuffer.includes('Choose the text style')
-        ) {
-            return { action: 'auto-respond', response: '\r' };
-        }
-
-        // Already logged in — keychain has valid token, Claude entered main UI.
-        // Only detect before /login is sent; after /login the screen may re-render
-        // with "Welcome back" text but we're already in the OAuth flow.
-        if (!loginCommandSent && cleanBuffer.includes('Welcome back')) {
-            return { action: 'already-authenticated' };
-        }
-
-        // Recent Claude versions may render the authenticated main screen without
-        // "Welcome back". Require the version header, input prompt, and shortcut
-        // footer together so selection prompts cannot trigger a forced /login.
-        const hasClaudeVersionHeader = /\bClaude Code v\d+(?:\.\d+)+\b/.test(cleanBuffer);
-        const hasMainInputPrompt = /(?:^|\n)[^\S\r\n]*❯(?:[^\S\r\n]|$)/.test(cleanBuffer)
-            && cleanBuffer.includes('? for shortcuts');
-        if (!loginCommandSent && hasClaudeVersionHeader && hasMainInputPrompt) {
-            return { action: 'already-authenticated' };
-        }
-
-        return { action: 'discard' };
-    }
-
-    return { action: 'forward' };
+export function readClaudeLoginUrl(buffer: string): string | null {
+    // Wait for the native command's terminator, never publish a partial URL.
+    return stripAnsiOnly(buffer).match(/https:\/\/[^\s]*\/oauth\/authorize[^\s]*(?=\s)/)?.[0] ?? null;
 }
 
-const CLAUDE_LOGIN_PRE_OAUTH_TIMEOUT_MS = 60_000;
-const MAX_NODE_TIMEOUT_MS = 2_147_483_647;
+export function isLoginCommandInput(text: string): boolean {
+    return /^[!！/@]/.test(text.trim()) || text.includes('@@');
+}
 
-export function createClaudeLoginPreAuthDeadline(
-    onTimeout: () => void,
-    timeoutMs = CLAUDE_LOGIN_PRE_OAUTH_TIMEOUT_MS,
-): { clear(): void } {
-    if (
-        !Number.isSafeInteger(timeoutMs)
-        || timeoutMs < 0
-        || timeoutMs > MAX_NODE_TIMEOUT_MS
-    ) {
-        throw new RangeError('Claude pre-OAuth timeout is outside the supported range');
-    }
-
-    let active = true;
-    const timer = setTimeout(() => {
-        if (!active) return;
-        active = false;
-        onTimeout();
-    }, timeoutMs);
-
-    return {
-        clear(): void {
-            if (!active) return;
-            active = false;
-            clearTimeout(timer);
-        },
+export function startClaudeLoginFlow(child: pty.IPty, options: {
+    sendMessage: (message: string) => void;
+    complete: (result: ClaudeLoginResult) => void;
+    startupTimeoutMs?: number;
+    authorizationTimeoutMs?: number;
+}): void {
+    let finished = false;
+    let urlSent = false;
+    let submitted = false;
+    let expectedState: string | null = null;
+    let buffer = '';
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    let submitTimer: ReturnType<typeof setTimeout> | undefined;
+    let releaseInput = (): void => {};
+    const subscriptions: pty.IDisposable[] = [];
+    const finish = (result: ClaudeLoginResult, terminate = false): void => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(deadline);
+        clearTimeout(submitTimer);
+        buffer = '';
+        expectedState = null;
+        for (const subscription of subscriptions) subscription.dispose();
+        releaseInput();
+        if (terminate) {
+            try { child.kill(); } catch { logger.warn('[!login:claude] Could not signal login process'); }
+        }
+        logger.info(`[!login:claude] finished=${result.success ? 'success' : result.reason}`);
+        options.complete(result);
     };
-}
-
-export function shouldAcceptClaudeLoginResult(input: {
-    loginSucceeded: boolean;
-    aborted: boolean;
-    credentialExistedBefore: boolean;
-    credentialExistsAfter: boolean;
-}): boolean {
-    return !input.aborted && (
-        input.loginSucceeded
-        || (!input.credentialExistedBefore && input.credentialExistsAfter)
-    );
+    const armDeadline = (milliseconds: number, reason: 'startup-timeout' | 'authorization-timeout'): void => {
+        clearTimeout(deadline);
+        deadline = setTimeout(() => finish({ success: false, reason }, true), milliseconds);
+    };
+    releaseInput = registerInteractiveSession(text => {
+        if (finished) return;
+        const input = text.trim();
+        if (input === '!cancel' || input === '!取消') {
+            finish({ success: false, reason: 'cancelled' }, true);
+            return;
+        }
+        if (isLoginCommandInput(input)) {
+            options.sendMessage('登录流程进行中，请勿重复发送命令；发送 !cancel 可退出当前登录。');
+            return;
+        }
+        if (!urlSent) {
+            options.sendMessage('正在获取授权链接，请等待链接出现后再提交授权码。');
+            return;
+        }
+        if (submitted) {
+            options.sendMessage('授权码已提交，正在等待登录结果；发送 !cancel 可取消。');
+            return;
+        }
+        if (!/^[^\s#\x00-\x1f\x7f]+#[^\s#\x00-\x1f\x7f]+$/.test(input)) {
+            options.sendMessage('请完整粘贴浏览器显示的 code#state 授权码，或发送 !cancel 取消。');
+            return;
+        }
+        if (expectedState && input.split('#')[1] !== expectedState) {
+            options.sendMessage('授权码不属于本次登录，请打开本次链接后重新复制完整授权码。');
+            return;
+        }
+        submitted = true;
+        try {
+            child.write(input);
+            submitTimer = setTimeout(() => {
+                if (finished) return;
+                try { child.write('\r'); }
+                catch { finish({ success: false, reason: 'input-error' }, true); }
+            }, 120);
+        } catch { finish({ success: false, reason: 'input-error' }, true); }
+    });
+    subscriptions.push(child.onData(data => {
+        if (finished || urlSent) return;
+        buffer = (buffer + data).slice(-65536);
+        const url = readClaudeLoginUrl(buffer);
+        if (!url) return;
+        urlSent = true;
+        expectedState = new URL(url).searchParams.get('state');
+        buffer = '';
+        armDeadline(options.authorizationTimeoutMs ?? 15 * 60_000, 'authorization-timeout');
+        logger.info('[!login:claude] authorization URL ready');
+        options.sendMessage('🔗 请在浏览器中打开以下链接登录:\n\n' + codeBlock(url)
+            + '\n\n请在 15 分钟内完成授权，将授权码粘贴到下方发送。取消: !cancel');
+    }));
+    subscriptions.push(child.onExit(({ exitCode, signal }) => {
+        // Old credentials or a partial success message cannot override a failed exit.
+        finish(exitCode === 0 && !signal ? { success: true }
+            : { success: false, reason: 'exit', exitCode, ...(signal ? { signal } : {}) });
+    }));
+    armDeadline(options.startupTimeoutMs ?? 60_000, 'startup-timeout');
 }
 
 /**
@@ -832,6 +823,7 @@ function buildChildEnv(instancePath: string): Record<string, string | undefined>
     // Remove happy-cli / ambient provider variables
     delete env.HAPPY_SESSION_ID;
     delete env.HAPPY_SERVER_URL;
+    delete env.CLAUDECODE;
     for (const key of Object.keys(env)) {
         if (key.startsWith('ANTHROPIC_') || key.startsWith('OPENAI_')) {
             delete env[key];
@@ -846,17 +838,17 @@ function buildChildEnv(instancePath: string): Record<string, string | undefined>
  *
  * Flow:
  * 1. Validate profile name, create instance directory
- * 2. Spawn `claude` with CLAUDE_CONFIG_DIR pointing to the instance
+ * 2. Spawn `claude auth login --claudeai` with an isolated profile config directory
  * 3. Forward Claude's login prompt output to mobile (markdown code blocks for copyability)
  * 4. User pastes OAuth key on mobile → piped to Claude's stdin
- * 5. On successful login (.credentials.json appears), register profile
+ * 5. Register the profile only after the dedicated login process exits successfully
  */
 export async function handleLoginBangCommand(
     args: string,
     ctx: BangCommandContext,
 ): Promise<BangCommandResult> {
-    const codexReject = rejectCodexFlagInSession(args, ctx);
-    if (codexReject) return codexReject;
+    const rejected = rejectProviderFlags(args, ctx);
+    if (rejected) return rejected;
 
     if (hasActiveInteractiveSession()) {
         return {
@@ -889,7 +881,7 @@ export async function handleLoginBangCommand(
         if (targetAgent === 'codex') {
             messages.push('!login --codex <账户名> 登录 Codex');
         } else {
-            messages.push('!login <账户名> 登录 Claude');
+            messages.push(ctx.isConsoleSession ? '!login --Claude <账户名> 登录 Claude' : '!login <账户名> 登录 Claude');
         }
 
         return { message: messages, action: 'none' };
@@ -912,7 +904,6 @@ export async function handleLoginBangCommand(
     const instancePath = getInstancePath(profileName);
     const dirExistedBefore = existsSync(instancePath);
     const credentialPath = join(instancePath, '.credentials.json');
-    const credentialExistedBefore = existsSync(credentialPath);
     try {
         mkdirSync(instancePath, { recursive: true });
     } catch (err) {
@@ -922,25 +913,7 @@ export async function handleLoginBangCommand(
         };
     }
 
-    // Pre-create .claude.json to:
-    // 1. Mark onboarding as completed (skip theme selector TUI)
-    // 2. Pre-approve workspace trust for cwd (skip "Accessing workspace" prompt)
-    const claudeJsonPath = join(instancePath, '.claude.json');
-    if (!existsSync(claudeJsonPath)) {
-        const cwd = homedir().replace(/\\/g, '/');
-        writeFileSync(claudeJsonPath, JSON.stringify({
-            hasCompletedOnboarding: true,
-            numStartups: 0,
-            projects: {
-                [cwd]: { hasTrustDialogAccepted: true },
-            },
-        }, null, 2), 'utf-8');
-        logger.debug('[!login] Pre-created .claude.json with onboarding + workspace trust');
-    }
-
-    // Pre-create settings.json to skip onboarding TUI and inherit proxy/env config.
-    // Without this, Claude shows a full-screen theme selector unusable on mobile,
-    // and proxy settings from the current instance won't carry over.
+    // Retain the existing per-profile proxy/environment inheritance.
     const settingsPath = join(instancePath, 'settings.json');
     if (!existsSync(settingsPath)) {
         const seedSettings: Record<string, unknown> = {};
@@ -961,7 +934,7 @@ export async function handleLoginBangCommand(
         logger.debug('[!login] Pre-created settings.json with env from current instance');
     }
 
-    // Spawn Claude CLI in a pseudo-TTY so the interactive login prompt works
+    // Use the official finite login command, never a model/chat shell.
     ensurePtySpawnHelper();
     const childEnv = buildChildEnv(instancePath);
     // node-pty needs a clean env record (no undefined values)
@@ -975,7 +948,7 @@ export async function handleLoginBangCommand(
         const shell = process.platform === 'win32' && claudeInfo.needsShell;
         ptyProcess = pty.spawn(
             shell ? process.env.COMSPEC || 'cmd.exe' : claudeInfo.path,
-            shell ? ['/c', claudeInfo.path] : [],
+            shell ? ['/c', claudeInfo.path, 'auth', 'login', '--claudeai'] : ['auth', 'login', '--claudeai'],
             {
                 name: 'xterm-256color',
                 cols: 1000, // Wide enough to prevent PTY line-wrapping mid-URL (OAuth URLs ~400 chars)
@@ -992,206 +965,35 @@ export async function handleLoginBangCommand(
         };
     }
 
-    // Output buffering — debounce PTY chunks into meaningful messages
-    let outputBuffer = '';
-    let flushTimer: ReturnType<typeof setTimeout> | null = null;
-    let exited = false;
-
-    const flushOutput = (): void => {
-        if (flushTimer) {
-            clearTimeout(flushTimer);
-            flushTimer = null;
-        }
-        const text = stripTerminalOutput(outputBuffer).trim();
-        outputBuffer = '';
-        if (text) {
-            // Use sendAgentTextMessage for markdown rendering (code block with copy button)
-            ctx.client.sendCodexMessage({ type: 'message', message: codeBlock(text) });
-        }
-    };
-
-    let loginUrlSent = false;
-    let loginCommandSent = false;
-    let loginSucceeded = false;
-    let aborted = false;
-    let terminalNoticeSent = false;
-    let preAuthDeadline: { clear(): void } | null = null;
-
-    const clearPreAuthDeadline = (): void => {
-        preAuthDeadline?.clear();
-        preAuthDeadline = null;
-    };
-
-    const finishTerminalFailure = (message: string, flushBufferedOutput: boolean): void => {
-        if (terminalNoticeSent || exited) return;
-        aborted = true;
-        terminalNoticeSent = true;
-        clearPreAuthDeadline();
-        unregisterInteractiveSession();
-        if (flushBufferedOutput) {
-            flushOutput();
-        } else {
-            if (flushTimer) clearTimeout(flushTimer);
-            flushTimer = null;
-            outputBuffer = '';
-        }
-        try { ptyProcess.kill(); } catch (err) {
-            logger.debug('[!login] Failed to terminate Claude PTY:', err);
-        }
-        if (!dirExistedBefore) cleanupInstance(instancePath);
-        ctx.client.sendCodexMessage({ type: 'message', message });
-        ctx.client.sendSessionEvent({ type: 'ready' });
-    };
-
-    ptyProcess.onData((data: string) => {
-        if (loginSucceeded || aborted) return; // Already finishing — ignore residual PTY output
-        outputBuffer += data;
-
-        const result = analyzePtyOutput(outputBuffer, loginUrlSent, loginCommandSent);
-        logger.debug(`[!login] onData action=${result.action} bufLen=${outputBuffer.length} stripped="${stripTerminalOutput(outputBuffer).slice(0, 200)}"`);
-
-        switch (result.action) {
-            case 'auto-respond':
-                logger.debug(`[!login] Auto-responding: ${result.response.trim()}`);
-                if (result.response === '/login\r') loginCommandSent = true;
-                outputBuffer = '';
-                if (flushTimer) clearTimeout(flushTimer);
-                ptyProcess.write(result.response);
-                return;
-
-            case 'forward-url':
-                loginUrlSent = true;
-                clearPreAuthDeadline();
-                logger.debug(`[!login] OAuth URL detected: ${result.url}`);
-                outputBuffer = '';
-                if (flushTimer) clearTimeout(flushTimer);
-
-                ctx.client.sendCodexMessage({ type: 'message', message:
-                    '🔗 请在浏览器中打开以下链接登录:\n\n' + codeBlock(result.url) + '\n\n登录后将 OAuth Key 粘贴到下方发送'
-                });
-                return;
-
-            case 'already-authenticated':
-                // Claude found existing credentials (keychain), but user asked to login —
-                // always force OAuth flow so they authenticate with the intended account.
-                logger.debug('[!login] Already authenticated — forcing /login for fresh credentials');
-                outputBuffer = '';
-                if (flushTimer) clearTimeout(flushTimer);
-                loginCommandSent = true; // Prevent re-triggering "Welcome back" detection
-                ptyProcess.write('/login\r');
-                return;
-
-            case 'discard':
-                // Keep accumulating — don't clear buffer during phase 1.
-                // The buffer grows until we match a URL or an auto-respond prompt.
-                return;
-
-            case 'forward': {
-                const forwardText = stripAnsiOnly(outputBuffer);
-
-                // Detect "Login successful" → auto-send Enter, then kill process
-                if (forwardText.includes('Login successful')) {
-                    logger.debug('[!login] Login successful detected, sending Enter and finishing');
-                    loginSucceeded = true;
-                    clearPreAuthDeadline();
-                    outputBuffer = '';
-                    if (flushTimer) clearTimeout(flushTimer);
-                    ptyProcess.write('\r');
-                    // Give Claude a moment to save credentials, then kill
-                    setTimeout(() => { try { ptyProcess.kill(); } catch {} }, 2000);
-                    return;
+    startClaudeLoginFlow(ptyProcess, {
+        sendMessage: message => ctx.client.sendCodexMessage({ type: 'message', message }),
+        complete: result => {
+            if (result.success) {
+                try {
+                    registerProfile(profileName);
+                    linkSharedDirectories(instancePath);
+                    syncProjectContext(instancePath);
+                    ctx.client.sendCodexMessage({ type: 'message', message:
+                        `✅ 配置 "${profileName}" 登录成功\n\n`
+                        + `切换账号: ${ctx.isConsoleSession ? '!auth-all --Claude' : '!auth'} ${profileName}` });
+                } catch (err) {
+                    logger.warn('[!login:claude] Profile registration failed after authorization');
+                    ctx.client.sendCodexMessage({ type: 'message', message: `⚠️ 登录成功但注册失败: ${(err as Error).message}` });
                 }
-
-                // Detect OAuth error (invalid code) → kill process and notify user
-                if (forwardText.includes('OAuth error') || forwardText.includes('Invalid code')) {
-                    logger.debug('[!login] OAuth error detected, terminating login session');
-                    finishTerminalFailure('❌ 登录失败: 无效的 OAuth Code\n\n请重新使用 !login 登录', false);
-                    return;
-                }
-
-                if (flushTimer) clearTimeout(flushTimer);
-                flushTimer = setTimeout(flushOutput, 300);
-                return;
+            } else {
+                // Preserve credentials if the CLI wrote them just before cancellation.
+                if (!dirExistedBefore && !existsSync(credentialPath)) cleanupInstance(instancePath);
+                const reason = result.reason === 'cancelled' ? '登录已取消'
+                    : result.reason === 'startup-timeout' ? '登录启动超时'
+                    : result.reason === 'authorization-timeout' ? '等待授权超时'
+                    : result.reason === 'input-error' ? '授权码提交失败'
+                    : result.signal ? `登录被中断（信号 ${result.signal}）`
+                    : `登录失败（退出码 ${result.exitCode ?? '未知'}）`;
+                ctx.client.sendCodexMessage({ type: 'message', message: `❌ ${reason}\n\n`
+                    + `重新尝试: !login ${ctx.isConsoleSession ? '--Claude ' : ''}${profileName}` });
             }
-        }
-    });
-
-    // Register interactive input handler
-    registerInteractiveSession((text: string) => {
-        const trimmed = text.trim();
-
-        if (trimmed === '!cancel' || trimmed === '!取消') {
-            logger.debug('[!login] User cancelled login');
-            finishTerminalFailure('❌ 登录已取消', true);
-            return;
-        }
-
-        if (exited) {
-            logger.debug('[!login] Process already exited, ignoring input');
-            return;
-        }
-
-        logger.debug('[!login] Feeding input to Claude PTY');
-        // Claude Code's OAuth code input is a password/paste-aware field — writing
-        // `text + '\r'` in one chunk causes the trailing `\r` to be swallowed as
-        // part of the pasted payload, so submit never fires. Write the body, let
-        // Claude's paste buffer flush, then send `\r` as an independent keystroke.
-        try {
-            const body = text.replace(/[\r\n]+$/, '');
-            ptyProcess.write(body);
-            setTimeout(() => {
-                try { ptyProcess.write('\r'); } catch (err) {
-                    logger.debug('[!login] Failed to send submit CR:', err);
-                }
-            }, 120);
-        } catch (err) {
-            logger.debug('[!login] Failed to write to PTY:', err);
-        }
-    });
-
-    // Handle process exit
-    ptyProcess.onExit(({ exitCode }) => {
-        exited = true;
-        clearPreAuthDeadline();
-        unregisterInteractiveSession();
-        if (terminalNoticeSent) return;
-        flushOutput();
-
-        // Only trust explicit PTY success signals or newly written credential files.
-        // Do NOT check keychain here — it may contain old tokens from before this login attempt.
-        const hasCredentials = shouldAcceptClaudeLoginResult({
-            loginSucceeded,
-            aborted,
-            credentialExistedBefore,
-            credentialExistsAfter: existsSync(credentialPath),
-        });
-
-        if (hasCredentials) {
-            try {
-                registerProfile(profileName);
-                linkSharedDirectories(instancePath);
-                syncProjectContext(instancePath);
-                const msg = `✅ 配置 "${profileName}" 登录成功\n\n`
-                    + `切换账号: !auth ${profileName}`;
-                ctx.client.sendCodexMessage({ type: 'message', message: msg });
-            } catch (err) {
-                logger.debug('[!login] Failed to register profile:', err);
-                ctx.client.sendCodexMessage({ type: 'message', message: `⚠️ 登录成功但注册失败: ${(err as Error).message}` });
-            }
-        } else {
-            if (!dirExistedBefore) cleanupInstance(instancePath);
-            logger.debug(`[!login] Login failed with exit code: ${exitCode ?? 'unknown'}`);
-            ctx.client.sendCodexMessage({ type: 'message', message: `❌ 登录失败或已取消\n\n重新尝试: !login ${profileName}` });
-        }
-
-        ctx.client.sendSessionEvent({ type: 'ready' });
-    });
-
-    preAuthDeadline = createClaudeLoginPreAuthDeadline(() => {
-        finishTerminalFailure(
-            `❌ 登录启动超时\n\n重新尝试: !login ${profileName}`,
-            false,
-        );
+            ctx.client.sendSessionEvent({ type: 'ready' });
+        },
     });
 
     // Return immediately — the interactive session runs asynchronously
@@ -1754,6 +1556,7 @@ function performCodexLogin(
 
     let outputBuffer = '';
     let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    let successTimer: ReturnType<typeof setTimeout> | undefined;
     let exited = false;
     let loginSucceeded = false;
     // State for failure / cancel paths — set by error/cancel handlers, consumed by
@@ -1779,8 +1582,10 @@ function performCodexLogin(
         }
     };
 
+    let releaseInput = (): void => {};
+
     ptyProcess.onData((data: string) => {
-        if (loginSucceeded) return;
+        if (loginSucceeded || cancelled || errorMessage || finalized) return;
         outputBuffer += data;
         recentOutput = (recentOutput + data).slice(-4096);
 
@@ -1821,14 +1626,14 @@ function performCodexLogin(
                 outputBuffer = '';
                 if (flushTimer) clearTimeout(flushTimer);
                 logger.debug('[!login:codex] Login success detected');
-                setTimeout(() => { try { ptyProcess.kill(); } catch {} }, 1000);
+                successTimer = setTimeout(() => { try { ptyProcess.kill(); } catch {} }, 1000);
                 return;
 
             case 'error':
                 outputBuffer = '';
                 if (flushTimer) clearTimeout(flushTimer);
                 errorMessage = result.message;
-                unregisterInteractiveSession();
+                releaseInput();
                 ptyProcess.kill();
                 return;
 
@@ -1840,18 +1645,23 @@ function performCodexLogin(
     });
 
     // Register interactive input handler (for !cancel support)
-    registerInteractiveSession((text: string) => {
+    releaseInput = registerInteractiveSession((text: string) => {
         const trimmed = text.trim();
         if (trimmed === '!cancel' || trimmed === '!取消') {
             logger.debug('[!login:codex] User cancelled login');
             cancelled = true;
+            clearTimeout(successTimer);
             loginSucceeded = false;
-            unregisterInteractiveSession();
+            releaseInput();
             flushOutput();
             ptyProcess.kill();
             return;
         }
-        if (exited) return;
+        if (exited || loginSucceeded) return;
+        if (isLoginCommandInput(trimmed)) {
+            ctx.client.sendCodexMessage({ type: 'message', message: '登录流程进行中，请勿重复发送命令；发送 !cancel 可退出当前登录。' });
+            return;
+        }
         // Forward any other input to PTY (in case codex prompts for something)
         try { ptyProcess.write(text + '\r'); } catch {}
     });
@@ -1863,9 +1673,10 @@ function performCodexLogin(
         }
         finalized = true;
         exited = true;
+        clearTimeout(successTimer);
         logger.info(`[!login:codex] onExit entry: exitCode=${exitCode} loginSucceeded=${loginSucceeded} cancelled=${cancelled} errorMessage=${errorMessage ? JSON.stringify(errorMessage).slice(0, 200) : 'null'}`);
         flushOutput();
-        unregisterInteractiveSession();
+        releaseInput();
 
         // Ordering matters: migrate → restore → register → unlock → notify.
         // The mobile client is told "success" only after the lock is released, so a
@@ -1878,7 +1689,7 @@ function performCodexLogin(
         let migrated = false;
         let registerError: Error | null = null;
         try {
-            if (loginSucceeded && existsSync(defaultAuthPath)) {
+            if (loginSucceeded && !cancelled && !errorMessage && existsSync(defaultAuthPath)) {
                 const stats = statSync(defaultAuthPath);
                 mkdirSync(codexInstancePath, { recursive: true });
                 copyFileSync(defaultAuthPath, join(codexInstancePath, 'auth.json'));

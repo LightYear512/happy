@@ -5,7 +5,7 @@ import test from 'node:test';
 test('account_intent_boundary', () => {
   const script = String.raw`
     import assert from 'node:assert/strict';
-    import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+    import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
     import { join } from 'node:path';
     import * as intent from './src/commands/bang/accountIntent.ts';
 
@@ -17,6 +17,23 @@ test('account_intent_boundary', () => {
       assert.deepEqual(first, { profileName: 'work', setAt: 100 });
       assert.deepEqual(second, { profileName: 'personal', setAt: 101 });
       assert.deepEqual(intent.readAccountIntent('codex', root), second);
+      const dsHome=join(root,'auth/codex/instances/deepseek');
+      mkdirSync(dsHome,{recursive:true});
+      writeFileSync(join(dsHome,'config.toml'),'model="deepseek-flash"\n');
+      const oldDocument=readFileSync(join(root,'account-intent.json'),'utf8');
+      const ds=intent.publishAccountIntent('codex','deepseek',200,root,'deepseek');
+      assert.equal(readFileSync(join(root,'account-intent.json'),'utf8'),oldDocument);
+      assert.deepEqual(intent.readAccountIntent('codex',root,'gpt'),second);
+      assert.deepEqual(intent.readAccountIntent('codex',root,'deepseek'),ds);
+      assert.throws(()=>intent.publishAccountIntent('codex','deepseek',201,root,'gpt'),/model family/);
+      const dsDocument=readFileSync(join(root,'deepseek-account-intent.json'),'utf8');
+      intent.publishAccountIntent('codex','personal',101,root,'gpt');
+      assert.equal(readFileSync(join(root,'deepseek-account-intent.json'),'utf8'),dsDocument);
+      assert.deepEqual(intent.readAccountIntent('codex',root,'deepseek'),ds);
+      // The following legacy assertions keep their original timestamp fixture.
+      writeFileSync(join(root,'account-intent.json'),oldDocument);
+      writeFileSync(join(root,'deepseek-account-intent.json'),JSON.stringify({schema:'happy.account-intent/1',codex:ds,unexpected:true}));
+      assert.throws(()=>intent.readAccountIntent('codex',root,'deepseek'),/invalid/);
       assert.equal(intent.readSessionAccountSelection('session-a', 'codex', root), null);
       intent.writeSessionAccountSelection('session-a', 'codex', 'manual', 100, root);
       assert.deepEqual(intent.readSessionAccountSelection('session-a', 'codex', root), {

@@ -894,7 +894,7 @@ export class TmuxUtilities {
                 throw new TmuxSessionIdentifierError(`Window identifier required: ${sessionIdentifier}`);
             }
 
-            const result = await this.executeWinOp('kill-window', [parsed.window], parsed.session);
+            const result = await this.executeWinOp('kill-window', [], parsed.session, parsed.window);
             return result;
         } catch (error) {
             if (error instanceof TmuxSessionIdentifierError) {

@@ -1,0 +1,19 @@
+{
+  "schemaVersion": "contract-first-module-gate/v2",
+  "contractProfile": "contract-first-minimal-boundary/v1",
+  "riskTriggers": ["release-security-or-performance-claim"],
+  "module": "happy-cli.codex-raw-item-diagnostics",
+  "owner": "Happy CLI native app-server notification observer",
+  "publicApis": { "notApplicableReason": "No public protocol or request shape changes; the existing notification is observed locally." },
+  "budgets": [{
+    "field": "per-runtime diagnostic admission and output privacy",
+    "enforcement": "createCodexRawItemDiagnostics requires an exact selected Happy session, admits 16 normal plus 128 generic-ID samples before formatting, emits only fixed allowlisted metadata through local-only diagnosticTrace, and catches extraction failures",
+    "phase": "rawResponseItem/completed callback before existing bridge handling",
+    "errorKind": "drop diagnostics without changing the provider event or failing the callback",
+    "zeroTest": { "name": "happy_codex_raw_item_diagnostics_boundary", "file": "happy-codex-raw-item-diagnostics-v1.test.mjs" },
+    "overflowTest": { "name": "happy_codex_raw_item_diagnostics_boundary", "file": "happy-codex-raw-item-diagnostics-v1.test.mjs" }
+  }],
+  "lifecycleTransitions": { "notApplicableReason": "No provider, account, input or history lifecycle changes; observer counters are runtime-local and never drive recovery." },
+  "provenanceFields": { "notApplicableReason": "Diagnostic hashes correlate observations only and are not security or recovery authority." },
+  "evidence": { "mode": "approval", "openFindingCount": 0 }
+}

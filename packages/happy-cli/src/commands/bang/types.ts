@@ -41,6 +41,10 @@ export interface BangCommandContext {
     flavor?: 'claude' | 'codex' | 'gemini';
     /** Codex app-server owns an atomic child swap and must commit CODEX_HOME only after readiness. */
     deferCodexProfileSwitch?: boolean;
+    /** A selected profile is not proof of a live app-server after failed recovery. */
+    codexRuntimeReady?: boolean;
+    /** !restart explicitly retries this suspended account transition. */
+    codexRecoveryTarget?: string;
 }
 
 export interface BangCommandResult {
@@ -102,24 +106,32 @@ export function renderOptionsBlock(suggestions: BangOptionSuggestion[]): string 
     return `<options>\n${suggestions.map(renderOptionSuggestion).join('\n')}\n</options>`;
 }
 
-/** Parse `--codex` flag from args string; returns cleaned args and whether flag was present. */
-export function parseCodexFlag(args: string): { cleanArgs: string; hasCodexFlag: boolean } {
-    const hasCodexFlag = /(?:^|\s)--codex(?:\s|$)/.test(args);
-    const cleanArgs = args.replace(/\s*--codex(?:\s|$)/, ' ').replace(/\s+/g, ' ').trim();
-    return { cleanArgs, hasCodexFlag };
+/** Provider flags are case-insensitive; menus use `--Claude` and `--codex`. */
+export function parseProviderFlags(args: string): { cleanArgs: string; flavor?: 'claude' | 'codex'; error?: string } {
+    const parts = args.trim().split(/\s+/).filter(Boolean);
+    const flags = parts.filter(part => /^--(?:claude|codex)$/i.test(part));
+    const providers = new Set(flags.map(flag => flag.slice(2).toLowerCase()));
+    const cleanArgs = parts.filter(part => !/^--(?:claude|codex)$/i.test(part)).join(' ');
+    if (providers.size > 1) {
+        return { cleanArgs, error: '❌ --Claude 和 --codex 不能同时使用，请选择一种账号类型' };
+    }
+    const flavor = providers.has('codex') ? 'codex' : providers.has('claude') ? 'claude' : undefined;
+    return { cleanArgs, flavor };
 }
 
 /**
- * Reject `--codex` flag in non-console contexts. Normal sessions are flavor-pinned
+ * Reject conflicting flags and provider flags in non-console contexts. Normal sessions are flavor-pinned
  * by `ctx.flavor` — cross-flavor management belongs in the console.
  *
  * Returns null when the call is allowed, an error result when it should be blocked.
  */
-export function rejectCodexFlagInSession(args: string, ctx: BangCommandContext): BangCommandResult | null {
-    if (ctx.isConsoleSession) return null;
-    if (!/(?:^|\s)--codex(?:\s|$)/.test(args)) return null;
+export function rejectProviderFlags(args: string, ctx: BangCommandContext): BangCommandResult | null {
+    const { flavor, error } = parseProviderFlags(args);
+    if (error) return { message: error, action: 'none' };
+    if (ctx.isConsoleSession || !flavor) return null;
+    const flag = flavor === 'claude' ? '--Claude' : '--codex';
     return {
-        message: '❌ 普通会话不支持 --codex 标志\n\n跨 flavor 管理请在控制台中操作；codex 会话内直接使用命令即可（无需 --codex）',
+        message: `❌ 普通会话不支持 ${flag} 标志\n\n请在控制台中指定账号类型；普通会话内直接使用命令即可`,
         action: 'none',
     };
 }

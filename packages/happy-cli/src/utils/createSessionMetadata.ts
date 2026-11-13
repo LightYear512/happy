@@ -104,6 +104,13 @@ export function createSessionMetadata(opts: CreateSessionMetadataOptions): Sessi
         permissionMode: opts.permissionMode,
     };
     metadata.name = stableHappySessionName(metadata);
+    if (opts.flavor === 'codex' && !metadata.consoleSession && process.env.HAPPY_RESUME_TITLE) {
+        // Old restore titles may be longer than a stable name. Keep the path
+        // name in that case instead of failing an otherwise valid restore.
+        try {
+            metadata.name = stableHappySessionName({ name: process.env.HAPPY_RESUME_TITLE });
+        } catch { /* The existing path name remains valid. */ }
+    }
     if ((opts.titleAuthority ?? sessionTitleAuthority()) === 'external') metadata.titleAuthority = 'external';
 
     return {

@@ -1,4 +1,6 @@
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { readCodexModelFamily } from '@/codex/defaultModelConfig';
 import { logger } from '@/ui/logger';
 import {
     readCcsProfiles,
@@ -10,11 +12,12 @@ import {
     type AuthFlavor,
 } from './ccsProfiles';
 import { getCachedUsageSummary, getCachedProfileUsageEntry, fetchProfileUsageSummary, readOAuthToken, type ProfileUsageEntry } from './usageCommand';
-import { parseCodexFlag, rejectCodexFlagInSession, type BangCommandContext, type BangCommandResult } from './types';
+import { parseProviderFlags, rejectProviderFlags, type BangCommandContext, type BangCommandResult } from './types';
 import {
     publishAccountIntent,
     readAccountIntent,
     writeSessionAccountSelection,
+    type CodexAccountFamily,
 } from './accountIntent';
 
 type ProfileOptionSuggestion = {
@@ -79,12 +82,11 @@ export function resolveAuthFlavor(ctx: BangCommandContext): AuthFlavor {
  * - `!auth` — List available CCS profiles (use !auth-all to set the global account)
  */
 export async function handleAuthBangCommand(args: string, ctx: BangCommandContext): Promise<BangCommandResult> {
-    const codexReject = rejectCodexFlagInSession(args, ctx);
-    if (codexReject) return codexReject;
+    const rejected = rejectProviderFlags(args, ctx);
+    if (rejected) return rejected;
 
-    const { cleanArgs, hasCodexFlag } = parseCodexFlag(args);
-    // In console: no ctx.flavor, use --codex flag; in session: ctx.flavor takes precedence
-    const flavor: AuthFlavor = hasCodexFlag ? 'codex' : resolveAuthFlavor(ctx);
+    const { cleanArgs, flavor: explicitFlavor } = parseProviderFlags(args);
+    const flavor: AuthFlavor = explicitFlavor ?? resolveAuthFlavor(ctx);
 
     if (!cleanArgs) {
         if (!ctx.isConsoleSession) {
@@ -111,8 +113,11 @@ export async function handleAuthBangCommand(args: string, ctx: BangCommandContex
  * - `!auth-all <name>` — Record a newer global profile for sessions to apply at their next input
  */
 export async function handleAuthAllBangCommand(args: string, ctx: BangCommandContext): Promise<BangCommandResult> {
-    const { cleanArgs, hasCodexFlag } = parseCodexFlag(args);
-    const flavor: AuthFlavor = hasCodexFlag ? 'codex' : resolveAuthFlavor(ctx);
+    const rejected = rejectProviderFlags(args, ctx);
+    if (rejected) return rejected;
+    const { cleanArgs, flavor: explicitFlavor } = parseProviderFlags(args);
+    // The machine console manages both providers, regardless of its transport flavor.
+    const flavor: AuthFlavor = explicitFlavor ?? (ctx.isConsoleSession ? 'claude' : resolveAuthFlavor(ctx));
 
     if (!cleanArgs) {
         ctx.client.sendSessionEvent({ type: 'message', message: '⏳ 账号信息查询中' });
@@ -122,9 +127,22 @@ export async function handleAuthAllBangCommand(args: string, ctx: BangCommandCon
     return switchAllProfiles(cleanArgs, flavor);
 }
 
+/** Recognize credentials scoped to this Claude profile without exposing them to OAuth usage APIs. */
+function hasClaudeApiCredential(instancePath: string): boolean {
+    try {
+        const settings = JSON.parse(readFileSync(join(instancePath, 'settings.json'), 'utf8'));
+        return ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN'].some((key) => {
+            const value = settings?.env?.[key];
+            return typeof value === 'string' && value.trim().length > 0;
+        });
+    } catch {
+        return false;
+    }
+}
+
 /**
- * Check whether a profile's auth is available and likely valid.
- * Returns a status indicator: '' (ok), '⚠' (no token / not initialized).
+ * Check whether a profile has API credentials or an OAuth token.
+ * Returns a status indicator: '' (configured), '⚠' (no credentials / not initialized).
  */
 function getProfileStatus(profile: CcsProfileInfo, flavor: AuthFlavor = 'claude', codexNames?: Set<string>): string {
     if (flavor === 'codex') {
@@ -132,6 +150,7 @@ function getProfileStatus(profile: CcsProfileInfo, flavor: AuthFlavor = 'claude'
         return names.has(profile.name) ? '' : '⚠';
     }
     if (!existsSync(profile.instancePath)) return '⚠';
+    if (hasClaudeApiCredential(profile.instancePath)) return '';
     if (!readOAuthToken(profile.instancePath)) return '⚠';
     return '';
 }
@@ -370,7 +389,7 @@ function buildProfileOptions(
     profiles: CcsProfileInfo[],
     usageMap: Map<string, ProfileUsageEntry>,
     opts: {
-        command: '@a' | '@aa' | '@aa-codex';
+        command: string;
         currentProfile?: string | null;
         defaultProfile?: string | null;
         flavor: AuthFlavor;
@@ -413,16 +432,42 @@ function buildLegacyProfileListResult(options: ReturnType<typeof buildProfileOpt
     };
 }
 
+/** Reuse the original account status, usage, ordering and unavailable section for family menus. */
+export async function buildCodexFamilyAccountMenu(
+    family: CodexAccountFamily,
+    command: string,
+    message: string,
+): Promise<BangCommandResult> {
+    const profiles = readCodexProfiles().filter(profile => readCodexModelFamily(profile.codexHome) === family);
+    const usageMap = new Map(await Promise.all(profiles.map(async profile => [
+        profile.name, await fetchProfileUsageSummary(profile.name, 'codex', false),
+    ] as const)));
+    const options = buildProfileOptions(codexToCcsProfiles(profiles), usageMap, {
+        command,
+        defaultProfile: readAccountIntent('codex', undefined, family)?.profileName ?? readCodexDefaultProfile(),
+        flavor: 'codex', codexNames: new Set(profiles.map(profile => profile.name)),
+    });
+    const result = buildLegacyProfileListResult(options, `Codex + ${family === 'gpt' ? 'GPT' : 'DeepSeek'}`);
+    return {
+        ...result, message,
+        suggestions: options.filter(option => !option.disabled).map(option => ({
+            label: option.label, value: option.value,
+        })),
+    };
+}
+
 async function listProfiles(isConsole: boolean, flavor: AuthFlavor = 'claude'): Promise<BangCommandResult> {
     const { profiles: ccsProfiles, defaultProfile: claudeDefault } = readCcsProfiles();
     const codexProfiles = flavor === 'codex' ? readCodexProfiles() : [];
+    const currentCodex = !isConsole ? codexProfiles.find(profile => profile.name === getCurrentProfileForFlavor('codex')) : undefined;
+    const sessionProvider = currentCodex ? readCodexModelFamily(currentCodex.codexHome) : undefined;
 
     if (flavor === 'codex' && codexProfiles.length === 0) {
         return { message: '❌ 未找到已登录的 Codex 账户。', action: 'none' };
     }
 
     const profiles: CcsProfileInfo[] = flavor === 'codex'
-        ? codexToCcsProfiles(codexProfiles)
+        ? codexToCcsProfiles(sessionProvider ? codexProfiles.filter(profile => readCodexModelFamily(profile.codexHome) === sessionProvider) : codexProfiles)
         : ccsProfiles;
 
     const codexNames = flavor === 'codex' ? new Set(codexProfiles.map(p => p.name)) : undefined;
@@ -444,7 +489,7 @@ async function listProfiles(isConsole: boolean, flavor: AuthFlavor = 'claude'): 
             await fetchProfileUsageSummary(profile.name, flavor, false),
         ] as const)));
         const suggestions = buildProfileOptions(profiles, usageMap, {
-            command: flavor === 'codex' ? '@aa-codex' : '@aa',
+            command: flavor === 'codex' ? '@aa --codex' : '@aa --Claude',
             defaultProfile,
             flavor,
             codexNames,
@@ -507,7 +552,14 @@ function switchProfile(
         };
     }
 
-    const globalSetAt = readAccountIntent(flavor === 'codex' ? 'codex' : 'claude')?.setAt ?? 0;
+    const current = profiles.find(profile => profile.name === currentProfile);
+    if (flavor === 'codex' && current
+        && readCodexModelFamily(current.instancePath) !== readCodexModelFamily(target.instancePath)) {
+        return { message: '此会话只能切换同一模型类型的账号。请从主菜单创建另一类型的会话。', action: 'none' };
+    }
+
+    const globalSetAt = readAccountIntent(flavor === 'codex' ? 'codex' : 'claude', undefined,
+        flavor === 'codex' ? readCodexModelFamily(current?.instancePath ?? target.instancePath) : undefined)?.setAt ?? 0;
     const happySessionId = ((ctx?.client as unknown as { sessionId?: string })?.sessionId ?? '').trim();
     const markManualChoice = (): string | null => {
         if (!happySessionId) return null;
@@ -527,7 +579,7 @@ function switchProfile(
 
     // Check if already on this profile. A manual selection still consumes the
     // current global setting so the session remains pinned until a newer one.
-    if (target.name === currentProfile) {
+    if (target.name === currentProfile && ctx?.codexRuntimeReady !== false) {
         const warning = markManualChoice();
         return {
             message: warning ? [`✅ 当前已是 "${profileName}"`, warning] : `✅ 当前已是 "${profileName}"`,
@@ -594,7 +646,9 @@ function switchAllProfiles(profileName: string, flavor: AuthFlavor = 'claude'): 
     }
 
     try {
-        publishAccountIntent(flavor === 'codex' ? 'codex' : 'claude', profileName);
+        const family = flavor === 'codex' ? readCodexModelFamily(target.instancePath) : undefined;
+        if (flavor === 'codex' && !family) throw new Error('Unknown Codex model family');
+        publishAccountIntent(flavor === 'codex' ? 'codex' : 'claude', profileName, Date.now(), undefined, family);
         logger.debug(`[!auth] Recorded global account intent (${flavor}): ${profileName}`);
     } catch (err) {
         logger.debug('[!auth] Failed to write global account intent:', err);

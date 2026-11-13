@@ -422,6 +422,10 @@ export const zhHans: TranslationStructure = {
             badgeYolo: 'YOLO',
         },
         codexModel: {
+            gpt6Low: 'GPT-6 Astra 低',
+            gpt6Medium: 'GPT-6 Astra 中',
+            gpt6High: 'GPT-6 Astra 高',
+            gpt6XHigh: 'GPT-6 Astra 超高',
             title: 'CODEX MODEL',
             default: '使用 CLI 设置',
             gpt5CodexLow: 'gpt-5-codex low',

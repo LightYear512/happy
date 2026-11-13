@@ -10,7 +10,9 @@ import type { SessionTurnReport } from './types';
 
 type DaemonPostError = { error: string; status?: number };
 const DAEMON_POST_TIMEOUT_MS = 10_000;
-const DAEMON_RESTORE_TIMEOUT_MS = 55_000;
+const DAEMON_SPAWN_TIMEOUT_MS = 30_000;
+// Outlive the daemon's 180-second restore deadline and owned-child cleanup.
+const DAEMON_RESTORE_TIMEOUT_MS = 210_000;
 const DAEMON_STOP_TIMEOUT_MS = 10_000;
 
 async function daemonPost(path: string, body?: any, timeoutMs = DAEMON_POST_TIMEOUT_MS): Promise<DaemonPostError | any> {
@@ -124,7 +126,8 @@ export async function spawnDaemonSession(
   restoreSessionId?: string,
   resume?: string,
   title?: string,
-  agent?: 'claude' | 'codex' | 'gemini'
+  agent?: 'claude' | 'codex' | 'gemini',
+  codexProfile?: string,
 ): Promise<any> {
   const result = await daemonPost('/spawn-session', {
     directory,
@@ -132,7 +135,8 @@ export async function spawnDaemonSession(
     resume,
     title,
     agent,
-  });
+    ...(codexProfile ? { codexProfile } : {}),
+  }, restoreSessionId ? DAEMON_RESTORE_TIMEOUT_MS : DAEMON_SPAWN_TIMEOUT_MS);
   return result;
 }
 

@@ -42,13 +42,30 @@
         {
           "name": "existing_restore_identity_consumer_is_fail_closed",
           "file": "provider-readiness.hostile.test.mjs"
+        },
+        {
+          "name": "failed_recovery_accepts_new_input_without_duplicate_submission_or_false_delivery_receipt",
+          "file": "provider-readiness.hostile.test.mjs"
         }
       ]
     }
   ],
-  "budgets": {
-    "notApplicableReason": "The single readiness transition is enforced by one hostile lifecycle test; it does not consume an independently stored runtime budget."
-  },
+  "budgets": [
+    {
+      "field": "absolute startup recovery deadline",
+      "enforcement": "runSerial preserves the entry deadline through queuing and spawn; initialize and openAccountClient consume remaining recovery time without cold retries; cleanup preserves the primary error",
+      "phase": "daemon restore before provider-ready acknowledgement and live account recovery",
+      "errorKind": "CodexAppServerRequestTimeout or expired startup deadline; cleanup failures retain the original operation",
+      "zeroTest": {
+        "name": "startup_deadline_preserves_primary_error_and_cleans_only_owned_processes",
+        "file": "provider-readiness.hostile.test.mjs"
+      },
+      "overflowTest": {
+        "name": "startup_deadline_preserves_primary_error_and_cleans_only_owned_processes",
+        "file": "provider-readiness.hostile.test.mjs"
+      }
+    }
+  ],
   "lifecycleTransitions": [
     {
       "from": "Happy session created without provider identity",
@@ -62,6 +79,17 @@
           "file": "provider-readiness.hostile.test.mjs"
         }
       ]
+    },
+    {
+      "from": "Account recovery failed with unsubmitted inputs retained",
+      "to": "One bounded recovery on new input, or a visible failure; never a silent automatic retry loop",
+      "creator": "Codex account recovery failure",
+      "advancer": "New input or explicit retry claims the failed selection synchronously",
+      "consumer": "Original FIFO batch and exact provider thread; receipt acknowledges acceptance only",
+      "rejectTests": [{
+        "name": "failed_recovery_accepts_new_input_without_duplicate_submission_or_false_delivery_receipt",
+        "file": "provider-readiness.hostile.test.mjs"
+      }]
     }
   ],
   "provenanceFields": [

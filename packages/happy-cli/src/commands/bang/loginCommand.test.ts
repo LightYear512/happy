@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { analyzePtyOutput, analyzeCodexPtyOutput, stripAnsiOnly, parseLoginArgs, recoverInterruptedCodexLogin, acquireCodexLoginLock, updateCodexLoginLockToSpawned, createClaudeLoginPreAuthDeadline, shouldAcceptClaudeLoginResult, type PtyAction } from './loginCommand';
+import { analyzeCodexPtyOutput, stripAnsiOnly, parseLoginArgs, recoverInterruptedCodexLogin, acquireCodexLoginLock, updateCodexLoginLockToSpawned, readClaudeLoginUrl } from './loginCommand';
 
 // Real OAuth URL from actual Claude Code login flow
 const REAL_OAUTH_URL = 'https://claude.ai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference+user%3Asessions%3Aclaude_code+user%3Amcp_servers+user%3Afile_upload&code_challenge=9wvqXasXp7FespyUXZRRUy7pzFl6NfFQR0bO-vCLBr4&code_challenge_method=S256&state=2ppMXLEutGbkjDlq3aZdYUJqF3-sU7RUX1xODTviPkE';
@@ -39,232 +39,17 @@ describe('stripAnsiOnly', () => {
     });
 });
 
-describe('analyzePtyOutput', () => {
-    describe('phase 1 — before login URL sent', () => {
-        const PRE_LOGIN = false;
-
-        it('extracts complete real-world OAuth URL with PTY line wrapping at 120 cols', () => {
-            // Simulate: URL wrapped at 120 cols + Claude UI text after
-            const wrappedUrl = simulatePtyWrap(REAL_OAUTH_URL, 120);
-            const buffer = '\x1B[1mOpen this URL:\x1B[0m\n' + wrappedUrl +
-                '\x1B[20;1HPaste code here if prompted\x1B[21;1H> Esc to cancel';
-            const result = analyzePtyOutput(buffer, PRE_LOGIN, false);
-            expect(result.action).toBe('forward-url');
-            expect((result as Extract<PtyAction, { action: 'forward-url' }>).url).toBe(REAL_OAUTH_URL);
-        });
-
-        it('extracts complete URL with PTY line wrapping at 80 cols', () => {
-            const wrappedUrl = simulatePtyWrap(REAL_OAUTH_URL, 80);
-            const buffer = wrappedUrl + '\x1B[25;1HPaste code here';
-            const result = analyzePtyOutput(buffer, PRE_LOGIN, false);
-            expect(result.action).toBe('forward-url');
-            expect((result as Extract<PtyAction, { action: 'forward-url' }>).url).toBe(REAL_OAUTH_URL);
-        });
-
-        it('strips "Pastecodehereifprompted" concatenated after URL (no positioning)', () => {
-            const buffer = REAL_OAUTH_URL + 'Pastecodehereifprompted>Esctocancel';
-            const result = analyzePtyOutput(buffer, PRE_LOGIN, false);
-            expect(result.action).toBe('forward-url');
-            expect((result as Extract<PtyAction, { action: 'forward-url' }>).url).toBe(REAL_OAUTH_URL);
-        });
-
-        it('extracts URL from clean text with newlines', () => {
-            const buffer = 'Open this URL:\n' + REAL_OAUTH_URL + '\nThen paste the code';
-            const result = analyzePtyOutput(buffer, PRE_LOGIN, false);
-            expect(result.action).toBe('forward-url');
-            expect((result as Extract<PtyAction, { action: 'forward-url' }>).url).toBe(REAL_OAUTH_URL);
-        });
-
-        it('extracts URL with ANSI style codes interleaved', () => {
-            const buffer = 'Go to: https://claude.\x1B[0mai/\x1B[1moauth/authorize?code=true&client_id=abc&state=xyz\x1B[0m\n';
-            const result = analyzePtyOutput(buffer, PRE_LOGIN, false);
-            expect(result.action).toBe('forward-url');
-            expect((result as Extract<PtyAction, { action: 'forward-url' }>).url)
-                .toBe('https://claude.ai/oauth/authorize?code=true&client_id=abc&state=xyz');
-        });
-
-        it('ignores documentation URLs (not OAuth)', () => {
-            const buffer = 'See https://docs.anthropic.com/security-guide for details\n';
-            const result = analyzePtyOutput(buffer, PRE_LOGIN, false);
-            expect(result).toEqual({ action: 'discard' });
-        });
-
-        it('detects "Not logged in" and responds with /login', () => {
-            const buffer = '\x1B[31mNot logged in\x1B[0m. Run /login to authenticate.';
-            const result = analyzePtyOutput(buffer, PRE_LOGIN, false);
-            expect(result).toEqual({ action: 'auto-respond', response: '/login\r' });
-        });
-
-        it('does not send /login again after already sent (prevents loop)', () => {
-            const buffer = 'Not logged in. Run /login';
-            const result = analyzePtyOutput(buffer, PRE_LOGIN, true);
-            expect(result).toEqual({ action: 'discard' });
-        });
-
-        it('detects "Select login method" with proper whitespace', () => {
-            const buffer = '\x1B[1mSelect login method:\x1B[0m\n\x1B[32m❯\x1B[0m 1. Claude account\n  2. Anthropic Console\n';
-            const result = analyzePtyOutput(buffer, PRE_LOGIN, false);
-            expect(result).toEqual({ action: 'auto-respond', response: '\r' });
-        });
-
-        it('detects workspace trust prompt', () => {
-            const buffer = '\x1B[?25l' +
-                'Accessing workspace: C:/Users/xuhao\x1B[3;1H' +
-                'Quick safety check\x1B[4;1H' +
-                '1. Yes, I trust this folder\x1B[5;1H' +
-                '2. No, exit\x1B[?25h';
-            const result = analyzePtyOutput(buffer, PRE_LOGIN, false);
-            expect(result).toEqual({ action: 'auto-respond', response: '\r' });
-        });
-
-        it('detects onboarding theme selector', () => {
-            const buffer = '\x1B[?25l Choose the text style\x1B[0m\n1. Dark mode\n2. Light mode\n';
-            const result = analyzePtyOutput(buffer, PRE_LOGIN, false);
-            expect(result).toEqual({ action: 'auto-respond', response: '\r' });
-        });
-
-        it('detects "Welcome back" as already-authenticated', () => {
-            const buffer = 'Claude Code v2.1.87\nTips for getting started\nWelcome back!  Run /init to create a CLAUDE.md';
-            const result = analyzePtyOutput(buffer, PRE_LOGIN, false);
-            expect(result).toEqual({ action: 'already-authenticated' });
-        });
-
-        it('detects "Welcome back" with ANSI sequences', () => {
-            const buffer = '\x1B[1mClaude Code v2.1.87\x1B[0m\n\x1B[32mWelcome back\x1B[0m! Run /init';
-            const result = analyzePtyOutput(buffer, PRE_LOGIN, false);
-            expect(result).toEqual({ action: 'already-authenticated' });
-        });
-
-        it('detects an authenticated Claude main prompt without Welcome back', () => {
-            const buffer = '\x1B[1mClaude Code v2.1.170\x1B[0m\n'
-                + 'Account\n'
-                + '❯\u00A0Try "explain this project"\n'
-                + '? for shortcuts';
-            const result = analyzePtyOutput(buffer, PRE_LOGIN, false);
-            expect(result).toEqual({ action: 'already-authenticated' });
-        });
-
-        it('does not classify partial Claude main-screen markers as authenticated', () => {
-            const versionOnly = 'Claude Code v2.1.170\nAccount';
-            const promptOnly = 'Account\n❯\u00A0Try "explain this project"\n? for shortcuts';
-            const alreadySent = 'Claude Code v2.1.170\nAccount\n'
-                + '❯\u00A0Try "explain this project"\n? for shortcuts';
-
-            expect(analyzePtyOutput(versionOnly, PRE_LOGIN, false)).toEqual({ action: 'discard' });
-            expect(analyzePtyOutput(promptOnly, PRE_LOGIN, false)).toEqual({ action: 'discard' });
-            expect(analyzePtyOutput(alreadySent, PRE_LOGIN, true)).toEqual({ action: 'discard' });
-        });
-
-        it('keeps the login method selector ahead of authenticated main-screen detection', () => {
-            const buffer = 'Claude Code v2.1.170\nSelect login method:\n'
-                + '❯ 1. Claude account\n  2. Anthropic Console\n? for shortcuts';
-            const result = analyzePtyOutput(buffer, PRE_LOGIN, false);
-            expect(result).toEqual({ action: 'auto-respond', response: '\r' });
-        });
-
-        it('does not detect "Welcome back" after /login already sent', () => {
-            const buffer = 'Claude Code v2.1.87\nWelcome back! Run /init';
-            const result = analyzePtyOutput(buffer, false, true);
-            // loginCommandSent=true → skip "Welcome back" to avoid loop after forced /login
-            expect(result).toEqual({ action: 'discard' });
-        });
-
-        it('does not detect "Welcome back" after login URL sent (phase 2)', () => {
-            const buffer = 'Welcome back! Login successful';
-            const result = analyzePtyOutput(buffer, true, true);
-            // In phase 2 (loginUrlSent=true), always returns 'forward'
-            expect(result).toEqual({ action: 'forward' });
-        });
-
-        it('prioritizes OAuth URL over "Welcome back"', () => {
-            const buffer = 'Welcome back\nhttps://claude.ai/oauth/authorize?code=true\n';
-            const result = analyzePtyOutput(buffer, PRE_LOGIN, false);
-            expect(result.action).toBe('forward-url');
-        });
-
-        it('discards incomplete output', () => {
-            expect(analyzePtyOutput('Loading Claude Code...', PRE_LOGIN, false)).toEqual({ action: 'discard' });
-            expect(analyzePtyOutput('', PRE_LOGIN, false)).toEqual({ action: 'discard' });
-        });
-
-        it('prioritizes OAuth URL over other patterns', () => {
-            const buffer = 'Not logged in\nhttps://claude.ai/oauth/authorize?code=true\n';
-            const result = analyzePtyOutput(buffer, PRE_LOGIN, false);
-            expect(result.action).toBe('forward-url');
-        });
-    });
-
-    describe('phase 2 — after login URL sent', () => {
-        it('forwards all output', () => {
-            expect(analyzePtyOutput('Login successful!', true, true)).toEqual({ action: 'forward' });
-            expect(analyzePtyOutput('1. Option\n2. Option\n', true, true)).toEqual({ action: 'forward' });
-        });
-    });
-});
-
-describe('createClaudeLoginPreAuthDeadline', () => {
-    it('fires a zero-delay pre-OAuth deadline exactly once', async () => {
-        let deliveries = 0;
-        const deadline = createClaudeLoginPreAuthDeadline(() => {
-            deliveries++;
-        }, 0);
-
-        await new Promise(resolve => setTimeout(resolve, 20));
-        deadline.clear();
-        deadline.clear();
-
-        expect(deliveries).toBe(1);
-    });
-
-    it('clearing after an OAuth URL prevents pre-OAuth timeout delivery', async () => {
-        let deliveries = 0;
-        const deadline = createClaudeLoginPreAuthDeadline(() => {
-            deliveries++;
-        }, 20);
-
-        deadline.clear();
-        deadline.clear();
-        await new Promise(resolve => setTimeout(resolve, 40));
-
-        expect(deliveries).toBe(0);
-    });
-
-    it('rejects unsafe pre-OAuth timeout budgets', () => {
-        for (const timeoutMs of [-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648]) {
-            expect(() => createClaudeLoginPreAuthDeadline(() => {}, timeoutMs)).toThrow(RangeError);
+describe('readClaudeLoginUrl', () => {
+    it('waits for a complete native OAuth URL across output chunks', () => {
+        for (let i = 1; i <= REAL_OAUTH_URL.length; i++) {
+            expect(readClaudeLoginUrl(REAL_OAUTH_URL.slice(0, i))).toBeNull();
         }
-    });
-});
-
-describe('shouldAcceptClaudeLoginResult', () => {
-    it('accepts only explicit success or credentials created by this login attempt', () => {
-        expect(shouldAcceptClaudeLoginResult({
-            loginSucceeded: true,
-            aborted: false,
-            credentialExistedBefore: true,
-            credentialExistsAfter: true,
-        })).toBe(true);
-        expect(shouldAcceptClaudeLoginResult({
-            loginSucceeded: false,
-            aborted: false,
-            credentialExistedBefore: false,
-            credentialExistsAfter: true,
-        })).toBe(true);
-        expect(shouldAcceptClaudeLoginResult({
-            loginSucceeded: false,
-            aborted: false,
-            credentialExistedBefore: true,
-            credentialExistsAfter: true,
-        })).toBe(false);
+        expect(readClaudeLoginUrl(REAL_OAUTH_URL + '\r\n')).toBe(REAL_OAUTH_URL);
     });
 
-    it('rejects aborted Claude login results even when credentials exist', () => {
-        expect(shouldAcceptClaudeLoginResult({
-            loginSucceeded: true,
-            aborted: true,
-            credentialExistedBefore: false,
-            credentialExistsAfter: true,
-        })).toBe(false);
+    it('ignores ordinary chat screens and non-authorization URLs', () => {
+        expect(readClaudeLoginUrl('Claude Code v2.1.307\n❯ Try something\nauto mode on\n')).toBeNull();
+        expect(readClaudeLoginUrl('https://docs.claude.com/help\n')).toBeNull();
     });
 });
 
@@ -372,6 +157,18 @@ describe('parseLoginArgs', () => {
     });
 
     describe('positional + flag combinations', () => {
+        it.each(['--Claude box2601', 'box2601 --Claude', '--claude box2601', '--CLAUDE box2601 --Claude'])(
+            '%s selects Claude even with a Codex transport', args => {
+                expect(parseLoginArgs(args, 'codex')).toEqual({ kind: 'ok', profileName: 'box2601', targetAgent: 'claude' });
+            },
+        );
+
+        it('rejects conflicting providers before selecting an account', () => {
+            expect(parseLoginArgs('--Claude box2601 --codex', undefined)).toMatchObject({
+                kind: 'error', message: expect.stringContaining('不能同时使用'),
+            });
+        });
+
         it('name only → claude', () => {
             expect(parseLoginArgs('abc', 'claude')).toEqual({
                 kind: 'ok',

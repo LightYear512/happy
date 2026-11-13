@@ -859,7 +859,7 @@ describe('ApiSessionClient connection handling', () => {
             content: {
                 id: inputAcceptedEventId(localId),
                 type: 'event',
-                data: { type: 'message', message: expect.stringMatching(/^\d{2}:\d{2} 已接收，正在投递$/u) },
+                data: { type: 'message', message: expect.stringMatching(/^\d{2}:\d{2} 已接收$/u) },
             },
         });
     });

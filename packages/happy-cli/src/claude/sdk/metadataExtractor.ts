@@ -8,6 +8,7 @@ import type { SDKSystemMessage } from './types'
 import { logger } from '@/ui/logger'
 
 export interface SDKMetadata {
+    sessionId?: string
     tools?: string[]
     slashCommands?: string[]
 }
@@ -37,14 +38,15 @@ export async function extractSDKMetadata(environment?: NodeJS.ProcessEnv): Promi
         for await (const message of sdkQuery) {
             if (message.type === 'system' && message.subtype === 'init') {
                 const systemMessage = message as SDKSystemMessage
-                
+
                 const metadata: SDKMetadata = {
+                    sessionId: systemMessage.session_id,
                     tools: systemMessage.tools,
                     slashCommands: systemMessage.slash_commands
                 }
-                
+
                 logger.debug('[metadataExtractor] Captured SDK metadata:', metadata)
-                
+
                 // Abort the query since we got what we need
                 abortController.abort()
                 

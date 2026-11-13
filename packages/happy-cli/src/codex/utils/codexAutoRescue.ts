@@ -1,12 +1,7 @@
 /**
- * Auto-rescue for codex's server-side compaction failures.
- *
- * Codex's `/backend-api/codex/responses/compact` endpoint is unstable on flaky
- * proxies — it emits an `error` notification with `willRetry: false` and a
- * message containing "Error running remote compact task". When we see that
- * signature we trigger our local heuristic /compact so the user doesn't have
- * to retry by hand. The cooldown gate stops failure storms (multiple retries
- * within the same turn) from spawning duplicate rescues.
+ * Recover unusable Codex context through the existing local compaction path.
+ * A fresh thread must complete a turn before another automatic rescue is
+ * allowed; elapsed time alone must never restart a persistent failure loop.
  */
 
 import { extractCodexErrorDetail } from './codexErrorDetail';
@@ -19,31 +14,32 @@ export function shouldAutoRescue(params: unknown): boolean {
     if (record.willRetry === true) return false;
 
     const detail = extractCodexErrorDetail(params).toLowerCase();
-    return detail.includes(COMPACT_FAILURE_NEEDLE);
+    return detail.includes(COMPACT_FAILURE_NEEDLE) || hasInvalidEncryptedContent(record);
 }
 
-export interface RescueGate {
-    tryClaim(now: number): boolean;
-    /**
-     * Roll back the most recent successful claim. Used when the operation that
-     * follows tryClaim() fails — we must NOT eat the cooldown for an attempt
-     * that never produced any user-visible action, otherwise the next genuine
-     * failure within the cooldown window goes un-rescued and the user sees a
-     * raw "Codex error: stream disconnected".
-     */
-    release(): void;
+function hasInvalidEncryptedContent(value: unknown, depth = 0): boolean {
+    if (depth > 6) return false;
+    if (typeof value === 'string') {
+        // Native Codex wraps the upstream API error JSON in error.message.
+        try { return hasInvalidEncryptedContent(JSON.parse(value), depth + 1); }
+        catch { return false; }
+    }
+    if (!value || typeof value !== 'object') return false;
+    const record = value as Record<string, unknown>;
+    return record.code === 'invalid_encrypted_content'
+        || ['error', 'turn', 'message'].some((key) => hasInvalidEncryptedContent(record[key], depth + 1));
 }
 
-export function createRescueGate(cooldownMs: number): RescueGate {
-    let lastAt: number | null = null;
+export function createRescueGate(): { tryClaim(): boolean; resetAfterSuccess(): void } {
+    let claimed = false;
     return {
-        tryClaim(now: number): boolean {
-            if (lastAt !== null && now - lastAt < cooldownMs) return false;
-            lastAt = now;
+        tryClaim(): boolean {
+            if (claimed) return false;
+            claimed = true;
             return true;
         },
-        release(): void {
-            lastAt = null;
+        resetAfterSuccess(): void {
+            claimed = false;
         },
     };
 }

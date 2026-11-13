@@ -12,6 +12,7 @@ import {
   DEFAULT_DAEMON_SESSION_AGENT,
   filterProfileEnvironmentVariablesForAgent,
   isDaemonManagedSession,
+  isDirectConsoleStopTarget,
   isFreshDaemonSessionCandidate,
   isExactOnlineConsoleOwner,
   isProviderReadyForDaemonRegistration,
@@ -64,6 +65,15 @@ describe('daemon console ownership', () => {
     ]);
     expect(selectTrackedConsoleSessions(sessions).map(([pid]) => pid)).toEqual([41]);
   });
+
+  it('protects the daemon console from ordinary session stop requests', () => {
+    const console: TrackedSession = { startedBy: 'daemon', pid: 41, isConsoleSession: true };
+    const ordinary: TrackedSession = { startedBy: 'daemon', pid: 42, happySessionId: 'session-a' };
+
+    expect(isDirectConsoleStopTarget([[41, console]])).toBe(true);
+    expect(isDirectConsoleStopTarget([[42, ordinary]])).toBe(false);
+    expect(isDirectConsoleStopTarget([])).toBe(false);
+  });
 });
 
 describe('console restore ownership', () => {
@@ -96,10 +106,14 @@ describe('console restore ownership', () => {
 });
 
 describe('session startup deadline', () => {
-  it('keeps new creation below the 30-second relay and restore below its 60-second relay', () => {
+  it('keeps new creation short and allows cold history restore within its 210-second relay', () => {
+    // A real cold Codex start + bootstrap injection can consume 16 seconds,
+    // before Happy's network registration and readiness publication.
+    expect(NEW_SESSION_REGISTRATION_TIMEOUT_MS).toBe(24_000);
     expect(NEW_SESSION_REGISTRATION_TIMEOUT_MS).toBeLessThan(25_000);
-    expect(RESTORE_SESSION_STARTUP_TIMEOUT_MS).toBeGreaterThan(50_000);
-    expect(RESTORE_SESSION_STARTUP_TIMEOUT_MS).toBeLessThan(60_000);
+    expect(30_000 - NEW_SESSION_REGISTRATION_TIMEOUT_MS).toBeGreaterThanOrEqual(6_000);
+    expect(RESTORE_SESSION_STARTUP_TIMEOUT_MS).toBe(180_000);
+    expect(210_000 - RESTORE_SESSION_STARTUP_TIMEOUT_MS).toBeGreaterThanOrEqual(30_000);
   });
 
   it('keeps one total input-readiness deadline', async () => {
@@ -345,6 +359,8 @@ describe('isProviderReadyForDaemonRegistration', () => {
   it('daemon registration requires a durable provider id for fresh Codex children', () => {
     const codex = { flavor: 'codex', startedBy: 'daemon' } as const;
     expect(isProviderReadyForDaemonRegistration(codex)).toBe(false);
+    expect(isProviderReadyForDaemonRegistration({ ...codex, consoleSession: false })).toBe(false);
+    expect(isProviderReadyForDaemonRegistration({ ...codex, consoleSession: true })).toBe(true);
     expect(isProviderReadyForDaemonRegistration({
       ...codex,
       claudeSessionId: '00000000-0000-4000-8000-000000000001',

@@ -1,0 +1,35 @@
+{
+  "schemaVersion": "contract-first-module-gate/v2",
+  "contractProfile": "contract-first-minimal-boundary/v1",
+  "module": "happy-cli.session-startup-diagnostics",
+  "owner": "happy-cli.daemon",
+  "riskTriggers": ["release-security-or-performance-claim"],
+  "publicApis": [{
+    "name": "Daemon startup failure errorMessage",
+    "inputs": ["Actual child stderr", "OS spawn error, exit status and signal", "Original startup deadline"],
+    "acceptedStates": ["Failed startup with bounded redacted diagnostics", "Ready child with diagnostics cleared"],
+    "rejectedStates": ["Credential-bearing diagnostics including JSON Authorization", "Exit receipt before stderr closes", "Discarded timeout diagnostics", "Orphaned owned group after leader exit", "Forged or closed child handle as group authority"],
+    "outputState": "Failure remains failure, with bounded redacted diagnostics; no additional restore attempt",
+    "provenanceFields": ["Child exitCode and signalCode", "Bounded stderr prefix"],
+    "enforcement": "captureSessionStartupDiagnostics and waitForTrackedSessionStartup",
+    "negativeTests": [{"name": "startup_failure_diagnostics_are_bounded_complete_and_redacted", "file": "startup-diagnostics.test.mjs"}]
+  }],
+  "budgets": [{
+    "field": "Startup stderr prefix: 8192 bytes; original absolute startup deadline",
+    "enforcement": "Bounded buffer capture; existing deadline rejects readiness before cleanup",
+    "phase": "Session startup only",
+    "errorKind": "Structured startup failure with truncation marker",
+    "zeroTest": {"name": "startup_failure_diagnostics_are_bounded_complete_and_redacted", "file": "startup-diagnostics.test.mjs"},
+    "overflowTest": {"name": "startup_failure_diagnostics_are_bounded_complete_and_redacted", "file": "startup-diagnostics.test.mjs"}
+  }],
+  "lifecycleTransitions": [{
+    "from": "Capturing startup stderr",
+    "to": "Closed or deadline-cleaned child and its spawn-owned group, summarized before diagnostic disposal",
+    "creator": "spawnHappyCLI child process",
+    "advancer": "Child close or existing startup deadline; detached group authority is established by spawn and revoked on close",
+    "consumer": "Daemon restore response",
+    "rejectTests": [{"name": "startup_failure_diagnostics_are_bounded_complete_and_redacted", "file": "startup-diagnostics.test.mjs"}]
+  }],
+  "provenanceFields": {"notApplicableReason": "No new identity or persistent provenance format; OS process fields are tested through real children."},
+  "evidence": {"mode": "approval", "openFindingCount": 0}
+}

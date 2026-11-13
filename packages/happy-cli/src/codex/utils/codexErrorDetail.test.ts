@@ -1,5 +1,16 @@
 import { describe, expect, it } from 'vitest';
-import { extractCodexErrorDetail, formatCodexErrorForUi } from './codexErrorDetail';
+import { extractCodexErrorDetail, formatCodexErrorForUi, isCodexCapacityError } from './codexErrorDetail';
+
+describe('isCodexCapacityError', () => {
+    it('accepts native error and completed-turn shapes, never text or quota failures', () => {
+        expect(isCodexCapacityError({ error: { codexErrorInfo: 'serverOverloaded' }, willRetry: false })).toBe(true);
+        expect(isCodexCapacityError({ turn: { error: { codex_error_info: 'server_overloaded' } } })).toBe(true);
+        for (const info of ['usageLimitExceeded', 'rateLimitExceeded', 'unauthorized', 'other', undefined]) {
+            expect(isCodexCapacityError({ error: { codexErrorInfo: info, message: 'Selected model is at capacity.' } })).toBe(false);
+        }
+        expect(isCodexCapacityError({ error: { codexErrorInfo: 'serverOverloaded' }, willRetry: true })).toBe(false);
+    });
+});
 
 describe('extractCodexErrorDetail', () => {
     it('extracts message from nested error object (real codex payload)', () => {

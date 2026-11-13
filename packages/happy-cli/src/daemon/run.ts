@@ -1,8 +1,10 @@
 import fs from 'fs/promises';
 import os from 'os';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { stripVTControlCharacters } from 'node:util';
+import type { ChildProcess } from 'node:child_process';
 
-import { killProcessTree } from '@/utils/processKill';
+import { killOwnedProcessGroup, killProcessTree } from '@/utils/processKill';
 
 import { ApiClient } from '@/api/api';
 import { XC_VIRTUAL_SESSION_ID_PATTERN,
@@ -28,6 +30,51 @@ import { expandEnvironmentVariables } from '@/utils/expandEnvVars';
 import { getCodexInstancePath } from '@/commands/bang/ccsProfiles';
 import { reportProjectError } from '@/utils/projectSessionStartup';
 import { findAllHappyProcesses } from './doctor';
+import { redactSensitive } from '@/codex/utils/redactSecrets';
+import { decodeBase64, decrypt } from '@/api/encryption';
+import { selectInitialRestoreMessages, validateRecentMessageWindow } from '@/api/sessionMessageRecovery';
+import { RemoteRestoreDelivery, RESTORE_ALREADY_RUNNING, restoreTransportNotice, validateRemoteRestoreState, withinRestoreNoticeBudget,
+  type RemoteRestoreState } from './remoteRestore';
+
+/** Retain only a bounded startup stderr prefix; never retain running-session output. */
+export function captureSessionStartupDiagnostics(child: ChildProcess): {
+  closed: Promise<void>;
+  describeFailure: (reason: string) => string;
+  clear: () => void;
+} {
+  const limit = 8 * 1024;
+  let chunks: Buffer[] | null = [];
+  let bytes = 0;
+  let truncated = false;
+  let spawnError: Error | undefined;
+  child.on('error', error => { if (chunks !== null) spawnError = error; });
+  const closed = new Promise<void>(resolve => child.once('close', () => resolve()));
+  child.stderr?.on('data', (chunk: Buffer) => {
+    if (chunks === null) return;
+    const remaining = limit - bytes;
+    if (remaining > 0) {
+      const kept = Buffer.from(chunk.subarray(0, remaining));
+      chunks.push(kept);
+      bytes += kept.length;
+    }
+    if (chunk.length > remaining) truncated = true;
+  });
+  return {
+    closed,
+    describeFailure: reason => {
+      let stderr = Buffer.concat(chunks ?? [], bytes).toString('utf8');
+      // Do not expose a token fragment whose prefix or terminator was cut off.
+      if (truncated) stderr = stderr.slice(0, Math.max(0, stderr.lastIndexOf('\n')));
+      const detail = redactSensitive(stripVTControlCharacters(
+        `${spawnError ? `${spawnError.message}\n` : ''}${stderr}`,
+      )).trim();
+      const summary = Buffer.from(detail).subarray(0, limit).toString('utf8');
+      return `${reason} (exitCode=${child.exitCode ?? 'null'}, signal=${child.signalCode ?? 'none'})`
+        + (summary ? `: ${summary}` : '') + (truncated ? ' [stderr truncated]' : '');
+    },
+    clear: () => { chunks = null; bytes = 0; truncated = false; spawnError = undefined; },
+  };
+}
 
 export function applyTrackedSessionTurn(session: TrackedSession, report: SessionTurnReport): boolean {
   if ((report.state === 'running') !== (report.token !== null)) return false;
@@ -42,8 +89,8 @@ export function applyTrackedSessionTurn(session: TrackedSession, report: Session
 }
 
 // Restore file persistence for session auto-restore.
-// Only stores immutable spawn params. sessionTag and claudeSessionId come from Server at restore time.
-export interface RestoreFileData {
+// Spawn params and local automatic-retry/delivery authority. Native identity still comes from Server.
+export interface RestoreFileData extends RemoteRestoreState {
   directory: string;
   agent: 'claude' | 'codex' | 'gemini';
   titleAuthority?: 'external';
@@ -84,11 +131,25 @@ export function runSerial<K, V>(
   queues: Map<K, Promise<void>>,
   key: K,
   start: () => Promise<V>,
+  deadlineAt?: number,
 ): Promise<V> {
   const previous = queues.get(key) ?? Promise.resolve();
-  const result = previous.catch(() => undefined).then(start);
+  let waitTimer: ReturnType<typeof setTimeout> | undefined;
+  const operation = previous.catch(() => undefined).then(() => {
+    clearTimeout(waitTimer);
+    if (deadlineAt !== undefined) requireSessionStartupBudget(deadlineAt);
+    return start();
+  });
+  // Expire a queued caller promptly, but retain its place until the previous
+  // owner finishes. An expired caller must never start work or unlock a peer.
+  const result = deadlineAt === undefined ? operation : Promise.race([operation,
+    new Promise<never>((_resolve, reject) => {
+      waitTimer = setTimeout(() => reject(new Error('Session startup deadline expired while queued')),
+        Math.max(0, deadlineAt - Date.now()));
+    }),
+  ]);
   let tail: Promise<void>;
-  tail = result.then(() => undefined, () => undefined).finally(() => {
+  tail = operation.then(() => undefined, () => undefined).finally(() => {
     if (queues.get(key) === tail) queues.delete(key);
   });
   queues.set(key, tail);
@@ -97,10 +158,20 @@ export function runSerial<K, V>(
 
 // Mobile new-session RPCs have a 30-second Server relay budget. Leave enough
 // time to terminate an unregistered child and return a structured error.
-export const NEW_SESSION_REGISTRATION_TIMEOUT_MS = 20_000;
-// Server-initiated restore has its own 60-second relay budget and must keep
-// waiting for exact provider identity rather than publishing a false restore.
-export const RESTORE_SESSION_STARTUP_TIMEOUT_MS = 58_000;
+export const NEW_SESSION_REGISTRATION_TIMEOUT_MS = 24_000;
+// Replaying an existing history can take minutes. Keep a bounded restore budget
+// below the 210-second local control-client wait, including cleanup headroom.
+// The unchanged Server restore ACK still expires at 60 seconds; it is not this
+// local operation's deadline or evidence that the provider is input-ready.
+// A live process alone is never an input-ready acknowledgement.
+export const RESTORE_SESSION_STARTUP_TIMEOUT_MS = 180_000;
+
+/** Reject an exhausted absolute budget before another restore effect starts. */
+export function requireSessionStartupBudget(deadlineAt: number): void {
+  if (!Number.isSafeInteger(deadlineAt) || deadlineAt <= Date.now()) {
+    throw new Error('Session startup deadline expired');
+  }
+}
 
 export function shouldRegisterMachineForSession(startedBy?: 'daemon' | 'terminal'): boolean {
   return startedBy !== 'daemon';
@@ -110,6 +181,12 @@ export function selectTrackedConsoleSessions(
   sessions: ReadonlyMap<number, TrackedSession>,
 ): Array<[number, TrackedSession]> {
   return Array.from(sessions.entries()).filter(([, tracked]) => tracked.isConsoleSession === true);
+}
+
+export function isDirectConsoleStopTarget(
+  sessions: ReadonlyArray<readonly [number, TrackedSession]>,
+): boolean {
+  return sessions.some(([, tracked]) => tracked.isConsoleSession === true);
 }
 
 export function createSessionStartupDeadline(
@@ -141,6 +218,8 @@ export function waitForTrackedSessionStartup(input: {
   terminate: () => Promise<boolean>;
   complete: (session: TrackedSession) => SpawnSessionResult;
   timeoutMs: number;
+  deadlineAt?: number;
+  describeFailure?: (reason: string) => string;
 }): Promise<SpawnSessionResult> {
   return new Promise((resolve) => {
     let settled = false;
@@ -150,13 +229,17 @@ export function waitForTrackedSessionStartup(input: {
       settled = true;
       accepting = false;
       deadline.cancel();
+      if (result.type === 'error' && input.describeFailure) {
+        result = { ...result, errorMessage: input.describeFailure(result.errorMessage) };
+      }
       input.unregister();
       resolve(result);
     };
     const failAfterCleanup = (message: string) => {
       if (!accepting) return;
       accepting = false;
-      input.unregister();
+      // Keep diagnostics until termination/pipe drainage has finished. Readiness
+      // and late exit callbacks are already rejected by accepting=false.
       void Promise.resolve().then(input.terminate).then(
         terminated => settle({ type: 'error', errorMessage: terminated
           ? message : `${message}; process cleanup failed` }),
@@ -166,7 +249,7 @@ export function waitForTrackedSessionStartup(input: {
     const deadline = createSessionStartupDeadline(() => {
       const message = `Session startup timeout for PID ${input.pid}${input.suffix ?? ''}`;
       failAfterCleanup(message);
-    }, input.timeoutMs);
+    }, input.deadlineAt === undefined ? input.timeoutMs : Math.max(0, input.deadlineAt - Date.now()));
     input.register({
       resolve: (session) => {
         if (!accepting) return;
@@ -203,10 +286,11 @@ const SAFE_CODEX_PROFILE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const CODEX_PROVIDER_SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 
 export function isProviderReadyForDaemonRegistration(
-  metadata: Pick<Metadata, 'flavor' | 'startedBy' | 'claudeSessionId'>,
+  metadata: Pick<Metadata, 'flavor' | 'startedBy' | 'claudeSessionId' | 'consoleSession'>,
 ): boolean {
   return metadata.startedBy !== 'daemon'
     || metadata.flavor !== 'codex'
+    || metadata.consoleSession === true
     || (typeof metadata.claudeSessionId === 'string'
       && CODEX_PROVIDER_SESSION_ID.test(metadata.claudeSessionId));
 }
@@ -280,6 +364,52 @@ function isCurrentDaemonTmuxWindow(session: TrackedSession, pid: number): boolea
     && session.pid === pid
     && typeof session.tmuxSessionId === 'string'
     && session.tmuxSessionId.length > 0;
+}
+
+/** Retire the owned process tree before tmux can reparent detached sidecars. */
+export async function terminateTrackedSession(
+  pid: number,
+  session: TrackedSession,
+  tracked: Map<number, TrackedSession>,
+): Promise<boolean> {
+  if (tracked.get(pid) !== session) {
+    logger.debug(`[DAEMON RUN] Refusing to signal unowned session PID ${pid}`);
+    return false;
+  }
+  const tmuxWindow = isCurrentDaemonTmuxWindow(session, pid);
+  // A reaped parent is not a live PID authority. Its actual detached-spawn
+  // handle can still own the original group while inherited pipes remain open.
+  const exitedChild = session.startedBy === 'daemon' && session.tmuxSessionId === undefined
+    && session.pid === pid && session.childProcess?.pid === pid
+    && (session.childProcess.exitCode !== null || session.childProcess.signalCode !== null);
+  if (exitedChild) {
+    try {
+      if (!await killOwnedProcessGroup(session.childProcess!)) return false;
+    } catch (error) {
+      logger.debug(`[DAEMON RUN] Failed to retire child group ${pid}: ${String(error)}`);
+      return false;
+    }
+    if (tracked.get(pid) === session) tracked.delete(pid);
+    return true;
+  }
+  const managed = tmuxWindow || isCurrentDaemonChild(session, pid) || isDaemonManagedSession(
+    session, recoverRestoredDaemonSessions(await findAllHappyProcesses()),
+  );
+  if (!managed) {
+    logger.debug(`[DAEMON RUN] Refusing to signal unowned session PID ${pid}`);
+    return false;
+  }
+  try {
+    await killProcessTree(pid);
+    // The pane may already have disappeared when its command exited. A false
+    // killWindow result does not undo the verified process-tree retirement.
+    if (tmuxWindow) await getTmuxUtilities().killWindow(session.tmuxSessionId!);
+  } catch (error) {
+    logger.debug(`[DAEMON RUN] Failed to retire session PID ${pid}: ${String(error)}`);
+    return false;
+  }
+  if (tracked.get(pid) === session) tracked.delete(pid);
+  return true;
 }
 
 export function isDaemonManagedSession(
@@ -363,29 +493,65 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-async function writeRestoreFile(sessionId: string, data: RestoreFileData): Promise<void> {
+const restoreFileQueue = new Map<string, Promise<void>>();
+
+async function writeRestoreData(path: string, data: RestoreFileData): Promise<void> {
+  const temporary = `${path}.${randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(temporary, JSON.stringify(data), { encoding: 'utf-8', mode: 0o600, flag: 'wx' });
+    await fs.rename(temporary, path);
+  } finally { await fs.rm(temporary, { force: true }); }
+}
+
+export async function updateRestoreState(sessionId: string,
+  change: (state: RemoteRestoreState) => RemoteRestoreState): Promise<RemoteRestoreState> {
+  return runSerial(restoreFileQueue, sessionId, async () => {
+    const open = getRestoreFilePath(sessionId);
+    const closed = getClosedRestoreFilePath(sessionId);
+    const isClosed = await pathExists(closed);
+    if (isClosed && await pathExists(open)) throw new Error('Conflicting open and closed restore authority');
+    const path = isClosed ? closed : open;
+    const current = parseRestoreFileData(JSON.parse(await fs.readFile(path, 'utf-8')));
+    const state = change({ lastAttemptedUserSeq: current.lastAttemptedUserSeq,
+      restoreNotices: current.restoreNotices });
+    validateRemoteRestoreState(state);
+    const next = { ...current, ...state };
+    if (JSON.stringify(next) !== JSON.stringify(current)) await writeRestoreData(path, next);
+    return state;
+  });
+}
+
+export async function writeRestoreFile(sessionId: string, data: RestoreFileData): Promise<void> {
+  return runSerial(restoreFileQueue, sessionId, async () => {
   const dir = getRestoreDir();
   await fs.mkdir(dir, { recursive: true });
   if (await pathExists(getClosedRestoreFilePath(sessionId))) {
     return;
   }
   let existingProfile: string | undefined;
+  let remoteState: RemoteRestoreState = {};
   try {
     const current = parseRestoreFileData(JSON.parse(await fs.readFile(getRestoreFilePath(sessionId), 'utf-8')));
     existingProfile = current.codexProfile;
-  } catch { /* first write or legacy invalid file */ }
+    remoteState = { lastAttemptedUserSeq: current.lastAttemptedUserSeq, restoreNotices: current.restoreNotices };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
   const codexProfile = data.codexProfile ?? existingProfile;
-  await fs.writeFile(getRestoreFilePath(sessionId), JSON.stringify({
+  await writeRestoreData(getRestoreFilePath(sessionId), {
     ...data,
+    ...remoteState,
     ...(codexProfile ? { codexProfile } : {}),
-  }), 'utf-8');
+  });
+  });
 }
 
 export function parseRestoreFileData(value: unknown): RestoreFileData {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid restore authority');
   const row = value as Record<string, unknown>;
   const keys = Object.keys(row);
-  if (keys.some((key) => !['agent', 'directory', 'titleAuthority', 'codexProfile'].includes(key))
+  if (keys.some((key) => !['agent', 'directory', 'titleAuthority', 'codexProfile',
+    'lastAttemptedUserSeq', 'restoreNotices'].includes(key))
     || typeof row.directory !== 'string' || !row.directory
     || !['claude', 'codex', 'gemini'].includes(String(row.agent))
     || (row.titleAuthority !== undefined && row.titleAuthority !== 'external')
@@ -393,7 +559,12 @@ export function parseRestoreFileData(value: unknown): RestoreFileData {
       || typeof row.codexProfile !== 'string' || !SAFE_CODEX_PROFILE.test(row.codexProfile)))) {
     throw new Error('Invalid restore authority');
   }
-  return { directory: row.directory, agent: row.agent as RestoreFileData['agent'],
+  const remoteState: RemoteRestoreState = {
+    ...(row.lastAttemptedUserSeq !== undefined ? { lastAttemptedUserSeq: row.lastAttemptedUserSeq as number } : {}),
+    ...(row.restoreNotices !== undefined ? { restoreNotices: row.restoreNotices as RemoteRestoreState['restoreNotices'] } : {}),
+  };
+  validateRemoteRestoreState(remoteState);
+  return { directory: row.directory, agent: row.agent as RestoreFileData['agent'], ...remoteState,
     ...(row.titleAuthority === 'external' ? { titleAuthority: 'external' as const } : {}),
     ...(typeof row.codexProfile === 'string' ? { codexProfile: row.codexProfile } : {}) };
 }
@@ -428,9 +599,10 @@ async function readRestoreFile(sessionId: string): Promise<RestoreFileData | nul
   }
 }
 
-async function reopenRestoreFile(
+export async function reopenRestoreFile(
   sessionId: string,
 ): Promise<{ state: 'reopened' | 'already-open'; data: RestoreFileData }> {
+  return runSerial(restoreFileQueue, sessionId, async () => {
   const restorePath = getRestoreFilePath(sessionId);
   const closedPath = getClosedRestoreFilePath(sessionId);
   const closed = await pathExists(closedPath);
@@ -448,9 +620,11 @@ async function reopenRestoreFile(
     return { state: 'reopened', data };
   }
   return { state: 'already-open', data };
+  });
 }
 
-async function closeRestoreFile(sessionId: string, createIfMissing: boolean): Promise<'closed' | 'already-closed' | 'missing'> {
+export async function closeRestoreFile(sessionId: string, createIfMissing: boolean): Promise<'closed' | 'already-closed' | 'missing'> {
+  return runSerial(restoreFileQueue, sessionId, async () => {
   const restorePath = getRestoreFilePath(sessionId);
   const closedPath = getClosedRestoreFilePath(sessionId);
   await fs.mkdir(getRestoreDir(), { recursive: true });
@@ -483,6 +657,7 @@ async function closeRestoreFile(sessionId: string, createIfMissing: boolean): Pr
     }
     throw error;
   }
+  });
 }
 
 // Prepare initial metadata
@@ -716,59 +891,6 @@ export async function startDaemon(): Promise<void> {
 
     const recoveredSessions = recoverRestoredDaemonSessions(await findAllHappyProcesses());
 
-    const waitForProcessExit = async (pid: number, timeoutMs: number): Promise<boolean> => {
-      const deadline = Date.now() + timeoutMs;
-      while (Date.now() < deadline) {
-        if (!isProcessAlive(pid)) {
-          return true;
-        }
-        await new Promise(resolve => setTimeout(resolve, 100));
-      }
-      return !isProcessAlive(pid);
-    };
-
-    const terminateTrackedSession = async (pid: number, session: TrackedSession): Promise<boolean> => {
-      if (pidToTrackedSession.get(pid) !== session) {
-        logger.debug(`[DAEMON RUN] Refusing to signal unowned session PID ${pid}`);
-        return false;
-      }
-      if (isCurrentDaemonTmuxWindow(session, pid)) {
-        const killed = await getTmuxUtilities().killWindow(session.tmuxSessionId!);
-        if ((!killed && isProcessAlive(pid)) || !await waitForProcessExit(pid, 1000)) return false;
-        if (pidToTrackedSession.get(pid) === session) pidToTrackedSession.delete(pid);
-        return true;
-      }
-      const managed = isCurrentDaemonChild(session, pid) || isDaemonManagedSession(
-        session,
-        recoverRestoredDaemonSessions(await findAllHappyProcesses()),
-      );
-      if (!managed) {
-        logger.debug(`[DAEMON RUN] Refusing to signal unowned session PID ${pid}`);
-        return false;
-      }
-      try {
-        await killProcessTree(pid);
-      } catch (error) {
-        logger.debug(`[DAEMON RUN] Failed to signal session PID ${pid}:`, error);
-      }
-      const gracefulExitMs = session.startedBy === 'daemon' ? 3000 : 1000;
-      if (await waitForProcessExit(pid, gracefulExitMs)) {
-        pidToTrackedSession.delete(pid);
-        return true;
-      }
-
-      if (pidToTrackedSession.get(pid) !== session || !isCurrentDaemonChild(session, pid)) return false;
-      try { process.kill(-pid, 'SIGKILL'); } catch { /* process group may already be gone */ }
-      try { process.kill(pid, 'SIGKILL'); } catch { /* process may already be gone */ }
-      if (await waitForProcessExit(pid, 1000)) {
-        pidToTrackedSession.delete(pid);
-        return true;
-      }
-
-      logger.debug(`[DAEMON RUN] Daemon-owned session PID ${pid} remained alive after SIGKILL`);
-      return false;
-    };
-
     const retireDuplicateTrackedSessionOwners = async (sessionId: string) => {
       const ownership = reconcileLiveTrackedSessionOwnership(pidToTrackedSession, sessionId, isProcessAlive);
       for (const [duplicatePid, duplicate] of ownership.duplicates) {
@@ -779,7 +901,7 @@ export async function startDaemon(): Promise<void> {
         }
       }
       const results = await Promise.all(ownership.duplicates.map(
-        ([duplicatePid, duplicate]) => terminateTrackedSession(duplicatePid, duplicate)));
+        ([duplicatePid, duplicate]) => terminateTrackedSession(duplicatePid, duplicate, pidToTrackedSession)));
       for (const [index, terminated] of results.entries()) {
         if (!terminated) {
           const [duplicatePid, duplicate] = ownership.duplicates[index]!;
@@ -800,7 +922,7 @@ export async function startDaemon(): Promise<void> {
       if (existsSync(getClosedRestoreFilePath(sessionId))) {
         const results = await Promise.all(Array.from(pidToTrackedSession.entries())
           .filter(([, session]) => trackedSessionMatchesIdentity(session, sessionId))
-          .map(([pid, session]) => terminateTrackedSession(pid, session)));
+          .map(([pid, session]) => terminateTrackedSession(pid, session, pidToTrackedSession)));
         if (results.some(result => !result)) {
           logger.debug(`[DAEMON RUN] Closed recovered session ${sessionId} could not be fully terminated`);
         }
@@ -828,7 +950,7 @@ export async function startDaemon(): Promise<void> {
       if (matches.length === 0) {
         return false;
       }
-      const results = await Promise.all(matches.map(([pid, tracked]) => terminateTrackedSession(pid, tracked)));
+      const results = await Promise.all(matches.map(([pid, tracked]) => terminateTrackedSession(pid, tracked, pidToTrackedSession)));
       return results.every(Boolean);
     };
 
@@ -894,7 +1016,7 @@ export async function startDaemon(): Promise<void> {
             pidToAwaiter.delete(pid);
             awaiter.cancel();
           }
-          void terminateTrackedSession(pid, existingSession);
+          void terminateTrackedSession(pid, existingSession, pidToTrackedSession);
         }
         return;
       }
@@ -905,7 +1027,7 @@ export async function startDaemon(): Promise<void> {
         if (!matchesExpectedHappySessionId(existingSession.expectedHappySessionId, sessionId)) {
           logger.debug(`[DAEMON RUN] Restore identity mismatch: expected ${existingSession.expectedHappySessionId}, received ${sessionId}`);
           void (async () => {
-            const terminated = await terminateTrackedSession(pid, existingSession);
+            const terminated = await terminateTrackedSession(pid, existingSession, pidToTrackedSession);
             const awaiter = pidToAwaiter.get(pid);
             if (awaiter) {
               pidToAwaiter.delete(pid);
@@ -934,7 +1056,7 @@ export async function startDaemon(): Promise<void> {
             pidToAwaiter.delete(pid);
             awaiter.fail('Restored provider identity mismatch');
           }
-          void terminateTrackedSession(pid, existingSession);
+          void terminateTrackedSession(pid, existingSession, pidToTrackedSession);
           return;
         }
 
@@ -981,14 +1103,14 @@ export async function startDaemon(): Promise<void> {
           if (readyStartup) {
             pidToAwaiter.delete(readyStartup.pid);
             readyStartup.awaiter.fail('Failed to persist session restore authority');
-            void terminateTrackedSession(readyStartup.pid, readyStartup.session);
+            void terminateTrackedSession(readyStartup.pid, readyStartup.session, pidToTrackedSession);
           }
           return;
         }
       } else if (readyStartup && !tracked?.isConsoleSession) {
         pidToAwaiter.delete(readyStartup.pid);
         readyStartup.awaiter.fail('Session restore authority is missing a working directory');
-        void terminateTrackedSession(readyStartup.pid, readyStartup.session);
+        void terminateTrackedSession(readyStartup.pid, readyStartup.session, pidToTrackedSession);
         return;
       }
 
@@ -1015,7 +1137,13 @@ export async function startDaemon(): Promise<void> {
     };
 
     // Spawn a new session (sessionId reserved for future --resume functionality)
-    const spawnSession = async (options: SpawnSessionOptions): Promise<SpawnSessionResult> => {
+    const spawnSession = async (options: SpawnSessionOptions, restoreDeadlineAt?: number): Promise<SpawnSessionResult> => {
+      // This is an internal argument, never a deadline supplied by an RPC caller.
+      const restoreDeadline = options.restoreSessionId
+        ? restoreDeadlineAt ?? Date.now() + RESTORE_SESSION_STARTUP_TIMEOUT_MS : undefined;
+      if (restoreDeadline !== undefined && restoreDeadline <= Date.now()) {
+        return { type: 'error', errorMessage: 'Session startup deadline expired before spawn' };
+      }
       logger.debugLargeJson('[DAEMON RUN] Spawning session', options);
 
       if (shuttingDown) return { type: 'error', errorMessage: 'Daemon is shutting down' };
@@ -1226,7 +1354,7 @@ export async function startDaemon(): Promise<void> {
               pendingAwaiter.cancel();
               logger.debug(`[DAEMON RUN] Cancelled pending awaiter for superseded PID ${pid}`);
             }
-            if (!await terminateTrackedSession(pid, session)) {
+            if (!await terminateTrackedSession(pid, session, pidToTrackedSession)) {
               return { type: 'error', errorMessage:
                 `Stale session PID ${pid} could not be terminated before resume` };
             }
@@ -1259,6 +1387,9 @@ export async function startDaemon(): Promise<void> {
         }
 
         const childEnv = buildDaemonChildEnvironment(process.env, extraEnv, sessionAgent, options.resume);
+        const startupDeadlineAt = restoreDeadline ?? Date.now() + NEW_SESSION_REGISTRATION_TIMEOUT_MS;
+        requireSessionStartupBudget(startupDeadlineAt);
+        childEnv.HAPPY_SESSION_STARTUP_DEADLINE_MS = String(startupDeadlineAt);
 
         if (useTmux && tmuxSessionName !== undefined) {
           // Try to spawn in tmux session
@@ -1312,12 +1443,13 @@ export async function startDaemon(): Promise<void> {
             return waitForTrackedSessionStartup({
               pid: tmuxResult.pid,
               suffix: ' (tmux)',
+              deadlineAt: startupDeadlineAt,
               timeoutMs: options.restoreSessionId
                 ? RESTORE_SESSION_STARTUP_TIMEOUT_MS
                 : NEW_SESSION_REGISTRATION_TIMEOUT_MS,
               register: awaiter => pidToAwaiter.set(tmuxResult.pid!, awaiter),
               unregister: () => pidToAwaiter.delete(tmuxResult.pid!),
-              terminate: () => terminateTrackedSession(tmuxResult.pid!, trackedSession),
+              terminate: () => terminateTrackedSession(tmuxResult.pid!, trackedSession, pidToTrackedSession),
               complete: (completedSession) => {
                 logger.debug(`[DAEMON RUN] Session ${completedSession.happySessionId} fully spawned with webhook (tmux)`);
                 return { type: 'success', sessionId: completedSession.happySessionId! };
@@ -1331,6 +1463,7 @@ export async function startDaemon(): Promise<void> {
 
         // Regular process spawning (fallback or if tmux not available)
         if (!useTmux) {
+          requireSessionStartupBudget(startupDeadlineAt);
           if (shuttingDown) {
             return { type: 'error', errorMessage: 'Daemon is shutting down' };
           }
@@ -1344,6 +1477,7 @@ export async function startDaemon(): Promise<void> {
             stdio: ['ignore', 'pipe', 'pipe'],  // Capture stdout/stderr for debugging
             env: childEnv
           });
+          const startupDiagnostics = captureSessionStartupDiagnostics(happyProcess);
 
           // Log output for debugging
           if (process.env.DEBUG) {
@@ -1353,13 +1487,19 @@ export async function startDaemon(): Promise<void> {
             happyProcess.stderr?.on('data', (data) => {
               logger.debug(`[DAEMON RUN] Child stderr: ${data.toString()}`);
             });
+          } else {
+            // Both pipes must drain even when debug logging is disabled.
+            happyProcess.stdout?.resume();
           }
 
           if (!happyProcess.pid) {
             logger.debug('[DAEMON RUN] Failed to spawn process - no PID returned');
+            await startupDiagnostics.closed;
+            const errorMessage = startupDiagnostics.describeFailure('Failed to spawn Happy process - no PID returned');
+            startupDiagnostics.clear();
             return {
               type: 'error',
-              errorMessage: 'Failed to spawn Happy process - no PID returned'
+              errorMessage,
             };
           }
 
@@ -1378,15 +1518,12 @@ export async function startDaemon(): Promise<void> {
 
           pidToTrackedSession.set(happyProcess.pid, trackedSession);
 
-          happyProcess.on('exit', (code, signal) => {
-            logger.debug(`[DAEMON RUN] Child PID ${happyProcess.pid} exited with code ${code}, signal ${signal}`);
-            if (happyProcess.pid) {
-              onChildExited(happyProcess.pid);
-            }
-          });
-
-          happyProcess.on('error', (error) => {
-            logger.debug(`[DAEMON RUN] Child process error:`, error);
+          // 'exit' may precede the final stderr bytes (including inherited
+          // provider pipes). The existing startup deadline still bounds waiting.
+          void startupDiagnostics.closed.then(() => {
+            logger.debug(`[DAEMON RUN] Child PID ${happyProcess.pid} closed`, {
+              exitCode: happyProcess.exitCode, signal: happyProcess.signalCode,
+            });
             if (happyProcess.pid) {
               onChildExited(happyProcess.pid);
             }
@@ -1397,12 +1534,17 @@ export async function startDaemon(): Promise<void> {
 
           return waitForTrackedSessionStartup({
             pid: happyProcess.pid,
+            deadlineAt: startupDeadlineAt,
             timeoutMs: options.restoreSessionId
               ? RESTORE_SESSION_STARTUP_TIMEOUT_MS
               : NEW_SESSION_REGISTRATION_TIMEOUT_MS,
+            describeFailure: startupDiagnostics.describeFailure,
             register: awaiter => pidToAwaiter.set(happyProcess.pid!, awaiter),
-            unregister: () => pidToAwaiter.delete(happyProcess.pid!),
-            terminate: () => terminateTrackedSession(happyProcess.pid!, trackedSession),
+            unregister: () => {
+              pidToAwaiter.delete(happyProcess.pid!);
+              startupDiagnostics.clear();
+            },
+            terminate: () => terminateTrackedSession(happyProcess.pid!, trackedSession, pidToTrackedSession),
             complete: (completedSession) => {
               logger.debug(`[DAEMON RUN] Session ${completedSession.happySessionId} fully spawned with webhook`);
               return { type: 'success', sessionId: completedSession.happySessionId! };
@@ -1431,6 +1573,10 @@ export async function startDaemon(): Promise<void> {
       recoveredEvidence?: ReadonlyArray<{ pid: number; sessionId: string }>,
     ): Promise<boolean> => {
       const initialMatches = matchingTrackedSessions(sessionId);
+      if (isDirectConsoleStopTarget(initialMatches)) {
+        logger.debug(`[DAEMON RUN] Refusing direct stop for daemon console ${sessionId}`);
+        return false;
+      }
       const pidFallback = /^PID-([1-9][0-9]*)$/.test(sessionId);
       const happySessionId = pidFallback
         ? initialMatches[0]?.[1].happySessionId
@@ -1480,7 +1626,7 @@ export async function startDaemon(): Promise<void> {
       const terminateTarget = happySessionId || sessionId;
       const matches = matchingTrackedSessions(terminateTarget);
       const results = await Promise.all(matches.map(([pid, tracked]) =>
-        terminateTrackedSession(pid, tracked)));
+        terminateTrackedSession(pid, tracked, pidToTrackedSession)));
       const allExited = results.every(Boolean) && matchingTrackedSessions(terminateTarget).length === 0;
       if (!allExited) {
         if (happySessionId) closingSessionIds.delete(happySessionId);
@@ -1495,13 +1641,13 @@ export async function startDaemon(): Promise<void> {
     };
 
     // Handle child process exit
-    const onChildExited = (pid: number) => {
+    const onChildExited = (pid: number, startupError = 'Happy child exited before provider restore was ready') => {
       logger.debug(`[DAEMON RUN] Removing exited process PID ${pid} from tracking`);
       const tracked = pidToTrackedSession.get(pid);
       const awaiter = pidToAwaiter.get(pid);
       if (awaiter) {
         pidToAwaiter.delete(pid);
-        awaiter.fail('Happy child exited before provider restore was ready');
+        awaiter.fail(startupError);
       }
       pidToTrackedSession.delete(pid);
       const sessionId = tracked?.happySessionId ?? tracked?.expectedHappySessionId;
@@ -1592,7 +1738,8 @@ export async function startDaemon(): Promise<void> {
 
     type ExactRestoreResult = SpawnSessionResult & { agent?: RestoreFileData['agent'] };
     const restoreSessionUnlocked = async (params: { sessionId: string; claudeSessionId: string | null;
-      summary: string | null; permissionMode?: PermissionMode }): Promise<ExactRestoreResult> => {
+      summary: string | null; permissionMode?: PermissionMode }, deadlineAt: number): Promise<ExactRestoreResult> => {
+      requireSessionStartupBudget(deadlineAt);
       if (shuttingDown) return { type: 'error', errorMessage: 'Daemon is shutting down' };
       if (!isSafeHappySessionId(params.sessionId)) return { type: 'error', errorMessage: 'Invalid Happy session ID' };
       if (closingSessionIds.has(params.sessionId)) {
@@ -1663,7 +1810,7 @@ export async function startDaemon(): Promise<void> {
         restoreSessionId: params.sessionId,
         permissionMode: params.permissionMode,
         environmentVariables,
-      });
+      }, deadlineAt);
       if (result.type !== 'success') {
         await rollbackReopen();
         return result;
@@ -1679,11 +1826,65 @@ export async function startDaemon(): Promise<void> {
       return { ...result, agent: restoreData.agent };
     };
 
-    const restoreSession = (params: { sessionId: string; claudeSessionId: string | null;
-      summary: string | null; permissionMode?: PermissionMode }): Promise<ExactRestoreResult> =>
-      runSerial(lifecycleQueue, params.sessionId, () => restoreSessionUnlocked(params));
+    const queueRestore = (sessionId: string,
+      start: (deadlineAt: number) => Promise<ExactRestoreResult>): Promise<ExactRestoreResult> => {
+      const deadlineAt = Date.now() + RESTORE_SESSION_STARTUP_TIMEOUT_MS;
+      return runSerial(lifecycleQueue, sessionId, () => start(deadlineAt), deadlineAt)
+        .catch(error => ({ type: 'error', errorMessage: error instanceof Error ? error.message : String(error) }));
+    };
 
-    restoreControlSession = (sessionId, permissionMode) => runSerial(lifecycleQueue, sessionId, async () => {
+    const latestRestoreUserSeq = async (sessionId: string, deadlineAt: number): Promise<number> => {
+      const remote = await api.restoreSessionById(sessionId);
+      requireSessionStartupBudget(deadlineAt);
+      const rows = validateRecentMessageWindow(await api.getSessionMessages(sessionId));
+      requireSessionStartupBudget(deadlineAt);
+      return selectInitialRestoreMessages(rows, row => {
+        const value = decrypt(remote.encryptionKey, remote.encryptionVariant, decodeBase64(row.content.c));
+        if (!value || typeof value !== 'object' || Array.isArray(value)) {
+          throw new Error('Persisted restore message cannot be decrypted');
+        }
+        return value as Record<string, unknown>;
+      }).at(-1)?.seq ?? 0;
+    };
+
+    const restoreDelivery = new RemoteRestoreDelivery(updateRestoreState,
+      (sessionId, notice) => withinRestoreNoticeBudget(async remaining => {
+        const session = await api.restoreSessionById(sessionId);
+        const writer = api.sessionMessageClient(session);
+        const input = { messageRole: 'agent' as const, messageType: 'event' as const,
+          message: notice.message!, eventId: notice.id,
+          localId: sessionErrorLocalId(sessionId, notice.id), timeoutMs: remaining(),
+          encryptedRecord: notice.encryptedRecord };
+        const encryptedRecord = writer.prepareAgentEventOnce(input);
+        // Persist identical ciphertext before the first emit. After an unknown
+        // ACK, Server can confirm the same row even beyond its 150-message window.
+        await updateRestoreState(sessionId, state => ({ ...state,
+          restoreNotices: state.restoreNotices?.map(item => item.id === notice.id
+            ? { ...item, encryptedRecord } : item) }));
+        await writer.sendAgentEventOnce({ ...input, encryptedRecord, timeoutMs: remaining() });
+      }),
+      error => logger.debug('[DAEMON RUN] Restore notification remains unconfirmed:', error));
+
+    const restoreSession = (params: { sessionId: string; claudeSessionId: string | null;
+      summary: string | null; permissionMode?: PermissionMode }): Promise<ExactRestoreResult> => {
+      const operation = queueRestore(params.sessionId, async deadlineAt => {
+        // A live owner is checked by the existing exact-identity/readiness path.
+        const live = matchingTrackedSessions(params.sessionId).filter(([pid]) => isProcessAlive(pid));
+        if (live.length) {
+          // A notification after daemon reconstruction must not close the
+          // authority of a still-starting child or reset its recovery window.
+          return live.length === 1 && classifyTrackedInputState(live[0]![1]) === 'online'
+            ? restoreSessionUnlocked(params, deadlineAt)
+            : { type: 'error', errorMessage: RESTORE_ALREADY_RUNNING };
+        }
+        const inputSeq = await latestRestoreUserSeq(params.sessionId, deadlineAt);
+        return restoreDelivery.run(params.sessionId, inputSeq, () => restoreSessionUnlocked(params, deadlineAt));
+      });
+      void operation.then(() => restoreDelivery.flush());
+      return operation;
+    };
+
+    restoreControlSession = (sessionId, permissionMode) => queueRestore(sessionId, async deadlineAt => {
       let remote;
       try { remote = await api.restoreSessionById(sessionId); }
       catch (error) { return { type: 'error', errorMessage: error instanceof Error ? error.message : String(error) }; }
@@ -1692,9 +1893,18 @@ export async function startDaemon(): Promise<void> {
       const summary = summaryValue && typeof summaryValue === 'object'
         && typeof (summaryValue as { text?: unknown }).text === 'string'
         ? (summaryValue as { text: string }).text : null;
+      // Explicit local recovery may retry the same input, but its diagnostic
+      // events must not authorize a second automatic attempt afterward.
+      if (!matchingTrackedSessions(sessionId).some(([pid]) => isProcessAlive(pid))) {
+        // The existing session sequence is an upper bound on all input already
+        // present. Explicit recovery must not acquire a history-query gate.
+        const inputSeq = Number.isSafeInteger(remote.seq) ? remote.seq : 0;
+        if (inputSeq > 0) await updateRestoreState(sessionId, state => ({ ...state,
+          lastAttemptedUserSeq: Math.max(inputSeq, state.lastAttemptedUserSeq ?? 0) }));
+      }
       return restoreSessionUnlocked({ sessionId,
         claudeSessionId: typeof providerSessionId === 'string' ? providerSessionId : null,
-        summary, permissionMode });
+        summary, permissionMode }, deadlineAt);
     });
 
     replaceControlSession = (input) => runSerial(lifecycleQueue, input.previousSessionId, async () => {
@@ -1728,19 +1938,22 @@ export async function startDaemon(): Promise<void> {
       if (!isSafeHappySessionId(params.sessionId) || !params.eventId || !params.source || !params.code || !params.message) {
         return false;
       }
-      const session = await api.restoreSessionById(params.sessionId);
-      const workspace = session.metadata?.path;
-      const notice = typeof workspace === 'string' && workspace
-        ? await reportProjectError({ workspace, source: params.source, code: params.code,
-            message: params.message, reportedBy: params.sessionId })
-        : null;
-      await api.sessionMessageClient(session).sendAgentEventOnce({
-        messageRole: 'agent',
-        messageType: 'event',
-        message: notice ?? params.message,
-        eventId: params.eventId,
-        localId: sessionErrorLocalId(params.sessionId, params.eventId),
-        timeoutMs: 20_000,
+      const transport = restoreTransportNotice(params.source, params.code, params.message);
+      await withinRestoreNoticeBudget(async remaining => {
+        const session = await api.restoreSessionById(params.sessionId);
+        await api.sessionMessageClient(session).sendAgentEventOnce({
+          messageRole: 'agent', messageType: 'event',
+          message: transport ?? redactSensitive(params.message).slice(0, 2000),
+          eventId: params.eventId, localId: sessionErrorLocalId(params.sessionId, params.eventId),
+          timeoutMs: remaining(),
+        });
+        const workspace = session.metadata?.path;
+        if (transport === null && typeof workspace === 'string' && workspace) {
+          // Error reporting is not a transport ACK gate. Progress/duplicate
+          // suppression are informational and must never become XC bugs.
+          void reportProjectError({ workspace, source: params.source, code: params.code,
+            message: params.message, reportedBy: params.sessionId });
+        }
       });
       return true;
     };
@@ -1759,6 +1972,19 @@ export async function startDaemon(): Promise<void> {
     // Connect to server
     apiMachine.connect();
 
+    // Recover pending delivery from the same restore authorities, including
+    // closed sessions. Never revive a provider just to deliver its result.
+    const restoreEntries = await fs.readdir(getRestoreDir()).catch(() => [] as string[]);
+    for (const name of restoreEntries) {
+      const match = /^([A-Za-z0-9][A-Za-z0-9._-]{0,127})\.(?:json|closed)$/u.exec(name);
+      if (!match) continue;
+      try {
+        const data = parseRestoreFileData(JSON.parse(await fs.readFile(join(getRestoreDir(), name), 'utf-8')));
+        if (data.restoreNotices?.length) restoreDelivery.recover([match[1]!]);
+      } catch { /* Empty close markers and unrelated invalid authorities are not notification jobs. */ }
+    }
+    void restoreDelivery.flush();
+
     // Spawn console session (lightweight bang-command-only session for mobile control)
     let consoleSessionSpawning = false;
     const consoleDir = join(configuration.happyHomeDir, 'console');
@@ -1773,6 +1999,7 @@ export async function startDaemon(): Promise<void> {
       try {
         const result = await spawnSession({
           directory: consoleDir,
+          agent: 'codex',
           consoleSession: true,
           approvedNewDirectoryCreation: true,
         });
@@ -1803,6 +2030,7 @@ export async function startDaemon(): Promise<void> {
       }
       heartbeatRunning = true;
       try {
+      void restoreDelivery.flush();
 
       if (process.env.DEBUG) {
         logger.debug(`[DAEMON RUN] Health check started at ${new Date().toLocaleString()}`);
@@ -1896,7 +2124,7 @@ export async function startDaemon(): Promise<void> {
         }
         await new Promise(resolve => setTimeout(resolve, 1000));
         const results = await Promise.all(consoleSessions.map(([pid, tracked]) =>
-          terminateTrackedSession(pid, tracked).catch(error => {
+          terminateTrackedSession(pid, tracked, pidToTrackedSession).catch(error => {
             logger.debug(`[DAEMON RUN] Failed to terminate console PID ${pid}:`, error);
             return false;
           })));

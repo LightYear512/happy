@@ -119,6 +119,10 @@ describe('createSessionMetadata', () => {
         expect(metadata.currentModelCode).toBe('default');
         expect(metadata.models?.map((model) => model.code)).toEqual([
             'default',
+            'gpt-6-astra:low',
+            'gpt-6-astra:medium',
+            'gpt-6-astra:high',
+            'gpt-6-astra:xhigh',
             'gpt-5.6-sol:minimal',
             'gpt-5.6-sol:low',
             'gpt-5.6-sol:medium',

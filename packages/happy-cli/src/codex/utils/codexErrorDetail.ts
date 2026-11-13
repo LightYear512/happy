@@ -39,6 +39,15 @@ export function formatCodexErrorForUi(detail: string): string {
     return /^(codex\s+)?error[:\s]/i.test(trimmed) ? trimmed : `Codex error: ${trimmed}`;
 }
 
+/** Only the structured upstream capacity error permits an empty-input continuation. */
+export function isCodexCapacityError(params: unknown): boolean {
+    const record = readRecord(params);
+    if (!record || record.willRetry === true) return false;
+    const error = readRecord(record.error) ?? readRecord(readRecord(record.turn)?.error);
+    const info = error?.codexErrorInfo ?? error?.codex_error_info;
+    return info === 'serverOverloaded' || info === 'server_overloaded';
+}
+
 export function extractCodexErrorDetail(params: unknown): string {
     const record = readRecord(params);
     if (!record) {

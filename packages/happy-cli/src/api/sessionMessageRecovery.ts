@@ -1,4 +1,5 @@
 /** Exact selection and merge rules for messages missed during a live reconnect. */
+import { UserMessageSchema } from './types';
 
 export const RECENT_MESSAGE_WINDOW = 150;
 export const MAX_RECOVERY_COLLECTION_BYTES = 32 * 1024 * 1024;
@@ -32,6 +33,40 @@ export class SessionRecoveryError extends Error {
 
 export function validateRecentMessageWindow(rawRows: unknown): SessionRecoveryRow[] {
     return validateAndOrderRows(rawRows, RECENT_MESSAGE_WINDOW);
+}
+
+/** Shared restore admission: system events never constitute new user input. */
+export function selectInitialRestoreMessages(
+    rows: SessionRecoveryRow[],
+    decryptMessage: (row: SessionRecoveryRow) => Record<string, unknown>,
+): SessionRecoveryRow[] {
+    const pending: SessionRecoveryRow[] = [];
+    let boundaryFound = false;
+    for (let index = rows.length - 1; index >= 0; index -= 1) {
+        const row = rows[index]!;
+        const body = decryptMessage(row);
+        if (body.role === 'agent') {
+            const content = body.content;
+            if (!content || typeof content !== 'object' || Array.isArray(content)
+                || typeof (content as Record<string, unknown>).type !== 'string') {
+                throw new SessionRecoveryError('persisted agent restore message is invalid');
+            }
+            if ((content as Record<string, unknown>).type !== 'event') {
+                boundaryFound = true;
+                break;
+            }
+        } else {
+            if (body.role !== 'user') throw new SessionRecoveryError('persisted restore message role is invalid');
+            if (!UserMessageSchema.safeParse(body).success) {
+                throw new SessionRecoveryError('persisted user restore message is invalid');
+            }
+            pending.push(row);
+        }
+    }
+    if (rows.length === RECENT_MESSAGE_WINDOW && !boundaryFound) {
+        throw new SessionRecoveryError('full recent message window contains no processed-response boundary');
+    }
+    return pending.reverse();
 }
 
 export function selectRecoveryMessages(rawRows: unknown, anchor: SessionRecoveryAnchor): SessionRecoveryRow[] {

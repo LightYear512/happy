@@ -27,6 +27,7 @@ import {
     recoveryRowBytes,
     sameRecoveryRow,
     selectRecoveryMessages,
+    selectInitialRestoreMessages,
     validateRecentMessageWindow,
     type SessionRecoveryAnchor,
     type SessionRecoveryRow,
@@ -543,7 +544,7 @@ export class ApiSessionClient extends EventEmitter {
         try {
             const rows = validateRecentMessageWindow(rawMessages);
             const recovery = mode === 'restore'
-                ? this.selectInitialRestoreMessages(rows)
+                ? selectInitialRestoreMessages(rows, row => this.decryptPersistedMessage(row))
                 : selectRecoveryMessages(rows, anchor);
             let restoreNoticeSent = false;
             for (const message of recovery) {
@@ -569,35 +570,6 @@ export class ApiSessionClient extends EventEmitter {
                 recoveryFailureReason(error));
             return 'rejected';
         }
-    }
-
-    private selectInitialRestoreMessages(rows: SessionRecoveryRow[]): SessionRecoveryRow[] {
-        const pending: SessionRecoveryRow[] = [];
-        let processedResponseBoundaryFound = false;
-        for (let index = rows.length - 1; index >= 0; index -= 1) {
-            const row = rows[index]!;
-            const body = this.decryptPersistedMessage(row);
-            if (body.role === 'agent') {
-                const content = body.content;
-                if (!content || typeof content !== 'object' || Array.isArray(content)
-                    || typeof (content as Record<string, unknown>).type !== 'string') {
-                    throw new SessionRecoveryError('persisted agent restore message is invalid');
-                }
-                if ((content as Record<string, unknown>).type !== 'event') {
-                    processedResponseBoundaryFound = true;
-                    break;
-                }
-                continue;
-            }
-            if (body.role !== 'user') throw new SessionRecoveryError('persisted restore message role is invalid');
-            const parsed = UserMessageSchema.safeParse(body);
-            if (!parsed.success) throw new SessionRecoveryError('persisted user restore message is invalid');
-            pending.push(row);
-        }
-        if (rows.length === RECENT_MESSAGE_WINDOW && !processedResponseBoundaryFound) {
-            throw new SessionRecoveryError('full recent message window contains no processed-response boundary');
-        }
-        return pending.reverse();
     }
 
     private enqueuePersistedMessage(rawMessage: unknown, options: { allowAcceptedReplay?: boolean } = {}): boolean {
@@ -907,7 +879,9 @@ export class ApiSessionClient extends EventEmitter {
         try {
             this.sendSessionEvent({
                 type: 'message',
-                message: `${time} 已接收，正在投递`,
+                // This receipt proves queue acceptance, not a live provider or
+                // model submission. Recovery/turn status is reported separately.
+                message: `${time} 已接收`,
             }, inputAcceptedEventId(message.localKey));
             logUserInputStage('acceptance-receipt-emitted', createUserInputTrace(this.sessionId, message),
                 message.content.text);

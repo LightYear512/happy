@@ -55,6 +55,7 @@ import { projectPath } from '@/projectPath';
 import { logger } from '@/ui/logger';
 import { existsSync } from 'node:fs';
 import { isBun } from './runtime';
+import { spawnWithOwnedProcessGroup } from './processKill';
 
 /**
  * Spawn the Happy CLI with the given arguments in a cross-platform way.
@@ -101,5 +102,6 @@ export function spawnHappyCLI(args: string[], options: SpawnOptions = {}): Child
   }
   
   const runtime = isBun() ? 'bun' : 'node';
-  return spawn(runtime, nodeArgs, { ...options, windowsHide: true });
+  const spawnProcess = options.detached ? spawnWithOwnedProcessGroup : spawn;
+  return spawnProcess(runtime, nodeArgs, { ...options, windowsHide: true });
 }

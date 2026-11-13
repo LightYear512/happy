@@ -45,10 +45,13 @@ async function ensureDaemonForSession(startedBy: 'daemon' | 'terminal' | undefin
   if (await checkIfDaemonRunningAndCleanupStaleState()) return;
 
   logger.debug('Starting Happy background service...');
+  // IMPORTANT: Exclude HAPPY_CHAT_ID/HAPPY_SESSION_ID so daemon doesn't pass them to child sessions,
+  // which would cause skipClaudeMailHook() to skip XC mail delivery
+  const { HAPPY_CHAT_ID, HAPPY_SESSION_ID, ...cleanEnv } = process.env;
   const daemonProcess = spawnHappyCLI(['daemon', 'start-sync'], {
     detached: true,
     stdio: 'ignore',
-    env: process.env,
+    env: cleanEnv,
   });
   daemonProcess.unref();
 
@@ -486,10 +489,12 @@ async function ensureDaemonForSession(startedBy: 'daemon' | 'terminal' | undefin
 
     } else if (daemonSubcommand === 'start') {
       // Spawn detached daemon process
+      // IMPORTANT: Exclude HAPPY_CHAT_ID/HAPPY_SESSION_ID so daemon doesn't pass them to child sessions
+      const { HAPPY_CHAT_ID, HAPPY_SESSION_ID, ...cleanEnv } = process.env;
       const child = spawnHappyCLI(['daemon', 'start-sync'], {
         detached: true,
         stdio: 'ignore',
-        env: process.env
+        env: cleanEnv
       });
       child.unref();
 

@@ -4,6 +4,8 @@
 
 This release expands AI agent support and refines the voice experience, while improving markdown rendering for a better chat experience.
 
+- Added GPT-6 Astra reasoning choices to the Codex model menu while keeping the option to follow CLI settings.
+- Restored CLI-provided Codex model menus so model names and choices refresh from session metadata instead of being replaced by a fixed list.
 - We are working on adding Gemini support using ACP and hopefully fixing codex stability issues using the same approach soon! Stay tuned.
 - Removed model configurations from agents. We were not able to keep up with the models so for now we are removing the configuration from the mobile app. You can still configure it through your CLIs, happy will simply use defaults.
 - Elevenlabs ... is epxensive. Voice conversations will soon require a subscription after 3 free trials - we'll soon allow connecting your own ElevenLabs agent if you want to manage your own spendings.

@@ -74,7 +74,7 @@ describe('shouldAutoRescue — real-world param shapes', () => {
     // emitted by the now-removed `!simcompact` dev bang command, which
     // synthesised what was believed to be the wire shape of a real codex
     // compact failure (also matches the happier-reference fake-codex shape).
-    // This is the ONLY real-world fallback params capture present across all
+    // This was the original compact-failure capture present across all
     // ~/.happy/logs/ on this machine — older logs (5944, 2516, 2568) either
     // predate the auto-rescue log line or only logged a side-channel message
     // without dumping the params object.
@@ -135,11 +135,11 @@ describe('shouldAutoRescue — real-world param shapes', () => {
     });
 });
 
-describe('shouldAutoRescue — only a server compact failure appends the project doc', () => {
+describe('shouldAutoRescue — unrelated failures do not append the project doc', () => {
     // Auto-rescue is the ONLY automatic path into runManualCompact('compact'),
     // which is where .happy/on-fallback-compact.md is appended. So "could this
     // error append the project doc?" reduces to "does shouldAutoRescue return
-    // true?". Every non-compact error below must return false → no append.
+    // true?". Every unrelated error below must return false → no append.
     it('does NOT trigger (→ never appends the doc) on non-compact errors', () => {
         const nonCompact: Array<{ label: string; params: unknown }> = [
             { label: 'rate limit', params: { error: { message: 'Rate limit exceeded, slow down' }, willRetry: false } },
@@ -159,7 +159,7 @@ describe('shouldAutoRescue — only a server compact failure appends the project
         }
     });
 
-    it('DOES trigger only on a genuine server compact failure (willRetry:false + needle)', () => {
+    it('DOES trigger on a genuine server compact failure (willRetry:false + needle)', () => {
         expect(shouldAutoRescue({
             error: { message: 'Error running remote compact task: stream disconnected before completion' },
             willRetry: false,
@@ -167,58 +167,35 @@ describe('shouldAutoRescue — only a server compact failure appends the project
     });
 });
 
+describe('encrypted context failures', () => {
+    const upstream = { type: 'error', error: {
+        type: 'invalid_request_error', code: 'invalid_encrypted_content',
+        message: 'The encrypted content for item rs_example could not be verified. Reason: Encrypted content could not be decrypted or parsed.',
+        param: null,
+    }, status: 400 };
+
+    it.each([
+        { error: upstream.error },
+        { error: { message: JSON.stringify(upstream) }, willRetry: false },
+        { turn: { status: 'failed', error: { message: JSON.stringify(upstream) } } },
+    ])('recognizes the upstream code across native envelopes: %j', (params) => {
+        expect(shouldAutoRescue(params)).toBe(true);
+    });
+
+    it('does not turn unrelated 400s, quoted text, or transient errors into context resets', () => {
+        expect(shouldAutoRescue({ error: { code: 'invalid_request_error', message: 'bad request' }, status: 400 })).toBe(false);
+        expect(shouldAutoRescue({ error: { message: 'example: invalid_encrypted_content' } })).toBe(false);
+        expect(shouldAutoRescue({ error: upstream.error, willRetry: true })).toBe(false);
+    });
+});
+
 describe('createRescueGate', () => {
-    it('first call always succeeds', () => {
-        const gate = createRescueGate(30_000);
-        expect(gate.tryClaim(0)).toBe(true);
-    });
-
-    it('second call within cooldown is rejected', () => {
-        const gate = createRescueGate(30_000);
-        expect(gate.tryClaim(1000)).toBe(true);
-        expect(gate.tryClaim(15_000)).toBe(false);
-        expect(gate.tryClaim(30_999)).toBe(false);
-    });
-
-    it('call after cooldown succeeds', () => {
-        const gate = createRescueGate(30_000);
-        expect(gate.tryClaim(1000)).toBe(true);
-        expect(gate.tryClaim(31_001)).toBe(true);
-    });
-
-    it('subsequent claims reset the cooldown anchor', () => {
-        const gate = createRescueGate(30_000);
-        expect(gate.tryClaim(1000)).toBe(true);
-        expect(gate.tryClaim(31_001)).toBe(true);
-        expect(gate.tryClaim(45_000)).toBe(false);
-        expect(gate.tryClaim(61_002)).toBe(true);
-    });
-
-    it('rejects burst of failures from same compact storm', () => {
-        const gate = createRescueGate(30_000);
-        expect(gate.tryClaim(0)).toBe(true);
-        // 10 retries within 5 seconds — only first should win
-        for (let t = 100; t <= 5000; t += 500) {
-            expect(gate.tryClaim(t)).toBe(false);
-        }
-    });
-
-    it('release rolls back the most recent claim so the next call wins', () => {
-        // Real scenario: tryClaim succeeds → kick off rescue → rescue throws
-        // (rollout missing, build error). The next genuine compact failure
-        // within 30s must still be rescuable, otherwise the user gets a raw
-        // codex error after a silent failed rescue.
-        const gate = createRescueGate(30_000);
-        expect(gate.tryClaim(1000)).toBe(true);
-        // Without release: would be rejected as cooldown-blocked
-        gate.release();
-        expect(gate.tryClaim(2000)).toBe(true);
-    });
-
-    it('release before any claim is a safe no-op', () => {
-        const gate = createRescueGate(30_000);
-        expect(() => gate.release()).not.toThrow();
-        // Subsequent tryClaim still works
-        expect(gate.tryClaim(0)).toBe(true);
+    it('allows only one automatic recovery until an actual successful turn', () => {
+        const gate = createRescueGate();
+        expect(gate.tryClaim()).toBe(true);
+        for (let i = 0; i < 10; i++) expect(gate.tryClaim()).toBe(false);
+        gate.resetAfterSuccess();
+        expect(gate.tryClaim()).toBe(true);
+        expect(gate.tryClaim()).toBe(false);
     });
 });

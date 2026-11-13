@@ -80,6 +80,10 @@ export function getClaudeModelModes(): ModelMode[] {
 export function getCodexModelModes(_translate: Translate): ModelMode[] {
     return [
         { key: 'default', name: _translate('agentInput.codexModel.default'), description: 'Use Codex CLI config' },
+        { key: 'gpt-6-astra:low', name: _translate('agentInput.codexModel.gpt6Low'), description: 'gpt-6-astra / low reasoning' },
+        { key: 'gpt-6-astra:medium', name: _translate('agentInput.codexModel.gpt6Medium'), description: 'gpt-6-astra / medium reasoning' },
+        { key: 'gpt-6-astra:high', name: _translate('agentInput.codexModel.gpt6High'), description: 'gpt-6-astra / high reasoning' },
+        { key: 'gpt-6-astra:xhigh', name: _translate('agentInput.codexModel.gpt6XHigh'), description: 'gpt-6-astra / xhigh reasoning' },
         { key: 'gpt-5.6-sol:minimal', name: _translate('agentInput.codexModel.gpt5Minimal'), description: 'gpt-5.6-sol / minimal reasoning' },
         { key: 'gpt-5.6-sol:low', name: _translate('agentInput.codexModel.gpt5Low'), description: 'gpt-5.6-sol / low reasoning' },
         { key: 'gpt-5.6-sol:medium', name: _translate('agentInput.codexModel.gpt5Medium'), description: 'gpt-5.6-sol / medium reasoning' },
@@ -116,10 +120,6 @@ export function getAvailableModels(
     metadata: Metadata | null | undefined,
     translate: Translate,
 ): ModelMode[] {
-    if (flavor === 'codex') {
-        return getCodexModelModes(translate);
-    }
-
     const metadataModels = mapMetadataOptions(metadata?.models);
     if (metadataModels.length > 0) {
         return metadataModels;

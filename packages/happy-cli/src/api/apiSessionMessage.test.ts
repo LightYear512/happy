@@ -26,7 +26,7 @@ const { ioMock, socket, makeSocket, getMock, isAxiosErrorMock, decryptMock, encr
         decryptMock: vi.fn(() => ({
             role: 'user', content: { type: 'text', text: 'hello' }, meta: { sentFrom: 'cli' },
         } as any)),
-        encryptMock: vi.fn(() => new Uint8Array([1, 2, 3])),
+        encryptMock: vi.fn((..._args: unknown[]) => new Uint8Array([1, 2, 3])),
     };
 });
 
@@ -34,13 +34,18 @@ vi.mock('socket.io-client', () => ({ io: ioMock }));
 vi.mock('axios', () => ({
     default: { get: getMock, isAxiosError: isAxiosErrorMock },
 }));
-vi.mock('@/configuration', () => ({ configuration: { serverUrl: 'https://happy.test' } }));
+vi.mock('@/configuration', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('@/configuration')>();
+    return { ...actual, configuration: { ...actual.configuration, serverUrl: 'https://happy.test' } };
+});
 vi.mock('./encryption', () => ({
     encrypt: encryptMock,
     encodeBase64: vi.fn(() => 'encrypted-user-message'),
     decodeBase64: vi.fn(() => new Uint8Array([1, 2, 3])),
     decrypt: decryptMock,
 }));
+
+import { UserMessageSchema, modelFacingUserText } from './types';
 
 import { ApiSessionMessageClient, sendAgentEventOnce, sendCodexMessageOnce, sendUserMessageOnce } from './apiSessionMessage';
 
@@ -301,6 +306,18 @@ describe('ApiSessionMessageClient', () => {
                     displayText: 'compact summary', presentation: 'compact' },
             }),
         );
+    });
+
+    it('produces consumable model input when compact presentation has no separate display text', async () => {
+        socket.connected = true;
+        acknowledge(socket, { id: 'compact-no-display', seq: 19, localId, createdAt: 12347 });
+        const client = new ApiSessionMessageClient('secret-token', session);
+        await client.sendUserMessageOnce({
+            messageRole: 'user', messageText: 'resume the unfinished work',
+            localId, timeoutMs: 10_000, presentation: 'compact',
+        });
+        const content = encryptMock.mock.calls[0][2];
+        expect(modelFacingUserText(UserMessageSchema.parse(content))).toBe('resume the unfinished work');
     });
 
     it('persists the received Mail card while binding full model text in encrypted metadata', async () => {

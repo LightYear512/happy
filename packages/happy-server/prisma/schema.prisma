@@ -129,6 +129,7 @@ model SessionMessage {
 
     @@unique([sessionId, localId])
     @@index([sessionId, seq])
+    @@index([sessionId, createdAt(sort: Desc)])
 }
 
 //

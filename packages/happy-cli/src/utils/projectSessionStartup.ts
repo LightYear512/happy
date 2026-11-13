@@ -67,13 +67,19 @@ interface ProjectSessionCommandResult {
 export function installHappySessionEnvironment(
     nativeSessionId: string,
     env: NodeJS.ProcessEnv = process.env,
+    options?: { skipXcBinding?: boolean },
 ): void {
     const sessionId = nativeSessionId.trim();
     if (!sessionId) throw new Error('Happy session ID is unavailable');
     env.HAPPY_CHAT_ID = sessionId;
-    env.XC_HOST = 'happy';
-    env.XC_CONVERSATION_ID = sessionId;
-    env.XC_HOST_NAME = 'Happy';
+    // The transport owns the XC identity. A Claude runtime ID must never
+    // change a Happy-hosted conversation's binding or mail delivery route.
+    if (!options?.skipXcBinding) {
+        env.XC_HOST = 'happy';
+        env.XC_CONVERSATION_ID = sessionId;
+        env.XC_HOST_NAME = 'Happy';
+        env.XC_SESSION_ID = sessionId;
+    }
 }
 
 export interface ProjectErrorReportOptions {

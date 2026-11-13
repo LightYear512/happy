@@ -169,14 +169,16 @@ export type AppServerStreamUpdate =
 
 type TurnEndStatus = 'completed' | 'failed' | 'cancelled';
 
-function pickTurnEndStatus(params: RecordLike, method: string): TurnEndStatus {
-    const rawStatus = params.status;
+export function pickTurnEndStatus(params: unknown, method: string): TurnEndStatus {
+    const record = asRecord(params) ?? {};
+    const turn = asRecord(record.turn);
+    if (method === 'error' || record.error != null || turn?.error != null) return 'failed';
+    const rawStatus = turn?.status ?? record.status;
     if (rawStatus === 'completed' || rawStatus === 'failed' || rawStatus === 'cancelled') return rawStatus;
-    if (rawStatus === 'canceled') return 'cancelled';
+    if (rawStatus === 'canceled' || rawStatus === 'interrupted') return 'cancelled';
 
     if (method === 'turn/interrupted') return 'cancelled';
 
-    if (params.error !== undefined && params.error !== null) return 'failed';
     return 'completed';
 }
 
@@ -269,7 +271,8 @@ export function createAppServerStreamBridge(): {
         }
 
         // -- turn/completed ----------------------------------------------
-        if (method === 'turn/completed') {
+        if (method === 'turn/completed' || method === 'error') {
+            if (method === 'error' && record.willRetry === true) return [];
             if (!currentTurnId) return [];
             const status = pickTurnEndStatus(record, method);
             const envelope = createEnvelope('agent', { t: 'turn-end', status }, { turn: currentTurnId });
@@ -277,7 +280,9 @@ export function createAppServerStreamBridge(): {
             const lastText = readText(record, ['lastAgentMessage', 'message', 'text']);
             const updates: AppServerStreamUpdate[] = [
                 { type: 'envelope', envelope },
-                { type: 'task-complete', lastAgentMessage: lastText ?? undefined },
+                status === 'completed'
+                    ? { type: 'task-complete', lastAgentMessage: lastText ?? undefined }
+                    : { type: 'turn-aborted' },
             ];
             currentTurnId = null;
             return updates;

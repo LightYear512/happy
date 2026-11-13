@@ -8,6 +8,7 @@ import { parseSpecialCommand } from "@/parsers/specialCommands";
 import { logger } from "@/lib";
 import { PushableAsyncIterable } from "@/utils/PushableAsyncIterable";
 import { getProjectPath } from "./utils/path";
+import { resolveClaudeSessionFile } from "./utils/resolveClaudeSessionFile";
 import { awaitFileExist } from "@/modules/watcher/awaitFileExist";
 import { systemPrompt } from "./utils/systemPrompt";
 import { PermissionResult } from "./sdk/types";
@@ -31,7 +32,7 @@ export async function claudeRemote(opts: {
 
     // Dynamic parameters
     nextMessage: () => Promise<{ message: string, mode: EnhancedMode } | null>,
-    onReady: () => void,
+    onReady: () => void | Promise<void>,
     isAborted: (toolCallId: string) => boolean,
 
     // Callbacks
@@ -41,51 +42,15 @@ export async function claudeRemote(opts: {
     onCompletionEvent?: (message: string) => void,
     onSessionReset?: () => void,
     /** Called when Claude returns an error result (rate limit, max turns, etc.) */
-    onErrorResult?: (message: string) => void,
+    onErrorResult?: (message: string) => void | Promise<void>,
     /** Called when a rate_limit_event is received from the SDK stream */
     onRateLimitEvent?: (info: { rateLimitType: string; resetsAt: number | null }) => void,
 }) {
 
-    // Check if session is valid
-    let startFrom = opts.sessionId;
-    if (opts.sessionId && !claudeCheckSession(opts.sessionId, opts.path)) {
-        startFrom = null;
-    }
-    
-    // Extract --resume from claudeArgs if present (for first spawn)
-    if (!startFrom && opts.claudeArgs) {
-        for (let i = 0; i < opts.claudeArgs.length; i++) {
-            if (opts.claudeArgs[i] === '--resume') {
-                // Check if next arg exists and looks like a session ID
-                if (i + 1 < opts.claudeArgs.length) {
-                    const nextArg = opts.claudeArgs[i + 1];
-                    // If next arg doesn't start with dash and contains dashes, it's likely a UUID
-                    if (!nextArg.startsWith('-') && nextArg.includes('-')) {
-                        if (claudeCheckSession(nextArg, opts.path)) {
-                            startFrom = nextArg;
-                            logger.debug(`[claudeRemote] Found --resume with valid session ID: ${startFrom}`);
-                        } else {
-                            logger.debug(`[claudeRemote] --resume session ${nextArg} not found on disk, starting fresh`);
-                        }
-                        break;
-                    } else {
-                        // Just --resume without UUID - SDK doesn't support this
-                        logger.debug('[claudeRemote] Found --resume without session ID - not supported in remote mode');
-                        break;
-                    }
-                } else {
-                    // --resume at end of args - SDK doesn't support this
-                    logger.debug('[claudeRemote] Found --resume without session ID - not supported in remote mode');
-                    break;
-                }
-            }
-        }
-    }
-
     // Get initial message
     const initial = await opts.nextMessage();
     if (!initial) { // No initial message - exit
-        return;
+        return 'no-input' as const;
     }
 
     // Handle special commands
@@ -100,6 +65,39 @@ export async function claudeRemote(opts: {
             opts.onSessionReset();
         }
         return;
+    }
+
+    // Resolve against the selected account after taking the input. A missing
+    // transcript must never silently turn a restored chat into a fresh one.
+    let startFrom = opts.sessionId;
+    let resumeRequested = startFrom !== null;
+    if (!startFrom && opts.claudeArgs) {
+        for (let i = 0; i < opts.claudeArgs.length; i++) {
+            const arg = opts.claudeArgs[i];
+            if (arg === '--resume' || arg === '-r' || arg.startsWith('--resume=')) {
+                resumeRequested = true;
+                const candidate = arg.startsWith('--resume=') ? arg.slice('--resume='.length) : opts.claudeArgs[i + 1];
+                startFrom = candidate && !candidate.startsWith('-') ? candidate : null;
+                break;
+            }
+            if (arg === '--continue' || arg === '-c') resumeRequested = true;
+        }
+    }
+    if (resumeRequested) {
+        let readable = false;
+        try {
+            readable = !!startFrom && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(startFrom)
+                && claudeCheckSession(startFrom, opts.path);
+        } catch {
+            // A read failure has the same recovery path as a missing transcript.
+        }
+        if (!readable) {
+            const message = '无法恢复原 Claude 会话：当前账号找不到可读的历史记录，或恢复命令缺少明确的会话 ID。请修复共享历史目录后重试。为保护上下文，已阻止新建空白会话；只有明确发送 /clear 才会重置。';
+            logger.debug('[claudeRemote] Resume blocked; keeping the requested session identity');
+            if (opts.onErrorResult) await opts.onErrorResult(message);
+            else opts.onCompletionEvent?.(message);
+            return 'resume-unavailable' as const;
+        }
     }
 
     // Handle /compact command
@@ -185,7 +183,9 @@ export async function claudeRemote(opts: {
                 if (systemInit.session_id) {
                     logger.debug(`[claudeRemote] Waiting for session file to be written to disk: ${systemInit.session_id}`);
                     const projectDir = getProjectPath(opts.path);
-                    const found = await awaitFileExist(join(projectDir, `${systemInit.session_id}.jsonl`));
+                    const sessionFile = resolveClaudeSessionFile(systemInit.session_id, opts.path)
+                        ?? join(projectDir, `${systemInit.session_id}.jsonl`);
+                    const found = await awaitFileExist(sessionFile);
                     logger.debug(`[claudeRemote] Session file found: ${systemInit.session_id} ${found}`);
                     opts.onSessionFound(systemInit.session_id);
                 }
@@ -217,7 +217,7 @@ export async function claudeRemote(opts: {
                     const errorText = resultMsg.result || `Error: ${resultMsg.subtype}`;
                     logger.debug(`[claudeRemote] Error result: ${errorText}`);
                     if (opts.onErrorResult) {
-                        opts.onErrorResult(errorText);
+                        await opts.onErrorResult(errorText);
                     }
                     // Don't call onReady() — turn should be closed as 'failed' by launcher
                     // Still wait for next message so user can retry after limit resets
@@ -241,7 +241,7 @@ export async function claudeRemote(opts: {
                 }
 
                 // Send ready event
-                opts.onReady();
+                await opts.onReady();
 
                 // Push next message
                 const next = await opts.nextMessage();
@@ -276,4 +276,5 @@ export async function claudeRemote(opts: {
     } finally {
         updateThinking(false);
     }
+    return undefined;
 }

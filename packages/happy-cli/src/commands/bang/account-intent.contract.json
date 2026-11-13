@@ -1,18 +1,39 @@
 {
   "schemaVersion": "contract-first-module-gate/v2",
   "contractProfile": "contract-first-minimal-boundary/v1",
-  "riskTriggers": ["public-abi-or-persistent-format"],
+  "riskTriggers": [
+    "public-abi-or-persistent-format"
+  ],
   "module": "happy.account-intent",
   "owner": "happy-cli account command and provider input boundary",
   "publicApis": [
     {
       "name": "publish_and_consume_account_intent",
-      "inputs": ["validated provider flavor", "validated profile name", "Happy session ID"],
-      "acceptedStates": ["missing global intent or session selection", "strict v1 global intent and session selection", "clock rollback normalized to the next monotonic timestamp"],
-      "rejectedStates": ["malformed schema or unknown field", "invalid or exhausted timestamp"],
-      "provenanceFields": ["flavor", "profileName", "setAt", "Happy session ID"],
-      "outputState": "one monotonic global intent and one per-session current profile plus last-seen global timestamp",
-      "enforcement": "strict parser plus atomic writers",
+      "inputs": [
+        "validated provider flavor",
+        "validated profile name",
+        "Happy session ID",
+        "fixed Codex model family"
+      ],
+      "acceptedStates": [
+        "missing global intent or session selection",
+        "strict v1 global intent and session selection",
+        "clock rollback normalized to the next monotonic timestamp",
+        "legacy GPT document and separate DeepSeek document keep the same strict v1 shape"
+      ],
+      "rejectedStates": [
+        "malformed schema or unknown field",
+        "invalid or exhausted timestamp",
+        "cross-family global profile"
+      ],
+      "provenanceFields": [
+        "flavor",
+        "profileName",
+        "setAt",
+        "Happy session ID"
+      ],
+      "outputState": "independent GPT and DeepSeek monotonic intent; legacy GPT readers retain the original file and schema; each session samples only its fixed family before real input",
+      "enforcement": "strict parser and atomic writers, explicit family selection in both Codex runners and manual account switching",
       "negativeTests": [
         {
           "name": "account_intent_boundary",
@@ -22,7 +43,7 @@
     }
   ],
   "budgets": {
-    "notApplicableReason": "two bounded local JSON documents add no resource budget"
+    "notApplicableReason": "Fixed small local JSON documents add no resource budget."
   },
   "lifecycleTransitions": {
     "notApplicableReason": "input-boundary switching uses monotonic scalar comparison, not a persisted lifecycle"

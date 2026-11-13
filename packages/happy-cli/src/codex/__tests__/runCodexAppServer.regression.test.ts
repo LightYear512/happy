@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
+import { runInNewContext } from 'node:vm';
 import * as ts from 'typescript';
 import { findAllNodes, findFirstNode, findMethodCalls } from './astHelpers';
+import { RESTORE_SESSION_STARTUP_TIMEOUT_MS } from '@/daemon/run';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SOURCE_PATH = resolve(__dirname, '..', 'runCodexAppServer.ts');
@@ -61,6 +63,38 @@ function findModeHashChangeBranch(): ts.IfStatement | null {
 // --- Contracts ----------------------------------------------------------
 
 describe('runCodexAppServer — AST regression contracts', () => {
+    it('does not cold-retry a resume that already owns the whole startup deadline', () => {
+        const call = findFirstNode(SF, (node): node is ts.CallExpression =>
+            ts.isCallExpression(node) && ts.isIdentifier(node.expression)
+            && node.expression.text === 'performCodexAccountSwap');
+        expect(call).not.toBeNull();
+        const options = call!.arguments[0] as ts.ObjectLiteralExpression;
+        const policy = options.properties.find((property) =>
+            ts.isPropertyAssignment(property) && property.name.getText(SF) === 'recoverResumeTimeout');
+        expect(policy && ts.isPropertyAssignment(policy)).toBe(true);
+        const expression = (policy as ts.PropertyAssignment).initializer.getText(SF);
+        for (const deadlineAt of [undefined, Date.now() + 54_000, Date.now() - 1]) {
+            for (const recoverResumeTimeout of [false, true]) {
+                expect(runInNewContext(expression, { deadlineAt, recoverResumeTimeout }))
+                    .toBe(false);
+            }
+        }
+    });
+
+    it('gives live account recovery one absolute restore budget', () => {
+        const calls = findAllNodes(SF, (node): node is ts.CallExpression =>
+            ts.isCallExpression(node) && ts.isIdentifier(node.expression)
+            && node.expression.text === 'openAccountClient'
+            && node.arguments[1]?.getText(SF) === 'threadId');
+        expect(calls).toHaveLength(1);
+        const before = Date.now();
+        const deadlineAt = runInNewContext(calls[0]!.arguments[2]!.getText(SF), {
+            RESTORE_SESSION_STARTUP_TIMEOUT_MS,
+        }) as number;
+        expect(deadlineAt).toBeGreaterThanOrEqual(before + 180_000);
+        expect(deadlineAt).toBeLessThanOrEqual(Date.now() + 180_000);
+    });
+
     describe('mode-hash-change branch never rebuilds the Codex thread', () => {
         const branch = findModeHashChangeBranch();
 
@@ -234,6 +268,26 @@ describe('runCodexAppServer — AST regression contracts', () => {
                 expect(source).toContain('excludeTurns: true');
                 expect(source).not.toContain('persistExtendedHistory');
             });
+
+            it.each([undefined, 60_000, 500, -1])(
+                `thread/resume call at L${line} retains its startup deadline (%s ms remaining)`,
+                (remainingMs) => {
+                    const deadlineAt = remainingMs === undefined ? undefined : Date.now() + remainingMs;
+                    const options = runInNewContext(`(${call.arguments[2].getText(SF)})`, { deadlineAt }) as {
+                        deadlineAt?: number;
+                        timeoutMs?: number;
+                    };
+                    expect(options.deadlineAt).toBe(deadlineAt);
+                    if (remainingMs === undefined) {
+                        expect(options.timeoutMs).toBeUndefined();
+                    } else {
+                        // Execute the actual request-options expression, without replacing
+                        // the clock or simulating a provider response.
+                        expect(options.timeoutMs).toBeLessThanOrEqual(remainingMs);
+                        expect(options.timeoutMs).toBeGreaterThanOrEqual(deadlineAt! - Date.now());
+                    }
+                },
+            );
         }
     });
 

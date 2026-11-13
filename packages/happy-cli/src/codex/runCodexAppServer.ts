@@ -15,6 +15,7 @@ import React from 'react';
 import { homedir } from 'node:os';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { ApiClient } from '@/api/api';
 import { localCommandUserText, modelFacingUserText } from '@/api/types';
 import { projectPath } from '@/projectPath';
@@ -22,21 +23,23 @@ import { registerShutdownHandlers } from '@/utils/shutdownHandlers';
 import { createCodexAppServerClient, type CodexAppServerClient } from './codexAppServerClient';
 import {
     performCodexAccountSwap,
+    CodexAccountSwapCancelled,
     requireExactCodexThreadResume,
     type AccountSwapResult,
 } from './codexAccountSwap';
 import { buildCodexChildEnv } from './codexEnvBuilder';
-import { createAppServerStreamBridge, type AppServerStreamUpdate } from './appServerStreamBridge';
+import { CodexProcessCleanupError } from './codexAppServerProcess';
+import { createAppServerStreamBridge, pickTurnEndStatus, type AppServerStreamUpdate } from './appServerStreamBridge';
 import { withCodexModelModeMetadata } from './modelMode';
-import { resolveCodexModelModeOrDefault } from './defaultModelConfig';
+import { resolveCodexModelModeOrDefault, readCodexModelFamily } from './defaultModelConfig';
 import { CodexPermissionHandler } from './utils/permissionHandler';
 import { ReasoningProcessor } from './utils/reasoningProcessor';
 import { DiffProcessor } from './utils/diffProcessor';
-import { extractCodexErrorDetail, formatCodexErrorForUi } from './utils/codexErrorDetail';
+import { extractCodexErrorDetail, formatCodexErrorForUi, isCodexCapacityError } from './utils/codexErrorDetail';
 import { randomUUID } from 'node:crypto';
-import { logger } from '@/ui/logger';
+import { diagnosticTrace, logger } from '@/ui/logger';
 import { Credentials, readSettings } from '@/persistence';
-import { initialMachineMetadata, shouldRegisterMachineForSession } from '@/daemon/run';
+import { initialMachineMetadata, RESTORE_SESSION_STARTUP_TIMEOUT_MS, shouldRegisterMachineForSession } from '@/daemon/run';
 import { MessageQueue2, type MessageQueueBatch } from '@/utils/MessageQueue2';
 import { createUserInputTrace, logUserInputStage } from '@/utils/userInputTrace';
 import { hashObject } from '@/utils/deterministicJson';
@@ -82,6 +85,7 @@ import { loadFallbackCompactDocs } from './utils/projectFallbackDocs';
 import { shouldAutoRescue, createRescueGate } from './utils/codexAutoRescue';
 import { createTurnLifecycle } from './utils/turnLifecycle';
 import { createRecentUserBuffer } from './utils/recentUserBuffer';
+import { createCodexRawItemDiagnostics } from './utils/codexRawItemDiagnostics';
 import { createHtaskReplyMonitorRuntime } from '@/commands/bang/replyMonitorRuntime';
 
 // ---------------------------------------------------------------------------
@@ -126,6 +130,25 @@ export function readThreadId(value: unknown): string | null {
         if (typeof c === 'string' && c.trim().length > 0) return c.trim();
     }
     return null;
+}
+
+/** Publish only a durable thread: persist Happy's real bootstrap instructions first. */
+export async function startCodexThread(
+    client: CodexAppServerClient,
+    params: Readonly<Record<string, unknown>>,
+    deadlineAt?: number,
+): Promise<string> {
+    const response = await client.request('thread/start', params, { deadlineAt });
+    const id = readThreadId(response);
+    if (!id) throw new Error('Codex app-server thread/start returned no thread id');
+    // An untouched thread/start is only live state in Codex. This replaces the
+    // bootstrap previously prepended to the first user turn; no invented user
+    // message, model turn, or hand-written rollout is needed to make it durable.
+    await client.request('thread/inject_items', {
+        threadId: id,
+        items: [{ type: 'message', role: 'developer', content: [{ type: 'input_text', text: systemPrompt }] }],
+    }, { deadlineAt });
+    return id;
 }
 
 // codex 0.130.0 emits the turn id under a nested `turn` object in
@@ -233,9 +256,15 @@ export async function runCodexWithAppServer(opts: {
         session?: ApiSessionClient;
         /** Override the session working dir (sandbox roots / .happy doc lookup). */
         cwd?: string;
+        /** Shorten the bounded capacity backoff in offline runtime tests. */
+        capacityRetryDelaysMs?: readonly number[];
         onRuntimeReady?: (handles: { requestExit: () => void }) => void;
     };
 }): Promise<void> {
+    // A new session's explicit CODEX_HOME is its local account choice. Restores
+    // still use the saved/global selection rules and never repin on restart.
+    const explicitCodexProfile = !opts.restoreSessionId && !opts.codexSessionId
+        ? getCurrentCodexProfile() ?? undefined : undefined;
     //
     // Apply default codex profile if CODEX_HOME is not set
     //
@@ -248,6 +277,9 @@ export async function runCodexWithAppServer(opts: {
         }
     }
     let activeCodexProfile = getCurrentCodexProfile();
+    const accountIntentFamily = readCodexModelFamily(process.env.CODEX_HOME || join(homedir(), '.codex'));
+    const readGlobalAccountIntent = () => accountIntentFamily
+        ? readAccountIntent('codex', undefined, accountIntentFamily) : null;
 
     //
     // Session setup (mirrors runCodex)
@@ -310,6 +342,7 @@ export async function runCodexWithAppServer(opts: {
     // Message queue (same as runCodex)
     //
 
+    const observeRawItem = createCodexRawItemDiagnostics(session.sessionId);
     const messageQueue = new MessageQueue2<EnhancedMode>((mode) => hashObject({
         permissionMode: mode.permissionMode,
         model: mode.model,
@@ -338,6 +371,39 @@ export async function runCodexWithAppServer(opts: {
     let activeTurnId: string | null = null;
     let threadIdStored = false;
     let client: CodexAppServerClient | null = null;
+    let shouldExit = false;
+    type AccountSwapSource = 'global' | 'single-session';
+    type AccountSwapRequest = { target: string; source: AccountSwapSource; seenSetAt: number };
+    let pendingAccountSwap: AccountSwapRequest | null = null;
+    let failedAccountSwap: AccountSwapRequest | null = null;
+    let accountRecovery: AbortController | null = null;
+    let recoveryOperation: Promise<AccountSwapResult<CodexAppServerClient>> | null = null;
+    let wakeRecovery: (() => void) | null = null;
+    const capacityRetryDelays = opts.deps?.capacityRetryDelaysMs ?? [10_000, 30_000, 60_000];
+    let capacityRecovery: { controller: AbortController; attempts: number; waiting: boolean; stopRequested: boolean } | null = null;
+    const requestExit = (): void => {
+        shouldExit = true;
+        capacityRecovery?.controller.abort();
+        messageQueue.close();
+        accountRecovery?.abort();
+        turnLifecycle.finish();
+        wakeRecovery?.();
+    };
+    const stopRuntimeClients = async (): Promise<void> => {
+        requestExit();
+        const retiring = client;
+        client = null;
+        const results = await Promise.allSettled([
+            retiring?.dispose(),
+            recoveryOperation?.then(async (result) => {
+                if (result.ok) await result.client.dispose();
+                else if (result.cleanupFailed) throw result.error;
+            }),
+        ]);
+        for (const result of results) {
+            if (result.status === 'rejected') throw result.reason;
+        }
+    };
     const replyMonitor = createHtaskReplyMonitorRuntime(session, 'codex', undefined, undefined, (text) => {
         const enhancedMode: EnhancedMode = {
             permissionMode: currentPermissionMode,
@@ -348,6 +414,7 @@ export async function runCodexWithAppServer(opts: {
     });
 
     const onUserMessage = (message: import('@/api/types').UserMessage): void => {
+        if (shouldExit) throw new Error('Codex runtime is closing');
         if (message.meta?.permissionMode) {
             currentPermissionMode = message.meta.permissionMode as PermissionMode;
             session.updateMetadata((metadata) => ({
@@ -430,6 +497,8 @@ export async function runCodexWithAppServer(opts: {
                 isConsoleSession: false,
                 flavor: 'codex',
                 deferCodexProfileSwitch: true,
+                codexRuntimeReady: client !== null && failedAccountSwap === null && accountRecovery === null,
+                codexRecoveryTarget: failedAccountSwap?.target,
             }).then(async result => {
                 await new Promise(resolve => setTimeout(resolve, 200));
                 const messages = Array.isArray(result.message) ? result.message : [result.message];
@@ -457,13 +526,18 @@ export async function runCodexWithAppServer(opts: {
                 // path disposes the child and respawns it with the new env;
                 // the savedThreadId hand-off keeps the conversation intact.
                 if (result.action === 'restart-session') {
-                    const target = result.restartProfile || activeCodexProfile || 'unknown';
+                    if (shouldExit) return;
+                    const target = result.restartProfile || failedAccountSwap?.target || activeCodexProfile;
+                    if (!target) throw new Error('No Codex profile selected for restart');
                     logger.debug(`[CodexAppServer] Single-session swap requested → ${target}`);
                     pendingAccountSwap = {
                         target,
                         source: 'single-session',
-                        seenSetAt: result.restartSeenGlobalSetAt,
+                        seenSetAt: result.restartSeenGlobalSetAt ?? readGlobalAccountIntent()?.setAt ?? 0,
                     };
+                    accountRecovery?.abort();
+                    capacityRecovery?.controller.abort();
+                    wakeRecovery?.();
                     messageQueue.interrupt();
                 }
                 session.sendSessionEvent({ type: 'ready' });
@@ -483,6 +557,15 @@ export async function runCodexWithAppServer(opts: {
         // here rather than acknowledge input that was not accepted.
         const text = modelFacingUserText(message);
         messageQueue.push(text, enhancedMode, inputTrace);
+        if (capacityRecovery?.waiting) capacityRecovery.controller.abort();
+        // A new input is also a bounded retry request. Claim the failed target
+        // synchronously so a burst joins this recovery instead of cancelling or
+        // spawning it repeatedly. Existing pending input keeps its original owner.
+        if (failedAccountSwap && !pendingAccountSwap) {
+            pendingAccountSwap = failedAccountSwap;
+            failedAccountSwap = null;
+        }
+        wakeRecovery?.();
         logUserInputStage('provider-queue-enqueued', inputTrace, text, {
             queueDepth: messageQueue.size(),
         });
@@ -515,10 +598,11 @@ export async function runCodexWithAppServer(opts: {
         requestClient: CodexAppServerClient,
         permissionMode: PermissionMode,
         model: string | undefined,
+        deadlineAt?: number,
     ): Promise<string> => {
         const executionPolicy = resolveCodexExecutionPolicy(permissionMode, !!sandboxConfig);
         const modelConfig = resolveCodexModelModeOrDefault(model);
-        const threadResponse = await requestClient.request('thread/start', {
+        const freshThreadId = await startCodexThread(requestClient, {
             cwd: sessionCwd,
             approvalPolicy: toApprovalPolicy(executionPolicy.approvalPolicy),
             sandbox: executionPolicy.sandbox,
@@ -526,19 +610,17 @@ export async function runCodexWithAppServer(opts: {
             ...(modelConfig.reasoningEffort ? { config: { model_reasoning_effort: modelConfig.reasoningEffort } } : {}),
             experimentalRawEvents: true,
             persistExtendedHistory: true,
-        });
-        const freshThreadId = readThreadId(threadResponse);
-        if (!freshThreadId) throw new Error('Codex app-server thread/start returned no thread id');
+        }, deadlineAt);
+        needsSystemPromptInjection = false;
         logger.debug(`[CodexAppServer] Started thread: ${freshThreadId}`);
         return freshThreadId;
     };
 
-    // Auto-rescue gate: when codex's auto pre-sampling compaction fails
-    // (`willRetry: false`, message contains "Error running remote compact task")
-    // we trigger /compact for the user automatically. The cooldown prevents a
-    // failure storm (same turn retrying 5x in 2s) from spawning multiple
-    // rescues.
-    const autoRescueGate = createRescueGate(30_000);
+    // One recovery per consecutive failure streak. Only a completed model
+    // turn rearms this gate; ready events and timer ticks cannot do so.
+    const autoRescueGate = createRescueGate();
+    const turnOutcome: { status: 'completed' | 'failed' | 'cancelled'; detail?: string; capacity?: boolean } = { status: 'cancelled' };
+    let lastTerminalTurnId: string | null = null;
 
     // Pending turn tracking — turn/start RPC returns immediately (non-blocking).
     // We await `turnLifecycle.current` which is settled by the turn/completed,
@@ -558,7 +640,7 @@ export async function runCodexWithAppServer(opts: {
     async function runManualCompact(
         mode: 'compact' | 'clear',
         autoTriggered: boolean = false,
-    ): Promise<void> {
+    ): Promise<boolean> {
         // User-facing label for /compact: "本地压缩" when triggered by us
         // (auto-rescue or unknown), "/compact" when typed by the user. Avoid
         // surfacing "auto-rescue" — it's an internal abstraction.
@@ -571,15 +653,15 @@ export async function runCodexWithAppServer(opts: {
                 message: `⚠️ ${opLabel} 进行中`,
             });
             session.sendSessionEvent({ type: 'ready' });
-            return;
+            return false;
         }
-        if (!client) {
+        if (!client || accountRecovery || failedAccountSwap || shouldExit) {
             session.sendSessionEvent({
                 type: 'message',
                 message: `ℹ️ ${opLabel} 暂不可用`,
             });
             session.sendSessionEvent({ type: 'ready' });
-            return;
+            return false;
         }
         const previousThreadId = threadId;
         if (!previousThreadId) {
@@ -588,8 +670,10 @@ export async function runCodexWithAppServer(opts: {
                 message: `ℹ️ ${opLabel}：当前无对话`,
             });
             session.sendSessionEvent({ type: 'ready' });
-            return;
+            return false;
         }
+
+        capacityRecovery?.controller.abort();
 
         let finishCompact!: () => void;
         compactInFlight = new Promise<void>((resolve) => { finishCompact = resolve; });
@@ -626,7 +710,7 @@ export async function runCodexWithAppServer(opts: {
                         message: `⚠️ ${compactLabel} 失败：会话历史不存在`,
                     });
                     session.sendSessionEvent({ type: 'ready' });
-                    return;
+                    return false;
                 }
                 const built = await buildHeuristicSeed({
                     rolloutPath,
@@ -755,13 +839,13 @@ export async function runCodexWithAppServer(opts: {
                 messageQueue.push(replayText, replayMode);
                 logger.debug(`[CodexAppServer] [auto] /compact resume: pushed '${replayText}' to queue`);
             }
+            return true;
         } finally {
             finishCompact();
             compactInFlight = null;
         }
     }
 
-    let shouldExit = false;
 
     let keepAliveInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -793,8 +877,7 @@ export async function runCodexWithAppServer(opts: {
             logPath: process.env.DEBUG ? logger.getLogPath() : undefined,
             onExit: async () => {
                 logger.debug('[CodexAppServer] Exiting agent via Ctrl-C');
-                shouldExit = true;
-                messageQueue.close();
+                requestExit();
             },
         }), {
             exitOnCtrlC: false,
@@ -834,12 +917,8 @@ export async function runCodexWithAppServer(opts: {
     // block's dispose a no-op so we don't double-dispose.
     const removeShutdownHandlers = registerShutdownHandlers(async () => {
         logger.debug('[CodexAppServer] Received shutdown signal, disposing client and flushing');
-        const local = client;
-        client = null;
-        if (local) {
-            try { await local.dispose(); } catch (error) {
-                logger.debug('[CodexAppServer] Error disposing client on signal:', error);
-            }
+        try { await stopRuntimeClients(); } catch (error) {
+            diagnosticTrace('[CODEX] Shutdown cleanup failed', String(error));
         }
         try {
             replyMonitor.dispose();
@@ -863,11 +942,9 @@ export async function runCodexWithAppServer(opts: {
     }
     mcpServerConfigOverrides.push(`mcp_servers.happy.enabled=true`);
 
-    // Inject system prompt on the first turn of every fresh codex thread so
-    // the model knows to call mcp__happy__change_title. Restored sessions
-    // resume an existing thread that already had it. Reset to true whenever
-    // a brand-new thread is started (e.g. mode change), and consume only
-    // after a successful turn/start so transient RPC failures don't drop it.
+    // Fresh threads persist these instructions during creation. Keep the
+    // existing first-turn injection for an explicit resume of an outside
+    // Codex thread; a restored Happy session already has its bootstrap.
     let needsSystemPromptInjection = !opts.restoreSessionId;
 
     // Accumulate streaming text deltas — send as one message on turn completion
@@ -1044,6 +1121,8 @@ export async function runCodexWithAppServer(opts: {
 
     async function handleAbort() {
         logger.debug('[CodexAppServer] Abort requested');
+        if (capacityRecovery) capacityRecovery.stopRequested = true;
+        capacityRecovery?.controller.abort();
         try {
             if (client && threadId && activeTurnId) {
                 logger.debug(`[CodexAppServer] Interrupting turn ${activeTurnId} on thread ${threadId}`);
@@ -1062,9 +1141,10 @@ export async function runCodexWithAppServer(opts: {
 
     const handleKillSession = async () => {
         logger.debug('[CodexAppServer] Kill session requested - terminating process');
-        await handleAbort();
+        requestExit();
 
         try {
+            await stopRuntimeClients();
             if (session) {
                 replyMonitor.dispose();
                 session.updateMetadata((currentMetadata) => ({
@@ -1077,9 +1157,6 @@ export async function runCodexWithAppServer(opts: {
                 session.sendSessionDeath();
                 await session.flush();
                 await session.close();
-            }
-            if (client) {
-                await client.dispose();
             }
             stopCaffeinate();
             happyServer.stop();
@@ -1100,11 +1177,10 @@ export async function runCodexWithAppServer(opts: {
         removeTransportFatalHandler();
         removeTransportFatalHandler = registerSessionTransportFatalHandler(boundSession, async (snapshot) => {
             logger.warn(`[CodexAppServer] Happy transport became terminal (${snapshot.state}); shutting down the unreachable runtime`);
-            shouldExit = true;
-            messageQueue.close();
+            requestExit();
             const hardExit = setTimeout(() => process.exit(1), 5_000);
             hardExit.unref();
-            await handleAbort();
+            await stopRuntimeClients();
         });
     };
     bindTransportFatalHandler(session);
@@ -1113,6 +1189,47 @@ export async function runCodexWithAppServer(opts: {
     // Main loop
     //
 
+    const stopFailedRecovery = (detail: string): void => {
+        logger.warn('[CodexAppServer] Automatic context recovery stopped:', detail);
+        session.sendSessionEvent({
+            type: 'message',
+            message: `⚠️ 上下文自动恢复未成功，已停止本会话进程以避免反复请求。历史已保留；修复账号或服务后可重新打开会话。\n${detail}`,
+        });
+        requestExit();
+    };
+
+    const handleTurnFailure = (params: unknown): void => {
+        turnOutcome.status = 'failed';
+        turnOutcome.detail = extractCodexErrorDetail(params);
+        turnOutcome.capacity = isCodexCapacityError(params);
+        lastTerminalTurnId = readTurnId(params) ?? activeTurnId;
+        processBridgeUpdates(bridge.onNotification('error', params));
+        activeTurnId = null;
+        turnLifecycle.finish();
+        replyMonitor.endActiveReply('error');
+        // The turn consumer continues the existing thread after a bounded
+        // backoff. Never replay the accepted user input or switch its model.
+        if (turnOutcome.capacity && capacityRecovery
+            && !capacityRecovery.controller.signal.aborted
+            && capacityRecovery.attempts < capacityRetryDelays.length) return;
+        if (shouldAutoRescue(params)) {
+            if (compactInFlight) return; // A user-requested compaction already owns the handoff.
+            if (!autoRescueGate.tryClaim()) {
+                stopFailedRecovery(turnOutcome.detail);
+                return;
+            }
+            logger.warn('[CodexAppServer] Auto-rescue triggered for unusable context:', params);
+            void runManualCompact('compact', true).then((recovered) => {
+                if (!recovered) stopFailedRecovery('本地压缩无法完成');
+            }).catch((error) => {
+                stopFailedRecovery(error instanceof Error ? error.message : String(error));
+            });
+            return;
+        }
+        logger.warn('[CodexAppServer] Codex error notification:', params);
+        session.sendSessionEvent({ type: 'message', message: formatCodexErrorForUi(turnOutcome.detail) });
+    };
+
     // Attach all notification + request handlers to a codex app-server client.
     // Extracted so we can rebind the same callbacks onto a fresh client instance
     // after a !auth-all --codex swap. All captured vars (bridge, threadId, session,
@@ -1120,6 +1237,16 @@ export async function runCodexWithAppServer(opts: {
     // a swap is transparent — the new client's events route through the same
     // happy-session state as the old one.
     const registerClientHandlers = (c: CodexAppServerClient) => {
+        lastTerminalTurnId = null; // The retired client's callbacks are fenced by client identity.
+        const registerNotification: CodexAppServerClient['registerNotificationHandler'] = (method, handler) =>
+            c.registerNotificationHandler(method, (params) => {
+                if (c === client && !shouldExit) return handler(params);
+            });
+        const registerRequest: CodexAppServerClient['registerRequestHandler'] = (method, handler) =>
+            c.registerRequestHandler(method, (params, message) => {
+                if (c !== client || shouldExit) throw new Error('Codex client is not the active session owner');
+                return handler(params, message);
+            });
         const isRootThreadNotification = (method: string, params: unknown): boolean => {
             const notificationThreadId = readThreadId(params);
             if (threadId && notificationThreadId && notificationThreadId !== threadId) {
@@ -1131,7 +1258,7 @@ export async function runCodexWithAppServer(opts: {
             return true;
         };
 
-        c.registerNotificationHandler('turn/started', (params) => {
+        registerNotification('turn/started', (params) => {
             if (!isRootThreadNotification('turn/started', params)) return;
             const updates = bridge.onNotification('turn/started', params);
             // Extract turnId from notification
@@ -1142,141 +1269,82 @@ export async function runCodexWithAppServer(opts: {
             processBridgeUpdates(updates);
         });
 
-        c.registerNotificationHandler('turn/completed', (params) => {
-            if (!isRootThreadNotification('turn/completed', params)) return;
-            // Stale notification guard: a delayed turn/completed for a turn we
-            // already moved past (e.g. after /compact swap or auto-rescue
-            // re-thread) must not settle the NEW turn's promise.
-            const notifTurnId = readTurnId(params);
-            if (notifTurnId && activeTurnId && notifTurnId !== activeTurnId) {
-                logger.debug(`[CodexAppServer] Ignoring stale turn/completed turnId=${notifTurnId} (active=${activeTurnId})`);
+        const acceptsTerminalNotification = (method: string, params: unknown): boolean => {
+            if (!isRootThreadNotification(method, params) || !turnLifecycle.current) return false;
+            const id = readTurnId(params);
+            if (id && (id === lastTerminalTurnId || (activeTurnId && id !== activeTurnId))) {
+                logger.debug(`[CodexAppServer] Ignoring stale ${method} turnId=${id} (active=${activeTurnId})`);
+                return false;
+            }
+            return true;
+        };
+
+        registerNotification('turn/completed', (params) => {
+            if (!acceptsTerminalNotification('turn/completed', params)) return;
+            const status = pickTurnEndStatus(params, 'turn/completed');
+            if (status === 'failed') {
+                handleTurnFailure(params);
                 return;
             }
-            const updates = bridge.onNotification('turn/completed', params);
-            processBridgeUpdates(updates);
+            turnOutcome.status = status;
+            lastTerminalTurnId = readTurnId(params) ?? activeTurnId;
+            processBridgeUpdates(bridge.onNotification('turn/completed', params));
+            activeTurnId = null;
+            turnLifecycle.finish();
+            if (status === 'completed') autoRescueGate.resetAfterSuccess();
+        });
+
+        registerNotification('turn/interrupted', (params) => {
+            if (!acceptsTerminalNotification('turn/interrupted', params)) return;
+            turnOutcome.status = 'cancelled';
+            lastTerminalTurnId = readTurnId(params) ?? activeTurnId;
+            processBridgeUpdates(bridge.onNotification('turn/interrupted', params));
             activeTurnId = null;
             turnLifecycle.finish();
         });
 
-        c.registerNotificationHandler('turn/interrupted', (params) => {
-            if (!isRootThreadNotification('turn/interrupted', params)) return;
-            const notifTurnId = readTurnId(params);
-            if (notifTurnId && activeTurnId && notifTurnId !== activeTurnId) {
-                logger.debug(`[CodexAppServer] Ignoring stale turn/interrupted turnId=${notifTurnId} (active=${activeTurnId})`);
-                return;
-            }
-            const updates = bridge.onNotification('turn/interrupted', params);
-            processBridgeUpdates(updates);
-            activeTurnId = null;
-            turnLifecycle.finish();
-        });
-
-        c.registerNotificationHandler('item/agentMessage/delta', (params) => {
+        registerNotification('item/agentMessage/delta', (params) => {
             processBridgeUpdates(bridge.onNotification('item/agentMessage/delta', params));
         });
 
-        c.registerNotificationHandler('item/plan/delta', (params) => {
+        registerNotification('item/plan/delta', (params) => {
             processBridgeUpdates(bridge.onNotification('item/plan/delta', params));
         });
 
-        c.registerNotificationHandler('item/reasoning/summaryTextDelta', (params) => {
+        registerNotification('item/reasoning/summaryTextDelta', (params) => {
             processBridgeUpdates(bridge.onNotification('item/reasoning/summaryTextDelta', params));
         });
 
-        c.registerNotificationHandler('item/reasoning/textDelta', (params) => {
+        registerNotification('item/reasoning/textDelta', (params) => {
             processBridgeUpdates(bridge.onNotification('item/reasoning/textDelta', params));
         });
 
-        c.registerNotificationHandler('turn/diff/updated', (params) => {
+        registerNotification('turn/diff/updated', (params) => {
             processBridgeUpdates(bridge.onNotification('turn/diff/updated', params));
         });
 
-        c.registerNotificationHandler('item/started', (params) => {
+        registerNotification('item/started', (params) => {
             processBridgeUpdates(bridge.onNotification('item/started', params));
         });
 
-        c.registerNotificationHandler('item/completed', (params) => {
+        registerNotification('item/completed', (params) => {
             processBridgeUpdates(bridge.onNotification('item/completed', params));
         });
 
-        c.registerNotificationHandler('rawResponseItem/completed', (params) => {
+        registerNotification('rawResponseItem/completed', (params) => {
+            observeRawItem(params);
             processBridgeUpdates(bridge.onNotification('rawResponseItem/completed', params));
         });
 
-        c.registerNotificationHandler('error', (params) => {
+        registerNotification('error', (params) => {
             const record = params as Record<string, unknown> | null;
-            if (record && record.willRetry === true) return; // transient, codex will retry
-            if (!isRootThreadNotification('error', params)) return;
-
-            // Turn state-machine exit: a non-retryable error notification means
-            // the current turn is dead. Settle the pending promise (resolve,
-            // not reject — the error already flows through the session event
-            // stream below; the promise channel only signals "settled"). This
-            // closes the fourth state-machine exit so callers awaiting
-            // `turnLifecycle.current` never hang.
-            //
-            // Stale notification guard (parity with turn/completed and
-            // turn/interrupted handlers): if a delayed error for a turn we've
-            // already moved past arrives after a new turn has begun, ignore
-            // it — settling the new turn's promise on stale data would
-            // unblock the turn loop prematurely.
-            //
-            // We do NOT clear `activeTurnId` here — codex may still emit a
-            // `turn/interrupted` notification afterwards, and the existing
-            // handler at the turn/interrupted registration is the right place
-            // to clean that up. Clearing it eagerly would break the user's
-            // Ctrl-C interrupt path, which checks `activeTurnId` before
-            // sending the `turn/interrupt` RPC.
-            const errorTurnId = readTurnId(params);
-            if (errorTurnId && activeTurnId && errorTurnId !== activeTurnId) {
-                logger.debug(`[CodexAppServer] Ignoring stale error turnId=${errorTurnId} (active=${activeTurnId})`);
-                // Still surface the error message to the user below — the
-                // stale guard only blocks lifecycle settling, not user-visible
-                // error reporting.
-            } else {
-                turnLifecycle.finish();
-            }
-
-            // Auto-rescue: codex's server-side compact endpoint is unstable
-            // (~25% failure rate on flaky proxies). When it fails the current
-            // turn dies with `willRetry: false`. We detect that exact signature
-            // and kick off our local heuristic /compact path so the user sees
-            // the standard `Compaction started` / `Compaction completed` ack
-            // pair (same UX as a manual /compact) instead of "Codex error:
-            // stream disconnected".
-            if (shouldAutoRescue(params) && autoRescueGate.tryClaim(Date.now())) {
-                logger.warn('[CodexAppServer] Auto-rescue triggered for compact failure:', params);
-                // No "auto-rescue" preamble — runManualCompact emits the
-                // standard `Compaction started` / `Compaction completed`
-                // protocol events. From the user's POV this is identical to
-                // a manual /compact: same ack pair, same context-bar reset.
-                void runManualCompact('compact', true).catch((err) => {
-                    // Roll back the cooldown claim so the next genuine compact
-                    // failure within 30s is still rescuable. Without this, a
-                    // failed rescue silently disables auto-rescue for the
-                    // cooldown window and the user gets a raw codex error
-                    // after we've already eaten their one shot.
-                    autoRescueGate.release();
-                    logger.warn('[CodexAppServer] Auto-rescue /compact failed:', err);
-                    session.sendSessionEvent({
-                        type: 'message',
-                        message: '⚠️ 本地压缩失败',
-                    });
-                    session.sendSessionEvent({ type: 'ready' });
-                });
-                return;
-            }
-
-            replyMonitor.endActiveReply('error');
-            logger.warn('[CodexAppServer] Codex error notification:', params);
-            session.sendSessionEvent({
-                type: 'message',
-                message: formatCodexErrorForUi(extractCodexErrorDetail(params)),
-            });
+            if (record?.willRetry === true) return;
+            if (!acceptsTerminalNotification('error', params)) return;
+            handleTurnFailure(params);
         });
 
         // Register server request handlers for approval flows
-        c.registerRequestHandler('item/commandExecution/requestApproval', async (params) => {
+        registerRequest('item/commandExecution/requestApproval', async (params) => {
             const updates = bridge.onServerRequest('item/commandExecution/requestApproval', params);
             processBridgeUpdates(updates);
 
@@ -1293,7 +1361,7 @@ export async function runCodexWithAppServer(opts: {
             return mapPermissionDecision(result);
         });
 
-        c.registerRequestHandler('item/fileChange/requestApproval', async (params) => {
+        registerRequest('item/fileChange/requestApproval', async (params) => {
             const updates = bridge.onServerRequest('item/fileChange/requestApproval', params);
             processBridgeUpdates(updates);
 
@@ -1311,7 +1379,7 @@ export async function runCodexWithAppServer(opts: {
         });
 
         // Auto-approve MCP server elicitation requests (our own happy MCP server tools)
-        c.registerRequestHandler('mcpServer/elicitation/request', async (_params) => {
+        registerRequest('mcpServer/elicitation/request', async (_params) => {
             logger.debug('[CodexAppServer] Auto-approving MCP elicitation request');
             return { action: 'accept', content: {} };
         });
@@ -1324,31 +1392,8 @@ export async function runCodexWithAppServer(opts: {
     // drives the user-visible status message so the wording matches the path
     // that triggered it (mirrors claude-side `(via !auth-all)` for global vs
     // a bare `(via !auth)` for the single-session swap).
-    type AccountSwapSource = 'global' | 'single-session';
-    let pendingAccountSwap: { target: string; source: AccountSwapSource; seenSetAt?: number } | null = null;
     const savedAccount = readSessionAccountSelection(session.sessionId, 'codex');
-    const startupAccount = resolveStartupAccountSelection(savedAccount, readAccountIntent('codex'));
-    if (startupAccount && startupAccount.profileName !== activeCodexProfile) {
-        const savedHome = getCodexInstancePath(startupAccount.profileName);
-        if (!existsSync(join(savedHome, 'auth.json'))) {
-            throw new Error(`Selected Codex profile "${startupAccount.profileName}" is unavailable`);
-        }
-        process.env.CODEX_HOME = savedHome;
-        activeCodexProfile = startupAccount.profileName;
-    }
-    if (startupAccount?.source === 'global') {
-        try {
-            writeSessionAccountSelection(
-                session.sessionId,
-                'codex',
-                startupAccount.profileName,
-                startupAccount.seenGlobalSetAt,
-            );
-        } catch (error) {
-            logger.warn('[CodexAppServer] Failed to persist startup account selection:', error);
-        }
-    }
-    let lastSeenAccountIntent = startupAccount?.seenGlobalSetAt ?? 0;
+    let lastSeenAccountIntent = savedAccount?.seenGlobalSetAt ?? 0;
     const rememberAccountIntent = (profileName: string, setAt: number): void => {
         lastSeenAccountIntent = setAt;
         try {
@@ -1361,6 +1406,84 @@ export async function runCodexWithAppServer(opts: {
     };
     const expectedProviderSessionId = opts.codexSessionId;
 
+    const selectionIsCurrent = (selection: { seenSetAt: number }): boolean =>
+        !shouldExit && !pendingAccountSwap
+        && !accountIntentIsNewer(readGlobalAccountIntent(), selection.seenSetAt);
+
+    const sampleAccountIntent = (): boolean => {
+        const intent = readGlobalAccountIntent();
+        if (accountIntentIsNewer(intent, pendingAccountSwap?.seenSetAt ?? lastSeenAccountIntent)) {
+            if (!pendingAccountSwap && !failedAccountSwap && client && intent.profileName === activeCodexProfile) {
+                rememberAccountIntent(intent.profileName, intent.setAt);
+            } else {
+                pendingAccountSwap = { target: intent.profileName, source: 'global', seenSetAt: intent.setAt };
+            }
+        }
+        return pendingAccountSwap !== null;
+    };
+
+    // Both startup and live account handoff own one bounded recovery operation.
+    // Startup inherits the daemon deadline; live recovery gets one new budget.
+    // A ready client's later model turns never inherit the recovery deadline.
+    const openAccountClient = async (
+        selection: { target: string | null; seenSetAt: number },
+        exactThreadId: string | null,
+        deadlineAt?: number,
+    ): Promise<AccountSwapResult<CodexAppServerClient>> => {
+        const controller = new AbortController();
+        accountRecovery = controller;
+        const previous = client;
+        const modelConfig = resolveCodexModelModeOrDefault(currentModel);
+        const executionPolicy = resolveCodexExecutionPolicy(currentPermissionMode, !!sandboxConfig);
+        const operation = performCodexAccountSwap({
+            currentClient: previous,
+            threadId: exactThreadId,
+            isCurrent: () => !controller.signal.aborted && selectionIsCurrent(selection),
+            onCurrentRetired: () => { if (client === previous) client = null; },
+            retireBeforeResume: previous !== null && selection.target === activeCodexProfile,
+            // A resume consumes its recovery budget once; cold retry would
+            // discard progress and cannot fix an exhausted history-read budget.
+            recoverResumeTimeout: false,
+            createCandidate: async () => {
+                const targetHome = selection.target ? getCodexInstancePath(selection.target) : process.env.CODEX_HOME;
+                if (selection.target && (!targetHome || !existsSync(join(targetHome, 'auth.json')))) {
+                    throw new Error(`Selected Codex profile "${selection.target}" is unavailable`);
+                }
+                const envBuild = buildCodexChildEnv({
+                    baseEnv: { ...process.env, ...(targetHome ? { CODEX_HOME: targetHome } : {}) },
+                    logTag: 'CodexAppServer:restore',
+                });
+                return createCodexAppServerClient({
+                    configOverrides: mcpServerConfigOverrides, processEnv: envBuild.env,
+                    signal: controller.signal, deadlineAt,
+                });
+            },
+            prepareCandidate: registerClientHandlers,
+            resumeCandidate: async (candidate, id) => {
+                const response = await candidate.request('thread/resume', {
+                    threadId: id,
+                    approvalPolicy: toApprovalPolicy(executionPolicy.approvalPolicy),
+                    sandbox: executionPolicy.sandbox,
+                    ...(modelConfig.model ? { model: modelConfig.model } : {}),
+                    ...(modelConfig.reasoningEffort ? { config: { model_reasoning_effort: modelConfig.reasoningEffort } } : {}),
+                    excludeTurns: true,
+                }, {
+                    deadlineAt,
+                    // Cold history reconstruction may exceed the ordinary RPC timeout.
+                    // Use the remaining startup budget instead of discarding its progress
+                    // after 30 seconds; the same absolute deadline still bounds recovery.
+                    ...(deadlineAt === undefined ? {} : { timeoutMs: deadlineAt - Date.now() }),
+                });
+                return requireExactCodexThreadResume(readThreadId(response), id);
+            },
+        });
+        recoveryOperation = operation;
+        try { return await operation; }
+        finally {
+            if (accountRecovery === controller) accountRecovery = null;
+        }
+    };
+
     try {
         // Create app-server client. Build the child env via the shared helper so
         // codex sees the same proxy/dotenv treatment as `!login codex` — including
@@ -1368,66 +1491,63 @@ export async function runCodexWithAppServer(opts: {
         // the lowercase form). Without this, a daemon launched without proxy env
         // would spawn codex with no proxy and fail wss://chatgpt.com CONNECT. The
         // helper emits its own snapshot log line under the same tag.
-        logger.debug('[CodexAppServer] Creating app-server client');
-        const initialEnvBuild = buildCodexChildEnv({ logTag: 'CodexAppServer' });
-        client = await createCodexAppServerClient({
-            configOverrides: mcpServerConfigOverrides,
-            processEnv: initialEnvBuild.env,
-        });
-        logger.debug('[CodexAppServer] App-server client created');
-
-        // Register notification + request handlers BEFORE starting any thread
-        registerClientHandlers(client);
-
-        // Prove an existing provider thread is usable before the daemon can
-        // report the restored Happy session as online or deliver queued input.
-        // turn/start still applies the incoming message's model and permission
-        // mode, so this does not change account or per-turn selection.
-        if (opts.codexSessionId) {
-            const expectedThreadId = opts.codexSessionId;
-            const modelConfig = resolveCodexModelModeOrDefault(currentModel);
-            const executionPolicy = resolveCodexExecutionPolicy(
-                currentPermissionMode,
-                !!sandboxConfig,
-            );
-            logger.debug(`[CodexAppServer] Resuming thread ${expectedThreadId} before runtime readiness`);
-            const threadResponse = await client.request('thread/resume', {
-                threadId: expectedThreadId,
-                approvalPolicy: toApprovalPolicy(executionPolicy.approvalPolicy),
-                sandbox: executionPolicy.sandbox,
-                ...(modelConfig.model ? { model: modelConfig.model } : {}),
-                ...(modelConfig.reasoningEffort ? { config: { model_reasoning_effort: modelConfig.reasoningEffort } } : {}),
-                // Runtime readiness needs the exact provider identity, not a
-                // second copy of the complete rollout. Large threads can make
-                // the default resume response too large to serialize or frame.
-                excludeTurns: true,
-            });
-            threadId = requireExactCodexThreadResume(
-                readThreadId(threadResponse),
-                expectedThreadId,
-            );
-            // Exact restore already loaded this provider identity from the
-            // persisted Happy session. Rewriting the same value adds a remote
-            // ACK to the startup critical path and can make a healthy provider
-            // miss the bounded restore window.
-            threadIdStored = true;
-            opts.codexSessionId = undefined;
-            logger.debug(`[CodexAppServer] Provider thread ready: ${threadId}`);
-
+        const rawDeadline = opts.startedBy === 'daemon' ? process.env.HAPPY_SESSION_STARTUP_DEADLINE_MS : undefined;
+        if (rawDeadline !== undefined && (!Number.isSafeInteger(Number(rawDeadline)) || Number(rawDeadline) <= 0)) {
+            throw new Error('Invalid daemon session startup deadline');
         }
+        // Reserve two seconds inside the parent budget for readiness publication.
+        // The daemon leaves another six seconds before the 30-second relay for cleanup.
+        // Never give a second resume a fresh budget.
+        const startupDeadlineAt = rawDeadline === undefined
+            ? (expectedProviderSessionId ? Date.now() + RESTORE_SESSION_STARTUP_TIMEOUT_MS : undefined)
+            : Number(rawDeadline) - 2_000;
+        let startupSeenSetAt = 0;
+        while (!shouldExit) {
+            const startupAccount = resolveStartupAccountSelection(savedAccount, readGlobalAccountIntent(), explicitCodexProfile);
+            const selection = {
+                target: startupAccount?.profileName ?? activeCodexProfile,
+                seenSetAt: startupAccount?.seenGlobalSetAt ?? 0,
+            };
+            const result = await openAccountClient(selection, expectedProviderSessionId ?? null, startupDeadlineAt);
+            if (!result.ok) {
+                recoveryOperation = null;
+                if (result.cleanupFailed) throw result.error;
+                if (!shouldExit && !selectionIsCurrent(selection)) continue;
+                throw result.error;
+            }
+            if (!selectionIsCurrent(selection)) {
+                await result.client.dispose();
+                recoveryOperation = null;
+                continue;
+            }
+            client = result.client;
+            recoveryOperation = null;
+            threadId = result.threadId;
+            if (selection.target) {
+                activeCodexProfile = selection.target;
+                process.env.CODEX_HOME = getCodexInstancePath(selection.target);
+                startupSeenSetAt = selection.seenSetAt;
+            }
+            if (expectedProviderSessionId) {
+                threadIdStored = true;
+                opts.codexSessionId = undefined;
+            }
+            break;
+        }
+        if (shouldExit || !client) throw new CodexAccountSwapCancelled();
 
         // A daemon spawn is not ready until it owns a restorable provider
         // identity. Allocate the Codex thread without starting a model turn,
         // persist it, then publish the daemon webhook that resolves spawnSession.
         if (!threadId && opts.startedBy === 'daemon' && !opts.restoreSessionId && !opts.codexSessionId) {
-            threadId = await startFreshThread(client, currentPermissionMode, currentModel);
-            await session.updateMetadata((currentMetadata) => ({
-                ...currentMetadata,
-                claudeSessionId: threadId!,
-            }), { rejectOnServerError: true });
-            threadIdStored = true;
+            threadId = await startFreshThread(client, currentPermissionMode, currentModel, startupDeadlineAt);
+            // completeProviderInputReady persists the identity once, before
+            // the daemon can acknowledge readiness. Do not spend the startup
+            // budget on a duplicate metadata round trip here.
         }
 
+        if (shouldExit || !client) throw new CodexAccountSwapCancelled();
+        if (activeCodexProfile) rememberAccountIntent(activeCodexProfile, startupSeenSetAt);
         if (response) {
             await completeProviderInputReady({
                 session,
@@ -1436,7 +1556,10 @@ export async function runCodexWithAppServer(opts: {
                 providerSessionId: threadId ?? undefined,
                 expectedProviderSessionId,
                 onUserMessage,
+                isCancelled: () => shouldExit,
             });
+            if (threadId) threadIdStored = true;
+            if (shouldExit) throw new CodexAccountSwapCancelled();
             if (opts.startedBy === 'daemon' && activeCodexProfile) {
                 const profileRegistration = await notifyDaemonCodexProfile(response.id, activeCodexProfile);
                 if (profileRegistration.error) {
@@ -1444,6 +1567,11 @@ export async function runCodexWithAppServer(opts: {
                 }
             }
         } else {
+            if (threadId && !threadIdStored) {
+                await session.updateMetadata(metadata => ({ ...metadata, claudeSessionId: threadId! }),
+                    { rejectOnServerError: true });
+                threadIdStored = true;
+            }
             session.onUserMessage(onUserMessage);
         }
         session.keepAlive(thinking, 'remote');
@@ -1458,75 +1586,75 @@ export async function runCodexWithAppServer(opts: {
         // exits via the Ink Ctrl-C handler, which needs a TTY). No-op in
         // production (deps.onRuntimeReady absent).
         opts.deps?.onRuntimeReady?.({
-            requestExit: () => { shouldExit = true; messageQueue.close(); },
+            requestExit,
         });
 
         while (!shouldExit) {
+            if (failedAccountSwap && !pendingAccountSwap) {
+                const intent = readGlobalAccountIntent();
+                if (accountIntentIsNewer(intent, failedAccountSwap.seenSetAt)) {
+                    pendingAccountSwap = { target: intent.profileName, source: 'global', seenSetAt: intent.setAt };
+                } else {
+                    // Keep both the retained batch and new input in their
+                    // existing owners. New input, !restart, or a newer target
+                    // can request one new bounded operation; no timer retries
+                    // a failed target forever while the user is idle.
+                    await new Promise<void>((resolve) => { wakeRecovery = resolve; });
+                    wakeRecovery = null;
+                    continue;
+                }
+            }
             // Consume pending !auth-all --codex account swap before anything else.
             // Build and resume the candidate against the exact current thread first.
             // Only a ready candidate may replace and dispose the current client.
             if (pendingAccountSwap) {
-                const { target, source, seenSetAt } = pendingAccountSwap;
+                const selection: AccountSwapRequest = pendingAccountSwap;
+                const { target, source, seenSetAt } = selection;
                 pendingAccountSwap = null;
-                const savedThreadId: string | null = threadId;
+                failedAccountSwap = null;
                 let swapCommitted = false;
                 try {
-                    const currentClient: CodexAppServerClient | null = client;
-                    if (!currentClient) {
-                        throw new Error('Codex app-server client is not initialized');
-                    }
+                    session.sendSessionEvent({ type: 'message',
+                        message: `🔄 正在恢复账号 "${target}" 的原会话，输入已保留，无需重发。` });
+                } catch (statusError) {
+                    logger.warn('[CodexAppServer] Failed to publish account recovery status:', statusError);
+                }
+                try {
+                    if (compactInFlight) await compactInFlight;
                     const targetHome = getCodexInstancePath(target);
-                    const modelConfig = resolveCodexModelModeOrDefault(currentModel);
-                    const executionPolicy = resolveCodexExecutionPolicy(
-                        currentPermissionMode,
-                        !!sandboxConfig,
-                    );
-                    const result: AccountSwapResult<CodexAppServerClient> = await performCodexAccountSwap({
-                        currentClient,
-                        threadId: savedThreadId,
-                        createCandidate: async () => {
-                            const swapEnvBuild = buildCodexChildEnv({
-                                baseEnv: { ...process.env, CODEX_HOME: targetHome },
-                                logTag: 'CodexAppServer:swap',
-                            });
-                            return await createCodexAppServerClient({
-                                configOverrides: mcpServerConfigOverrides,
-                                processEnv: swapEnvBuild.env,
-                            });
-                        },
-                        prepareCandidate: registerClientHandlers,
-                        resumeCandidate: async (candidate, exactThreadId) => {
-                            const response = await candidate.request('thread/resume', {
-                                threadId: exactThreadId,
-                                approvalPolicy: toApprovalPolicy(executionPolicy.approvalPolicy),
-                                sandbox: executionPolicy.sandbox,
-                                ...(modelConfig.model ? { model: modelConfig.model } : {}),
-                                ...(modelConfig.reasoningEffort ? { config: { model_reasoning_effort: modelConfig.reasoningEffort } } : {}),
-                                excludeTurns: true,
-                            });
-                            return requireExactCodexThreadResume(
-                                readThreadId(response),
-                                exactThreadId,
-                            );
-                        },
-                    });
-                    if (!result.ok) throw result.error;
+                    const result = await openAccountClient(selection, threadId,
+                        Date.now() + RESTORE_SESSION_STARTUP_TIMEOUT_MS);
+                    if (!result.ok) {
+                        recoveryOperation = null;
+                        if (!shouldExit) client = result.client;
+                        if (result.cleanupFailed) throw result.error;
+                        if (!selectionIsCurrent(selection)) {
+                            if (!shouldExit) sampleAccountIntent();
+                            continue;
+                        }
+                        throw result.error;
+                    }
+                    if (!selectionIsCurrent(selection)) {
+                        await result.client.dispose();
+                        recoveryOperation = null;
+                        if (!shouldExit) sampleAccountIntent();
+                        continue;
+                    }
                     // performCodexAccountSwap has now disposed the old client.
                     // From here onward this is committed and must never be
                     // reported as a rollback-capable switch failure.
                     swapCommitted = true;
                     client = result.client;
+                    recoveryOperation = null;
                     threadId = result.threadId;
                     process.env.CODEX_HOME = targetHome;
                     activeCodexProfile = target;
+                    rememberAccountIntent(target, seenSetAt);
                     if (opts.startedBy === 'daemon' && response) {
                         const profileRegistration = await notifyDaemonCodexProfile(response.id, target);
                         if (profileRegistration.error) {
                             logger.warn(`[CodexAppServer] Failed to report account to daemon: ${profileRegistration.error}`);
                         }
-                    }
-                    if (seenSetAt !== undefined) {
-                        rememberAccountIntent(target, seenSetAt);
                     }
                     activeTurnId = null;
                     permissionHandler.reset();
@@ -1547,17 +1675,18 @@ export async function runCodexWithAppServer(opts: {
                     // interrupt a session; they are discovered only with real input.
                     messageQueue.clearInterrupt();
                 } catch (err) {
+                    if (err instanceof CodexProcessCleanupError) throw err;
+                    if (shouldExit) break;
                     const detail = (err as Error).message || 'unknown error';
                     const errMsg = swapCommitted
                         ? `⚠ 账号已切换，但会话状态刷新失败: ${detail}`
-                        : `⚠ 切换账号失败，本次输入未提交，请重试: ${detail}`;
+                        : `⚠ 会话恢复失败，未提交的输入已保留，尚未交给模型。发送新消息或 !restart 可重试 "${target}"，也可用 !auth 选择账号。${detail}`;
                     if (!swapCommitted) {
-                        // Do not process this input under the old account and do
-                        // not immediately retry the same failed global target.
-                        // The intent remains unacknowledged, so a later real input
-                        // gets one fresh attempt without adding persisted state.
-                        pending = null;
+                        failedAccountSwap = selection;
                     }
+                    diagnosticTrace('[CODEX] Account recovery failed', {
+                        target, threadId, seenSetAt, swapCommitted, error: detail,
+                    });
                     logger.warn(
                         swapCommitted
                             ? '[CodexAppServer] Account swap post-commit finalization failed:'
@@ -1605,25 +1734,9 @@ export async function runCodexWithAppServer(opts: {
             // that input reaches Codex. Keep the batch pending while the existing
             // transactional swap resumes the exact thread. An idle session therefore
             // performs no work, and an active turn is never interrupted by a file event.
-            const currentIntent = readAccountIntent('codex');
-            if (accountIntentIsNewer(currentIntent, lastSeenAccountIntent)) {
-                if (currentIntent.profileName === activeCodexProfile) {
-                    if (opts.startedBy === 'daemon' && response) {
-                        const registration = await notifyDaemonCodexProfile(response.id, currentIntent.profileName);
-                        if (registration.error) {
-                            logger.warn(`[CodexAppServer] Failed to report account to daemon: ${registration.error}`);
-                        }
-                    }
-                    rememberAccountIntent(currentIntent.profileName, currentIntent.setAt);
-                } else {
-                    pending = message;
-                    pendingAccountSwap = {
-                        target: currentIntent.profileName,
-                        source: 'global',
-                        seenSetAt: currentIntent.setAt,
-                    };
-                    continue;
-                }
+            if (sampleAccountIntent()) {
+                pending = message;
+                continue;
             }
 
             // Input ownership transfers synchronously to MessageQueue2. Check
@@ -1634,12 +1747,6 @@ export async function runCodexWithAppServer(opts: {
             // it is never rejected with a "please resend" response.
             const compactBarrier = compactInFlight;
             if (compactBarrier) await compactBarrier;
-
-            // Record only after the batch has crossed the compact barrier.
-            // A prompt accepted while compaction is building its seed remains
-            // solely in MessageQueue2; recording it earlier would put the same
-            // text in both the new seed and the following turn.
-            recentUserBuffer.record(message.message);
 
             // Mode change: keep the same Codex thread.
             //
@@ -1660,6 +1767,11 @@ export async function runCodexWithAppServer(opts: {
             messageBuffer.addMessage(message.message, 'user');
             currentModeHash = message.hash;
             let tracedTurnId: string | null = null;
+            turnOutcome.status = 'cancelled';
+            turnOutcome.detail = undefined;
+            turnOutcome.capacity = false;
+            const recovery = { controller: new AbortController(), attempts: 0, waiting: false, stopRequested: false };
+            capacityRecovery = recovery;
 
             try {
                 const requestClient = client;
@@ -1690,6 +1802,19 @@ export async function runCodexWithAppServer(opts: {
                     logUserInputStage('model-submit-start', input, input.content, { threadId });
                 }
                 await session.beginDaemonSessionTurn();
+                if (compactInFlight) await compactInFlight;
+                // No turn/start has been dispatched yet: it is still safe to
+                // retain this batch if a local/global account choice changed
+                // during awaited setup. After dispatch we never auto-replay.
+                if (shouldExit || requestClient !== client || sampleAccountIntent()) {
+                    pending = message;
+                    turnOutcome.status = 'cancelled';
+                    session.closeDaemonSessionTurn('cancelled');
+                    continue;
+                }
+                // Record only at the final dispatch boundary so a deferred
+                // input cannot appear both in a compact seed and its next turn.
+                recentUserBuffer.record(message.message);
                 replyMonitor.beginActiveReply('turn-start');
 
                 // turn/start RPC returns immediately with turnId; the turn itself
@@ -1711,48 +1836,86 @@ export async function runCodexWithAppServer(opts: {
                     compactState.pendingSeedText = null;
                     logger.debug(`[CodexAppServer] Injecting compact seed (${seed.length} chars) into next turn`);
                 }
-                const turnResponse = await requestClient.request('turn/start', {
-                    threadId,
-                    input: [{ type: 'text', text: turnInputText }],
-                    approvalPolicy: toApprovalPolicy(executionPolicy.approvalPolicy),
-                    sandboxPolicy: toSandboxPolicy(executionPolicy.sandbox, sessionCwd),
-                    ...(modelConfig.model ? { model: modelConfig.model } : {}),
-                    ...(modelConfig.reasoningEffort ? { effort: modelConfig.reasoningEffort } : {}),
-                });
-                const responseTurnId = readTurnId(turnResponse);
-                tracedTurnId = responseTurnId;
-                if (responseTurnId) {
-                    activeTurnId = responseTurnId;
-                }
-                for (const input of message.userInputs) {
-                    logUserInputStage('model-submit-accepted', input, input.content, {
-                        threadId,
-                        turnId: responseTurnId ?? null,
+                const requestThreadId = threadId;
+                while (true) {
+                    const turnResponse = await requestClient.request('turn/start', {
+                        threadId: requestThreadId,
+                        input: recovery.attempts === 0 ? [{ type: 'text', text: turnInputText }] : [],
+                        approvalPolicy: toApprovalPolicy(executionPolicy.approvalPolicy),
+                        sandboxPolicy: toSandboxPolicy(executionPolicy.sandbox, sessionCwd),
+                        ...(modelConfig.model ? { model: modelConfig.model } : {}),
+                        ...(modelConfig.reasoningEffort ? { effort: modelConfig.reasoningEffort } : {}),
                     });
-                }
-                if (injectSystemPrompt) {
-                    needsSystemPromptInjection = false;
-                }
-                logger.debug('[CodexAppServer] turn/start RPC returned:', JSON.stringify(turnResponse).substring(0, 200));
+                    const responseTurnId = readTurnId(turnResponse);
+                    tracedTurnId = responseTurnId;
+                    if (responseTurnId && turnLifecycle.current) {
+                        activeTurnId = responseTurnId;
+                        if (recovery.stopRequested) {
+                            await requestClient.request('turn/interrupt', { threadId: requestThreadId, turnId: responseTurnId });
+                        }
+                    }
+                    for (const input of recovery.attempts === 0 ? message.userInputs : []) {
+                        logUserInputStage('model-submit-accepted', input, input.content, {
+                            threadId,
+                            turnId: responseTurnId ?? null,
+                        });
+                    }
+                    if (injectSystemPrompt) {
+                        needsSystemPromptInjection = false;
+                    }
+                    logger.debug('[CodexAppServer] turn/start RPC returned:', JSON.stringify(turnResponse).substring(0, 200));
 
-                // Wait for the real turn completion (turn/completed notification).
-                // The turn-lifecycle state machine guarantees this settles via
-                // one of: turn/completed, turn/interrupted, error notification,
-                // or this catch block on RPC failure. Error notifications
-                // resolve (not reject), so this await only throws when the
-                // surrounding RPC itself failed — the catch below handles it.
-                const pending = turnLifecycle.current;
-                if (pending) {
-                    await pending;
+                    // Wait for the real turn completion (turn/completed notification).
+                    // The turn-lifecycle state machine guarantees this settles via
+                    // one of: turn/completed, turn/interrupted, error notification,
+                    // or this catch block on RPC failure. Error notifications
+                    // resolve (not reject), so this await only throws when the
+                    // surrounding RPC itself failed — the catch below handles it.
+                    const turnCompletion = turnLifecycle.current;
+                    if (turnCompletion) {
+                        await turnCompletion;
+                    }
+                    if (!turnOutcome.capacity || recovery.attempts >= capacityRetryDelays.length) break;
+                    const backoffMs = capacityRetryDelays[recovery.attempts++];
+                    if (!recovery.controller.signal.aborted && !shouldExit && !compactInFlight && messageQueue.size() === 0) {
+                        recovery.waiting = true;
+                        thinking = true;
+                        session.keepAlive(thinking, 'remote');
+                        session.sendSessionEvent({ type: 'message', message:
+                            `模型服务暂时繁忙，${Math.ceil(backoffMs / 1000)} 秒后使用原模型继续（${recovery.attempts}/${capacityRetryDelays.length}）。可点击停止取消。` });
+                        try {
+                            await delay(backoffMs, undefined, { signal: recovery.controller.signal });
+                        } catch (error) {
+                            if (!recovery.controller.signal.aborted) throw error;
+                        } finally {
+                            recovery.waiting = false;
+                        }
+                    }
+                    if (recovery.controller.signal.aborted || shouldExit || compactInFlight || messageQueue.size() > 0
+                        || requestClient !== client || threadId !== requestThreadId || sampleAccountIntent()) {
+                        turnOutcome.status = 'cancelled';
+                        break;
+                    }
+                    turnOutcome.status = 'cancelled';
+                    turnOutcome.detail = undefined;
+                    turnOutcome.capacity = false;
+                    permissionHandler.reset();
+                    reasoningProcessor.abort();
+                    replyMonitor.beginActiveReply('capacity-retry');
+                    turnLifecycle.begin();
                 }
-                logger.debug('[CodexAppServer] Turn fully completed');
+                // Notification callbacks mutate this while the turn is awaited.
+                const settledStatus = turnOutcome.status as ReturnType<typeof pickTurnEndStatus>;
+                logger.debug(`[CodexAppServer] Turn settled: ${settledStatus}`);
                 for (const input of message.userInputs) {
-                    logUserInputStage('model-turn-completed', input, input.content, {
+                    logUserInputStage(settledStatus === 'completed' ? 'model-turn-completed' : 'model-submit-or-turn-failed', input, input.content, {
+                        reason: turnOutcome.detail ?? turnOutcome.status,
                         threadId,
                         turnId: tracedTurnId,
                     });
                 }
             } catch (error) {
+                turnOutcome.status = 'failed';
                 for (const input of message.userInputs) {
                     logUserInputStage('model-submit-or-turn-failed', input, input.content, {
                         threadId,
@@ -1761,24 +1924,14 @@ export async function runCodexWithAppServer(opts: {
                     });
                 }
                 logger.warn('[CodexAppServer] Error in app-server session:', error);
-                replyMonitor.endActiveReply('turn-error');
-                // Settle the pending promise on RPC failure (the only path that
-                // legitimately rejects). Idempotent if it was already settled
-                // by an error notification handler that beat us here.
-                const unsettledTurn = turnLifecycle.current;
-                turnLifecycle.finish(error instanceof Error ? error : new Error(String(error)));
-                await unsettledTurn?.catch(() => {});
                 const errorMessage = error instanceof Error ? error.message : String(error);
-
-                if (errorMessage.includes('disposed') || errorMessage.includes('exited')) {
-                    messageBuffer.addMessage('Process exited unexpectedly', 'status');
-                    session.sendSessionEvent({ type: 'message', message: 'Process exited unexpectedly' });
-                } else {
-                    messageBuffer.addMessage(`Error: ${errorMessage.substring(0, 200)}`, 'status');
-                    session.sendSessionEvent({ type: 'message', message: `Error: ${errorMessage}` });
-                }
+                messageBuffer.addMessage(`Error: ${errorMessage.substring(0, 200)}`, 'status');
+                // The shared terminal path also covers a rejected turn/start RPC.
+                handleTurnFailure({ error: { message: errorMessage } });
             } finally {
-                session.closeDaemonSessionTurn();
+                recovery.controller.abort();
+                if (capacityRecovery === recovery) capacityRecovery = null;
+                session.closeDaemonSessionTurn(turnOutcome.status);
                 replyMonitor.endActiveReply('turn-finally');
                 permissionHandler.reset();
                 reasoningProcessor.abort();
@@ -1805,6 +1958,9 @@ export async function runCodexWithAppServer(opts: {
     } finally {
         // Clean up resources
         logger.debug('[CodexAppServer] Final cleanup start');
+        try { await stopRuntimeClients(); } catch (error) {
+            diagnosticTrace('[CODEX] Final cleanup failed', String(error));
+        }
         replyMonitor.dispose();
         removeTransportFatalHandler();
 
@@ -1816,12 +1972,6 @@ export async function runCodexWithAppServer(opts: {
         } catch (e) {
             logger.debug('[CodexAppServer] Error while closing session', e);
         }
-
-        if (client) {
-            logger.debug('[CodexAppServer] Disposing app-server client');
-            await client.dispose();
-        }
-
         happyServer.stop();
 
         if (process.stdin.isTTY) {

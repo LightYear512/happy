@@ -6,8 +6,9 @@
  */
 
 import { spawn } from 'node:child_process';
-import { execSync } from 'node:child_process';
-import { logger } from '@/ui/logger';
+import { diagnosticTrace, logger } from '@/ui/logger';
+import { CodexProcessCleanupError, stopCodexProcess } from './codexAppServerProcess';
+import { redactSensitive } from './utils/redactSecrets';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -29,10 +30,12 @@ type JsonRpcRequestHandler = (
 type JsonRpcNotificationHandler = (params: unknown) => Promise<void> | void;
 
 export type CodexAppServerClient = Readonly<{
+    /** OS owner of this client's dedicated process group (the CLI may be a shim). */
+    processId: number | undefined;
     request: (
         method: string,
         params?: unknown,
-        options?: Readonly<{ timeoutMs?: number }>,
+        options?: Readonly<{ timeoutMs?: number; deadlineAt?: number }>,
     ) => Promise<unknown>;
     notify: (method: string, params?: unknown) => Promise<void>;
     registerRequestHandler: (
@@ -52,10 +55,25 @@ export type CodexAppServerClient = Readonly<{
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const DEFAULT_INITIALIZE_TIMEOUT_MS = 15_000;
-const DEFAULT_DISPOSE_TIMEOUT_MS = 3_000;
+const DEFAULT_DISPOSE_TIMEOUT_MS = 1_000;
 const DEFAULT_FORCE_KILL_WAIT_MS = 1_000;
 
 const MAX_STDERR_CHARS = 8_000;
+
+export class CodexAppServerRequestTimeout extends Error {
+    constructor(readonly method: string, readonly timeoutMs: number) {
+        super(`Codex app-server request ${method} timed out after ${timeoutMs}ms`);
+        this.name = 'CodexAppServerRequestTimeout';
+    }
+}
+
+/** One absolute startup budget; expiration must never select a default timeout. */
+export function codexRequestTimeout(timeoutMs: number, deadlineAt?: number): number {
+    if (deadlineAt === undefined) return timeoutMs;
+    const remaining = Math.floor(deadlineAt - Date.now());
+    if (!Number.isFinite(remaining) || remaining <= 0) throw new Error('Codex startup deadline expired');
+    return Math.min(timeoutMs, remaining);
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -151,7 +169,7 @@ function sanitizeEnv(
 ): Record<string, string> {
     const env: Record<string, string> = {};
     for (const key of Object.keys(processEnv)) {
-        if (key === 'CODEX_THREAD_ID') continue;
+        if (key === 'CODEX_THREAD_ID' || key === 'HAPPY_SESSION_STARTUP_DEADLINE_MS') continue;
         const value = processEnv[key];
         if (typeof value === 'string') {
             env[key] = value;
@@ -172,20 +190,9 @@ function resolveCodexBinary(): string {
     if (typeof override === 'string' && override.length > 0) {
         return override;
     }
-    try {
-        execSync('codex --version', { encoding: 'utf8', windowsHide: true });
-        return 'codex';
-    } catch {
-        throw new Error(
-            'Codex CLI not found or not executable.\n' +
-                '\n' +
-                'To install codex:\n' +
-                '  npm install -g @openai/codex\n' +
-                '\n' +
-                'Alternatively, use Claude:\n' +
-                '  happy claude',
-        );
-    }
+    // Spawn itself is the executable check. A separate synchronous --version
+    // child both duplicates work and escapes the startup/cancellation budget.
+    return 'codex';
 }
 
 // ---------------------------------------------------------------------------
@@ -199,9 +206,14 @@ export async function createCodexAppServerClient(opts?: {
     initializeTimeoutMs?: number;
     disposeTimeoutMs?: number;
     forceKillWaitMs?: number;
+    /** Applies to initialization only; a ready client is not startup-deadline-bound. */
+    deadlineAt?: number;
+    signal?: AbortSignal;
     /** TOML config overrides passed as `--config-override key=value` CLI args (e.g. MCP server injection). */
     configOverrides?: readonly string[];
 }): Promise<CodexAppServerClient> {
+    opts?.signal?.throwIfAborted();
+    codexRequestTimeout(DEFAULT_INITIALIZE_TIMEOUT_MS, opts?.deadlineAt);
     const command = resolveCodexBinary();
     const args = ['app-server', '--listen', 'stdio://'];
     // Append config overrides as CLI args (codex uses `-c key=value`, same as happier)
@@ -219,7 +231,9 @@ export async function createCodexAppServerClient(opts?: {
     );
     const initializeTimeoutMs = positiveTimeout(
         opts?.initializeTimeoutMs,
-        Math.min(requestTimeoutMs, DEFAULT_INITIALIZE_TIMEOUT_MS),
+        opts?.deadlineAt === undefined
+            ? Math.min(requestTimeoutMs, DEFAULT_INITIALIZE_TIMEOUT_MS)
+            : codexRequestTimeout(opts.deadlineAt - Date.now(), opts.deadlineAt),
     );
     const disposeTimeoutMs = positiveTimeout(opts?.disposeTimeoutMs, DEFAULT_DISPOSE_TIMEOUT_MS);
     const forceKillWaitMs = positiveTimeout(opts?.forceKillWaitMs, DEFAULT_FORCE_KILL_WAIT_MS);
@@ -238,6 +252,7 @@ export async function createCodexAppServerClient(opts?: {
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
         windowsVerbatimArguments,
+        detached: process.platform !== 'win32',
     });
 
     if (!child.stdin || !child.stdout || !child.stderr) {
@@ -391,6 +406,7 @@ export async function createCodexAppServerClient(opts?: {
     };
 
     const handleIncomingMessage = (message: JsonRpcMessage): void => {
+        if (disposing) return;
         const requestKey = toMessageKey(message.id);
 
         // Server request: has method + id
@@ -475,8 +491,7 @@ export async function createCodexAppServerClient(opts?: {
     child.stderr.setEncoding('utf8');
     child.stderr.on('data', (chunk: string) => {
         logger.debug(`[CodexAppServer] stderr: ${chunk.trim()}`);
-        if (stderrBuffer.length >= MAX_STDERR_CHARS) return;
-        stderrBuffer = (stderrBuffer + chunk).slice(0, MAX_STDERR_CHARS);
+        stderrBuffer = (stderrBuffer + redactSensitive(chunk)).slice(-MAX_STDERR_CHARS);
     });
 
     child.once('error', (error) => {
@@ -509,7 +524,7 @@ export async function createCodexAppServerClient(opts?: {
     const request = async (
         method: string,
         requestParams?: unknown,
-        requestOptions?: Readonly<{ timeoutMs?: number }>,
+        requestOptions?: Readonly<{ timeoutMs?: number; deadlineAt?: number }>,
     ): Promise<unknown> => {
         const id = ++nextId;
         const requestKey = toMessageKey(id);
@@ -519,15 +534,18 @@ export async function createCodexAppServerClient(opts?: {
             );
         }
 
-        const timeoutMs = positiveTimeout(requestOptions?.timeoutMs, requestTimeoutMs);
+        const timeoutMs = codexRequestTimeout(
+            positiveTimeout(requestOptions?.timeoutMs, requestTimeoutMs), requestOptions?.deadlineAt,
+        );
+        const startedAt = Date.now();
         const responsePromise = new Promise<unknown>((resolve, reject) => {
             const timer = setTimeout(() => {
                 pendingRequests.delete(requestKey);
-                reject(
-                    new Error(
-                        `Codex app-server request ${method} timed out after ${timeoutMs}ms`,
-                    ),
-                );
+                diagnosticTrace('[CODEX] RPC timeout', {
+                    method, pid: child.pid, elapsedMs: Date.now() - startedAt,
+                    stderrTail: redactSensitive(stderrBuffer),
+                });
+                reject(new CodexAppServerRequestTimeout(method, timeoutMs));
             }, timeoutMs);
 
             pendingRequests.set(requestKey, {
@@ -612,6 +630,9 @@ export async function createCodexAppServerClient(opts?: {
     const dispose = async (): Promise<void> => {
         if (disposePromise) return await disposePromise;
         disposing = true;
+        opts?.signal?.removeEventListener('abort', onAbort);
+        notificationHandlers.clear();
+        requestHandlers.clear();
 
         const disposedError = createDisposedError();
         failWaiters(state, disposedError);
@@ -624,34 +645,31 @@ export async function createCodexAppServerClient(opts?: {
                 // ignore
             }
             try {
-                child.kill();
-            } catch {
-                // ignore
+                await stopCodexProcess(child, closedPromise, disposeTimeoutMs, forceKillWaitMs);
+            } catch (error) {
+                throw new CodexProcessCleanupError(error);
             }
-            const exitedGracefully = closed || await Promise.race([
-                closedPromise.then(() => true),
-                new Promise<boolean>((resolve) => setTimeout(() => resolve(false), disposeTimeoutMs)),
-            ]);
-            if (exitedGracefully) return;
-            try {
-                child.kill('SIGKILL');
-            } catch {
-                // ignore
-            }
-            await Promise.race([
-                closedPromise,
-                new Promise<void>((resolve) => setTimeout(resolve, forceKillWaitMs)),
-            ]);
+            diagnosticTrace('[CODEX] Process retired', { pid: child.pid, closed });
         })();
 
         return await disposePromise;
     };
+
+    const onAbort = (): void => {
+        void dispose().catch((error: unknown) => {
+            diagnosticTrace('[CODEX] Cancellation cleanup failed', {
+                pid: child.pid, error: String(error),
+            });
+        });
+    };
+    opts?.signal?.addEventListener('abort', onAbort, { once: true });
 
     // -----------------------------------------------------------------------
     // Initialization handshake
     // -----------------------------------------------------------------------
 
     try {
+        opts?.signal?.throwIfAborted();
         logger.debug('[CodexAppServer] Sending initialize request');
         await request('initialize', {
             clientInfo: {
@@ -661,11 +679,12 @@ export async function createCodexAppServerClient(opts?: {
             capabilities: {
                 experimentalApi: true,
             },
-        }, { timeoutMs: initializeTimeoutMs });
+        }, { timeoutMs: initializeTimeoutMs, deadlineAt: opts?.deadlineAt });
         await notify('initialized');
         logger.debug('[CodexAppServer] Initialization complete');
 
         return {
+            processId: child.pid,
             request,
             notify,
             registerRequestHandler,
@@ -673,7 +692,13 @@ export async function createCodexAppServerClient(opts?: {
             dispose,
         };
     } catch (error) {
-        await dispose().catch(() => undefined);
+        // A cleanup error takes precedence: callers must not start another
+        // candidate while the previous process may still own resources.
+        try { await dispose(); }
+        catch (cleanup) {
+            throw new CodexProcessCleanupError(cleanup,
+                error instanceof Error ? error : new Error(String(error)));
+        }
         throw error;
     }
 }

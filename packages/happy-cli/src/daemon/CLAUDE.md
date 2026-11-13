@@ -71,8 +71,26 @@ Initiated by mobile app via backend RPC:
    - Creates directory if needed
    - Spawns detached Happy process with `--happy-starting-mode remote --started-by daemon`
    - Adds to `pidToTrackedSession` map
-   - Sets up one 58-second startup deadline for exact identity and final input readiness,
-     returning before the Server's 60-second restore RPC boundary
+   - Sets up one 20-second deadline for a new session, or 180 seconds for restoring
+     an existing history with exact identity and final input readiness; restore
+     local control/XC callers wait 210 seconds to include owned-child cleanup
+     and the reply. The unchanged Server restore ACK remains 60 seconds; slow
+     mobile restores can still receive an early timeout notification. Never
+     acknowledge success before exact provider input readiness to evade it
+   - Automatic restore requires a new canonical pending user-message sequence.
+     The attempted sequence is committed to the existing restore authority before
+     spawning; events cannot authorize another attempt. Explicit local restore
+     may retry, and records the current session sequence without a history gate.
+   - Results carry a local attempt ID and remain in that authority until message
+     persistence is confirmed. A daemon interruption yields an explicit unknown
+     outcome, never inferred success. Heartbeat sweeps retry pending delivery.
+     The queue is bounded at 16; a full queue blocks automatic admission before
+     spawning, while explicit local recovery remains available.
+   - The unchanged Server's 60-second timeout is a request-level notice, never
+     attributed to the current attempt. Notification lookup and sending share
+     one 20-second budget; progress does not create an XC bug record.
+   - Restore captures that deadline before lifecycle queuing and remote lookup;
+     expired queued requests return without spawning, and later stages never reset it
 4. New Happy process:
    - Creates session with backend, receives `happySessionId`
    - Installs the provider input consumer and merges the pending restore window

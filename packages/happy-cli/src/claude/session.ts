@@ -157,12 +157,20 @@ export class Session {
         for (let i = 0; i < this.claudeArgs.length; i++) {
             const arg = this.claudeArgs[i];
             
-            if (arg === '--continue') {
+            if (arg === '--continue' || arg === '-c') {
                 logger.debug('[Session] Consumed --continue flag');
                 continue;
             }
             
-            if (arg === '--resume') {
+            if (arg.startsWith('--resume=')) {
+                const candidate = arg.slice('--resume='.length);
+                if (!this.sessionId && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(candidate)) {
+                    this.sessionId = candidate;
+                }
+                continue;
+            }
+
+            if (arg === '--resume' || arg === '-r') {
                 // Check if next arg looks like a UUID (contains dashes and alphanumeric)
                 if (i + 1 < this.claudeArgs.length) {
                     const nextArg = this.claudeArgs[i + 1];

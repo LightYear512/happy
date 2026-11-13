@@ -48,12 +48,21 @@ describe('completeProviderInputReady', () => {
         expect(session.onUserMessage).not.toHaveBeenCalled();
     });
 
-    it('does not rewrite metadata for an exact restored provider identity', async () => {
+    it('refreshes restored lifecycle after readiness without changing the persisted identity or title', async () => {
         const order: string[] = [];
         const session = createSession({
             onUserMessage: vi.fn(() => order.push('consumer')),
             updateMetadata: vi.fn(async (handler) => {
-                expect(handler({ flavor: 'codex' })).toMatchObject({ claudeSessionId: 'provider-1' });
+                const before = Object.freeze({ flavor: 'codex', claudeSessionId: 'provider-1',
+                    hostPid: -1, lifecycleState: 'archived', lifecycleStateSince: 1,
+                    archivedBy: 'cli', archiveReason: 'User terminated',
+                    summary: { text: 'XC title' }, titleAuthority: 'external' });
+                const after = handler(before);
+                expect(after).toMatchObject({ claudeSessionId: 'provider-1', hostPid: process.pid,
+                    lifecycleState: 'running', summary: before.summary, titleAuthority: 'external' });
+                expect(after.lifecycleStateSince).toBeGreaterThan(1);
+                expect(after).not.toHaveProperty('archivedBy');
+                expect(after).not.toHaveProperty('archiveReason');
                 order.push('metadata');
             }),
             enableDaemonSessionTracking: vi.fn(() => order.push('daemon')),
@@ -67,9 +76,31 @@ describe('completeProviderInputReady', () => {
             onUserMessage: vi.fn(),
         });
 
-        expect(order).toEqual(['consumer', 'daemon']);
-        expect(session.updateMetadata).not.toHaveBeenCalled();
+        expect(order).toEqual(['consumer', 'daemon', 'metadata']);
         expect(session.enableDaemonSessionTracking).toHaveBeenCalledWith('provider-1');
+    });
+
+    it.each(['pending', 'rejected'])('does not wait for a %s restored lifecycle update', async (result) => {
+        const session = createSession({ updateMetadata: vi.fn(() => result === 'pending'
+            ? new Promise<void>(() => {}) : Promise.reject(new Error('metadata timeout'))) });
+        await completeProviderInputReady({ session, expectedHappySessionId: 'happy-1',
+            providerSessionId: 'provider-1', expectedProviderSessionId: 'provider-1',
+            onUserMessage: vi.fn() });
+        expect(session.enableDaemonSessionTracking).toHaveBeenCalledWith('provider-1');
+    });
+
+    it('does not reactivate a cancelled restore or a concurrently replaced provider', async () => {
+        let cancelled = false;
+        const session = createSession();
+        await completeProviderInputReady({ session, expectedHappySessionId: 'happy-1',
+            providerSessionId: 'provider-1', expectedProviderSessionId: 'provider-1',
+            onUserMessage: vi.fn(), isCancelled: () => cancelled });
+        const handler = session.updateMetadata.mock.calls[0][0];
+        const replaced = { claudeSessionId: 'provider-2', lifecycleState: 'archived' };
+        expect(handler(replaced)).toBe(replaced);
+        cancelled = true;
+        const archived = { claudeSessionId: 'provider-1', lifecycleState: 'archived' };
+        expect(handler(archived)).toBe(archived);
     });
 
     it('persists a fresh provider identity before daemon bookkeeping', async () => {

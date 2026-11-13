@@ -9,6 +9,7 @@ import {
     writeFakeCodexAppServerScript,
     createCodexAppServerTestEnvScope,
 } from './testkit/fakeCodexAppServer';
+import type { SessionEnvelope } from '@/sessionProtocol/types';
 import type { ApiSessionClient } from '@/api/apiSession';
 import type { ApiClient } from '@/api/api';
 import type { Metadata, UserMessage } from '@/api/types';
@@ -45,6 +46,8 @@ class FakeSession extends EventEmitter {
     readonly providerTurnEnds: Array<'completed' | 'failed' | 'cancelled'> = [];
     readonly daemonTurnEvents: Array<'started' | 'ended'> = [];
     readonly codexMessages: unknown[] = [];
+    readonly protocolMessages: SessionEnvelope[] = [];
+    readonly daemonTurnEnds: Array<'completed' | 'failed' | 'cancelled'> = [];
     readonly rpcHandlers = new Map<string, (params: unknown) => unknown>();
     metadata: Metadata = {
         path: '/workspace',
@@ -89,12 +92,15 @@ class FakeSession extends EventEmitter {
         this.daemonTurnEvents.push('started');
         return `xc-turn-v1-${'1'.repeat(64)}`;
     }
-    closeDaemonSessionTurn(): void { this.daemonTurnEvents.push('ended'); }
+    closeDaemonSessionTurn(status: 'completed' | 'failed' | 'cancelled' = 'completed'): void {
+        this.daemonTurnEvents.push('ended');
+        this.daemonTurnEnds.push(status);
+    }
     closeProviderSessionTurn(status: 'completed' | 'failed' | 'cancelled'): void {
         this.providerTurnEnds.push(status);
     }
     sendCodexMessage(message: unknown): void { this.codexMessages.push(message); }
-    sendSessionProtocolMessage(): void {}
+    sendSessionProtocolMessage(envelope: SessionEnvelope): void { this.protocolMessages.push(envelope); }
     sendClaudeSessionMessage(): void {}
     keepAlive(): void {}
     sendSessionDeath(): void {}
@@ -123,6 +129,9 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
         codexHome = await mkdtemp(join(tmpdir(), 'e2e-codexhome-'));
         projectCwd = await mkdtemp(join(tmpdir(), 'e2e-cwd-'));
         binDir = await mkdtemp(join(tmpdir(), 'e2e-bin-'));
+        // Never inherit or persist the developer's real global/session account choices.
+        process.env.HAPPY_HOME_DIR = join(binDir, 'isolated-happy-home');
+        await mkdir(process.env.HAPPY_HOME_DIR);
         turnLog = join(binDir, 'turns.log');
         threadTraceLog = join(binDir, 'thread-trace.jsonl');
         resumeTraceLog = join(binDir, 'resume-trace.jsonl');
@@ -154,7 +163,7 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
         await writeFile(join(dir, `rollout-2026-01-01T00-00-00-${uuid}.jsonl`), records.map((r) => JSON.stringify(r)).join('\n') + '\n');
     }
 
-    async function writeFakeBin(): Promise<string> {
+    async function writeFakeBin(failedTurns: number[] = [], completedOnly = false, failureError?: Record<string, unknown>): Promise<string> {
         // fake codex app-server. Uses console.log (auto-newline framing) and an
         // ASCII record separator so the script needs no backslash escapes.
         const mjs = await writeFakeCodexAppServerScript({
@@ -164,6 +173,10 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
                 'let nextThread = 0;',
                 `const threadIds = ${JSON.stringify([THREAD_UUID_1, THREAD_UUID_2, THREAD_UUID_3])};`,
                 'let nextTurn = 1;',
+                `const failedTurns = ${JSON.stringify(failedTurns)};`,
+                `const completedOnly = ${JSON.stringify(completedOnly)};`,
+                `const encryptedError = ${JSON.stringify(failureError ?? { message: JSON.stringify({ type: 'error', error: { type: 'invalid_request_error', code: 'invalid_encrypted_content', message: 'Encrypted content could not be decrypted or parsed.', param: null }, status: 400 }) })};`,
+
                 'let rejectTurnOnce = process.env.HAPPY_TEST_REJECT_FIRST_TURN === "1";',
                 'const rejectResume = process.env.HAPPY_TEST_REJECT_RESUME === "1";',
                 'const turnLog = process.env.HAPPY_TEST_TURN_LOG;',
@@ -183,6 +196,7 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
                 '  if (msg.method === "initialize") { reply(msg.id, { serverInfo: { name: "fake-codex", version: "0.0.0" } }); continue; }',
                 '  if (msg.method === "initialized") continue;',
                 '  if (msg.method === "thread/start") { reply(msg.id, { threadId: threadIds[Math.min(nextThread++, threadIds.length - 1)] }); continue; }',
+                '  if (msg.method === "thread/inject_items") { reply(msg.id, {}); continue; }',
                 '  if (msg.method === "thread/resume") {',
                 '    const tid = (msg.params && msg.params.threadId) || threadIds[0];',
                 '    if (resumeTraceLog) { try { fs.appendFileSync(resumeTraceLog, JSON.stringify({ threadId: tid, excludeTurns: msg.params && msg.params.excludeTurns }) + "\\n"); } catch {} }',
@@ -197,12 +211,19 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
                 '    const input = (msg.params && Array.isArray(msg.params.input)) ? msg.params.input : [];',
                 '    const text = input.map((p) => (p && typeof p.text === "string") ? p.text : "").join("");',
                 '    if (turnLog) { try { fs.appendFileSync(turnLog, text + DELIM); } catch {} }',
-                '    if (threadTraceLog) { try { fs.appendFileSync(threadTraceLog, JSON.stringify({ threadId, text, codexHome: process.env.CODEX_HOME }) + "\\n"); } catch {} }',
+                '    if (threadTraceLog) { try { fs.appendFileSync(threadTraceLog, JSON.stringify({ threadId, text, inputCount: input.length, model: msg.params.model, effort: msg.params.effort, codexHome: process.env.CODEX_HOME }) + "\\n"); } catch {} }',
                 '    if (rejectTurnOnce) { rejectTurnOnce = false; send({ id: msg.id, error: { code: -32000, message: "injected first turn rejection" } }); continue; }',
                 '    if (threadId === "child-thread") { reply(msg.id, { error: { message: "direct app-server input is not allowed for multi-agent v2 sub-agents" } }); continue; }',
                 '    reply(msg.id, { turnId });',
                 '    notify("turn/started", { threadId, turn: { id: turnId } });',
-                '    if (text.includes("__SPAWN_SUBAGENT__")) {',
+                '    if (failedTurns.includes(nextTurn - 1)) {',
+                '      if (!completedOnly) setTimeout(() => notify("error", { threadId, turnId, willRetry: false, error: encryptedError }), 5);',
+                '      setTimeout(() => notify("turn/completed", { threadId, turn: { id: turnId, status: "failed", error: encryptedError } }), 6);',
+                '      setTimeout(() => notify("error", { threadId, turnId, willRetry: false, error: encryptedError }), 30);',
+                '    } else if (failedTurns.length) {',
+                '      setTimeout(() => notify("item/agentMessage/delta", { threadId, turnId, delta: "Recovered answer" }), 5);',
+                '      setTimeout(() => notify("turn/completed", { threadId, turn: { id: turnId, status: "completed", error: null } }), 80);',
+                '    } else if (text.includes("__SPAWN_SUBAGENT__")) {',
                 '      setTimeout(() => notify("turn/started", { threadId: "child-thread", turn: { id: "child-turn" } }), 1);',
                 '      setTimeout(() => notify("turn/completed", { threadId: "child-thread", turn_id: "child-turn" }), 3);',
                 '      setTimeout(() => notify("turn/completed", { threadId, turn_id: turnId }), 8);',
@@ -247,7 +268,7 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
         }
     }
 
-    async function readThreadTraces(): Promise<Array<{ threadId: string; text: string; codexHome?: string }>> {
+    async function readThreadTraces(): Promise<Array<{ threadId: string; text: string; inputCount?: number; model?: string; effort?: string; codexHome?: string }>> {
         try {
             const raw = await readFile(threadTraceLog, 'utf-8');
             return raw.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
@@ -316,6 +337,55 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
 
         requestExit?.();
         await runtime;
+    });
+
+    it.each([
+        { name: 'recovers without replaying input', failures: [1], completedOnly: false, stop: false, exhaust: false },
+        { name: 'recovers from completed-only errors', failures: [1], completedOnly: true, stop: false, exhaust: false },
+        { name: 'stops after its bounded retry budget', failures: [1, 2, 3, 4], completedOnly: false, stop: false, exhaust: true },
+        { name: 'cancels the backoff when stopped', failures: [1], completedOnly: false, stop: true, exhaust: false },
+        { name: 'lets new user input replace the pending continuation', failures: [1], completedOnly: false, stop: false, exhaust: false, newInput: true },
+        { name: 'cancels the backoff on exit', failures: [1], completedOnly: false, stop: false, exhaust: false, exit: true },
+    ])('capacity recovery $name', async ({ failures, completedOnly, stop, exhaust, newInput, exit }) => {
+        const fakeBin = await writeFakeBin(failures, completedOnly, {
+            message: 'Selected model is at capacity. Please try a different model.', codexErrorInfo: 'serverOverloaded',
+        });
+        process.env.HAPPY_CODEX_APP_SERVER_BIN = fakeBin;
+        process.env.HAPPY_CODEX_APP_SERVER_RPC_TIMEOUT_MS = '4000';
+        process.env.HAPPY_TEST_THREAD_TRACE_LOG = threadTraceLog;
+        process.env.CODEX_HOME = codexHome;
+        await writeFile(join(codexHome, 'config.toml'), 'model = "gpt-6-astra"\nmodel_reasoning_effort = "xhigh"\n');
+        const fakeSession = new FakeSession();
+        let requestExit: (() => void) | undefined;
+        let ready!: () => void;
+        const readyPromise = new Promise<void>((resolve) => { ready = resolve; });
+        const runtime = runCodexWithAppServer({ credentials: {} as Credentials, deps: {
+            apiClient: fakeApi, session: fakeSession as unknown as ApiSessionClient, cwd: projectCwd,
+            capacityRetryDelaysMs: stop || newInput || exit ? [10_000, 10_000] : [20, 20],
+            onRuntimeReady: ({ requestExit: close }) => { requestExit = close; ready(); },
+        } });
+        try {
+            await readyPromise;
+            fakeSession.sendUserText('CAPACITY_TASK_ONCE');
+            await vi.waitFor(() => expect(fakeSession.sessionEvents.some((event) => event.message?.includes('使用原模型继续'))).toBe(true));
+            if (stop) await fakeSession.rpcHandlers.get('abort')?.({});
+            if (newInput) fakeSession.sendUserText('NEW_TASK_AFTER_CAPACITY');
+            if (exit) requestExit?.();
+            await vi.waitFor(() => expect(fakeSession.daemonTurnEnds).toHaveLength(newInput ? 2 : 1));
+            await new Promise((resolve) => setTimeout(resolve, 60));
+            const traces = await readThreadTraces();
+            expect(traces).toHaveLength(stop || exit ? 1 : exhaust ? 3 : 2);
+            expect(traces[0].text).toContain('CAPACITY_TASK_ONCE');
+            for (const trace of traces.slice(1)) expect(trace).toMatchObject({ inputCount: newInput ? 1 : 0,
+                text: newInput ? 'NEW_TASK_AFTER_CAPACITY' : '', threadId: traces[0].threadId });
+            for (const trace of traces) expect(trace).toMatchObject({ model: 'gpt-6-astra', effort: 'xhigh' });
+            expect(fakeSession.daemonTurnEvents).toEqual(newInput ? ['started', 'ended', 'started', 'ended'] : ['started', 'ended']);
+            expect(fakeSession.daemonTurnEnds).toEqual(newInput ? ['cancelled', 'completed'] : [stop || exit ? 'cancelled' : exhaust ? 'failed' : 'completed']);
+            expect(fakeSession.sessionEvents.filter((event) => event.message?.startsWith('Codex error:'))).toHaveLength(exhaust ? 1 : 0);
+        } finally {
+            requestExit?.();
+            await runtime;
+        }
     });
 
     it('resumes the exact restored thread before runtime readiness or queued input', async () => {
@@ -467,7 +537,9 @@ describe('runCodexWithAppServer — E2E fallback-compact docs injection (real tu
         }));
         expect(records).toHaveLength(1);
         expect(records[0]).not.toContain('XC_FIRST_THREAD_CONTEXT');
-        expect(records[0]).toMatch(/\n\n@$/u);
+        // Happy's bootstrap is now persisted at thread creation, not prepended
+        // to this first user input.
+        expect(records[0]).toBe('@');
     });
 
     it('prepares a daemon Codex provider identity before the first turn', async () => {
@@ -663,6 +735,81 @@ process.stdout.write(process.argv[3] === 'startup'
         expect(records[records.length - 1]).toContain('<!--HAPPY-PROJECT-DOCS-v1-->');
     }, 30_000);
 
+    it.each([false, true])('recovers encrypted history with fresh text context and correct terminal status (completedOnly=%s)', async (completedOnly) => {
+        await writeRollout(THREAD_UUID_1);
+        await writeRollout(THREAD_UUID_2);
+        const fakeBin = await writeFakeBin([1, 3], completedOnly);
+        process.env.HAPPY_CODEX_APP_SERVER_BIN = fakeBin;
+        process.env.HAPPY_CODEX_APP_SERVER_RPC_TIMEOUT_MS = '4000';
+        process.env.HAPPY_TEST_THREAD_TRACE_LOG = threadTraceLog;
+        process.env.CODEX_HOME = codexHome;
+        const fakeSession = new FakeSession();
+        let requestExit: (() => void) | undefined;
+        let resolveReady!: () => void;
+        const ready = new Promise<void>((resolve) => { resolveReady = resolve; });
+        const runtime = runCodexWithAppServer({ credentials: {} as Credentials, deps: {
+            apiClient: fakeApi, session: fakeSession as unknown as ApiSessionClient, cwd: projectCwd,
+            onRuntimeReady: ({ requestExit: close }) => { requestExit = close; resolveReady(); },
+        } });
+        try {
+            await ready;
+            fakeSession.sendUserText('finish my unfinished task');
+            await vi.waitFor(() => expect(fakeSession.daemonTurnEnds).toEqual(['failed', 'completed']), { timeout: 8000 });
+            const traces = await readThreadTraces();
+            expect(traces.map((t) => t.threadId)).toEqual([THREAD_UUID_1, THREAD_UUID_2]);
+            expect(traces[1].text).toContain('finish my unfinished task');
+            expect(traces[1].text).toContain('用户先前的问题');
+            expect(traces[1].text).not.toContain('encrypted_content');
+            expect(fakeSession.protocolMessages.filter((m) => m.ev.t === 'turn-end').map((m) => m.ev)).toEqual([
+                { t: 'turn-end', status: 'failed' }, { t: 'turn-end', status: 'completed' },
+            ]);
+            // A real completed turn rearms rescue; stale errors emitted while
+            // the replacement turn is running must not consume that allowance.
+            fakeSession.sendUserText('next independent task');
+            await vi.waitFor(() => expect(fakeSession.daemonTurnEnds).toEqual(['failed', 'completed', 'failed', 'completed']), { timeout: 8000 });
+            expect((await readThreadTraces()).map((t) => t.threadId)).toEqual([
+                THREAD_UUID_1, THREAD_UUID_2, THREAD_UUID_2, THREAD_UUID_3,
+            ]);
+            expect(fakeSession.sessionEvents.filter((e) => e.message === 'Compaction completed')).toHaveLength(2);
+        } finally {
+            requestExit?.();
+            await runtime;
+        }
+    }, 20_000);
+
+    it.each([false, true])('stops the runtime when recovery fails, without an automated retry storm (missingRollout=%s)', async (missingRollout) => {
+        if (!missingRollout) {
+            await writeRollout(THREAD_UUID_1);
+            await writeRollout(THREAD_UUID_2);
+        }
+        const fakeBin = await writeFakeBin([1, 2]);
+        process.env.HAPPY_CODEX_APP_SERVER_BIN = fakeBin;
+        process.env.HAPPY_CODEX_APP_SERVER_RPC_TIMEOUT_MS = '4000';
+        process.env.HAPPY_TEST_THREAD_TRACE_LOG = threadTraceLog;
+        process.env.CODEX_HOME = codexHome;
+        const fakeSession = new FakeSession();
+        let requestExit: (() => void) | undefined;
+        let finished = false;
+        let resolveReady!: () => void;
+        const ready = new Promise<void>((resolve) => { resolveReady = resolve; });
+        const runtime = runCodexWithAppServer({ credentials: {} as Credentials, deps: {
+            apiClient: fakeApi, session: fakeSession as unknown as ApiSessionClient, cwd: projectCwd,
+            onRuntimeReady: ({ requestExit: close }) => { requestExit = close; resolveReady(); },
+        } }).finally(() => { finished = true; });
+        try {
+            await ready;
+            fakeSession.sendUserText('resume unfinished work');
+            await vi.waitFor(() => expect(finished).toBe(true), { timeout: 8000 });
+            const traces = await readThreadTraces();
+            expect(traces).toHaveLength(missingRollout ? 1 : 2);
+            expect(fakeSession.daemonTurnEnds).toEqual(missingRollout ? ['failed'] : ['failed', 'failed']);
+            expect(fakeSession.sessionEvents.some((e) => e.message?.includes('已停止本会话进程'))).toBe(true);
+        } finally {
+            requestExit?.();
+            await runtime;
+        }
+    }, 15_000);
+
     it('keeps direct input and lifecycle on the root thread after a sub-agent turn', async () => {
         const fakeBin = await writeFakeBin();
         process.env.HAPPY_CODEX_APP_SERVER_BIN = fakeBin;
@@ -785,7 +932,7 @@ process.stdout.write(process.argv[3] === 'startup'
         expect(traces[1].codexHome).toBe(personalHome);
     }, 20_000);
 
-    it('does not wake an idle session for a global account target and switches before the next input', async () => {
+    it.each(['gpt', 'deepseek'] as const)('does not wake an idle %s session for a global account target and switches only its family before the next input', async (family) => {
         const happyHome = join(binDir, 'happy-home');
         const instances = join(happyHome, 'auth', 'codex', 'instances');
         const workHome = join(instances, 'work');
@@ -795,6 +942,15 @@ process.stdout.write(process.argv[3] === 'startup'
         await writeFile(join(workHome, 'auth.json'), JSON.stringify({ tokens: { access_token: 'work-test-token' } }));
         await writeFile(join(personalHome, 'auth.json'), JSON.stringify({ tokens: { access_token: 'personal-test-token' } }));
         await writeFile(join(instances, 'config.yaml'), 'default: work\n');
+
+        const model = family === 'gpt' ? 'gpt-6-astra' : 'deepseek-flash';
+        await writeFile(join(workHome, 'config.toml'), `model="${model}"\n`);
+        await writeFile(join(personalHome, 'config.toml'), `model="${model}"\n`);
+        const otherFamily = family === 'gpt' ? 'deepseek' : 'gpt';
+        const otherHome = join(instances, 'other-family');
+        await mkdir(otherHome);
+        await writeFile(join(otherHome, 'auth.json'), '{}');
+        await writeFile(join(otherHome, 'config.toml'), `model="${otherFamily === 'gpt' ? 'gpt-6-astra' : 'deepseek-flash'}"\n`);
 
         const fakeBin = await writeFakeBin();
         process.env.HAPPY_CODEX_APP_SERVER_BIN = fakeBin;
@@ -829,7 +985,9 @@ process.stdout.write(process.argv[3] === 'startup'
             await new Promise((resolve) => setTimeout(resolve, 20));
         }
 
-        publishAccountIntent('codex', 'personal', Date.now(), happyHome);
+        const chosenAt = Date.now();
+        publishAccountIntent('codex', 'personal', chosenAt, happyHome, family);
+        publishAccountIntent('codex', 'other-family', chosenAt + 1, happyHome, otherFamily);
         await new Promise((resolve) => setTimeout(resolve, 350));
         expect(await readResumeTraces()).toEqual([]);
         expect(fakeSession.sessionEvents.some((event) => event.message?.includes('Switched to "personal"'))).toBe(false);
@@ -907,7 +1065,7 @@ process.stdout.write(process.argv[3] === 'startup'
         expect(traces[0].text).toContain('startup-global-account');
     }, 15_000);
 
-    it('uses the canonical RPC timeout for account swap and keeps the old account usable on timeout', async () => {
+    it('waits beyond the ordinary RPC cap during account recovery and submits the retained burst once', async () => {
         const happyHome = join(binDir, 'happy-home');
         const instances = join(happyHome, 'auth', 'codex', 'instances');
         const workHome = join(instances, 'work');
@@ -923,6 +1081,7 @@ process.stdout.write(process.argv[3] === 'startup'
         process.env.HAPPY_CODEX_APP_SERVER_RPC_TIMEOUT_MS = '1000';
         process.env.HAPPY_TEST_RESUME_DELAY_MS = '1500';
         process.env.HAPPY_TEST_THREAD_TRACE_LOG = threadTraceLog;
+        process.env.HAPPY_TEST_RESUME_TRACE_LOG = resumeTraceLog;
         process.env.HAPPY_HOME_DIR = happyHome;
         process.env.CODEX_HOME = workHome;
 
@@ -943,42 +1102,49 @@ process.stdout.write(process.argv[3] === 'startup'
             },
         });
 
-        await runtimeReady;
-        fakeSession.sendUserText('first-account-prompt');
-        const firstDeadline = Date.now() + 2_000;
-        while (Date.now() < firstDeadline) {
-            if ((await readThreadTraces()).length >= 1) break;
-            await new Promise((resolve) => setTimeout(resolve, 20));
+        try {
+            await runtimeReady;
+            fakeSession.sendUserText('first-account-prompt');
+            const firstDeadline = Date.now() + 2_000;
+            while (Date.now() < firstDeadline) {
+                if ((await readThreadTraces()).length >= 1) break;
+                await new Promise((resolve) => setTimeout(resolve, 20));
+            }
+
+            fakeSession.sendUserText('!auth personal');
+            const resumeDeadline = Date.now() + 2_000;
+            while (Date.now() < resumeDeadline) {
+                if ((await readResumeTraces()).length >= 1) break;
+                await new Promise((resolve) => setTimeout(resolve, 20));
+            }
+            expect(await readResumeTraces()).toHaveLength(1);
+            fakeSession.sendUserText('input-during-recovery');
+            fakeSession.sendUserText('next-input-same-recovery');
+            const secondDeadline = Date.now() + 4_000;
+            let traces: Array<{ threadId: string; text: string; codexHome?: string }> = [];
+            while (Date.now() < secondDeadline) {
+                traces = await readThreadTraces();
+                if (traces.length >= 2) break;
+                await new Promise((resolve) => setTimeout(resolve, 20));
+            }
+
+            expect(fakeSession.sessionEvents.some((event) => event.message?.includes('timed out'))).toBe(false);
+            expect(fakeSession.sessionEvents.some((event) => event.message?.includes('Switched to "personal"'))).toBe(true);
+            expect(traces).toHaveLength(2);
+            expect(traces[0].threadId).toBe(traces[1].threadId);
+            expect(traces[0].codexHome).toBe(workHome);
+            expect(traces[1].codexHome).toBe(personalHome);
+            expect(traces[1].text).toContain('input-during-recovery');
+            expect(traces[1].text).toContain('next-input-same-recovery');
+            expect(traces[1].text.indexOf('input-during-recovery')).toBeLessThan(traces[1].text.indexOf('next-input-same-recovery'));
+            expect(await readResumeTraces()).toHaveLength(1);
+        } finally {
+            requestExit?.();
+            await runtime;
         }
-
-        fakeSession.sendUserText('!auth personal');
-        const failureDeadline = Date.now() + 2_000;
-        while (Date.now() < failureDeadline) {
-            if (fakeSession.sessionEvents.some((event) => event.message?.includes('timed out after 1000ms'))) break;
-            await new Promise((resolve) => setTimeout(resolve, 20));
-        }
-
-        fakeSession.sendUserText('old-account-still-usable');
-        const secondDeadline = Date.now() + 2_000;
-        let traces: Array<{ threadId: string; text: string; codexHome?: string }> = [];
-        while (Date.now() < secondDeadline) {
-            traces = await readThreadTraces();
-            if (traces.length >= 2) break;
-            await new Promise((resolve) => setTimeout(resolve, 20));
-        }
-
-        requestExit?.();
-        await runtime;
-
-        expect(fakeSession.sessionEvents.some((event) => event.message?.includes('timed out after 1000ms'))).toBe(true);
-        expect(fakeSession.sessionEvents.some((event) => event.message?.includes('Switched to "personal"'))).toBe(false);
-        expect(traces).toHaveLength(2);
-        expect(traces[0].threadId).toBe(traces[1].threadId);
-        expect(traces[0].codexHome).toBe(workHome);
-        expect(traces[1].codexHome).toBe(workHome);
     }, 15_000);
 
-    it('attempts a failed global account target once per input without using the old account', async () => {
+    it('bounds each new-input recovery, retains the original batch, and never submits on the wrong account', async () => {
         const happyHome = join(binDir, 'happy-home');
         const instances = join(happyHome, 'auth', 'codex', 'instances');
         const workHome = join(instances, 'work');
@@ -1027,21 +1193,37 @@ process.stdout.write(process.argv[3] === 'startup'
         fakeSession.sendUserText('must-not-run-on-old-account');
         const failureDeadline = Date.now() + 2_000;
         while (Date.now() < failureDeadline) {
-            if (fakeSession.sessionEvents.some((event) => event.message?.includes('本次输入未提交'))) break;
+            if (fakeSession.sessionEvents.some((event) => event.message?.includes('未提交的输入已保留'))) break;
             await new Promise((resolve) => setTimeout(resolve, 20));
         }
+        fakeSession.sendUserText('also-retain-this-input');
         await new Promise((resolve) => setTimeout(resolve, 300));
-
+        expect(await readResumeTraces()).toHaveLength(2);
+        expect(await readThreadTraces()).toHaveLength(1);
+        // A failed operation must not spin when no new input arrives.
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        expect(await readResumeTraces()).toHaveLength(2);
+        delete process.env.HAPPY_TEST_REJECT_RESUME;
+        fakeSession.sendUserText('recover-original-batch');
+        const recoveryDeadline = Date.now() + 3_000;
+        while (Date.now() < recoveryDeadline) {
+            if ((await readThreadTraces()).length >= 3) break;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+        }
         const traces = await readThreadTraces();
         const resumes = await readResumeTraces();
         requestExit?.();
         await runtime;
 
-        expect(fakeSession.sessionEvents.some((event) => event.message?.includes('本次输入未提交'))).toBe(true);
-        expect(resumes).toHaveLength(1);
+        expect(fakeSession.sessionEvents.some((event) => event.message?.includes('未提交的输入已保留'))).toBe(true);
+        expect(resumes).toHaveLength(3);
         expect(resumes[0]?.excludeTurns).toBe(true);
-        expect(traces).toHaveLength(1);
+        expect(traces).toHaveLength(3);
         expect(traces[0].text).toContain('first-account-prompt');
+        expect(traces[1].text).toContain('must-not-run-on-old-account');
+        expect(traces[2].text).toContain('also-retain-this-input');
+        expect(traces[2].text).toContain('recover-original-batch');
+        expect(traces.slice(1).every(trace => trace.codexHome === personalHome && trace.threadId === traces[0].threadId)).toBe(true);
     }, 15_000);
 
 });

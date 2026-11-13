@@ -21,6 +21,23 @@ export function resolveCodexModelModeOrDefault(modelMode: string | null | undefi
     return readCodexDefaultModelConfig();
 }
 
+/** Classify the configured model, including GPT accounts using a custom proxy. */
+export function readCodexModelFamily(codexHome: string): 'gpt' | 'deepseek' | undefined {
+    try {
+        const root = readTomlRootTable(readFileSync(join(codexHome, 'config.toml'), 'utf8'));
+        const model = parseTomlRootString(root, 'model');
+        if (model) {
+            if (/^deepseek(?:-|$)/i.test(model)) return 'deepseek';
+            if (/^(?:gpt-|codex-|o[1-9](?:-|$))/i.test(model)) return 'gpt';
+            return undefined;
+        }
+        const provider = parseTomlRootString(root, 'model_provider') || 'openai';
+        return provider === 'openai' ? 'gpt' : provider === 'deepseek' ? 'deepseek' : undefined;
+    } catch (error) {
+        return (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'gpt' : undefined;
+    }
+}
+
 export function readCodexDefaultModelConfig(): CodexModelModeConfig {
     const codexHome = process.env.CODEX_HOME || join(os.homedir(), '.codex');
     const configPath = join(codexHome, 'config.toml');

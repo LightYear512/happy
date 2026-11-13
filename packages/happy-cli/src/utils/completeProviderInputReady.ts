@@ -1,5 +1,6 @@
 import type { ApiSessionClient } from '@/api/apiSession';
 import type { UserMessage } from '@/api/types';
+import { logger } from '@/ui/logger';
 
 export interface CompleteProviderInputReadyOptions {
     session: ApiSessionClient;
@@ -8,6 +9,7 @@ export interface CompleteProviderInputReadyOptions {
     providerSessionId?: string;
     expectedProviderSessionId?: string;
     onUserMessage: (message: UserMessage) => void;
+    isCancelled?: () => boolean;
 }
 
 /**
@@ -18,6 +20,7 @@ export interface CompleteProviderInputReadyOptions {
 export async function completeProviderInputReady(
     options: CompleteProviderInputReadyOptions,
 ): Promise<void> {
+    if (options.isCancelled?.()) throw new Error('Provider startup cancelled');
     if (options.session.sessionId !== options.expectedHappySessionId) {
         throw new Error('Happy session identity changed before provider readiness');
     }
@@ -40,6 +43,27 @@ export async function completeProviderInputReady(
             claudeSessionId: options.providerSessionId,
         }), { rejectOnServerError: true });
     }
+    if (options.isCancelled?.()) throw new Error('Provider startup cancelled');
     options.session.enableDaemonSessionTracking(options.providerSessionId);
 
+    if (options.expectedProviderSessionId !== undefined) {
+        // Restore preserves the provider identity, but not the old process's
+        // archived lifecycle/PID. Refresh those projections after readiness;
+        // a lost metadata ACK must never fail a usable restored provider.
+        void options.session.updateMetadata((metadata) => {
+            if (options.isCancelled?.() || metadata.claudeSessionId !== options.expectedProviderSessionId) {
+                return metadata;
+            }
+            const { archivedBy: _archivedBy, archiveReason: _archiveReason, ...retained } = metadata;
+            return {
+                ...retained,
+                hostPid: process.pid,
+                lifecycleState: 'running',
+                lifecycleStateSince: metadata.lifecycleState === 'running'
+                    ? metadata.lifecycleStateSince : Date.now(),
+            };
+        }, { rejectOnServerError: true }).catch(() => {
+            logger.debug('[ProviderReady] Restored lifecycle refresh failed; input remains ready');
+        });
+    }
 }

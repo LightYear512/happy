@@ -9,11 +9,13 @@ import {
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { getHappyHome, type AuthFlavor } from './ccsProfiles';
+import { readCodexModelFamily } from '@/codex/defaultModelConfig';
 
 const INTENT_SCHEMA = 'happy.account-intent/1';
 const SELECTION_SCHEMA = 'happy.session-account-selection/1';
 
 export type AccountIntentFlavor = Exclude<AuthFlavor, 'gemini'>;
+export type CodexAccountFamily = 'gpt' | 'deepseek';
 
 export type AccountIntent = Readonly<{
     profileName: string;
@@ -62,8 +64,8 @@ function parseIntent(value: unknown): AccountIntent {
     return { profileName: value.profileName, setAt: Number(value.setAt) };
 }
 
-function readIntentDocument(home: string): AccountIntentDocument {
-    const path = join(home, 'account-intent.json');
+function readIntentDocument(home: string, file = 'account-intent.json'): AccountIntentDocument {
+    const path = join(home, file);
     if (!existsSync(path)) return { schema: INTENT_SCHEMA };
     const value: unknown = JSON.parse(readFileSync(path, 'utf8'));
     if (!isRecord(value)
@@ -131,8 +133,14 @@ function writeJsonAtomically(path: string, value: unknown): void {
 export function readAccountIntent(
     flavor: AccountIntentFlavor,
     home = getHappyHome(),
+    codexFamily?: CodexAccountFamily,
 ): AccountIntent | null {
-    return readIntentDocument(home)[flavor] ?? null;
+    const file = flavor === 'codex' && codexFamily === 'deepseek'
+        ? 'deepseek-account-intent.json' : 'account-intent.json';
+    const intent = readIntentDocument(home, file)[flavor] ?? null;
+    if (intent && flavor === 'codex' && codexFamily
+        && readCodexModelFamily(join(home, 'auth/codex/instances', intent.profileName)) !== codexFamily) return null;
+    return intent;
 }
 
 export function publishAccountIntent(
@@ -140,6 +148,7 @@ export function publishAccountIntent(
     profileName: string,
     now = Date.now(),
     home = getHappyHome(),
+    codexFamily?: CodexAccountFamily,
 ): AccountIntent {
     if (!profileName || profileName.trim() !== profileName) {
         throw new Error('Account profile name is invalid');
@@ -147,14 +156,22 @@ export function publishAccountIntent(
     if (!Number.isSafeInteger(now) || now <= 0) {
         throw new Error('Account intent timestamp is invalid');
     }
-    const current = readIntentDocument(home);
+    if (flavor === 'codex' && codexFamily
+        && readCodexModelFamily(join(home, 'auth/codex/instances', profileName)) !== codexFamily) {
+        throw new Error('Account profile does not belong to the selected model family');
+    }
+    // Keep the GPT document byte-compatible with running older GPT sessions.
+    // DeepSeek has its own timestamp and never overwrites that shared GPT slot.
+    const file = flavor === 'codex' && codexFamily === 'deepseek'
+        ? 'deepseek-account-intent.json' : 'account-intent.json';
+    const current = readIntentDocument(home, file);
     const previous = current[flavor]?.setAt ?? 0;
     if (previous === Number.MAX_SAFE_INTEGER) {
         throw new Error('Account intent timestamp is exhausted');
     }
     const setAt = Math.max(now, previous + 1);
     const intent = { profileName, setAt } as const;
-    writeJsonAtomically(join(home, 'account-intent.json'), {
+    writeJsonAtomically(join(home, file), {
         ...current,
         [flavor]: intent,
     });
@@ -195,7 +212,11 @@ export function accountIntentIsNewer(intent: AccountIntent | null, seenSetAt: nu
 export function resolveStartupAccountSelection(
     session: SessionAccountSelection | null,
     global: AccountIntent | null,
+    explicitProfile?: string,
 ): StartupAccountSelection | null {
+    if (explicitProfile && !session) {
+        return { profileName: explicitProfile, seenGlobalSetAt: global?.setAt ?? 0, source: 'session' };
+    }
     if (accountIntentIsNewer(global, session?.seenGlobalSetAt ?? 0)) {
         return {
             profileName: global.profileName,
